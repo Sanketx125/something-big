@@ -25,6 +25,7 @@ __pycache__/
 
 # Installers / packages
 *.msi
+*.whl
 
 # OS / editor noise
 .DS_Store
