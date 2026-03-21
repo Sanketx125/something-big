@@ -1,0 +1,45 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .top-face   { fill: #E6F1FB; stroke: #185FA5; opacity: 0.45; }
+    .front-face { fill: #B5D4F4; stroke: #185FA5; opacity: 0.45; }
+    .side-fill  { fill: #E6F1FB; }
+    .side-line  { stroke: #185FA5; }
+    .grid-line  { stroke: #185FA5; }
+    .eye-ring   { stroke: #185FA5; }
+    .eye-dot    { fill: #185FA5; }
+
+    @media (prefers-color-scheme: dark) {
+      .top-face   { fill: #042C53; stroke: #378ADD; opacity: 0.5; }
+      .front-face { fill: #0C447C; stroke: #378ADD; opacity: 0.5; }
+      .side-fill  { fill: #185FA5; }
+      .side-line  { stroke: #85B7EB; }
+      .grid-line  { stroke: #B5D4F4; }
+      .eye-ring   { stroke: #85B7EB; }
+      .eye-dot    { fill: #85B7EB; }
+    }
+  </style>
+
+  <!-- Top face — muted -->
+  <polygon points="4,8 8,4 20,4 16,8"
+           class="top-face" stroke-width="0.8" stroke-linejoin="round"/>
+
+  <!-- Front face — muted -->
+  <rect x="4" y="8" width="12" height="12"
+        class="front-face" stroke-width="0.9"/>
+
+  <!-- Right / Side face — HIGHLIGHTED -->
+  <polygon points="16,8 20,4 20,16 16,20"
+           class="side-fill side-line" stroke-width="1.1" stroke-linejoin="round"/>
+
+  <!-- Subtle grid on side face -->
+  <line x1="16" y1="14" x2="20" y2="10"
+        class="grid-line" stroke-width="0.6" stroke-linecap="round" opacity="0.3"/>
+  <line x1="18" y1="8"  x2="18" y2="20"
+        class="grid-line" stroke-width="0.6" stroke-linecap="round" opacity="0.3"/>
+
+  <!-- Ortho eye — bottom-left (viewing from right side toward left) -->
+  <circle cx="3" cy="20" r="2"
+          fill="none" class="eye-ring" stroke-width="0.9" opacity="0.75"/>
+  <circle cx="3" cy="20" r="0.7"
+          class="eye-dot" opacity="0.75"/>
+</svg>

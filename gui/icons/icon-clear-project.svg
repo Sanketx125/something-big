@@ -1,0 +1,24 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .folder-fill { fill: #FCEBEB; }
+    .folder-line { stroke: #E24B4A; }
+    .x-line      { stroke: #E24B4A; }
+
+    @media (prefers-color-scheme: dark) {
+      .folder-fill { fill: #501313; }
+      .folder-line { stroke: #E24B4A; }
+      .x-line      { stroke: #F09595; }
+    }
+  </style>
+
+  <!-- Folder body (project container) -->
+  <path d="M2 6C2 4.895 2.895 4 4 4H9L11 6H20C21.105 6 22 6.895 22 8V18C22 19.105 21.105 20 20 20H4C2.895 20 2 19.105 2 18V6Z"
+        class="folder-fill folder-line" stroke-width="1" stroke-linejoin="round"/>
+
+  <!-- Folder lid separator -->
+  <path d="M2 10H22" class="folder-line" stroke-width="1" stroke-linecap="round"/>
+
+  <!-- X inside folder body -->
+  <line x1="8"  y1="13" x2="16" y2="19" class="x-line" stroke-width="1.6" stroke-linecap="round"/>
+  <line x1="16" y1="13" x2="8"  y2="19" class="x-line" stroke-width="1.6" stroke-linecap="round"/>
+</svg>

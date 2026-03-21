@@ -1,0 +1,37 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .doc-fill    { fill: #FCEBEB; }
+    .doc-line    { stroke: #E24B4A; }
+    .corner-fill { fill: #F7C1C1; }
+    .x-line      { stroke: #E24B4A; }
+    .base-line   { stroke: #E24B4A; }
+
+    @media (prefers-color-scheme: dark) {
+      .doc-fill    { fill: #501313; }
+      .doc-line    { stroke: #E24B4A; }
+      .corner-fill { fill: #791F1F; }
+      .x-line      { stroke: #F09595; }
+      .base-line   { stroke: #E24B4A; }
+    }
+  </style>
+
+  <!-- Document body -->
+  <rect x="4" y="2" width="14" height="18" rx="2"
+        class="doc-fill doc-line" stroke-width="1"/>
+
+  <!-- Folded corner -->
+  <path d="M14 2V7H18"
+        class="corner-fill doc-line" stroke-width="0.8"/>
+
+  <!-- X strike — diagonal 1 -->
+  <line x1="7" y1="9" x2="15" y2="16"
+        class="x-line" stroke-width="1.5" stroke-linecap="round"/>
+
+  <!-- X strike — diagonal 2 -->
+  <line x1="15" y1="9" x2="7" y2="16"
+        class="x-line" stroke-width="1.5" stroke-linecap="round"/>
+
+  <!-- Ground / clear sweep line -->
+  <path d="M3 21H21"
+        class="base-line" stroke-width="1" stroke-linecap="round" opacity="0.4"/>
+</svg>

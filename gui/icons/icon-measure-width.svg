@@ -1,0 +1,55 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .cloud     { fill: #185FA5; }
+    .dim-line  { stroke: #EF9F27; }
+    .dim-label { fill: #EF9F27; }
+
+    @media (prefers-color-scheme: dark) {
+      .cloud     { fill: #85B7EB; }
+      .dim-line  { stroke: #FAC775; }
+      .dim-label { fill: #FAC775; }
+    }
+  </style>
+
+  <!-- Point cloud — object being measured -->
+  <circle cx="7"  cy="9"  r="0.85" class="cloud" opacity="0.50"/>
+  <circle cx="9"  cy="8"  r="0.85" class="cloud" opacity="0.60"/>
+  <circle cx="11" cy="9"  r="0.85" class="cloud" opacity="0.55"/>
+  <circle cx="13" cy="8"  r="0.85" class="cloud" opacity="0.50"/>
+  <circle cx="15" cy="9"  r="0.85" class="cloud" opacity="0.60"/>
+  <circle cx="17" cy="8"  r="0.85" class="cloud" opacity="0.55"/>
+  <circle cx="8"  cy="11" r="0.85" class="cloud" opacity="0.50"/>
+  <circle cx="10" cy="11" r="0.85" class="cloud" opacity="0.55"/>
+  <circle cx="12" cy="11" r="0.85" class="cloud" opacity="0.50"/>
+  <circle cx="14" cy="11" r="0.85" class="cloud" opacity="0.55"/>
+  <circle cx="16" cy="11" r="0.85" class="cloud" opacity="0.50"/>
+
+  <!-- Left vertical tick -->
+  <line x1="6" y1="6" x2="6" y2="15"
+        class="dim-line" stroke-width="1.2" stroke-linecap="round"/>
+
+  <!-- Right vertical tick -->
+  <line x1="18" y1="6" x2="18" y2="15"
+        class="dim-line" stroke-width="1.2" stroke-linecap="round"/>
+
+  <!-- Horizontal dimension line -->
+  <line x1="6" y1="14" x2="18" y2="14"
+        class="dim-line" stroke-width="1.2" stroke-linecap="round"/>
+
+  <!-- Arrow left -->
+  <polyline points="9,12 6,14 9,16"
+            fill="none" class="dim-line"
+            stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Arrow right -->
+  <polyline points="15,12 18,14 15,16"
+            fill="none" class="dim-line"
+            stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- W label -->
+  <text x="12" y="21"
+        text-anchor="middle" dominant-baseline="central"
+        font-family="system-ui, -apple-system, sans-serif"
+        font-size="4.5" font-weight="700"
+        class="dim-label" opacity="0.9">W</text>
+</svg>

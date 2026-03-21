@@ -1,0 +1,36 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .track      { stroke: #C8D4E0; }
+    .thumb-fill { fill: #E6F1FB; }
+    .thumb-line { stroke: #185FA5; }
+    .thumb-dot  { fill: #185FA5; }
+
+    @media (prefers-color-scheme: dark) {
+      .track      { stroke: #2A3550; }
+      .thumb-fill { fill: #0C447C; }
+      .thumb-line { stroke: #378ADD; }
+      .thumb-dot  { fill: #85B7EB; }
+    }
+  </style>
+
+  <!-- Track 1 — top -->
+  <line x1="3" y1="6" x2="21" y2="6"
+        class="track" stroke-width="1.4" stroke-linecap="round"/>
+  <!-- Thumb 1 — left (low value) -->
+  <circle cx="8" cy="6" r="2.5" class="thumb-fill thumb-line" stroke-width="1"/>
+  <circle cx="8" cy="6" r="1"   class="thumb-dot"/>
+
+  <!-- Track 2 — middle -->
+  <line x1="3" y1="12" x2="21" y2="12"
+        class="track" stroke-width="1.4" stroke-linecap="round"/>
+  <!-- Thumb 2 — center (mid value) -->
+  <circle cx="14" cy="12" r="2.5" class="thumb-fill thumb-line" stroke-width="1"/>
+  <circle cx="14" cy="12" r="1"   class="thumb-dot"/>
+
+  <!-- Track 3 — bottom -->
+  <line x1="3" y1="18" x2="21" y2="18"
+        class="track" stroke-width="1.4" stroke-linecap="round"/>
+  <!-- Thumb 3 — right (high value) -->
+  <circle cx="18" cy="18" r="2.5" class="thumb-fill thumb-line" stroke-width="1"/>
+  <circle cx="18" cy="18" r="1"   class="thumb-dot"/>
+</svg>

@@ -1,0 +1,18 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .glass-fill { fill: #E6F1FB; }
+    .glass-line { stroke: #185FA5; }
+    .plus       { stroke: #185FA5; }
+    .handle     { stroke: #185FA5; }
+    @media (prefers-color-scheme: dark) {
+      .glass-fill { fill: #0C447C; }
+      .glass-line { stroke: #378ADD; }
+      .plus       { stroke: #85B7EB; }
+      .handle     { stroke: #85B7EB; }
+    }
+  </style>
+  <circle cx="10" cy="10" r="6.5" class="glass-fill glass-line" stroke-width="1.1"/>
+  <line x1="10" y1="7"  x2="10" y2="13" class="plus"   stroke-width="1.3" stroke-linecap="round"/>
+  <line x1="7"  y1="10" x2="13" y2="10" class="plus"   stroke-width="1.3" stroke-linecap="round"/>
+  <line x1="14.5" y1="14.5" x2="20" y2="20" class="handle" stroke-width="1.6" stroke-linecap="round"/>
+</svg>

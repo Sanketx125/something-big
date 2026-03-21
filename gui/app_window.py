@@ -1,0 +1,10118 @@
+import os
+import random
+import vtk
+import time
+import numpy as np
+import pyvista as pv
+from pyvistaqt import QtInteractor
+from .cross_section.interactor_classify import ClassificationInteractor
+# Add this with your other imports at the top
+from gui.brush_size_dialog import activate_brush_tool_with_dialog, show_brush_size_dialog
+from .vtk_safety import VTKSafetyManager, safe_render, _validate_vtk_widget, safe_vtk_operation
+
+from PySide6.QtWidgets import (
+    QMainWindow, QFileDialog, QMessageBox, QWidget, QVBoxLayout, QInputDialog,
+    QDockWidget, QTreeWidget, QTreeWidgetItem, QMenu, QColorDialog, QSplitter, QComboBox,
+    QPushButton, QLabel, QSizePolicy, QHBoxLayout,
+    QDialog
+)
+from PySide6.QtCore import QObject, QEvent, Qt, QTimer, QSettings, Signal
+from PySide6.QtWidgets import QSlider
+# Add with your other gui imports (around line 20-30)
+from gui.point_count_widget import PointCountWidget, refresh_point_statistics
+
+from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut
+from gui.menu_sidebar_system import RibbonManager
+
+from .session_manager import SESSION  
+
+
+# ✅ imports from your project
+from .views import set_view
+from .cross_section.cut_section_controller import CutSectionController
+from .cross_section.interactor_slice import CrossSectionInteractor
+from .cross_section.interactor_classify import ClassificationInteractor
+from .cross_section.section_controller import SectionController
+from .data_loader import load_lidar_file
+from .pointcloud_display import update_pointcloud
+from .shading_display import update_shaded_class, ShadingControlPanel
+from .display_mode import DisplayModeDialog
+from .save_pointcloud import save_pointcloud, save_pointcloud_quick
+from .clear_project import clear_project
+from .shortcut_manager import ShortcutManager
+from .global_shortcuts import GlobalShortcutFilter
+from gui.digitize_tools import DigitizeManager
+from .classification_fast import UltraFastClassifier  # ✅ CORRECT - relative import
+from PySide6.QtWidgets import QApplication
+from .spatial_index import build_spatial_index_auto
+from .fit_view import FitViewController
+from pyproj import CRS  
+from gui.performance_optimizations import (
+    SpatialIndex, 
+    update_pointcloud_optimized,
+    fast_update_colors_optimized,
+    apply_classification_chunked
+)
+
+def patch_pyvistaqt_close():
+    """
+    Fix PyVistaQt's close() method to handle already-deleted timers.
+    This prevents AttributeError/RuntimeError during app shutdown.
+    """
+    try:
+        from pyvistaqt import QtInteractor
+        
+        # Store original close method
+        original_close = QtInteractor.close
+        
+        def safe_close(self):
+            """Safe close that handles deleted timers"""
+            try:
+                # Stop timer safely
+                if hasattr(self, 'render_timer') and self.render_timer is not None:
+                    try:
+                        self.render_timer.stop()
+                    except RuntimeError:
+                        # Timer already deleted - this is OK
+                        pass
+                    self.render_timer = None
+            except Exception:
+                pass
+            
+            # Call original close (skip timer part)
+            try:
+                # Manually do what original close does (without timer)
+                if hasattr(self, 'iren') and self.iren:
+                    self.iren.close()
+            except Exception:
+                pass
+        
+        # Replace close method
+        QtInteractor.close = safe_close
+        print("✅ PyVistaQt close() method patched")
+        
+    except Exception as e:
+        print(f"⚠️ PyVistaQt patch failed (not critical): {e}")
+
+# Apply patch immediately
+patch_pyvistaqt_close()
+
+# # ---------------- Main Application Window ----------------
+
+
+class Disable3DDoubleClickFilter(QObject):
+    """
+    Blocks double-click on the MAIN VTK interactor so app won't auto-switch to 3D.
+    3D view remains accessible only via Views -> 3D button.
+    """
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonDblClick:
+            # block only left double click (safe)
+            try:
+                if event.button() == Qt.LeftButton:
+                    event.accept()
+                    return True
+            except Exception:
+                event.accept()
+                return True
+        return False
+
+class NakshaApp(QMainWindow):
+    # Phase 4: Global signal bus
+    classification_finished = Signal(object)  # emits changed_mask (numpy array or None)
+
+    def __init__(self):
+
+       
+
+        super().__init__()
+        try:
+            import os
+            from PySide6.QtGui import QIcon
+            from PySide6.QtCore import QSize
+           
+            # Path to logo
+            logo_path = os.path.join(os.path.dirname(__file__), "icons", "logo.png")
+           
+            if os.path.exists(logo_path):
+                icon = QIcon(logo_path)
+                # Add multiple sizes for better display across different UI contexts
+                for size in [16, 24, 32, 48, 64, 128, 256]:
+                    icon.addFile(logo_path, QSize(size, size))
+               
+                self.setWindowIcon(icon)
+                print(f"✅ Window icon loaded: {logo_path}")
+            else:
+                print(f"⚠️ Logo not found at: {logo_path}")
+               
+        except Exception as e:
+            print(f"⚠️ Failed to set window icon: {e}")
+            import traceback
+            traceback.print_exc()
+ 
+        # ===== GPU SUPPORT INITIALIZATION =====
+        from gui.gpu_support import init_gpu_support
+        gpu_support = init_gpu_support()
+        print(f"🖥️ Rendering backend: {gpu_support.rendering_backend}")
+ 
+        # ===== GPU RENDER OPTIMIZATION =====
+        from gui.gpu_render_manager import GPURenderManager
+        self.gpu_render_manager = GPURenderManager(self)
+        self.gpu_render_manager.install()
+
+        # Phase 4: Global Signal Bus — connect classification_finished
+        self.classification_finished.connect(self._on_classification_finished)
+ 
+        # ✅ NEW: Auto-configure render delay based on GPU
+        recommended_delay = gpu_support.get_recommended_render_delay()
+        self.gpu_render_manager.set_render_delay(recommended_delay)
+        print(f"⏱️  Render delay: {recommended_delay}ms (auto-configured for {gpu_support.gpu_name})")
+ 
+        # ✅ Load theme FIRST
+        try:
+            from gui.theme_manager import ThemeManager
+            saved_theme = ThemeManager.load_saved_theme()
+            ThemeManager.apply_theme(self, saved_theme)
+        except Exception as e:
+            print(f"⚠️ Failed to apply theme: {e}")
+ 
+        # Settings
+        settings = QSettings("NakshaAI", "LidarApp")
+        self.settings = settings 
+        self.default_cut_width = settings.value("cut_section_width", 2.0, type=float)
+        
+        # Initialize cross-section line preferences with defaults FIRST
+        self.cross_line_color = (1.0, 0.0, 1.0)  # Default magenta (normalized RGB)
+        self.cross_line_width = 3
+        self.cross_line_style = "solid"
+        
+        # Then load saved preferences from QSettings if they exist
+        saved_color = settings.value("cross_line_color", None)
+        if saved_color:
+            try:
+                from PySide6.QtGui import QColor
+                qc = QColor(saved_color)
+                self.cross_line_color = (qc.redF(), qc.greenF(), qc.blueF())
+            except Exception as e:
+                pass
+        
+        saved_width = settings.value("cross_line_width", None)
+        if saved_width is not None:
+            self.cross_line_width = int(saved_width)
+        
+        saved_style = settings.value("cross_line_style", None)
+        if saved_style:
+            self.cross_line_style = str(saved_style)
+       
+        # ===== SET WINDOW TITLE WITH GPU INFO =====
+        if gpu_support.gpu_available:
+            self.setWindowTitle(f"NakshaAI-Lidar [GPU: {gpu_support.gpu_name}]")
+        else:
+            self.setWindowTitle("NakshaAI-Lidar [CPU Mode]")
+       
+        self.resize(1400, 900)  # Bigger window
+        # ✅ ADD THESE 3 LINES HERE:
+        self.cross_cursor = Qt.CrossCursor
+        self._cursor_state = False
+        self._active_tools = set()
+        # Storage initialization
+        self.data = None
+        self.display_mode = "rgb"
+        self.section_controller = SectionController(self)
+        self.active_mode = None          
+        self.last_classify_tool = None
+        self.section_dock = None
+        self.sec_vtk = None
+        self.current_view = "top"
+        self.class_palette = {}
+        self.view_palettes = {}     # per-view palette isolation
+
+        self.is_3d_mode = False
+        self.cut_section_controller = CutSectionController(self)
+        self._suppress_main_view_updates = False  #-----------------------------------------------code added by bala--------
+        
+        # CRS & Classification state
+        self.project_crs_epsg = None
+        self.project_crs_wkt = None
+        self.crs = None
+        self.active_classify_tool = None
+        self.from_classes = None
+        self.to_class = None
+        self.last_shade_azimuth = 45.0
+        self.last_shade_angle = 45.0
+        self.shading_dock = None
+        self.point_border_percent = 0
+        self.layers = []
+        self.dxf_attachments = []  # Store DXF attachment metadata
+        self.dxf_actors = []  
+        ## bd
+        self.dwg_attachments = []   # Store DWG attachment metadata
+        self.dwg_actors      = []   # Store DWG VTK actor groups
+        self.dwg_dialog      = None # DWG dialog reference
+ 
+        # ── SNT state (mirrors DWG pattern exactly) ──────────────
+        self.snt_attachments = []        # Store SNT attachment metadata
+        self.snt_actors = []             # Store SNT VTK actor groups
+        self.snt_dialog = None           # SNT dialog reference
+ 
+        self.classify_interactors = {}  # {view_idx: ClassificationInteractor}
+
+        
+        self.view_sync_map = {}
+        self._syncing_camera = False
+
+        # ===== VTK WIDGETS SETUP =====
+        self.frame = QWidget()
+        self.layout = QVBoxLayout(self.frame)
+
+        self.vtk_widget = QtInteractor(self.frame)
+        self.layout.addWidget(self.vtk_widget.interactor)
+        # ✅ Disable double-click switching to 3D on MAIN viewer only
+        if not hasattr(self, "_disable_3d_dblclick_filter"):
+            self._disable_3d_dblclick_filter = Disable3DDoubleClickFilter(self)
+
+        self.vtk_widget.interactor.installEventFilter(self._disable_3d_dblclick_filter)
+        self.frame.setLayout(self.layout)
+
+        from gui.theme_manager import ThemeManager
+        bg_color = "white" if ThemeManager.current() == "light" else "black"
+        self.vtk_widget.set_background(bg_color)
+        if bg_color == "black":
+            self.vtk_widget.renderer.SetBackground(0, 0, 0)
+            self.vtk_widget.renderer.SetBackground2(0, 0, 0)
+        else:
+            self.vtk_widget.renderer.SetBackground(1, 1, 1)
+            self.vtk_widget.renderer.SetBackground2(1, 1, 1)
+        self.vtk_widget.renderer.GradientBackgroundOff()
+        self.cross_interactor = None
+        self.cross_section_active = False  # track if cross-section tool is active
+        
+        try:
+            iren = self.vtk_widget.interactor
+            iren.AddObserver("KeyPressEvent", self._on_main_interactor_keypress)
+        except Exception as e:
+            print(f"⚠️ Failed to install ESC observer: {e}")
+        
+
+        # Secondary (cut section) frame — hidden by default
+        self.section_frame = QWidget()
+        self.section_layout = QVBoxLayout(self.section_frame)
+        self.sec_vtk = QtInteractor(self.section_frame)
+        self.sec_vtk.set_background(bg_color)
+        if bg_color == "black":
+            self.sec_vtk.renderer.SetBackground(0, 0, 0)
+            self.sec_vtk.renderer.SetBackground2(0, 0, 0)
+        else:
+            self.sec_vtk.renderer.SetBackground(1, 1, 1)
+            self.sec_vtk.renderer.SetBackground2(1, 1, 1)
+        self.sec_vtk.renderer.GradientBackgroundOff()
+        self.section_layout.addWidget(self.sec_vtk.interactor)
+        self.section_frame.setLayout(self.section_layout)
+
+        # Splitter setup (main + optional section view)
+        self.splitter = QSplitter()
+        self.splitter.addWidget(self.frame)
+        self.splitter.addWidget(self.section_frame)
+        self.splitter.setSizes([1400, 0])  # allocate all space to main view
+        self.section_frame.hide()          # hide right panel initially
+        self.setCentralWidget(self.splitter)
+        
+        # ✅ Load backup settings and start timer
+
+        from PySide6.QtGui import QShortcut, QKeySequence
+
+        self.shortcut_fit_view = QShortcut(QKeySequence("F"), self)
+        self.shortcut_fit_view.activated.connect(self.fit_view)
+
+        # Set default view
+        set_view(self, "top")
+
+        # Extra docks
+        self.section_docks = {}     # key = view_index (0-3)
+        self.section_vtks = {}      # QtInteractor objects per view
+        self.cross_action = None
+        self.current_saturation = 1.0   # 100% = normal
+        self.current_sharpness = 1.0  
+        self.classify_interactors = {}
+ 
+        # ===== 2D LOCK =====
+        from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+        interactor = self.vtk_widget.interactor
+        style = vtkInteractorStyleImage()
+        interactor.SetInteractorStyle(style)
+
+        cam = self.vtk_widget.renderer.GetActiveCamera()
+        cam.ParallelProjectionOn()
+        cam.SetFocalPoint(0, 0, 0)
+        cam.SetPosition(0, 0, 1)
+        cam.SetViewUp(0, 1, 0)
+        self.vtk_widget.renderer.ResetCamera()
+        self.vtk_widget.render()
+        # self.vtk_widget.interactor.AddObserver("RightButtonPressEvent", self.on_grid_label_right_click)
+        print("✅ Grid label detection enabled (right-click)")
+        
+
+        print("🔒 Main viewer locked to 2D Plan View")
+
+        self.fit_view_controller = FitViewController(self)
+
+        # ========================================================================
+        # 1. CREATE shortcuts dict FIRST
+        # ========================================================================
+        self.shortcuts = {}
+        print("🔍 Initializing shortcuts dict")
+
+        # ========================================================================
+        # 2. REGISTER Shift+1, Shift+2 FIRST (before filter)
+        # ========================================================================
+        self.shortcuts[('shift', '!')] = {'tool': 'cut_section', 'from': None, 'to': None}
+        self.shortcuts[('shift', '@')] = {'tool': 'cut_section_nested', 'from': None, 'to': None}
+        print("✅ Shift+1='cut_section', Shift+2='cut_section_nested' REGISTERED")
+
+        # ========================================================================
+        # 3. CREATE GlobalShortcutFilter AFTER shortcuts exist
+        # ========================================================================
+        from .global_shortcuts import GlobalShortcutFilter
+
+        self.short_cut_filter = GlobalShortcutFilter(self)
+        print("✅ GlobalShortcutFilter created")
+
+        # ========================================================================
+        # 4. INSTALL filter SAFELY
+        # ========================================================================
+        self.installEventFilter(self.short_cut_filter)
+        if hasattr(self, 'vtk_widget') and self.vtk_widget and hasattr(self.vtk_widget, 'interactor'):
+            self.vtk_widget.interactor.installEventFilter(self.short_cut_filter)
+            print("✅ Filter installed on VTK interactor")
+        else:
+            print("⚠️ VTK widget not ready - will retry")
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(1000, self._install_vtk_filter)
+
+        print("🔍 ALL SHORTCUTS:", {k: v['tool'] for k, v in self.shortcuts.items()})
+              
+        if not hasattr(self, 'brush_radius'):
+                    self.brush_radius = 1.0  # World units (for classification)
+            
+        if not hasattr(self, 'brush_preview_px'):
+            self.brush_preview_px = 20.0  # Pixel size for preview cursor
+    
+        if not hasattr(self, 'brush_shape'):
+            self.brush_shape = "circle"
+# ===================================================================================================================================
+        from PySide6.QtCore import QMutex
+        self._render_mutex = QMutex()
+        print("✅ Render mutex initialized")
+
+        # ===== INITIALIZE DIGITIZER =====
+        from gui.digitize_tools import DigitizeManager
+        renderer = self.vtk_widget.renderer
+        self.digitizer = DigitizeManager(self, renderer, self.vtk_widget.interactor)
+        print("✅ Digitizer initialized")   
+        
+        # ===== GRID LABEL HYPERLINK SYSTEM =====
+        from gui.grid_label_system import add_grid_label_system_to_app
+        add_grid_label_system_to_app(self)
+        print("✅ Grid label hyperlink system initialized")
+
+        from gui.select_rectangle_tool import SelectRectangleTool
+        self.select_rectangle_tool = SelectRectangleTool(self)
+        print("✅ Select Rectangle tool initialized")           
+        
+        # ----------------------------------------------------------------------------------------------------------------------------------
+        from gui.measurement_tools import MeasurementTool
+        self.measurement_tool = MeasurementTool(self.digitizer)
+        print("✅ Measurement tool initialized")
+
+        from gui.identification_tool import IdentificationTool
+        self.identification_tool = IdentificationTool(self)
+        print("✅ Identification tool initialized")
+
+        from gui.zoom_rectangle_tool import ZoomRectangleTool
+        self.zoom_rectangle_tool = ZoomRectangleTool(self)
+        print("✅ Zoom rectangle tool initialized")
+
+        from gui.curve_tools import CurveTool
+        self.curve_tool = CurveTool(self)
+        print("✅ Curve tool initialized") 
+
+        # ===== CREATE MENUS FIRST =====
+        self._create_menus()
+
+        # ===== THEN CREATE RIBBON MANAGER =====
+        self.ribbon_manager = RibbonManager(self)
+        
+        # ========================================
+        # TEST BORDER CONNECTION - after ribbon_manager setup
+        # ========================================
+        # ✅ Performance monitoring
+
+
+        self._perf_timers = {}
+
+        def start_timer(name):
+            """Start timing an operation."""
+            self._perf_timers[name] = time.time()
+
+        def end_timer(name):
+            """End timing and print result."""
+            if name in self._perf_timers:
+                elapsed = (time.time() - self._perf_timers[name]) * 1000
+                print(f"⏱️ {name}: {elapsed:.1f}ms")
+                del self._perf_timers[name]
+
+        # Attach to app
+        self.start_timer = start_timer
+        self.end_timer = end_timer
+
+        print("✅ Performance monitoring enabled")
+        def test_border_connection():
+            """Test if border slider in Display ribbon is connected"""
+            try:
+                display_ribbon = self.ribbon_manager.ribbons.get('display')
+                if display_ribbon:
+                    print("✅ Display ribbon found")
+
+                    slider = display_ribbon.findChild(QSlider)
+                    if slider:
+                        print(f"✅ Border slider found: range={slider.minimum()}-{slider.maximum()}, value={slider.value()}")
+
+                        def test_callback(val):
+                            print(f"🎯 TEST: Border callback received value: {val}")
+
+                        display_ribbon.border_width_changed.connect(test_callback)
+                        print("✅ Test callback connected")
+
+                        slider.setValue(25)
+                        print("✅ Test setValue(25) called")
+                    else:
+                        print("⚠️ Border slider NOT found in display ribbon")
+                else:
+                    print("⚠️ Display ribbon NOT found")
+            except Exception as e:
+                print(f"⚠️ Border test failed: {e}")
+                import traceback; traceback.print_exc()
+
+        # ✅ Schedule test after 800 ms
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(800, test_border_connection)
+        print("🔵 Border connection test scheduled")
+
+
+        self._setup_sidebar_layout()
+        self._connect_sidebar_actions()
+
+        # ===== STATUS BAR (Ring App Style) =====
+        self.status = self.statusBar()
+        self.status.setStyleSheet("""
+            QStatusBar {
+                max-height: 22px;
+            }
+            QStatusBar::item { 
+                border: none; 
+            } 
+            QLabel { 
+                font-weight: normal; 
+                font-size: 11px; 
+                padding: 0 2px; 
+            } 
+            QComboBox { 
+                font-size: 11px;
+                padding: 0 4px;
+                max-height: 18px;
+            }
+        """)
+
+        from PySide6.QtWidgets import QComboBox, QCheckBox
+
+        # 1. Total Points (Centered)
+        self.total_points_label = QLabel("Total Points: 0")
+        self.total_points_label.setAlignment(Qt.AlignCenter)
+        self.status.addWidget(self.total_points_label, 1)
+
+        # 2. Magnifier (Right)
+        self.magnifier_label = QLabel("Magnifier")
+        self.magnifier_combo = QComboBox()
+        self.magnifier_combo.addItems(["50%", "100%", "200%", "400%"])
+        self.magnifier_combo.setCurrentText("100%")
+        self.magnifier_combo.setEditable(True)
+        self.magnifier_combo.currentTextChanged.connect(self._on_magnifier_changed)
+        self.status.addPermanentWidget(self.magnifier_label)
+        self.status.addPermanentWidget(self.magnifier_combo)
+
+        # Hook up mouse scrolling to update the magnifier UI smoothly
+        def _sync_magnifier_from_scroll(obj, event):
+            if not hasattr(self, "_current_zoom_level"):
+                self._current_zoom_level = 100.0
+            
+            # VTK's default mouse wheel zoom factor is approximately exactly 1.1 per chunk
+            factor = 1.1 if event == "MouseWheelForwardEvent" else (1.0 / 1.1)
+            self._current_zoom_level *= factor
+            
+            # Clamp limits (e.g., 10% to 5000%)
+            self._current_zoom_level = max(10.0, min(self._current_zoom_level, 5000.0))
+            
+            zoom_int = int(round(self._current_zoom_level))
+            self.magnifier_combo.blockSignals(True)
+            self.magnifier_combo.setCurrentText(f"{zoom_int}%")
+            self.magnifier_combo.blockSignals(False)
+
+        try:
+            self.vtk_widget.interactor.AddObserver("MouseWheelForwardEvent", _sync_magnifier_from_scroll, 0.5)
+            self.vtk_widget.interactor.AddObserver("MouseWheelBackwardEvent", _sync_magnifier_from_scroll, 0.5)
+        except Exception as e:
+            print(f"⚠️ Failed to bind mouse wheel to magnifier: {e}")
+
+        self._update_window_title(None, None)
+        self.status.showMessage("Ready", 3000)
+
+        # ===== SHORTCUTS =====
+        self.shortcuts = {}
+        self._shortcut_filter = GlobalShortcutFilter(self)
+        self.installEventFilter(self._shortcut_filter)
+        self.vtk_widget.interactor.installEventFilter(self._shortcut_filter)
+        # ✅ Install globally so shortcuts work even when focus is NOT on main VTK widget
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self._shortcut_filter)
+        except Exception:
+            pass
+
+
+        # Drawing tool shortcuts
+        self.shortcut_line = QShortcut(QKeySequence("L"), self)
+        self.shortcut_line.activated.connect(lambda: self.digitizer.set_tool("Line"))
+        
+        self.shortcut_rect = QShortcut(QKeySequence("R"), self)
+        self.shortcut_rect.activated.connect(lambda: self.digitizer.set_tool("Rectangle"))
+        
+        self.shortcut_circle = QShortcut(QKeySequence("C"), self)
+        self.shortcut_circle.activated.connect(lambda: self.digitizer.set_tool("Circle"))
+        
+        self.shortcut_poly = QShortcut(QKeySequence("P"), self)
+        self.shortcut_poly.activated.connect(lambda: self.digitizer.set_tool("Polygon"))
+        
+        self.shortcut_freehand = QShortcut(QKeySequence("F"), self)
+        self.shortcut_freehand.activated.connect(lambda: self.digitizer.set_tool("Freehand"))
+        
+        self.shortcut_text = QShortcut(QKeySequence("T"), self)
+        self.shortcut_text.activated.connect(lambda: self.digitizer.set_tool("Text"))
+
+        # Temporary test shortcut - Remove after testing
+        self.shortcut_backup = QShortcut(QKeySequence("Ctrl+B"), self)
+        self.shortcut_backup.activated.connect(self.open_backup_settings)
+        print("🧪 Press Ctrl+B to open Backup Settings")
+
+        # Undo/Redo
+        self.undo_stack = []
+        self.redo_stack = []
+        self._last_changed_mask = None
+        self._max_undo_steps = 30  # Global cap for classification undo/redo
+        # Aliases — point to the SAME list objects (never reassign, always use .clear())
+        self.undostack = self.undo_stack
+        self.redostack = self.redo_stack
+        print("✅ Undo/Redo stacks initialized (0 steps)")
+
+        self._update_debounce_timer = None
+        self._pending_view_updates = set()
+        self._last_changed_mask = None
+
+        self.last_auto_save_time = 0
+        self.auto_backup_timer = QTimer(self)
+        self.auto_backup_timer.timeout.connect(self._auto_backup)
+        # ✅ Load settings and start timer with user's interval
+        self._load_backup_settings()
+
+        # Color thread
+        from PySide6.QtCore import QThread
+        self.color_thread = QThread()
+        self.color_thread.start()
+        self.color_workers = []
+        print("✅ Application initialized successfully")  
+
+        #Added by bala
+        # ============================================================
+        # MEMORY / SESSION MAINTENANCE (VERY IMPORTANT)
+        # ============================================================
+        from PySide6.QtCore import QTimer
+
+        self.__session_maintenance_timer = QTimer(self)
+        self.__session_maintenance_timer.setInterval(200)
+        self.__session_maintenance_timer.timeout.connect(self._on_session_tick)
+
+        QTimer.singleShot(
+            0,
+            self.__session_maintenance_timer.start
+        )                                                              #####
+
+        # ===== MEMORY LEAK GUARD =====
+        try:
+            from .memory_manager import MemoryLeakGuard
+
+            self._mem_guard = MemoryLeakGuard(self)
+            self._mem_guard.start()
+        except Exception as e:
+            print(f"⚠️ MemoryLeakGuard init failed (non-critical): {e}")
+            self._mem_guard = None
+
+
+
+    def set_cross_cursor_active(self, active: bool, tool_name: str = None):
+        # Initialize state tracking on first call
+        if not hasattr(self, '_cursor_state'):
+            self._cursor_state = False
+            self._active_tools = set()
+
+        # Case 1: Already active, trying to activate again
+        if active and self._cursor_state:
+            if tool_name:
+                self._active_tools.add(tool_name)
+            return  # Already active, nothing to do
+        
+        # Case 2: Deactivating specific tool
+        if not active and tool_name:
+            self._active_tools.discard(tool_name)
+            
+            # Don't deactivate if other tools are still active
+            if self._active_tools:
+                print(f"🔍 Cursor stays active (other tools: {', '.join(sorted(self._active_tools))})")
+                return
+        
+        # Update tracking state
+        self._cursor_state = active
+        
+        if active and tool_name:
+            self._active_tools.add(tool_name)
+        elif not active and not tool_name:
+            # Force clear all tools (emergency cleanup)
+            self._active_tools.clear()
+        
+        # Select cursor type
+        cursor = self.cross_cursor if active else Qt.ArrowCursor
+        widgets_updated = 0
+        errors = []
+        
+        # 1. Main view
+        if hasattr(self, "vtk_widget") and self.vtk_widget:
+            try:
+                self.vtk_widget.setCursor(cursor)
+                widgets_updated += 1
+            except Exception as e:
+                errors.append(f"Main view: {e}")
+        
+        # 2. Cross-section views (Views 1-4)
+        if hasattr(self, "section_vtks") and self.section_vtks:
+            for idx, vw in self.section_vtks.items():
+                try:
+                    if vw and vw.interactor:
+                        vw.interactor.setCursor(cursor)
+                        widgets_updated += 1
+                except Exception as e:
+                    errors.append(f"Section view {idx + 1}: {e}")
+        
+        # 3. Cut-section view
+        if hasattr(self, "cut_section_controller") and self.cut_section_controller:
+            try:
+                cut_vtk = getattr(self.cut_section_controller, "cut_vtk", None)
+                if cut_vtk and hasattr(cut_vtk, 'interactor'):
+                    cut_vtk.interactor.setCursor(cursor)
+                    widgets_updated += 1
+            except Exception as e:
+                errors.append(f"Cut section: {e}")
+        
+        # Success logging
+        state_emoji = "🎯" if active else "🔄"
+        state_text = "ACTIVE" if active else "INACTIVE"
+        tool_info = f" (tool: {tool_name})" if tool_name else ""
+        
+        print(f"{state_emoji} Cross cursor {state_text}{tool_info} - {widgets_updated} widgets updated")
+        
+        if self._active_tools:
+            print(f"   📋 Active tools: {', '.join(sorted(self._active_tools))}")
+        
+        # Error reporting
+        if errors:
+            print(f"   ⚠️ Errors occurred:")
+            for error in errors:
+                print(f"      • {error}")
+        
+        # Warning if no widgets were updated
+        if widgets_updated == 0:
+            print(f"   ⚠️ WARNING: No widgets updated - cursor may not change")  
+
+    def _cancel_cross_section_tool_only(self):
+        """Deactivate cross-section drawing tool but keep cross-section windows/views intact."""
+        try:
+            # If your CrossSectionInteractor has its own cancel/cleanup, call it safely
+            if getattr(self, "cross_interactor", None) is not None:
+                try:
+                    if hasattr(self.cross_interactor, "cancel"):
+                        self.cross_interactor.cancel()
+                except Exception:
+                    pass
+
+            iren = self.vtk_widget.interactor
+
+            # Restore previous style if available, otherwise fall back to 2D image style
+            prev = getattr(self, "previous_interactor_style", None)
+            if prev is not None:
+                iren.SetInteractorStyle(prev)
+            else:
+                from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+                iren.SetInteractorStyle(vtkInteractorStyleImage())
+
+        except Exception as e:
+            print(f"⚠️ Failed to restore interactor style: {e}")
+
+        # Reset tool state (do NOT clear section_vtks/section_docks)
+        self.cross_interactor = None
+        self.cross_section_active = False
+
+        # If you use a QAction-like cross_action, uncheck it
+        try:
+            if getattr(self, "cross_action", None) is not None:
+                self.cross_action.setChecked(False)
+        except Exception:
+            pass
+
+        if hasattr(self, "statusBar"):
+            self.statusBar().showMessage("Cross-section tool deactivated (views kept)", 2000)
+
+    def _install_vtk_filter(self):
+        """Delayed VTK filter install"""
+        if (hasattr(self, 'shortcutfilter') and 
+            hasattr(self, 'vtk_widget') and 
+            self.vtk_widget.interactor):
+            self.vtk_widget.interactor.installEventFilter(self.short_cut_filter)
+            print("✅ VTK filter installed (delayed)")
+
+    #Added by bala
+    def _on_session_tick(self):
+        try:
+            SESSION.maintenance()
+        except Exception:
+            pass                       #####
+
+
+
+
+    def clear_project(app):
+        """
+        Safely clear the current project from the NakshaApp instance.
+        Resets all viewers, layers, drawings, and temporary states.
+        ✅ FIXED: Now properly closes all cross-section windows
+        """
+        reply = QMessageBox.question(
+            app,
+            "Confirm Clear Project",
+            "Are you sure you want to clear the current project?\n"
+            "All unsaved data, drawings, and layers will be removed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.No:
+            return
+
+        try:
+            print("\n" + "="*60)
+            print("🧹 CLEARING PROJECT")
+            print("="*60)
+
+            # --- Clear main viewer ---
+            if hasattr(app, "vtk_widget") and app.vtk_widget:
+                app.vtk_widget.clear()
+                app.vtk_widget.render()
+                print("✅ Main viewer cleared")
+
+            # --- ✅ Close ALL cross-section dock windows (Views 1-4) ---
+            if hasattr(app, "section_docks") and app.section_docks:
+                for view_idx, dock in list(app.section_docks.items()):
+                    try:
+                        print(f"   Closing Cross Section View {view_idx + 1}...")
+                        dock.setVisible(False)  # Hide first
+                        dock.close()            # Then close
+                        dock.deleteLater()      # Schedule deletion
+                        print(f"   ✅ Closed Cross Section View {view_idx + 1}")
+                    except Exception as e:
+                        print(f"   ⚠️ Failed to close View {view_idx + 1}: {e}")
+                
+                # Clear the dictionaries
+                app.section_docks.clear()
+                print("✅ All cross-section docks closed")
+
+            # --- ✅ Clear cross-section VTK widgets ---
+            if hasattr(app, "section_vtks") and app.section_vtks:
+                for view_idx, vtk_widget in list(app.section_vtks.items()):
+                    try:
+                        vtk_widget.clear()
+                        vtk_widget.render()
+                        print(f"✅ Cleared VTK widget for View {view_idx + 1}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to clear VTK View {view_idx + 1}: {e}")
+                
+                app.section_vtks.clear()
+
+            # --- Clear legacy section view ---
+            if hasattr(app, "sec_vtk") and app.sec_vtk:
+                app.sec_vtk.clear()
+                app.sec_vtk.render()
+                print("✅ Legacy section view cleared")
+
+            # --- ✅ Clear section controller ---
+            if hasattr(app, "section_controller") and app.section_controller:
+                try:
+                    app.section_controller.clear()
+                    app.section_controller.active_view = None
+                    app.section_controller.current_vtk = None
+                    if hasattr(app.section_controller, 'view_vtks'):
+                        app.section_controller.view_vtks.clear()
+                    print("✅ Section controller cleared")
+                except Exception as e:
+                    print(f"⚠️ Section controller clear failed: {e}")
+
+            # --- ✅ Clear cut section if active ---
+            if hasattr(app, "cut_section_controller") and app.cut_section_controller:
+                try:
+                    if hasattr(app.cut_section_controller, 'clear'):
+                        app.cut_section_controller.clear()
+                    app.cut_section_controller.cut_points = None
+                    print("✅ Cut section cleared")
+                except Exception as e:
+                    print(f"⚠️ Cut section clear failed: {e}")
+
+            # --- Clear layers ---
+            if hasattr(app, "layers"):
+                app.layers.clear()
+                print("✅ Layers cleared")
+
+            # --- Clear digitizer drawings ---
+            if hasattr(app, "digitizer"):
+                app.digitizer.clear_drawings()
+                print("✅ Drawings cleared")
+
+            # --- ✅ Clear stored section data ---
+            for i in range(4):
+                for attr in [f"section_{i}_core_points", f"section_{i}_buffer_points",
+                            f"section_{i}_core_mask", f"section_{i}_buffer_mask"]:
+                    if hasattr(app, attr):
+                        try:
+                            delattr(app, attr)
+                        except:
+                            pass
+            print("✅ Section data cleared")
+
+            # --- ✅ Close Display Mode dialog ---
+            if hasattr(app, "display_dialog") and app.display_dialog:
+                try:
+                    app.display_dialog.close()
+                    app.display_dialog = None
+                    print("✅ Display Mode dialog closed")
+                except:
+                    pass
+
+            if hasattr(app, "display_mode_dialog") and app.display_mode_dialog:
+                try:
+                    app.display_mode_dialog.close()
+                    app.display_mode_dialog = None
+                except:
+                    pass
+
+            # --- ✅ Close Class Picker ---
+            if hasattr(app, "class_picker") and app.class_picker:
+                try:
+                    app.class_picker.close()
+                    app.class_picker = None
+                    print("✅ Class Picker closed")
+                except:
+                    pass
+
+            # --- Reset classification and data ---
+            app.data = None
+            app.project_crs_epsg = None
+            app.project_crs_wkt = None
+            app.loaded_file = None
+            app.last_save_path = None
+            app.class_palette = {}
+
+            # --- ✅ Clear view palettes ---
+            if hasattr(app, "view_palettes"):
+                app.view_palettes.clear()
+
+            # --- ✅ Clear undo/redo ---
+            if hasattr(app, "undo_stack"):
+                app.undo_stack.clear()
+            if hasattr(app, "redo_stack"):
+                app.redo_stack.clear()
+
+            # --- ✅ Deactivate classification tools ---
+            app.active_classify_tool = None
+
+            # --- Reset window title ---
+            app._update_window_title(None, None)
+            app.statusBar().showMessage("🧹 Project cleared successfully.", 3000)
+            
+            print("="*60)
+            print("✅ PROJECT CLEARED SUCCESSFULLY")
+            print("="*60 + "\n")
+
+        except Exception as e:
+            print(f"⚠️ Error while clearing project: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(app, "Error", f"Failed to clear project:\n{e}")
+
+    def _update_theme_icon(self):
+        import os
+        from PySide6.QtGui import QIcon
+        from gui.theme_manager import ThemeManager
+        icon_name = "moon-stars.svg" if ThemeManager.current() == "light" else "sun.svg"
+        icon_path = os.path.join(os.path.dirname(__file__), "icons", icon_name)
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.setIcon(QIcon(icon_path))
+
+    def toggle_theme(self):
+        """Toggle between light and dark themes."""
+        from gui.theme_manager import ThemeManager
+        ThemeManager.toggle_theme(self)
+        self._update_theme_icon()
+        
+        # Update canvas backgrounds
+        bg_color = "white" if ThemeManager.current() == "light" else "black"
+        if hasattr(self, 'vtk_widget') and self.vtk_widget:
+            try:
+                self.vtk_widget.set_background(bg_color)
+                if bg_color == "black":
+                    self.vtk_widget.renderer.SetBackground(0, 0, 0)
+                    self.vtk_widget.renderer.SetBackground2(0, 0, 0)
+                else:
+                    self.vtk_widget.renderer.SetBackground(1, 1, 1)
+                    self.vtk_widget.renderer.SetBackground2(1, 1, 1)
+            except Exception as e:
+                print(f"Error setting main canvas background: {e}")
+        if hasattr(self, 'sec_vtk') and self.sec_vtk:
+            try:
+                self.sec_vtk.set_background(bg_color)
+                if bg_color == "black":
+                    self.sec_vtk.renderer.SetBackground(0, 0, 0)
+                    self.sec_vtk.renderer.SetBackground2(0, 0, 0)
+                else:
+                    self.sec_vtk.renderer.SetBackground(1, 1, 1)
+                    self.sec_vtk.renderer.SetBackground2(1, 1, 1)
+            except Exception as e:
+                print(f"Error setting secondary canvas background: {e}")
+
+    def _create_menus(self):
+        """Top bar with buttons that open ribbons below it, with highlight states."""
+        from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget, QVBoxLayout, QToolButton
+        from PySide6.QtCore import QSize
+
+        # Hide the default menu bar
+        self.menuBar().hide()
+
+        # --- Create top bar ---
+        top_bar = QWidget()
+        top_bar.setObjectName("TopBar")
+        top_bar.setFixedHeight(34)
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(4, 2, 4, 2)
+        top_layout.setSpacing(2)
+
+        # --- Helper to create top buttons ---
+        self.menu_buttons = {}  # store references for highlighting
+        def add_menu_button(label, ribbon_name):
+            btn = QPushButton(label)
+            btn.setObjectName("menuButton")
+            btn.setFixedHeight(26)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda: self._handle_menu_click(ribbon_name))
+            self.menu_buttons[ribbon_name] = btn
+            top_layout.addWidget(btn)
+
+        # --- Add all menu buttons ---
+        add_menu_button("File", "file")
+        add_menu_button("Edit", "edit")
+        add_menu_button("View", "view")
+        add_menu_button("Tools", "tools")
+        add_menu_button("Classify", "classify")
+        add_menu_button("Display", "display")
+        add_menu_button("Measure", "measure")
+        add_menu_button("Identify", "identify")
+        add_menu_button("By Class", "by_class")
+        add_menu_button("Draw", "draw")
+        add_menu_button("Curve", "curve")
+        # add_menu_button(" AI ", "ai", badge_icon_path="gui/icons/ai-logo.png")
+
+        top_layout.addStretch()
+
+        try:
+            from gui.point_count_widget import PointCountWidget
+            self.point_count_widget = PointCountWidget(self)
+            self.point_count_widget.set_app(self)
+            
+            # Create standalone Stats button to align with theme toggle
+            self.stats_btn = QPushButton("Stats")
+            self.stats_btn.setObjectName("menuButton")
+            self.stats_btn.setFixedHeight(26)
+            self.stats_btn.setCursor(Qt.PointingHandCursor)
+            self.stats_btn.clicked.connect(lambda: self.point_count_widget.toggle_panel(self.stats_btn))
+            top_layout.addWidget(self.stats_btn)
+            
+            print("📊 Embedded Point Stats button inside Top Menu")
+        except Exception as e:
+            print(f"⚠️ Failed to init Point Stats: {e}")
+            self.point_count_widget = None
+
+        # --- Theme Toggle Button ---
+        self.theme_btn = QToolButton()
+        self.theme_btn.setObjectName("themeBtn")
+        self.theme_btn.setIconSize(QSize(20, 20))
+        self.theme_btn.setToolTip("Toggle Theme")
+        self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        top_layout.addWidget(self.theme_btn)
+        
+        self._update_theme_icon()
+
+        # --- Ribbon container (below top bar) ---
+        self.ribbon_container = QWidget()  # ✅ Changed from sidebar_container
+        self.ribbon_container.setObjectName("RibbonContainer")
+        self.ribbon_container.setFixedHeight(0)  # hidden until needed
+
+        # --- Combine everything vertically ---
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(top_bar)
+        layout.addWidget(self.ribbon_container)  # ✅ Changed
+        layout.addWidget(self.splitter, 1)
+        self.setCentralWidget(container)
+
+    def _capture_main_camera(self):
+        """Capture current main-view camera (zoom/pan/orientation)."""
+        try:
+            renderer = self.vtk_widget.renderer
+            cam = renderer.GetActiveCamera()
+        except Exception:
+            return None
+        return {
+            "pos": cam.GetPosition(),
+            "fp": cam.GetFocalPoint(),
+            "up": cam.GetViewUp(),
+            "ps": cam.GetParallelScale(),
+            "pp": 1 if cam.GetParallelProjection() else 0,
+            "va": cam.GetViewAngle(),
+        }
+
+    def _run_preserving_camera(self, render_fn):
+        """Run a render while preserving the current main-view zoom/pan."""
+        from PySide6.QtCore import QTimer
+
+        cam_state = self._capture_main_camera()
+        self._preserve_view = True
+        try:
+            render_fn()
+        finally:
+            self._preserve_view = False
+
+        # Restore camera immediately and once more after event loop flush
+        self._restore_main_camera(cam_state)
+        QTimer.singleShot(0,  lambda s=cam_state: self._restore_main_camera(s))
+        QTimer.singleShot(50, lambda s=cam_state: self._restore_main_camera(s))
+
+    def _restore_main_camera(self, state):
+        """Restore previously captured main-view camera."""
+        if not state or not hasattr(self, "vtk_widget") or not self.vtk_widget:
+            return
+        try:
+            renderer = self.vtk_widget.renderer
+            cam = renderer.GetActiveCamera()
+            cam.SetPosition(*state["pos"])
+            cam.SetFocalPoint(*state["fp"])
+            cam.SetViewUp(*state["up"])
+            if state.get("pp", 1):
+                cam.ParallelProjectionOn()
+                cam.SetParallelScale(state.get("ps", cam.GetParallelScale()))
+            else:
+                cam.ParallelProjectionOff()
+                cam.SetViewAngle(state.get("va", cam.GetViewAngle()))
+            renderer.ResetCameraClippingRange()
+            self.vtk_widget.render()
+        except Exception:
+            pass
+
+    def _apply_mode_without_camera_reset(self, render_callable):
+        """
+        Run a render function (e.g., update_pointcloud) while preventing any camera reset.
+        - Temporarily overrides QtInteractor methods that reset camera.
+        - Restores user camera immediately, after EndEvent, and via timers.
+        """
+        from PySide6.QtCore import QTimer
+
+        cam_state = self._capture_main_camera()
+
+        widget = self.vtk_widget
+        plotter = getattr(widget, "plotter", None)
+
+        # Save originals
+        orig_widget_reset = getattr(widget, "reset_camera", None)
+        orig_widget_clear = getattr(widget, "clear", None)
+        orig_widget_add_points = getattr(widget, "add_points", None)
+        orig_widget_add_mesh = getattr(widget, "add_mesh", None)
+
+        orig_plot_add_points = getattr(plotter, "add_points", None) if plotter else None
+        orig_plot_add_mesh = getattr(plotter, "add_mesh", None) if plotter else None
+        orig_plot_clear = getattr(plotter, "clear", None) if plotter else None
+
+        # Guards
+        def no_reset_camera(*args, **kwargs):
+            return None
+
+        def clear_preserving_cam(*args, **kwargs):
+            res = None
+            try:
+                if orig_widget_clear:
+                    res = orig_widget_clear(*args, **kwargs)
+            finally:
+                self._restore_main_camera(cam_state)
+            return res
+
+        def add_points_no_reset(*args, **kwargs):
+            kwargs["reset_camera"] = False
+            kwargs.setdefault("render", False)
+            return orig_widget_add_points(*args, **kwargs)
+
+        def add_mesh_no_reset(*args, **kwargs):
+            kwargs["reset_camera"] = False
+            kwargs.setdefault("render", False)
+            return orig_widget_add_mesh(*args, **kwargs)
+
+        def plot_add_points_no_reset(*args, **kwargs):
+            kwargs["reset_camera"] = False
+            kwargs.setdefault("render", False)
+            return orig_plot_add_points(*args, **kwargs)
+
+        def plot_add_mesh_no_reset(*args, **kwargs):
+            kwargs["reset_camera"] = False
+            kwargs.setdefault("render", False)
+            return orig_plot_add_mesh(*args, **kwargs)
+
+        def plot_clear_preserving_cam(*args, **kwargs):
+            res = None
+            try:
+                if orig_plot_clear:
+                    res = orig_plot_clear(*args, **kwargs)
+            finally:
+                self._restore_main_camera(cam_state)
+            return res
+
+        # Apply patches
+        try:
+            if orig_widget_reset:
+                widget.reset_camera = no_reset_camera
+            if orig_widget_clear:
+                widget.clear = clear_preserving_cam
+            if orig_widget_add_points:
+                widget.add_points = add_points_no_reset
+            if orig_widget_add_mesh:
+                widget.add_mesh = add_mesh_no_reset
+
+            if plotter:
+                if orig_plot_add_points:
+                    plotter.add_points = plot_add_points_no_reset
+                if orig_plot_add_mesh:
+                    plotter.add_mesh = plot_add_mesh_no_reset
+                if orig_plot_clear:
+                    plotter.clear = plot_clear_preserving_cam
+
+            # Global guard other code can check
+            self._freeze_camera = True
+
+            # Execute the render/update
+            render_callable()
+
+        finally:
+            # Remove guard and restore methods
+            self._freeze_camera = False
+
+            if orig_widget_reset:
+                widget.reset_camera = orig_widget_reset
+            if orig_widget_clear:
+                widget.clear = orig_widget_clear
+            if orig_widget_add_points:
+                widget.add_points = orig_widget_add_points
+            if orig_widget_add_mesh:
+                widget.add_mesh = orig_widget_add_mesh
+
+            if plotter:
+                if orig_plot_add_points:
+                    plotter.add_points = orig_plot_add_points
+                if orig_plot_add_mesh:
+                    plotter.add_mesh = orig_plot_add_mesh
+                if orig_plot_clear:
+                    plotter.clear = orig_plot_clear
+
+        # Restore camera immediately
+        self._restore_main_camera(cam_state)
+
+        # Also restore after render completes
+        try:
+            rw = widget.interactor.GetRenderWindow()
+            tag = [None]
+            def on_end(obj, evt):
+                try:
+                    self._restore_main_camera(cam_state)
+                finally:
+                    if tag[0] is not None:
+                        rw.RemoveObserver(tag[0])
+                        tag[0] = None
+            tag[0] = rw.AddObserver("EndEvent", on_end)
+        except Exception:
+            pass
+
+        # Timed backups in case of queued updates
+        QTimer.singleShot(0,  lambda s=cam_state: self._restore_main_camera(s))
+        QTimer.singleShot(80, lambda s=cam_state: self._restore_main_camera(s))
+        QTimer.singleShot(180,lambda s=cam_state: self._restore_main_camera(s))
+
+
+    # ------------------Active Buttons---------
+    def _update_ribbon_container_height(self):
+        """Fit the ribbon container to the currently visible ribbon."""
+        if not hasattr(self, "ribbon_manager") or not hasattr(self, "ribbon_container"):
+            return
+
+        current_name = self.ribbon_manager.current_ribbon
+        if not current_name:
+            self.ribbon_container.setFixedHeight(0)
+            return
+
+        ribbon = self.ribbon_manager.ribbons.get(current_name)
+        if ribbon is None:
+            self.ribbon_container.setFixedHeight(0)
+            return
+
+        container_layout = self.ribbon_container.layout()
+        if container_layout is not None:
+            container_layout.activate()
+
+        if ribbon.layout() is not None:
+            ribbon.layout().activate()
+
+        margins = container_layout.contentsMargins() if container_layout is not None else None
+        top_margin = margins.top() if margins is not None else 0
+        bottom_margin = margins.bottom() if margins is not None else 0
+
+        content_height = max(
+            ribbon.sizeHint().height(),
+            ribbon.minimumSizeHint().height(),
+            ribbon.minimumHeight(),
+        )
+        self.ribbon_container.setFixedHeight(content_height + top_margin + bottom_margin)
+
+    def _handle_menu_click(self, ribbon_name):
+        """Toggle ribbon and adjust container height"""
+        # if ribbon_name == "convert":
+        #     from gui.menu_sidebar_system import ByClassDialog
+ 
+        #     if not hasattr(self, "byclass_dialog") or self.byclass_dialog is None:
+        #         self.byclass_dialog = ByClassDialog(self)  # pass main app as parent
+        #     self.byclass_dialog.show()
+        #     self.byclass_dialog.raise_()
+        #     self.byclass_dialog.activateWindow()
+        if not hasattr(self, 'ribbon_manager'):
+            return
+ 
+        self.ribbon_manager.toggle_ribbon(ribbon_name)
+       
+        # Show/hide ribbon container
+        self._update_ribbon_container_height()
+       
+        self._sync_tools_for_ribbon_tab(self.ribbon_manager.current_ribbon)
+        self._highlight_active_button(ribbon_name)
+
+    def _sync_tools_for_ribbon_tab(self, ribbon_name):
+        """Keep Draw and Classify tools mutually exclusive when switching tabs."""
+        if ribbon_name == "draw":
+            self._enter_draw_tab_mode()
+            self._clear_ribbon_active_buttons("classify")
+        elif ribbon_name == "classify":
+            self._enter_classify_tab_mode()
+            self._clear_ribbon_active_buttons("draw")
+
+    def _enter_draw_tab_mode(self):
+        """Enable draw tooling and stop any active classification session."""
+        class_picker = getattr(self, "class_picker", None)
+        classification_active = bool(
+            getattr(self, "active_classify_tool", None)
+            or (class_picker and class_picker.isVisible())
+            or getattr(self, "classify_interactor", None)
+            or getattr(self, "classify_interactors", None)
+            or getattr(self, "cut_classify_interactor", None)
+        )
+
+        if classification_active:
+            try:
+                self.deactivate_classification_tool(preserve_cross_section=True)
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate classification for Draw tab: {e}")
+
+        if hasattr(self, "digitizer") and self.digitizer:
+            self.digitizer.enabled = True
+            print("✅ Draw tab active - digitizer enabled")
+
+    def _enter_classify_tab_mode(self):
+        """Disable draw tooling so classification tools own interaction."""
+        if hasattr(self, "digitizer") and self.digitizer:
+            try:
+                self.digitizer.set_tool(None)
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate draw tool for Classify tab: {e}")
+
+            self.digitizer.enabled = False
+            print("🚫 Classify tab active - digitizer disabled")
+
+        curve_tool = getattr(self, "curve_tool", None)
+        if curve_tool:
+            try:
+                if getattr(curve_tool, "active", False) and hasattr(curve_tool, "_cancel_curve"):
+                    curve_tool._cancel_curve()
+                elif getattr(curve_tool, "_select_mode", False):
+                    curve_tool.deactivate_select_mode()
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate curve tool for Classify tab: {e}")
+
+    def _clear_ribbon_active_buttons(self, ribbon_name):
+        """Clear sticky button states for a ribbon whose tools were just deactivated."""
+        if not hasattr(self, "ribbon_manager"):
+            return
+
+        ribbon = self.ribbon_manager.ribbons.get(ribbon_name)
+        if ribbon is None:
+            return
+
+        from gui.menu_sidebar_system import RibbonSection
+
+        for section in ribbon.findChildren(RibbonSection):
+            if section.active_button:
+                section.active_button.setChecked(False)
+                section.active_button = None
+
+    def _highlight_active_button(self, active_name):
+        """Highlight currently active menu button via QSS checked state."""
+        for name, btn in self.menu_buttons.items():
+            ribbon = self.ribbon_manager.ribbons.get(name)
+            is_visible = ribbon and ribbon.isVisible()
+
+            if name == active_name and is_visible:
+                btn.setChecked(True)
+            else:
+                btn.setChecked(False)
+
+    def open_selection_mode(self):
+        from gui.selection_popup import SelectionModeDialog
+        dlg = SelectionModeDialog(self)
+        dlg.show()
+    # ------------------------------------------------------------
+    # CUT SECTION BUFFER WIDTH PROMPT
+    # ------------------------------------------------------------
+    def _prompt_cut_width(self):
+        """Popup for global persistent cut section width."""
+        settings = QSettings("NakshaAI", "LidarApp")
+        current_val = getattr(self, "default_cut_width", 2.0)
+        val, ok = QInputDialog.getDouble(
+            self, "Set Default Cut Width",
+            f"Current cut width: ±{current_val:.2f} m",
+            current_val, 0.05, 10.0, 2
+        )
+        if ok:
+            self.default_cut_width = val
+            settings.setValue("cut_section_width", val)
+            settings.sync()
+            print(f"💾 Saved persistent default cut width: ±{val:.2f} m")
+            self.statusBar().showMessage(f"✅ Default cut width set to ±{val:.2f} m", 3000)
+
+    def open_next_cross_section_view(self):
+        """
+        ✅ AUTO-INCREMENT VIEW OPENING FOR SHORTCUT
+        - Opens View 1 if none are open
+        - Opens next available view (2, 3, 4) if views already exist
+        - Shows message if all 4 views are open
+        """
+        from PySide6.QtWidgets import QMessageBox
+        
+        # Restrict to top view only
+        if getattr(self, "current_view", None) != "top":
+            QMessageBox.warning(self, "Cross Section", "Cross Section works only in Top View.")
+            return
+        
+        # ✅ Sync palette FIRST
+        if hasattr(self, 'display_dialog') and self.display_dialog:
+            print(f"\n{'='*60}")
+            print(f"🔄 SYNCING PALETTE BEFORE CROSS-SECTION")
+            dialog = self.display_dialog
+            current_slot = dialog.current_slot
+            if hasattr(dialog, 'view_palettes') and current_slot in dialog.view_palettes:
+                self.class_palette = {}
+                for code, info in dialog.view_palettes[current_slot].items():
+                    self.class_palette[code] = {
+                        "show": bool(info.get("show", False)),
+                        "description": str(info.get("description", "")),
+                        "color": tuple(info.get("color", (128, 128, 128))),
+                        "weight": float(info.get("weight", 1.0))
+                    }
+                print(f"  ✅ Synced {len(self.class_palette)} classes from Display Mode")
+            print(f"{'='*60}\n")
+        
+        # ✅ Ensure dictionaries exist
+        if not hasattr(self, "section_docks"):
+            self.section_docks = {}
+        if not hasattr(self, "section_vtks"):
+            self.section_vtks = {}
+        
+        # ✅ Find next available view (0-3 = Views 1-4)
+        next_view = None
+        for i in range(4):
+            if i not in self.section_docks or not self.section_docks[i].isVisible():
+                next_view = i
+                break
+        
+        # ✅ All 4 views already open
+        if next_view is None:
+            QMessageBox.information(
+                self, 
+                "All Views Open", 
+                "All 4 cross-section views are already active.\n\n"
+                "Close one to open a new view."
+            )
+            self.statusBar().showMessage("⚠️ All 4 cross-section views already open", 3000)
+            return
+        
+        # ✅ Open the next view directly
+        print(f"✅ Auto-opening Cross Section View {next_view + 1}")
+        self._open_specific_cross_section_view(next_view)
+        
+        self.statusBar().showMessage(
+            f"✅ Cross Section View {next_view + 1} opened - Draw line on main view", 
+            3000
+        )
+
+    def enable_cross_section_mode(self):   #Added by bala
+        # Check if we're in top view (for main viewer)
+        if getattr(self, "current_view", None) != "top":
+            QMessageBox.warning(self, "Cut Section", "Main view must be in Top View")
+            return
+
+        # Deactivate any active digitize tool before enabling cross-section
+        self._deactivate_digitize_tool()
+ 
+        # ✅ Create NON-BLOCKING view selector (only once)
+        if not hasattr(self, '_view_selector_dialog') or self._view_selector_dialog is None:
+            # Create custom dialog
+            self._view_selector_dialog = QDialog(self)
+            self._view_selector_dialog.setWindowTitle("Select Cross-Section View")
+            self._view_selector_dialog.setWindowFlags(
+                Qt.Dialog |
+                Qt.WindowTitleHint |
+                Qt.WindowCloseButtonHint |
+                Qt.WindowSystemMenuHint
+            )
+            layout = QVBoxLayout()
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(8)
+           
+            # Label
+            label = QLabel("Target View:")
+            label.setStyleSheet("font-weight: bold;")
+            layout.addWidget(label)
+           
+            # Dropdown
+            combo = QComboBox()
+            combo.addItems(["View 1", "View 2", "View 3", "View 4"])
+            combo.setCurrentIndex(0)
+            combo.setMinimumWidth(150)
+            layout.addWidget(combo)
+           
+            # Store combo as property of the dialog
+            self._view_selector_dialog.view_combo = combo
+           
+            # Instructions
+            info_label = QLabel(
+                "• Draw line on main view to create cross-section\n"
+                "• Change dropdown to switch target view\n"
+                "• View opens automatically when you draw"
+            )
+            info_label.setStyleSheet("color: #888; font-size: 9pt; padding: 8px;")
+            info_label.setWordWrap(True)
+            layout.addWidget(info_label)
+           
+            self._view_selector_dialog.setLayout(layout)
+            self._view_selector_dialog.setFixedSize(280, 160)
+           
+            # Connect dropdown change
+            def on_view_changed(index):
+                print(f"🔄 Target view changed to: View {index + 1}")
+                self.section_controller.active_view = index
+                self.statusBar().showMessage(
+                    f"✅ Target: View {index + 1} - Draw line on main view",
+                    3000
+                )
+            combo.currentIndexChanged.connect(on_view_changed)
+           
+            # Save geometry on close
+            def save_geometry_on_close(event):
+                self.settings.setValue("ViewSelectorDialog_geometry",
+                                    self._view_selector_dialog.saveGeometry())
+                event.accept()
+            self._view_selector_dialog.closeEvent = save_geometry_on_close
+           
+            # Restore geometry
+            saved_geo = self.settings.value("ViewSelectorDialog_geometry")
+            if saved_geo:
+                self._view_selector_dialog.restoreGeometry(saved_geo)
+            else:
+                # Position at top-right of main window
+                self._view_selector_dialog.move(
+                    self.x() + self.width() - 320,
+                    self.y() + 100
+                )
+       
+        # ✅ ALWAYS SHOW AND BRING TO FRONT (even if already open!)
+        self._view_selector_dialog.show()
+        self._view_selector_dialog.raise_()
+        self._view_selector_dialog.activateWindow()  # ✅ Force focus
+       
+        # Get selected index
+        if hasattr(self._view_selector_dialog, 'view_combo'):
+            selected_index = self._view_selector_dialog.view_combo.currentIndex()
+        else:
+            selected_index = 0
+       
+        # Set active view in controller
+        self.section_controller.active_view = selected_index
+        print(f"✅ Cross-section mode enabled - Target: View {selected_index + 1}")
+       
+        # Attach main interactor
+        self._attach_cross_section_interactor()
+        self.set_cross_cursor_active(True, "cross_section")
+        self.statusBar().showMessage(
+            f"✅ Ready: Draw line → View {selected_index + 1} (change dropdown to switch)",
+            5000
+        )
+
+    def _open_specific_cross_section_view(self, view_index):
+        """
+        ✅ INTERNAL METHOD - Creates/activates a specific cross-section view
+        Called by both:
+        - enable_cross_section_mode() (manual dialog selection)
+        - open_next_cross_section_view() (auto-increment shortcut)
+        """
+        from PySide6.QtWidgets import QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton
+        from pyvistaqt import QtInteractor
+        from .cross_section.interactor_slice import CrossSectionInteractor
+
+        # Ensure dictionaries exist
+        if not hasattr(self, "section_docks"):
+            self.section_docks = {}
+        if not hasattr(self, "section_vtks"):
+            self.section_vtks = {}
+
+        # --------------------------------------------------------
+        # 1. Handle Existing Dock (Reuse)
+        # --------------------------------------------------------
+        if view_index in self.section_docks:
+            dock = self.section_docks[view_index]
+            
+            # Ensure visible and active
+            if not dock.isVisible():
+                dock.show()
+            dock.raise_()
+            dock.activateWindow()
+            
+            # Update controller state
+            self.section_controller.active_view = view_index
+            if view_index in self.section_vtks:
+                self.section_controller.current_vtk = self.section_vtks[view_index]
+                
+            print(f"🔁 View {view_index + 1} already open. Activated.")
+            
+            # ✅ CRITICAL: Still need to attach main interactor even for existing views
+            self._attach_cross_section_interactor()
+            return
+
+        # --------------------------------------------------------
+        # 2. Create New Dock (Only if not exists)
+        # --------------------------------------------------------
+        # Create new dock
+        dock = QDockWidget(f"Cross Section {view_index + 1}", self)
+        dock.setObjectName(f"CrossSectionDock_{view_index}")  # CRITICAL for persistence
+
+        frame = QWidget()
+        layout = QVBoxLayout(frame)
+        
+        # Create VTK widget
+        vtk_widget = QtInteractor(frame)
+        from gui.theme_manager import ThemeManager
+        bg_color = "white" if ThemeManager.current() == "light" else "black"
+        vtk_widget.set_background(bg_color)
+        if bg_color == "black":
+            vtk_widget.renderer.SetBackground(0, 0, 0)
+            vtk_widget.renderer.SetBackground2(0, 0, 0)
+        else:
+            vtk_widget.renderer.SetBackground(1, 1, 1)
+            vtk_widget.renderer.SetBackground2(1, 1, 1)
+        vtk_widget.renderer.GradientBackgroundOff()
+        layout.addWidget(vtk_widget.interactor)
+        self.cross_cursor = Qt.CrossCursor
+        self._cursor_state = False  # Track current cursor state
+        self._active_tools = set()  # Track which tools are active
+        
+        dock.setWidget(frame)
+        
+        # Add to main window FIRST (required for geometry operations)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        
+        # Set floating and window flags BEFORE geometry restoration
+        dock.setFloating(True)
+        dock.setWindowFlags(
+            Qt.Window |
+            Qt.WindowMinimizeButtonHint |
+            Qt.WindowCloseButtonHint
+        )
+        
+        dock.setFeatures(
+            QDockWidget.DockWidgetClosable |
+            QDockWidget.DockWidgetFloatable
+        )
+        
+        dock.setAllowedAreas(Qt.NoDockWidgetArea)
+        
+        # ✅ CORRECT: Restore individual dock geometry
+        dock_geo_key = f"CrossSectionDock_{view_index}_geometry"
+        saved_geometry = self.settings.value(dock_geo_key)
+        
+        if saved_geometry is not None:
+            # Restore saved position and size
+            dock.restoreGeometry(saved_geometry)
+            print(f"✅ Restored dock {view_index + 1} geometry (position + size)")
+        else:
+            # First time - use default offset position
+            offset = 40 * len(self.section_docks)
+            dock.move(self.x() + self.width() - 400 + offset, self.y() + 120 + offset)
+            dock.resize(500, 400)
+            print(f"→ No saved geometry - using default position for dock {view_index + 1}")
+        
+        dock.show()
+        
+        # Custom close event handler
+        original_close_event = dock.closeEvent
+
+
+        def safe_close_event(event):
+            """
+            ✅ FIXED: Proper VTK cleanup before closing to prevent handle errors
+            Shows confirmation dialog ONLY for Alt+F4, allows normal close otherwise
+            """
+            try:
+                # ✅ NEW: Check if close was triggered by Alt+F4 (or window X button)
+                from PySide6.QtWidgets import QMessageBox
+                from PySide6.QtGui import QCloseEvent
+               
+                # Check if this is a spontaneous event (user-initiated like Alt+F4 or X button)
+                # vs programmatic close
+                if event.spontaneous():
+                    reply = QMessageBox.question(
+                        self,
+                        "Close Cross-Section View?",
+                        f"Are you sure you want to close Cross-Section View {view_index + 1}?\n\n"
+                        "The view can be reopened from Tools → Cross Section.",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No
+                    )
+                   
+                    if reply == QMessageBox.No:
+                        print(f"❌ User cancelled closing View {view_index + 1}")
+                        event.ignore()
+                        return
+                   
+                    print(f"🚪 User confirmed closing View {view_index + 1} - cleaning up...")
+                else:
+                    # Programmatic close - no confirmation needed
+                    print(f"🚪 Programmatically closing View {view_index + 1} - cleaning up...")
+               
+                # ✅ CRITICAL: Stop all VTK rendering FIRST
+                try:
+                    # 1. Clear the VTK widget completely
+                    if view_index in self.section_vtks:
+                        vtk_widget = self.section_vtks[view_index]
+                       
+                        # Stop any active render timers
+                        if hasattr(vtk_widget, 'render_timer'):
+                            try:
+                                vtk_widget.render_timer.stop()
+                                vtk_widget.render_timer.deleteLater()
+                                vtk_widget.render_timer = None
+                            except:
+                                pass
+                       
+                        # Finalize the render window (releases GPU resources)
+                        try:
+                            render_window = vtk_widget.GetRenderWindow()
+                            if render_window:
+                                render_window.Finalize()
+                                print(f"   ✅ VTK render window finalized")
+                        except Exception as e:
+                            print(f"   ⚠️ Render window finalize warning: {e}")
+                       
+                        # Clear the renderer
+                        try:
+                            if hasattr(vtk_widget, 'renderer'):
+                                vtk_widget.renderer.RemoveAllViewProps()
+                                print(f"   ✅ Renderer cleared")
+                        except Exception as e:
+                            print(f"   ⚠️ Renderer clear warning: {e}")
+                       
+                        # Set render window to None (breaks the connection)
+                        try:
+                            vtk_widget.SetRenderWindow(None)
+                            print(f"   ✅ VTK widget disconnected from render window")
+                        except Exception as e:
+                            print(f"   ⚠️ SetRenderWindow warning: {e}")
+               
+                except Exception as e:
+                    print(f"   ⚠️ VTK cleanup error: {e}")
+               
+                # ✅ Save geometry BEFORE hiding
+                from PySide6.QtCore import QSettings
+                settings = QSettings("NakshaAI", "LidarApp")
+               
+                try:
+                    settings.setValue(f"CrossSectionDock_{view_index}_geometry", dock.saveGeometry())
+                    print(f"   💾 Dock {view_index + 1} geometry saved")
+                except Exception as e:
+                    print(f"   ⚠️ Geometry save failed: {e}")
+               
+                # ✅ NOW safe to hide and close
+                dock.hide()
+               
+                # Remove from tracking (but don't delete the widget yet - let Qt handle it)
+                if hasattr(self, 'section_docks') and view_index in self.section_docks:
+                    del self.section_docks[view_index]
+                if hasattr(self, 'section_vtks') and view_index in self.section_vtks:
+                    del self.section_vtks[view_index]
+               
+                # Schedule deletion for next event loop (safe cleanup)
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(100, lambda: dock.deleteLater())
+               
+                print(f"   ✅ View {view_index + 1} cleanup complete")
+               
+                # Accept the close event
+                event.accept()
+               
+            except Exception as e:
+                print(f"⚠️ Close event error: {e}")
+                event.accept()  # Still allow close on error
+ 
+        dock.closeEvent = safe_close_event
+        
+        # Register in app
+        self.section_docks[view_index] = dock
+        self.section_vtks[view_index] = vtk_widget
+        self.section_controller.active_view = view_index
+        self.section_controller.current_vtk = vtk_widget
+        
+        # If classification tool is already active, attach interactor
+        if getattr(self, "active_classify_tool", None):
+            try:
+                from gui.cross_section.interactor_classify import ClassificationInteractor
+                wrapper = ClassificationInteractor(self, vtk_widget.interactor)
+                vtk_widget.interactor.SetInteractorStyle(wrapper.style)
+                self.classify_interactors[view_index] = wrapper
+                print(f"✅ Classification interactor attached to NEW View {view_index + 1}")
+            except Exception as e:
+                print(f"⚠️ Failed to attach classification on new view {view_index + 1}: {e}")
+        
+        # Store in controller for global access
+        if not hasattr(self.section_controller, 'view_vtks'):
+            self.section_controller.view_vtks = {}
+        self.section_controller.view_vtks[view_index] = vtk_widget
+        
+        print(f"✅ Registered View {view_index + 1}: dock={dock}, vtk={vtk_widget}")
+        print(f"   Active view set to: {self.section_controller.active_view}")
+        
+        def on_dock_activated():
+            self.section_controller.active_view = view_index
+            print(f"✅ Dock {view_index + 1} activated -> Active View set")
+        
+        dock.visibilityChanged.connect(
+            lambda visible: on_dock_activated() if visible else None
+        )
+        
+        # Install shortcut filter for new dock
+        if hasattr(self, "_shortcut_filter"):
+            vtk_widget.interactor.installEventFilter(self._shortcut_filter)
+        
+        if hasattr(self, 'identification_tool') and self.identification_tool.active:
+            self.identification_tool.activate_for_section(vtk_widget, view_index)
+            print(f"🔍 Auto-activated identification for view {view_index + 1}")
+
+        # --------------------------------------------------------
+        # 3. Attach Main Interactor (For new docks)
+        # --------------------------------------------------------
+        self._attach_cross_section_interactor()
+        
+        self.statusBar().showMessage(
+            "✏️ Draw a line on the Plan View to create cross-section", 
+            5000
+        )
+        
+        print(f"✅ Cross Section View {view_index + 1} ready")
+
+                # ✅ Install camera sync observer if view syncing is enabled
+        if hasattr(self, 'view_sync_map') and view_index in self.view_sync_map:
+            source_idx = self.view_sync_map[view_index]
+            print(f"🔗 View {view_index + 1} syncs to View {source_idx + 1}")
+            
+            # Install camera observer
+            self._install_camera_sync_observer(view_index, vtk_widget)
+            
+            # Also install on source if not already done
+            if source_idx in self.section_vtks:
+                source_vtk = self.section_vtks[source_idx]
+                if not hasattr(source_vtk, '_sync_view_idx'):
+                    self._install_camera_sync_observer(source_idx, source_vtk)
+
+    def _attach_cross_section_interactor(self):
+        """
+        ✅ HELPER: Attaches CrossSectionInteractor to main view
+        Shared by both new and existing view activation
+        """
+        from .cross_section.interactor_slice import CrossSectionInteractor
+        
+        try:
+            main_interactor = self.vtk_widget.interactor
+            
+            # Save the old interactor to restore later
+            if not hasattr(self, 'previous_interactor_style'):
+                self.previous_interactor_style = main_interactor.GetInteractorStyle()
+                print(f"💾 Saved previous interactor style: {self.previous_interactor_style}")
+            
+            # Create and attach the cross-section interactor
+            self.cross_interactor = CrossSectionInteractor(self, main_interactor)
+            main_interactor.SetInteractorStyle(self.cross_interactor)
+            self.cross_interactor.section_controller = self.section_controller
+            
+            # Mark tool as active
+            self.cross_section_active = True
+            
+            # ✅ Create mock cross_action for compatibility
+            class MockAction:
+                def __init__(self):
+                    self._checked = True
+                
+                def isChecked(self):
+                    return self._checked
+                
+                def setChecked(self, checked):
+                    self._checked = checked
+            
+            self.cross_action = MockAction()
+            print("✅ Created mock cross_action for interactor compatibility")
+            
+            # Restore interactor after cross-section is drawn
+            def restore_interactor_after_draw():
+                if hasattr(self, 'previous_interactor_style') and self.previous_interactor_style:
+                    try:
+                        main_interactor.SetInteractorStyle(self.previous_interactor_style)
+                        print(f"🔄 Restored previous interactor style")
+                    except Exception as e:
+                        print(f"⚠️ Failed to restore interactor: {e}")
+                        from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+                        main_interactor.SetInteractorStyle(vtkInteractorStyleImage())
+                
+                self.cross_section_active = False
+                self.cross_interactor = None
+                print("🛑 Cross-section tool finished (auto-restore)")
+            
+            self.cross_interactor.on_section_complete = restore_interactor_after_draw
+            
+            print("🧭 CrossSectionInteractor attached to MAIN viewer (with auto-restore)")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to attach CrossSectionInteractor: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Install shortcut filter for main widget
+        if hasattr(self, "_shortcut_filter"):
+            self.vtk_widget.interactor.installEventFilter(self._shortcut_filter)
+
+  
+    def _on_section_updated(self, view_idx: int):
+        """
+        Call AFTER a cross-section is computed in view_idx.
+        - Does not store per-view masks
+        - Just triggers _sync_section_from(view_idx) based on the global section.
+        """
+        core = getattr(self, "section_core_points", None)
+        buf = getattr(self, "section_buffer_points", None)
+        if core is None or buf is None:
+            print("⚠️ _on_section_updated called but no global section data")
+            return
+
+        # Simple: propagate this new global section to any matched views
+        self._sync_section_from(view_idx)
+
+    def toggle_cross_section_mode(self, checked):
+        """
+        Toggle cross-section drawing mode.
+        ✅ FIXED: Automatically activates an existing open view if none is selected.
+        """
+        if checked:
+            # 1. Check if a view is already active
+            active_view = getattr(self.section_controller, 'active_view', None)
+            
+            # 2. If NO view is active, but we have open docks, pick the first one!
+            if active_view is None and hasattr(self, 'section_docks') and self.section_docks:
+                # Get the first available view index (e.g., 1, 2, 3, or 4)
+                first_view_idx = sorted(list(self.section_docks.keys()))[0]
+                
+                # Force this view to be active
+                self.section_controller.active_view = first_view_idx
+                self.section_controller.current_vtk = self.section_vtks[first_view_idx]
+                
+                print(f"⚠️ No active view selected. Auto-activating View {first_view_idx}")
+                
+                # Optional: Bring that dock to front so user knows which one it is
+                self.section_docks[first_view_idx].raise_()
+                self.section_docks[first_view_idx].activateWindow()
+
+            # 3. Now enable the mode as usual
+            self.enable_cross_section_mode()
+            
+        else:
+            self.deactivate_cross_section_tool()
+        
+        # ════════════════════════════════════════════════════════════════════════════════
+    # COMPLETE BIDIRECTIONAL SYNC - CAMERA + SECTION DATA
+    # ════════════════════════════════════════════════════════════════════════════════
+
+    def _on_section_updated(self, view_idx: int):
+        """
+        Call AFTER a cross-section is computed in view_idx.
+        Syncs BOTH section data AND camera to matched views.
+        """
+        core = getattr(self, f"section_{view_idx}_core_points", None)
+        buf = getattr(self, f"section_{view_idx}_buffer_points", None)
+        
+        # Also check global section data as fallback
+        if core is None:
+            core = getattr(self, "section_core_points", None)
+            buf = getattr(self, "section_buffer_points", None)
+        
+        if core is None:
+            print("⚠️ _on_section_updated: no section data available")
+            return
+
+        # Sync section data to matched views
+        self._sync_section_from(view_idx)
+
+
+    def _sync_section_from(self, source_idx: int):
+        """
+        Copy section data from source view to ALL targets that match it.
+        ✅ BIDIRECTIONAL: Works with bidirectional sync
+        ✅ SYNCS: Points, masks, indices, camera - everything!
+        """
+        import numpy as np
+        
+        # Re-entrancy guard
+        if getattr(self, '_sync_count', 0) > 0:
+            return
+        
+        self._sync_count = getattr(self, '_sync_count', 0) + 1
+        
+        try:
+            # Get source data - try view-specific first, then global
+            core = getattr(self, f"section_{source_idx}_core_points", None)
+            buf = getattr(self, f"section_{source_idx}_buffer_points", None)
+            
+            # Fallback to global section data
+            if core is None:
+                core = getattr(self, "section_core_points", None)
+                buf = getattr(self, "section_buffer_points", None)
+                
+                # If using global, also store to source view
+                if core is not None:
+                    setattr(self, f"section_{source_idx}_core_points", core)
+                    setattr(self, f"section_{source_idx}_buffer_points", buf)
+            
+            if core is None:
+                print(f"⚠️ _sync_section_from: no source data for View {source_idx + 1}")
+                return
+            
+            # All attributes to sync
+            attrs = [
+                'core_points', 'buffer_points', 
+                'core_mask', 'buffer_mask',
+                'core_indices', 'buffer_indices', 'indices', 
+                'points_transformed', 'combined_mask', 
+                'P1', 'P2', 'half_width'
+            ]
+            
+            # Collect source attributes
+            source_attrs = {}
+            for attr in attrs:
+                # Try view-specific first
+                val = getattr(self, f"section_{source_idx}_{attr}", None)
+                # Fallback to global
+                if val is None:
+                    val = getattr(self, f"section_{attr}", None)
+                source_attrs[attr] = val
+            
+            # Get source camera state
+            source_cam = None
+            if hasattr(self, 'section_vtks') and source_idx in self.section_vtks:
+                source_cam = self._get_camera_state_fast(self.section_vtks[source_idx])
+            
+            # Find ALL views to sync to (bidirectional)
+            views_to_sync = set()
+            
+            # Views where this view is the SOURCE
+            for target_idx, src in self.view_sync_map.items():
+                if src == source_idx:
+                    views_to_sync.add(target_idx)
+            
+            # Views where this view is the TARGET (for bidirectional)
+            if source_idx in self.view_sync_map:
+                views_to_sync.add(self.view_sync_map[source_idx])
+            
+            # Sync to each target view
+            for target_idx in views_to_sync:
+                if target_idx == source_idx:
+                    continue
+                if not hasattr(self, 'section_vtks') or target_idx not in self.section_vtks:
+                    continue
+                if not self.section_controller:
+                    continue
+                
+                vtk_widget = self.section_vtks[target_idx]
+                
+                # Copy ALL attributes to target
+                for attr, value in source_attrs.items():
+                    setattr(self, f"section_{target_idx}_{attr}", value)
+                
+                # Get target's view mode
+                view_mode = "side"
+                try:
+                    btns = getattr(self, "section_view_buttons", {}).get(target_idx, {})
+                    if btns.get("front") and btns["front"].isChecked():
+                        view_mode = "front"
+                except:
+                    pass
+                
+                print(f"   🔗 Syncing section: View {target_idx + 1} from View {source_idx + 1} (mode={view_mode})")
+                
+                # Save current active view
+                prev_active = getattr(self.section_controller, "active_view", None)
+                prev_vtk = getattr(self.section_controller, "current_vtk", None)
+                
+                try:
+                    # Clear and re-plot
+                    vtk_widget.clear()
+                    self.section_controller.active_view = target_idx
+                    self.section_controller.current_vtk = vtk_widget
+                    
+                    # Plot section with source data
+                    self.section_controller._plot_section(
+                        core,
+                        buf if buf is not None else np.empty((0, 3)),
+                        view=view_mode
+                    )
+                    
+                    # Apply source camera
+                    if source_cam:
+                        self._apply_camera_immediate(vtk_widget, source_cam)
+                        self._last_camera_states[target_idx] = source_cam.copy()
+                    
+                    # Auto-apply target's palette
+                    try:
+                        if hasattr(self, 'display_mode_dialog') and self.display_mode_dialog:
+                            dialog = self.display_mode_dialog
+                            slot = target_idx + 1
+                            if hasattr(dialog, 'view_palettes') and slot in dialog.view_palettes:
+                                self.section_controller._auto_apply_view_palette(
+                                    target_idx, dialog.view_palettes[slot]
+                                )
+                    except Exception as e:
+                        print(f"   ⚠️ Palette apply failed: {e}")
+                    
+                    print(f"   ✅ Section synced to View {target_idx + 1}")
+                    
+                finally:
+                    # Restore active view
+                    if prev_active is not None:
+                        self.section_controller.active_view = prev_active
+                    if prev_vtk is not None:
+                        self.section_controller.current_vtk = prev_vtk
+        
+        except Exception as e:
+            print(f"⚠️ Section sync error: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        finally:
+            self._sync_count = max(0, self._sync_count - 1)
+
+
+    # Keep the safe version as an alias
+    def _sync_section_from_safe(self, source_idx: int):
+        """Alias for _sync_section_from for backward compatibility."""
+        self._sync_section_from(source_idx)
+
+
+    def set_view_sync(self, target_view_num: int, source_view_num):
+        """
+        Configure sync between views.
+        ✅ BIDIRECTIONAL: Both views can drive sync
+        ✅ REAL-TIME: Immediate synchronization
+        ✅ SYNCS: Both camera AND section data
+        """
+        target_idx = target_view_num - 1
+
+        self._init_camera_sync_state()
+
+        if source_view_num is None:
+            # Clear sync for this target
+            if target_idx in self.view_sync_map:
+                del self.view_sync_map[target_idx]
+            
+            # Remove observer only if no relationships remain
+            has_any_sync = (
+                target_idx in self.view_sync_map or 
+                any(src == target_idx for src in self.view_sync_map.values())
+            )
+            if not has_any_sync:
+                self._remove_camera_sync_observer(target_idx)
+            
+            print(f"🔕 Sync cleared: View {target_view_num}")
+            return
+
+        source_idx = source_view_num - 1
+
+        if source_idx == target_idx:
+            print(f"⚠️ Ignoring self-sync for View {target_view_num}")
+            if target_idx in self.view_sync_map:
+                del self.view_sync_map[target_idx]
+            return
+
+        # Set the sync relationship (ALLOW BIDIRECTIONAL)
+        self.view_sync_map[target_idx] = source_idx
+        print(f"🔗 Sync set: View {target_view_num} = Match View {source_view_num}")
+
+        # Check if bidirectional
+        if source_idx in self.view_sync_map and self.view_sync_map[source_idx] == target_idx:
+            print(f"🔄 Bidirectional sync enabled: View {target_view_num} ↔ View {source_view_num}")
+
+        # Initial sync - BOTH section data AND camera
+        self._sync_section_from(source_idx)
+        self._sync_camera_immediate(source_idx)
+        
+        # Install observers on BOTH views for bidirectional sync
+        if hasattr(self, 'section_vtks'):
+            if source_idx in self.section_vtks:
+                self._install_realtime_camera_observer(source_idx, self.section_vtks[source_idx])
+            if target_idx in self.section_vtks:
+                self._install_realtime_camera_observer(target_idx, self.section_vtks[target_idx])
+
+
+    def _init_camera_sync_state(self):
+        """Initialize camera sync state."""
+        if not hasattr(self, 'view_sync_map'):
+            self.view_sync_map = {}
+        if not hasattr(self, '_camera_observers'):
+            self._camera_observers = {}
+        if not hasattr(self, '_last_camera_states'):
+            self._last_camera_states = {}
+        if not hasattr(self, '_sync_count'):
+            self._sync_count = 0
+
+
+    def _install_realtime_camera_observer(self, view_idx: int, vtk_widget):
+        """
+        Install REAL-TIME camera observer.
+        ✅ BIDIRECTIONAL: Works for both views
+        ✅ ZERO DELAY: Immediate sync
+        """
+        try:
+            self._init_camera_sync_state()
+            
+            if view_idx in self._camera_observers:
+                return
+            
+            if not _validate_vtk_widget(vtk_widget):
+                return
+            
+            self._last_camera_states[view_idx] = self._get_camera_state_fast(vtk_widget)
+            vtk_widget._sync_view_idx = view_idx
+            
+            def realtime_sync(obj, event):
+                """Real-time bidirectional sync — throttled to 30fps."""
+                import time as _time
+                if getattr(self, '_sync_count', 0) > 0:
+                    return
+                
+                # ✅ THROTTLE: 30fps max (33ms between syncs)
+                now = _time.time()
+                last_sync = getattr(self, '_last_camera_sync_time', 0)
+                if (now - last_sync) < 0.033:
+                    return
+                
+                is_source = any(src == view_idx for src in self.view_sync_map.values())
+                has_target = view_idx in self.view_sync_map
+                
+                if not is_source and not has_target:
+                    return
+                
+                current = self._get_camera_state_fast(vtk_widget)
+                if current is None:
+                    return
+                
+                last = self._last_camera_states.get(view_idx)
+                if last and not self._camera_changed_fast(last, current):
+                    return
+                
+                self._last_camera_states[view_idx] = current
+                self._last_camera_sync_time = now
+                self._sync_camera_bidirectional(view_idx, current)
+            
+            interactor = vtk_widget.interactor
+            observer_id = interactor.AddObserver("MouseMoveEvent", realtime_sync)
+            end_observer_id = vtk_widget.GetRenderWindow().AddObserver("EndEvent", realtime_sync)
+            
+            self._camera_observers[view_idx] = {
+                'interactor': interactor,
+                'observer_id': observer_id,
+                'end_observer_id': end_observer_id,
+                'render_window': vtk_widget.GetRenderWindow(),
+                'vtk_widget': vtk_widget
+            }
+            
+            print(f"✅ Real-time camera observer installed for View {view_idx + 1}")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to install observer: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+    def _sync_camera_bidirectional(self, source_idx: int, source_state: dict):
+        """
+        Sync camera bidirectionally.
+        """
+        self._sync_count = getattr(self, '_sync_count', 0) + 1
+        
+        try:
+            if not hasattr(self, 'section_vtks'):
+                return
+            
+            views_to_sync = set()
+            
+            for target_idx, src in self.view_sync_map.items():
+                if src == source_idx:
+                    views_to_sync.add(target_idx)
+            
+            if source_idx in self.view_sync_map:
+                views_to_sync.add(self.view_sync_map[source_idx])
+            
+            for target_idx in views_to_sync:
+                if target_idx == source_idx:
+                    continue
+                if target_idx not in self.section_vtks:
+                    continue
+                
+                target_vtk = self.section_vtks[target_idx]
+                self._last_camera_states[target_idx] = source_state.copy()
+                self._apply_camera_immediate(target_vtk, source_state)
+        
+        except Exception as e:
+            print(f"⚠️ Bidirectional sync error: {e}")
+        
+        finally:
+            self._sync_count = max(0, self._sync_count - 1)
+
+
+    def _remove_camera_sync_observer(self, view_idx: int):
+        """Remove camera observer."""
+        if not hasattr(self, '_camera_observers') or view_idx not in self._camera_observers:
+            return
+        
+        try:
+            info = self._camera_observers[view_idx]
+            
+            if 'interactor' in info and 'observer_id' in info:
+                try:
+                    info['interactor'].RemoveObserver(info['observer_id'])
+                except:
+                    pass
+            
+            if 'render_window' in info and 'end_observer_id' in info:
+                try:
+                    info['render_window'].RemoveObserver(info['end_observer_id'])
+                except:
+                    pass
+            
+            del self._camera_observers[view_idx]
+            print(f"🔓 Observer removed from View {view_idx + 1}")
+            
+        except Exception as e:
+            print(f"⚠️ Observer removal error: {e}")
+
+
+    def _sync_camera_immediate(self, source_idx: int):
+        """Initial camera sync."""
+        if getattr(self, '_sync_count', 0) > 0:
+            return
+        
+        self._sync_count = getattr(self, '_sync_count', 0) + 1
+        
+        try:
+            if not hasattr(self, 'section_vtks') or source_idx not in self.section_vtks:
+                return
+            
+            source_vtk = self.section_vtks[source_idx]
+            source_state = self._get_camera_state_fast(source_vtk)
+            
+            if source_state is None:
+                return
+            
+            for target_idx, src in self.view_sync_map.items():
+                if src != source_idx:
+                    continue
+                if target_idx not in self.section_vtks:
+                    continue
+                
+                target_vtk = self.section_vtks[target_idx]
+                self._last_camera_states[target_idx] = source_state.copy()
+                self._apply_camera_immediate(target_vtk, source_state)
+        
+        finally:
+            self._sync_count = max(0, self._sync_count - 1)
+
+
+    def _apply_camera_immediate(self, vtk_widget, camera_state):
+        """Apply camera state immediately."""
+        try:
+            renderer = vtk_widget.renderer
+            if renderer is None:
+                return
+            
+            camera = renderer.GetActiveCamera()
+            if camera is None:
+                return
+            
+            camera.SetPosition(camera_state["position"])
+            camera.SetFocalPoint(camera_state["focal_point"])
+            camera.SetViewUp(camera_state["view_up"])
+            camera.SetParallelScale(camera_state["parallel_scale"])
+            camera.SetClippingRange(camera_state["clipping_range"])
+            
+            if camera_state.get("parallel_projection", True):
+                camera.ParallelProjectionOn()
+            else:
+                camera.ParallelProjectionOff()
+            
+            renderer.ResetCameraClippingRange()
+            
+            render_window = vtk_widget.GetRenderWindow()
+            if render_window:
+                render_window.Render()
+            
+        except Exception:
+            pass
+
+
+    def _get_camera_state_fast(self, vtk_widget):
+        """Get camera state fast."""
+        try:
+            renderer = vtk_widget.renderer
+            if renderer is None:
+                return None
+            
+            camera = renderer.GetActiveCamera()
+            if camera is None:
+                return None
+            
+            return {
+                "position": camera.GetPosition(),
+                "focal_point": camera.GetFocalPoint(),
+                "view_up": camera.GetViewUp(),
+                "parallel_scale": camera.GetParallelScale(),
+                "parallel_projection": camera.GetParallelProjection(),
+                "clipping_range": camera.GetClippingRange(),
+            }
+        except:
+            return None
+
+
+    def _camera_changed_fast(self, state1, state2, tolerance=0.0001):
+        """Fast camera comparison."""
+        if state1 is None or state2 is None:
+            return True
+        
+        try:
+            s1 = state1["parallel_scale"]
+            s2 = state2["parallel_scale"]
+            if abs(s1 - s2) > tolerance * max(s1, s2, 1.0):
+                return True
+            
+            fp1 = state1["focal_point"]
+            fp2 = state2["focal_point"]
+            
+            dx = fp1[0] - fp2[0]
+            dy = fp1[1] - fp2[1]
+            dz = fp1[2] - fp2[2]
+            dist_sq = dx*dx + dy*dy + dz*dz
+            
+            threshold = tolerance * max(s1, s2, 1.0)
+            if dist_sq > threshold * threshold:
+                return True
+            
+            return False
+        except:
+            return True
+
+    def disable_all_camera_sync(self):
+        """Disable all sync."""
+        if hasattr(self, '_camera_observers'):
+            for view_idx in list(self._camera_observers.keys()):
+                self._remove_camera_sync_observer(view_idx)
+            self._camera_observers.clear()
+        
+        self._sync_count = 0
+        
+        if hasattr(self, 'view_sync_map'):
+            self.view_sync_map.clear()
+        
+        print("✅ All camera sync disabled")
+                  
+    def cleanup_closed_section_views(self):
+        """
+        AGGRESSIVE cleanup of ALL section view references when cross-section closes.
+        ✅ FIXED: Now properly removes widget references to stop false "cross-section active" detection
+        """
+        print("\n" + "="*60)
+        print("🧹 CLEANUP: Starting section view cleanup...")
+        print("="*60)
+        
+        view_indices = set()
+        
+        # 1. From section_vtks (CRITICAL - these cause "Cross-section active" false positive)
+        if hasattr(self, 'section_vtks') and self.section_vtks:
+            view_indices.update(self.section_vtks.keys())
+            print(f"   Found in section_vtks: {list(self.section_vtks.keys())}")
+        
+        # 2. From section_docks
+        if hasattr(self, 'section_docks') and self.section_docks:
+            view_indices.update(self.section_docks.keys())
+            print(f"   Found in section_docks: {list(self.section_docks.keys())}")
+        
+        # 3. From classify_interactors
+        if hasattr(self, 'classify_interactors') and self.classify_interactors:
+            view_indices.update(self.classify_interactors.keys())
+            print(f"   Found in classify_interactors: {list(self.classify_interactors.keys())}")
+        
+        # 4. Scan for stored section data attributes
+        data_attrs = ['P1', 'P2', 'half_width', 'core_points', 'buffer_points', 
+                    'core_mask', 'buffer_mask']
+        
+        for attr in data_attrs:
+            for i in range(10):  # Check views 0-9
+                key = f"section_{i}_{attr}"
+                if hasattr(self, key):
+                    view_indices.add(i)
+                    print(f"   Found stored data: {key}")
+                    break  # Move to next attr
+        
+        if not view_indices:
+            print("   ✅ No section views found - already clean")
+            print("="*60 + "\n")
+            return
+        
+        print(f"   📋 Will clean views: {sorted(view_indices)}")
+        
+        # ✅ CRITICAL FIX: Clean each view COMPLETELY
+        for view_idx in sorted(view_indices):
+            try:
+                print(f"\n   🔧 Cleaning section view {view_idx}...")
+                
+                # 1. ✅ CRITICAL: Remove from section_vtks FIRST (this stops "Cross-section active" detection)
+                if hasattr(self, 'section_vtks') and view_idx in self.section_vtks:
+                    try:
+                        # Clear the VTK widget
+                        vtk_widget = self.section_vtks[view_idx]
+                        if hasattr(vtk_widget, 'clear'):
+                            vtk_widget.clear()
+                    except:
+                        pass
+                    
+                    del self.section_vtks[view_idx]
+                    print(f"      ✅ Removed section_vtks[{view_idx}]")
+                
+                # 2. Remove from section_docks
+                if hasattr(self, 'section_docks') and view_idx in self.section_docks:
+                    try:
+                        dock = self.section_docks[view_idx]
+                        dock.hide()  # Hide first
+                    except:
+                        pass
+                    
+                    del self.section_docks[view_idx]
+                    print(f"      ✅ Removed section_docks[{view_idx}]")
+                
+                # 3. Remove from classify_interactors
+                if hasattr(self, 'classify_interactors') and view_idx in self.classify_interactors:
+                    del self.classify_interactors[view_idx]
+                    print(f"      ✅ Removed classify_interactors[{view_idx}]")
+                
+                # 4. Delete ALL stored section data
+                for attr in data_attrs:
+                    key = f"section_{view_idx}_{attr}"
+                    if hasattr(self, key):
+                        delattr(self, key)
+                        print(f"      ✅ Deleted {key}")
+                
+                print(f"   ✅ Cross-section view {view_idx} cleanup complete")
+                
+            except Exception as e:
+                print(f"   ⚠️ Cleanup error for view {view_idx}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 5. ✅ CRITICAL: Verify section_vtks is now empty
+        if hasattr(self, 'section_vtks'):
+            if self.section_vtks:
+                print(f"\n   ⚠️ WARNING: section_vtks not empty: {list(self.section_vtks.keys())}")
+                # Force clear
+                self.section_vtks.clear()
+                print(f"   🔨 FORCED CLEAR: section_vtks")
+            else:
+                print(f"\n   ✅ VERIFIED: section_vtks is empty")
+        
+        # 6. Reset classify_interactor if all cross-sections closed
+        if not getattr(self, 'section_vtks', {}):
+            if hasattr(self, 'classify_interactor'):
+                self.classify_interactor = None
+                print("   🔄 All cross-sections closed - reset classify_interactor")
+        
+        print("\n" + "="*60)
+        print("✅ CLEANUP COMPLETE")
+        print("="*60 + "\n")
+
+    def deactivate_cross_section_tool(self):
+        """Deactivate cross-section tool only (do not close cross-section windows)."""
+        try:
+            self._cancel_cross_section_tool_only()
+            self.set_cross_cursor_active(False, "cross_section")  
+            print("🛑 Cross-section tool deactivated")
+        except Exception as e:
+            print(f"⚠️ deactivate_cross_section_tool failed: {e}")
+
+    # --------------------------------------------------------------
+    def enable_section_point_picking(self):
+        """Enable clicking to select/highlight points in the cut section view."""
+        iren = self.app.sec_vtk.interactor
+        iren.AddObserver("LeftButtonPressEvent", self._on_section_point_click)
+
+    # --------------------------------------------------------------
+    def _on_section_point_click(self, obj, evt):
+        """Handle left-click to pick a point in the section/profile view."""
+        x, y = self.app.sec_vtk.interactor.GetEventPosition()
+        picker = vtk.vtkPointPicker()
+        picker.Pick(x, y, 0, self.app.sec_vtk.renderer)
+        pid = picker.GetPointId()
+        if pid >= 0 and pid < len(self.app.section_points):
+            picked_point = self.app.section_points[pid]
+            print(f"✅ Selected section point: {picked_point}")
+            self._highlight_section_point(pid)
+
+    # --------------------------------------------------------------
+    def _highlight_section_point(self, pid):
+        """Visually highlight the selected point in the section view."""
+        pt = self.app.section_points[pid]
+        # Create a sphere marker at the selected point
+        cloud = pv.PolyData([pt])
+        self.app.sec_vtk.add_points(cloud, color="red", point_size=12, render_points_as_spheres=True)
+        self.app.sec_vtk.render()
+
+    def enable_cut_section_mode(self):
+        """
+        Enable cut section mode.
+        Cut section draws on the CROSS-SECTION window, NOT the main view.
+        """
+        # Check if we're in top view (for main viewer)
+        if getattr(self, "current_view", None) != "top":
+            QMessageBox.warning(self, "Cut Section", "Main view must be in Top View")
+            return
+
+        # ✅ Do NOT touch the main interactor - cut section works on cross-section window!
+        # Just activate the cut section controller
+        self.cut_section_controller.activate()
+        self.cut_section_mode_on = True
+        self.set_cross_cursor_active(True, "cut_section")
+        print("✅ Cut Section Mode enabled on cross-section window.")
+
+    def toggle_cut_section_mode(self, checked):
+        """Toggle cut section mode (for UI Actions)."""
+        if checked:
+            self.enable_cut_section_mode()
+        else:
+            if hasattr(self, 'cut_section_controller'):
+                self.cut_section_controller.cancel_cut_section()
+            self.cut_section_mode_on = False
+            self.app.set_cross_cursor_active(False)
+            self.set_cross_cursor_active(False, "cut_section") 
+            print("🛑 Cut Section Mode disabled.")
+
+    # ------------------ Hook into classification tools ------------------
+    def on_classification_tool_start(self):
+        """When classification tool activated."""
+        if getattr(self, 'active_classify_tool', None) == "cut_section":
+            if hasattr(self, 'cut_section_controller'):
+                self.cut_section_controller.lock_for_classification()
+        elif getattr(self, 'active_classify_tool', None) == "cross_section":
+            if hasattr(self, 'section_controller'):
+                self.section_controller.lock_for_classification()
+
+    def on_classification_tool_end(self):
+        """When classification tool finished or canceled."""
+        if getattr(self, 'active_classify_tool', None) == "cut_section":
+            if hasattr(self, 'cut_section_controller'):
+                self.cut_section_controller.unlock_after_classification()
+        elif getattr(self, 'active_classify_tool', None) == "cross_section":
+            if hasattr(self, 'section_controller'):
+                self.section_controller.unlock_after_classification()
+
+
+    def toggle_view_mode(self, mode: str):
+        """
+        Switch between 2D plan view (locked top view) and full 3D orbit view.
+        ✅ SIMPLE FIX: Backs up and restores section view actors
+        """
+        from vtkmodules.vtkInteractionStyle import (
+            vtkInteractorStyleImage,
+            vtkInteractorStyleTrackballCamera,
+        )
+       
+        # ✅ STEP 1: Backup all section view actors BEFORE any changes
+        section_actors_backup = {}
+        if hasattr(self, 'section_vtks') and self.section_vtks:
+            for view_idx, vtk_widget in self.section_vtks.items():
+                try:
+                    if hasattr(vtk_widget, 'renderer') and vtk_widget.renderer:
+                        actors = vtk_widget.renderer.GetActors()
+                        actors.InitTraversal()
+                        actor_list = []
+                        for i in range(actors.GetNumberOfItems()):
+                            actor = actors.GetNextActor()
+                            if actor:
+                                actor_list.append(actor)
+                        section_actors_backup[view_idx] = actor_list
+                        print(f"💾 Backed up {len(actor_list)} actors from View {view_idx + 1}")
+                except Exception as e:
+                    print(f"⚠️ Backup failed for View {view_idx + 1}: {e}")
+ 
+        # ✅ STEP 2: Do the view mode switch
+        if mode == "3d":
+            self.is_3d_mode = True
+            print("🌀 Switching to 3D view (tools disabled)")
+ 
+            self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
+            cam = self.vtk_widget.renderer.GetActiveCamera()
+            cam.ParallelProjectionOff()
+            self.vtk_widget.render()
+ 
+            if hasattr(self, "digitizer"):
+                self.digitizer.disable_all_tools()
+           
+            self.active_classify_tool = None
+            self.statusBar().showMessage("3D Mode: tools disabled", 4000)
+ 
+        elif mode == "2d":
+            self.is_3d_mode = False
+            print("📐 Switching to 2D Plan View (tools enabled)")
+ 
+            cam = self.vtk_widget.renderer.GetActiveCamera()
+            cam.ParallelProjectionOn()
+            cam.SetFocalPoint(0, 0, 0)
+            cam.SetPosition(0, 0, 1)
+            cam.SetViewUp(0, 1, 0)
+            self.vtk_widget.renderer.ResetCamera()
+ 
+            self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
+            self.vtk_widget.render()
+
+            if (
+                hasattr(self, "digitizer")
+                and self.digitizer
+                and not getattr(self, "active_classify_tool", None)
+            ):
+                self.digitizer.enabled = True
+
+            self.statusBar().showMessage("2D Plan View locked (no 3D rotation)", 4000)
+        else:
+            print(f"⚠️ Unknown view mode: {mode}")
+            return
+ 
+        # ✅ STEP 3: Restore section view actors if they were lost
+        from PySide6.QtCore import QTimer
+       
+        def restore_actors():
+            if not section_actors_backup:
+                return
+               
+            for view_idx, actor_list in section_actors_backup.items():
+                if view_idx not in self.section_vtks:
+                    continue
+                   
+                vtk_widget = self.section_vtks[view_idx]
+                if not vtk_widget or not hasattr(vtk_widget, 'renderer'):
+                    continue
+               
+                try:
+                    renderer = vtk_widget.renderer
+                   
+                    # Check current actor count
+                    current_actors = renderer.GetActors()
+                    current_count = current_actors.GetNumberOfItems() if current_actors else 0
+                   
+                    # If actors were lost, restore them
+                    if current_count == 0 and len(actor_list) > 0:
+                        print(f"🔄 Restoring {len(actor_list)} actors to View {view_idx + 1}")
+                        for actor in actor_list:
+                            try:
+                                renderer.AddActor(actor)
+                            except:
+                                pass
+                        vtk_widget.render()
+                        print(f"✅ View {view_idx + 1} restored")
+                    else:
+                        print(f"✅ View {view_idx + 1} OK ({current_count} actors)")
+                       
+                except Exception as e:
+                    print(f"⚠️ Restore failed for View {view_idx + 1}: {e}")
+       
+        # Restore after a short delay to let any pending operations complete
+        QTimer.singleShot(100, restore_actors)
+        QTimer.singleShot(300, restore_actors)  # Double-check
+        
+    def open_shortcut_manager(self):
+        self._shortcut_manager = ShortcutManager.open_manager(self)
+        self._shortcut_manager.applied.connect(self.update_shortcuts)
+
+    def update_shortcuts(self, shortcuts):
+        if shortcuts:
+            self.shortcuts = shortcuts
+            print("✅ Shortcuts updated:", self.shortcuts)
+
+    def keyPressEvent(self, event):
+        # Let GlobalShortcutFilter handle all global shortcuts
+        super().keyPressEvent(event)
+
+    def open_file(self):
+            """
+            Load LiDAR file with OPTIMIZED memory management and performance
+            ✅ FIXED: Pre-allocated arrays (no vstack copies)
+            ✅ FIXED: Memory safety check (prevents OOM crashes)
+            ✅ OPTIMIZED: Batch progress updates
+            ✅ OPTIMIZED: Skip unnecessary padding
+            ✅ PRESERVED: All original logic intact
+            """
+            from PySide6.QtCore import QCoreApplication
+            from PySide6.QtWidgets import QMessageBox, QFileDialog
+            from gui.progress_dialog import LoadingProgressDialog
+            import os
+            import time
+            import numpy as np
+
+            print(f"\n{'='*70}")
+            print(f"📂 OPEN FILE - OPTIMIZED MODE")
+            print(f"{'='*70}")
+
+            # ============================================================================
+            # STEP 1: AUTO-SAVE CURRENT FILE (if exists)
+            # ============================================================================
+            if hasattr(self, 'data') and self.data is not None:
+                save_path = getattr(self, 'last_save_path', None) or getattr(self, 'loaded_file', None)
+                
+                if save_path:
+                    try:
+                        print(f"\n💾 AUTO-SAVING CURRENT FILE")
+                        print(f"   Path: {os.path.basename(save_path)}")
+                        print(f"   Points: {len(self.data.get('xyz', [])):,}")
+                        
+                        # ✅ OPTIMIZED: Single import path (remove try/except cascade)
+                        from gui.save_pointcloud import save_pointcloud_quick
+                        result = save_pointcloud_quick(self, save_path)
+                        
+                        if result:
+                            print(f"✅ Saved successfully")
+                            if hasattr(self, "statusBar"):
+                                self.statusBar().showMessage(f"💾 Saved: {os.path.basename(save_path)}", 2000)
+                                QCoreApplication.processEvents()
+                        else:
+                            print(f"⚠️ Save returned False")
+                            
+                    except Exception as e:
+                        print(f"❌ SAVE FAILED: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        
+                        reply = QMessageBox.warning(
+                            self,
+                            "Save Failed",
+                            f"Failed to auto-save:\n\n{e}\n\n"
+                            f"Continue without saving?",
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.No
+                        )
+                        if reply == QMessageBox.No:
+                            return
+
+            # ============================================================================
+            # STEP 2: SHOW FILE DIALOG
+            # ============================================================================
+            filenames, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Select File(s)",
+                "",
+                "LiDAR Files (*.las *.laz);;All Files (*.las *.laz *.ply *.ptc *.prj)"
+            )
+            
+            if not filenames:
+                print("   User cancelled")
+                return
+
+            print(f"\n✅ USER SELECTED {len(filenames)} FILE(S)")
+            for i, f in enumerate(filenames):
+                print(f"   {i+1}. {os.path.basename(f)}")
+
+            # ============================================================================
+            # ✅ NEW: STEP 2.5 - MEMORY SAFETY CHECK
+            # ============================================================================
+            try:
+                import psutil
+                
+                # Calculate estimated memory requirement
+                total_file_size_mb = sum(os.path.getsize(f) for f in filenames if os.path.exists(f)) / (1024 * 1024)
+                # Estimate: uncompressed LAZ is ~3x file size, plus processing overhead
+                estimated_memory_mb = total_file_size_mb * 4  
+                
+                # Check available memory
+                available_memory_mb = psutil.virtual_memory().available / (1024 * 1024)
+                
+                print(f"\n🧮 MEMORY CHECK:")
+                print(f"   File size: {total_file_size_mb:.0f} MB")
+                print(f"   Estimated memory needed: {estimated_memory_mb:.0f} MB")
+                print(f"   Available memory: {available_memory_mb:.0f} MB")
+                
+                # Warn if using more than 70% of available memory
+                if estimated_memory_mb > available_memory_mb * 0.7:
+                    reply = QMessageBox.warning(
+                        self,
+                        "⚠️ Memory Warning",
+                        f"Loading these files may require ~{estimated_memory_mb:.0f} MB of memory.\n"
+                        f"You have {available_memory_mb:.0f} MB available.\n\n"
+                        f"This may cause slowdowns or crashes.\n\n"
+                        f"Recommendations:\n"
+                        f"• Load files in smaller batches\n"
+                        f"• Close other applications\n"
+                        f"• Upgrade RAM for large datasets\n\n"
+                        f"Continue anyway?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No
+                    )
+                    if reply == QMessageBox.No:
+                        print("   ⚠️ User cancelled due to memory warning")
+                        return
+                    print("   ⚠️ User chose to continue despite warning")
+                else:
+                    print(f"   ✅ Sufficient memory available")
+                    
+            except ImportError:
+                print("\n⚠️ psutil not installed - skipping memory check")
+                print("   Install with: pip install psutil")
+            except Exception as e:
+                print(f"\n⚠️ Memory check failed: {e}")
+
+            # ============================================================================
+            # STEP 3: CLEAR CURRENT PROJECT (ALWAYS - preserve DXF only)
+            # ============================================================================
+            print(f"\n{'='*60}")
+            print(f"🧹 CLEARING CURRENT PROJECT")
+            print(f"{'='*60}")
+            
+            # ✅ OPTIMIZED: Only backup DXF if it actually exists
+            dxf_backup = []
+            if hasattr(self, 'dxf_actors') and self.dxf_actors:
+                for dxf_data in self.dxf_actors:
+                    for actor in dxf_data.get('actors', []):
+                        dxf_backup.append(actor)
+                
+                if dxf_backup:  # Only remove if we have actors
+                    renderer = self.vtk_widget.renderer
+                    for actor in dxf_backup:
+                        renderer.RemoveActor(actor)
+                    print(f"   💾 Backed up {len(dxf_backup)} DXF actors")
+
+            # ── SNT backup (same pattern as DXF — backup then restore) ──  ##BD
+            snt_backup = []
+            if hasattr(self, 'snt_actors') and self.snt_actors:
+                renderer = self.vtk_widget.renderer
+                for snt_data in self.snt_actors:
+                    for actor in snt_data.get('actors', []):
+                        snt_backup.append(actor)
+                        try:
+                            renderer.RemoveActor(actor)
+                        except Exception:
+                            pass
+                if snt_backup:
+                    print(f"   💾 Backed up {len(snt_backup)} SNT actors")
+            
+            # Clear VTK completely
+            if hasattr(self, "vtk_widget") and self.vtk_widget:
+                renderer = self.vtk_widget.renderer
+                renderer.RemoveAllViewProps()
+                
+                if hasattr(self.vtk_widget, 'actors'):
+                    self.vtk_widget.actors.clear()
+                if hasattr(self.vtk_widget, '_actors'):
+                    self.vtk_widget._actors.clear()
+                
+                self.vtk_widget.render()
+                print(f"   ✅ VTK cleared")
+            
+            # Clear cross-sections
+            if hasattr(self, 'section_vtks') and self.section_vtks:
+                for view_idx, vtk_widget in self.section_vtks.items():
+                    try:
+                        vtk_widget.renderer.RemoveAllViewProps()
+                        if hasattr(vtk_widget, 'actors'):
+                            vtk_widget.actors.clear()
+                        vtk_widget.render()
+                    except:
+                        pass
+                print(f"   ✅ Cross-sections cleared")
+            
+            # Clear ALL internal state
+            try:
+                from .memory_manager import ObserverRegistry, release_data_arrays
+
+                release_data_arrays(self)
+                ObserverRegistry.release_all()
+                mem_guard = getattr(self, "_mem_guard", None)
+                if mem_guard is not None:
+                    mem_guard.force_gc()
+            except Exception as e:
+                print(f"⚠️ Memory manager clear hook skipped: {e}")
+
+            self.data = None
+            self.loaded_file = None
+            self.last_save_path = None
+            self.class_palette = {}
+            
+            if hasattr(self, "view_palettes"):
+                self.view_palettes.clear()
+            
+            if hasattr(self, 'undo_stack'):
+                self.undo_stack.clear()
+            if hasattr(self, 'redo_stack'):
+                self.redo_stack.clear()
+            
+            if hasattr(self, 'spatial_index'):
+                self.spatial_index = None
+            
+            print(f"   ✅ All data cleared")
+            
+            # ✅ OPTIMIZED: Removed unnecessary gc.collect() - Python handles this
+            QCoreApplication.processEvents()
+            
+            # Restore DXF actors
+            if dxf_backup:
+                renderer = self.vtk_widget.renderer
+                for actor in dxf_backup:
+                    renderer.AddActor(actor)
+                self.vtk_widget.render()
+                QCoreApplication.processEvents()
+                print(f"   ✅ Restored {len(dxf_backup)} DXF actors")
+            
+            # Restore SNT actors
+            if snt_backup:
+                renderer = self.vtk_widget.renderer
+                for actor in snt_backup:
+                    renderer.AddActor(actor)
+                self.vtk_widget.render()
+                print(f"   ✅ Restored {len(snt_backup)} SNT actors")
+            
+            print(f"{'='*60}")
+            print(f"✅ CLEAR COMPLETE")
+            print(f"{'='*60}\n")
+
+            # ============================================================================
+            # STEP 4: LOAD NEW FILE(S) - SINGLE OR MULTIPLE
+            # ============================================================================
+            
+            # Handle special file types (single file only)
+            if len(filenames) == 1:
+                filename = filenames[0]
+                
+                if filename.lower().endswith(".ptc"):
+                    print(f"📋 Loading PTC palette...")
+                    self._load_single_ptc(filename)
+                    return
+                
+                if filename.lower().endswith(".prj"):
+                    print(f"📋 Loading TerraScan PRJ...")
+                    self._load_terrascan_prj(filename)
+                    return
+            
+            # ============================================================================
+            # OPTIMIZED LOADER: Memory-efficient multi-file loading
+            # ============================================================================
+            print(f"{'='*60}")
+            print(f"📂 LOADING {len(filenames)} FILE(S) - OPTIMIZED MODE")
+            print(f"{'='*60}")
+            
+            progress = LoadingProgressDialog(self, show_cancel=False)
+            progress.set_filename(f"{len(filenames)} file(s)" if len(filenames) > 1 else os.path.basename(filenames[0]))
+            progress.show()
+
+            # ✅ OPTIMIZED: Batch progress updates
+            def update_progress(percent, status, force=False):
+                """Update progress - batched to reduce overhead"""
+                if force or not hasattr(update_progress, '_last_update'):
+                    progress.set_progress(percent)
+                    progress.set_status(status)
+                    QCoreApplication.processEvents()
+                    update_progress._last_update = time.time()
+                else:
+                    # Only update if 200ms have passed
+                    if time.time() - update_progress._last_update > 0.2:
+                        progress.set_progress(percent)
+                        progress.set_status(status)
+                        QCoreApplication.processEvents()
+                        update_progress._last_update = time.time()
+
+            load_start = time.time()
+            
+            # ============================================================================
+            # ✅ PHASE 1: SCAN FILES TO GET TOTAL POINT COUNT (for pre-allocation)
+            # ============================================================================
+            print(f"\n📊 Phase 1: Scanning files...")
+            update_progress(2, "Scanning files...", force=True)
+            
+            from .data_loader import load_lidar_file
+            
+            file_info = []  # Store info about each file
+            total_points = 0
+            first_has_rgb = False
+            first_has_intensity = False
+            
+            for i, filename in enumerate(filenames):
+                try:
+                    # Quick scan to get point count without loading full data
+                    # Most LAZ libraries can get count without full read
+                    tile_data = load_lidar_file(filename, parent=self)
+                    
+                    if not tile_data:
+                        print(f"   ⚠️ Skipping: {os.path.basename(filename)}")
+                        continue
+                    
+                    n_points = len(tile_data.get('xyz', []))
+                    total_points += n_points
+                    
+                    has_rgb = tile_data.get("rgb") is not None
+                    has_intensity = tile_data.get("intensity") is not None
+                    
+                    if i == 0:
+                        first_has_rgb = has_rgb
+                        first_has_intensity = has_intensity
+                    
+                    file_info.append({
+                        'filename': filename,
+                        'data': tile_data,  # Keep data in memory for now
+                        'n_points': n_points,
+                        'has_rgb': has_rgb,
+                        'has_intensity': has_intensity
+                    })
+                    
+                    print(f"   {i+1}. {os.path.basename(filename)}: {n_points:,} points")
+                    
+                except Exception as e:
+                    print(f"   ❌ Failed to scan {os.path.basename(filename)}: {e}")
+                    continue
+            
+            if not file_info:
+                progress.finish_error("No files loaded successfully")
+                return
+            
+            print(f"\n✅ Scan complete: {len(file_info)} files, {total_points:,} total points")
+            
+            # ============================================================================
+            # ✅ PHASE 2: PRE-ALLOCATE ARRAYS (ZERO COPY MERGE!)
+            # ============================================================================
+            print(f"\n📦 Phase 2: Allocating memory...")
+            update_progress(10, "Allocating memory...", force=True)
+            
+            try:
+                # Pre-allocate all arrays at once
+                merged_xyz = np.empty((total_points, 3), dtype=np.float64)
+                merged_classification = np.empty(total_points, dtype=np.uint8)
+                
+                # ✅ OPTIMIZED: Only allocate RGB/intensity if ANY file has it
+                merged_rgb = np.empty((total_points, 3), dtype=np.uint8) if any(f['has_rgb'] for f in file_info) else None
+                merged_intensity = np.empty(total_points, dtype=np.float32) if any(f['has_intensity'] for f in file_info) else None
+                
+                print(f"   ✅ Allocated {total_points:,} points")
+                print(f"      - XYZ: {merged_xyz.nbytes / (1024**2):.1f} MB")
+                print(f"      - Classification: {merged_classification.nbytes / (1024**2):.1f} MB")
+                if merged_rgb is not None:
+                    print(f"      - RGB: {merged_rgb.nbytes / (1024**2):.1f} MB")
+                if merged_intensity is not None:
+                    print(f"      - Intensity: {merged_intensity.nbytes / (1024**2):.1f} MB")
+                
+            except MemoryError:
+                progress.finish_error("Out of memory! Try loading fewer files.")
+                QMessageBox.critical(
+                    self,
+                    "Memory Error",
+                    f"Failed to allocate memory for {total_points:,} points.\n\n"
+                    f"Required: ~{(total_points * 20) / (1024**2):.0f} MB\n\n"
+                    f"Try loading files in smaller batches."
+                )
+                return
+            
+            # ============================================================================
+            # ✅ PHASE 3: FILL PRE-ALLOCATED ARRAYS (NO COPYING!)
+            # ============================================================================
+            print(f"\n📥 Phase 3: Filling arrays...")
+            
+            offset = 0
+            first_file = file_info[0]['filename']
+            first_crs_epsg = None
+            first_crs_wkt = None
+            
+            for i, info in enumerate(file_info):
+                percent = 15 + int((i / len(file_info)) * 70)
+                update_progress(percent, f"Merging file {i+1}/{len(file_info)}...")
+                
+                tile_data = info['data']
+                n = info['n_points']
+                
+                # Fill XYZ and classification directly (NO COPY!)
+                merged_xyz[offset:offset+n] = tile_data["xyz"]
+                merged_classification[offset:offset+n] = tile_data["classification"]
+                
+                # Fill RGB if available
+                if merged_rgb is not None:
+                    if info['has_rgb']:
+                        merged_rgb[offset:offset+n] = tile_data["rgb"]
+                    else:
+                        # ✅ OPTIMIZED: Fill missing RGB only when needed
+                        merged_rgb[offset:offset+n] = 128  # Gray
+                
+                # Fill intensity if available
+                if merged_intensity is not None:
+                    if info['has_intensity']:
+                        merged_intensity[offset:offset+n] = tile_data["intensity"]
+                    else:
+                        # ✅ OPTIMIZED: Fill missing intensity only when needed
+                        merged_intensity[offset:offset+n] = 0
+                
+                # Get CRS from first file
+                if i == 0:
+                    if tile_data.get("crs_epsg"):
+                        first_crs_epsg = tile_data["crs_epsg"]
+                        first_crs_wkt = tile_data.get("crs_wkt")
+                        
+                        self.project_crs_epsg = first_crs_epsg
+                        self.project_crs_wkt = first_crs_wkt
+                        
+                        try:
+                            from pyproj import CRS
+                            self.crs = CRS.from_epsg(first_crs_epsg)
+                            print(f"      📐 CRS: {self.crs.name}")
+                        except:
+                            pass
+                
+                # ✅ PRESERVED: Store as layer for reference (keep original logic)
+                layer = {
+                    "type": "laz_tile",
+                    "filename": info['filename'],
+                    "xyz": tile_data["xyz"],
+                    "classification": tile_data.get("classification"),
+                    "rgb": tile_data.get("rgb"),
+                    "intensity": tile_data.get("intensity"),
+                    "crs_epsg": tile_data.get("crs_epsg"),
+                    "visible": True,
+                }
+                self.layers.append(layer)
+                
+                if hasattr(self, 'layers_dock') and self.layers_dock:
+                    self.layers_dock.add_layer(layer)
+                
+                offset += n
+                
+                # Clear tile data to free memory
+                del tile_data
+            
+            print(f"   ✅ All files merged into pre-allocated arrays (zero copy!)")
+            
+            # ============================================================================
+            # ✅ PHASE 4: CREATE FINAL DATA DICT (NO COPY - just references!)
+            # ============================================================================
+            update_progress(87, "Finalizing data...", force=True)
+            
+            self.data = {
+                "xyz": merged_xyz,
+                "classification": merged_classification
+            }
+            
+            if merged_rgb is not None:
+                self.data["rgb"] = merged_rgb
+            if merged_intensity is not None:
+                self.data["intensity"] = merged_intensity
+            
+            print(f"\n✅ Final dataset ready: {total_points:,} points")
+            print(f"   Memory used: {(merged_xyz.nbytes + merged_classification.nbytes + (merged_rgb.nbytes if merged_rgb is not None else 0)) / (1024**2):.1f} MB")
+            
+            # ✅ PRESERVED: Build DEM for shading
+            try:
+                from gui.shading_display import build_base_dem_mesh
+                build_base_dem_mesh(self, percentile_filter=99.9, downsample=2)
+            except:
+                pass
+            
+            # Set file paths
+            self.loaded_file = first_file
+            self.last_save_path = first_file
+            
+            # ✅ PRESERVED: Build spatial index
+            if total_points > 50_000:
+                try:
+                    update_progress(90, "Building spatial index...", force=True)
+                    from gui.performance_optimizations import SpatialIndex
+                    self.spatial_index = SpatialIndex(self.data["xyz"])
+                    print(f"   ✅ Spatial index built")
+                except Exception as e:
+                    print(f"   ⚠️ Spatial index failed: {e}")
+                    self.spatial_index = None
+            
+            # ✅ PRESERVED: Restore display settings
+            update_progress(92, "Restoring settings...", force=True)
+            try:
+                from .display_mode import restore_display_settings_for_file
+                restore_display_settings_for_file(self, first_file)
+            except:
+                pass
+            
+            # Set display mode
+            self.display_mode = "class"
+            
+            # ✅ PRESERVED: Load palette
+            update_progress(94, "Loading palette...", force=True)
+            palette_to_apply = self._get_palette_for_file(first_file)
+            
+            # ✅ PRESERVED: Apply palette and render
+            if palette_to_apply:
+                visible_count = len([c for c, v in palette_to_apply.items() if v.get("show")])
+                update_progress(96, f"Rendering {visible_count} classes...", force=True)
+                
+                print(f"🎨 Applying palette with {visible_count} visible classes...")
+                
+                self.apply_class_map({
+                    "classes": palette_to_apply,
+                    "slot": 0,
+                    "color_mode": 0,
+                    "target_view": 0
+                })
+            from gui.save_pointcloud import finalize_drawing_render
+            finalize_drawing_render(self)
+            print("✅ Drawings finalized after point cloud render")
+            # ✅ PRESERVED: Finalize
+            update_progress(98, "Finalizing...", force=True)
+            
+            try:
+                from .pointcloud_display import force_interactor_ready
+                force_interactor_ready(self, delay_ms=300)
+            except:
+                pass
+            
+            self.toggle_view_mode("2d")
+            
+            # Update title
+            if len(filenames) == 1:
+                self._update_window_title(first_file, self.project_crs_epsg)
+            else:
+                self._update_window_title(f"{len(filenames)} files ({total_points:,} pts)", self.project_crs_epsg)
+            
+            # ✅ PRESERVED: Auto-load drawings
+            if hasattr(self, "digitizer") and self.digitizer:
+                try:
+                    self.digitizer.auto_load_drawings(first_file)
+                except:
+                    pass
+            
+            # ✅ PRESERVED: Update statistics
+            if hasattr(self, 'point_count_widget') and self.point_count_widget:
+                try:
+                    from gui.point_count_widget import refresh_point_statistics
+                    refresh_point_statistics(self)
+                except:
+                    pass
+            
+            total_time = time.time() - load_start
+            
+            print(f"\n{'='*60}")
+            print(f"✅ LOAD COMPLETE - OPTIMIZED MODE")
+            print(f"   Files: {len(filenames)}")
+            print(f"   Points: {total_points:,}")
+            print(f"   Time: {total_time:.1f}s")
+            print(f"   Performance: {total_points / total_time:,.0f} points/sec")
+            print(f"{'='*60}\n")
+            
+            progress.finish_success(f"Loaded {total_points:,} points in {total_time:.1f}s")
+        
+
+    def attach_classification_to_main(self):
+        """
+        Attach ClassificationInteractor to the MAIN view (plan view).
+
+        This lets all classification tools (rectangle, circle, brush, etc.)
+        work directly on the main window.
+        """
+        try:
+            from gui.cross_section.interactor_classify import ClassificationInteractor
+        except ImportError:
+            try:
+                # If your module path is different, adjust here
+                from .cross_section.interactor_classify import ClassificationInteractor
+            except ImportError as e:
+                print(f"⚠️ Cannot import ClassificationInteractor: {e}")
+                return
+
+        # Ensure main PyVista widget exists
+        if not hasattr(self, 'vtk_widget') or self.vtk_widget is None:
+            print("⚠️ No main VTK widget (vtk_widget) - cannot attach ClassificationInteractor to main view")
+            return
+
+        iren = self.vtk_widget.interactor
+
+        # Create a new ClassificationInteractor for the MAIN view
+        wrapper = ClassificationInteractor(self, iren, mode="2d")
+
+        # Replace current interactor style with classification style
+        iren.SetInteractorStyle(wrapper.style)
+
+        # Keep a reference so we can deactivate later if needed
+        self.classify_interactor = wrapper
+
+        print("✅ ClassificationInteractor attached to MAIN view")
+ 
+ 
+    def _load_single_ptc(self, filename):
+        """Load PTC palette file"""
+        from gui.progress_dialog import LoadingProgressDialog
+        from PySide6.QtCore import QCoreApplication
+       
+        progress = LoadingProgressDialog(self, show_cancel=False)
+        progress.set_filename(filename)
+        progress.show()
+       
+        progress.set_progress(30, "Loading class palette...")
+        QCoreApplication.processEvents()
+       
+        palette = self._load_ptc_file(filename)
+        if palette:
+            palette = self._normalize_palette_weights(palette)
+           
+            progress.set_progress(80, "Applying palette...")
+            QCoreApplication.processEvents()
+           
+            self.display_mode = "class"
+            self.apply_class_map({
+                "classes": palette,
+                "slot": 0,
+                "color_mode": 0
+            })
+           
+            from PySide6.QtCore import QSettings
+            settings = QSettings("NakshaAI", "LidarApp")
+            settings.setValue("last_ptc_path", filename)
+           
+            if hasattr(self, 'point_count_widget') and self.point_count_widget:
+                refresh_point_statistics(self)
+           
+            progress.finish_success("Class palette loaded!")
+        else:
+            progress.finish_error("Failed to load palette")
+ 
+ 
+    def _load_terrascan_prj(self, filename):
+        """Load TerraScan PRJ project"""
+        from gui.progress_dialog import LoadingProgressDialog
+        from PySide6.QtCore import QCoreApplication
+       
+        progress = LoadingProgressDialog(self, show_cancel=False)
+        progress.set_filename(filename)
+        progress.show()
+       
+        progress.set_progress(20, "Parsing TerraScan project...")
+        QCoreApplication.processEvents()
+       
+        from .data_loader import _parse_terrascan_prj
+        laz_files = _parse_terrascan_prj(filename)
+       
+        total_files = len(laz_files)
+        for i, laz in enumerate(laz_files):
+            percent = 20 + int((i / total_files) * 60)
+            progress.set_progress(percent, f"Loading tile {i+1}/{total_files}...")
+            QCoreApplication.processEvents()
+           
+            laz_data = load_lidar_file(laz, parent=self)
+            if laz_data:
+                layer = {
+                    "type": "laz_tile",
+                    "filename": laz,
+                    "xyz": laz_data["xyz"],
+                    "crs_epsg": laz_data.get("crs_epsg"),
+                    "visible": True,
+                }
+                self.layers.append(layer)
+                if hasattr(self, 'layers_dock') and self.layers_dock:
+                    self.layers_dock.add_layer(layer)
+       
+        progress.set_progress(90, "Rendering project...")
+        QCoreApplication.processEvents()
+       
+        self.display_mode = "class"
+        self._refresh_view(include_overlays=True)
+        self._update_window_title(filename, self.project_crs_epsg)
+        self.loaded_file = filename
+        self.last_save_path = filename
+       
+        # Set CRS
+        if self.project_crs_epsg and not hasattr(self, 'crs'):
+            try:
+                from pyproj import CRS
+                self.crs = CRS.from_epsg(self.project_crs_epsg)
+                print(f"✅ Project CRS set: {self.crs.name}")
+            except Exception as e:
+                print(f"⚠️ Could not create CRS object: {e}")
+       
+        from .display_mode import restore_display_settings_for_file
+        restore_display_settings_for_file(self, filename)
+       
+        if hasattr(self, 'point_count_widget') and self.point_count_widget:
+            refresh_point_statistics(self)
+       
+        progress.finish_success(f"Loaded {total_files} tiles")
+ 
+ 
+    def _load_single_lidar_file(self, filename):
+        """Load single LAZ/LAS/PLY file"""
+        from gui.progress_dialog import LoadingProgressDialog
+        from PySide6.QtCore import QCoreApplication
+        import time
+       
+        progress = LoadingProgressDialog(self, show_cancel=False)
+        progress.set_filename(filename)
+        progress.show()
+       
+        def update_progress(percent, status):
+            progress.set_progress(percent)
+            progress.set_status(status)
+            QCoreApplication.processEvents()
+       
+        print(f"\n{'='*60}")
+        print(f"📂 Loading file: {os.path.basename(filename)}")
+        print(f"{'='*60}")
+       
+        load_start = time.time()
+       
+        update_progress(15, "Opening file...")
+       
+        lidar_data = load_lidar_file(filename, parent=self)
+        if not lidar_data:
+            print("❌ Failed to load LiDAR file")
+            progress.finish_error("Failed to read file")
+            return
+       
+        n_points = len(lidar_data.get('xyz', []))
+        progress.set_points_count(n_points)
+        print(f"📊 Data loaded: {n_points:,} points")
+       
+        update_progress(35, f"Processing {n_points:,} points...")
+       
+        # Set main data
+        self.data = lidar_data
+       
+        # Build spatial index
+        if n_points > 50_000:
+            try:
+                update_progress(50, "Building spatial index...")
+                from gui.performance_optimizations import SpatialIndex
+                self.spatial_index = SpatialIndex(self.data["xyz"])
+                print(f"✅ Spatial index ready")
+            except Exception as e:
+                print(f"⚠️ Spatial index failed: {e}")
+                self.spatial_index = None
+       
+        # Set CRS
+        if lidar_data.get("crs_epsg"):
+            self.project_crs_epsg = lidar_data["crs_epsg"]
+            self.project_crs_wkt = lidar_data.get("crs_wkt")
+           
+            if not hasattr(self, 'crs') or self.crs is None:
+                try:
+                    from pyproj import CRS
+                    self.crs = CRS.from_epsg(self.project_crs_epsg)
+                    print(f"✅ Project CRS set: {self.crs.name}")
+                except Exception as e:
+                    print(f"⚠️ Could not create CRS object: {e}")
+       
+        self.loaded_file = filename
+        self.last_save_path = filename
+       
+        # Restore settings
+        update_progress(55, "Checking for saved settings...")
+        from .display_mode import restore_display_settings_for_file
+        restore_display_settings_for_file(self, filename)
+       
+        # Set display mode
+        self.display_mode = "class"
+       
+        # Get palette
+        update_progress(60, "Loading classification palette...")
+        palette_to_apply = self._get_palette_for_file(filename)
+       
+        # Apply palette
+        if palette_to_apply:
+            visible_count = len([c for c, v in palette_to_apply.items() if v.get("show")])
+            update_progress(85, f"Rendering {visible_count} visible classes...")
+           
+            self.apply_class_map({
+                "classes": palette_to_apply,
+                "slot": 0,
+                "color_mode": 0,
+                "target_view": 0
+            })
+       
+        # Finalize
+        update_progress(95, "Finalizing...")
+       
+        from .pointcloud_display import force_interactor_ready
+        force_interactor_ready(self, delay_ms=300)
+       
+        self.toggle_view_mode("2d")
+        self._update_window_title(filename, lidar_data.get("crs_epsg"))
+       
+        # Auto-load drawings
+        if hasattr(self, "digitizer") and self.digitizer:
+            try:
+                self.digitizer.auto_load_drawings(filename)
+            except Exception as e:
+                print(f"⚠️ Failed to auto-load drawings: {e}")
+       
+        # Update statistics
+        if hasattr(self, 'point_count_widget') and self.point_count_widget:
+            refresh_point_statistics(self)
+       
+        total_time = time.time() - load_start
+        print(f"{'='*60}")
+        print(f"✅ LOAD COMPLETE: {os.path.basename(filename)}")
+        print(f"   ⏱️ Time: {total_time:.1f}s")
+        print(f"{'='*60}\n")
+       
+        progress.finish_success(f"Loaded {n_points:,} points in {total_time:.1f}s")
+ 
+ 
+    def _get_palette_for_file(self, filename):
+        """Helper to get appropriate palette for file"""
+        import os
+        from PySide6.QtCore import QSettings
+       
+        # Use existing palette if available
+        if hasattr(self, 'class_palette') and self.class_palette:
+            print("🔄 Reusing existing/restored palette")
+            palette = self._normalize_palette_weights(self.class_palette)
+           
+            # Ensure at least one class is visible
+            if not any(v.get("show") for v in palette.values()):
+                for code in palette:
+                    palette[code]["show"] = True
+           
+            return palette
+       
+        # Try to load from last PTC
+        settings = QSettings("NakshaAI", "LidarApp")
+        last_ptc = settings.value("last_ptc_path", "")
+       
+        if last_ptc and os.path.exists(last_ptc):
+            print(f"📁 Loading PTC: {os.path.basename(last_ptc)}")
+            from .display_mode import DisplayModeDialog
+            dlg = DisplayModeDialog(self)
+            dlg.load_classes_from_path(last_ptc)
+            dlg.close()
+           
+            class_map = {}
+            for row in range(dlg.table.rowCount()):
+                show = dlg.table.cellWidget(row, 0).isChecked()
+                code = int(dlg.table.item(row, 1).text())
+                desc = dlg.table.item(row, 2).text()
+                draw = dlg.table.item(row, 3).text()
+                lvl = dlg.table.item(row, 4).text()
+                color = dlg.table.item(row, 5).background().color().getRgb()[:3]
+               
+                class_map[code] = {
+                    "show": show,
+                    "description": desc,
+                    "draw": draw,
+                    "lvl": lvl,
+                    "color": color,
+                    "weight": 1.0
+                }
+           
+            # Ensure at least one class is visible
+            if not any(v.get("show") for v in class_map.values()):
+                for code in class_map:
+                    class_map[code]["show"] = True
+           
+            return class_map
+       
+        print("📋 Using TerraScan defaults")
+        return None
+    # ============================================================
+    # SIMPLER VERSION - Just add progress to existing code
+    # ============================================================
+
+    def show_loading_progress(parent, filename, total_steps=5):
+        """
+        Simple wrapper - show progress dialog during existing load.
+        Call this BEFORE your existing load_lidar_file() call.
+        """
+        # Ensure the LoadingProgressDialog symbol is available (import locally)
+        try:
+            from gui.progress_dialog import LoadingProgressDialog
+        except Exception as e:
+            print(f"⚠️ Could not import LoadingProgressDialog: {e}")
+            # Fallback minimal progress object to avoid crashes when the dialog class is missing
+            class LoadingProgressDialog:
+                def __init__(self, parent, show_cancel=False):
+                    self._percent = 0
+                    self._filename = ""
+                def set_filename(self, fn):
+                    self._filename = fn
+                def show(self):
+                    pass
+                def set_progress(self, p):
+                    self._percent = p
+                def set_status(self, s):
+                    pass
+                def finish_success(self, msg=None):
+                    pass
+                def finish_error(self, msg=None):
+                    pass
+
+        progress = LoadingProgressDialog(parent, show_cancel=False)
+        progress.set_filename(filename)
+        progress.show()
+        
+        # Simulate progress (since existing loader doesn't report it)
+        from PySide6.QtCore import QTimer, QCoreApplication
+        
+        step = [0]
+        
+        def advance():
+            step[0] += 1
+            percent = int((step[0] / total_steps) * 100)
+            progress.set_progress(percent)
+            
+            statuses = [
+                "Opening file...",
+                "Reading point data...",
+                "Processing colors...",
+                "Loading classification...",
+                "Building spatial index..."
+            ]
+            if step[0] <= len(statuses):
+                progress.set_status(statuses[step[0] - 1])
+            
+            QCoreApplication.processEvents()      
+        return progress, advance
+    def _on_main_interactor_keypress(self, obj, evt):
+        """
+        Handle ESC key in main interactor.
+        
+        Priority order:
+        1. Cancel active curve drawing (if in progress)
+        2. Exit curve select mode (if active)
+        3. Cancel cross-section mode (existing logic)
+        4. Deactivate digitizer tools
+        5. Deactivate measurement/other tools
+        
+        After ESC: right-click on grid labels works for loading LAZ.
+        """
+        key = obj.GetKeySym()
+
+        if key == "Escape":
+            print("🔑 ESC pressed — checking active tools...")
+            handled = False
+
+            # ══════════════════════════════════════════════════════
+            # PRIORITY 1: Cancel active curve drawing
+            # ══════════════════════════════════════════════════════
+            if hasattr(self, 'curve_tool') and self.curve_tool:
+                ct = self.curve_tool
+                
+                # If actively drawing a curve → cancel it
+                if ct.active:
+                    ct._cancel_curve()
+                    print("   ✅ Curve drawing cancelled")
+                    handled = True
+                
+                # If in select mode → exit it
+                elif getattr(ct, '_select_mode', False):
+                    ct.deactivate_select_mode()
+                    print("   ✅ Curve select mode deactivated")
+                    handled = True
+
+            # ══════════════════════════════════════════════════════
+            # PRIORITY 2: Cancel cross-section mode (YOUR EXISTING LOGIC)
+            # ══════════════════════════════════════════════════════
+            if not handled:
+                current_style = self.vtk_widget.interactor.GetInteractorStyle()
+
+                if isinstance(current_style, CrossSectionInteractor):
+                    print("🛑 ESC pressed - cleaning up cross-section")
+
+                    # AGGRESSIVE CLEANUP: Remove ALL preview actors
+                    renderer = self.vtk_widget.renderer
+                    sc = self.section_controller
+
+                    # Remove 2D centerline
+                    if hasattr(sc, '_centerline_actor_2d') and sc._centerline_actor_2d:
+                        renderer.RemoveActor2D(sc._centerline_actor_2d)
+                        sc._centerline_actor_2d = None
+                        sc._centerline_points_2d = None
+                        sc._centerline_poly_2d = None
+
+                    # Remove 2D rectangle
+                    if hasattr(sc, '_rubber_actor_2d') and sc._rubber_actor_2d:
+                        renderer.RemoveActor2D(sc._rubber_actor_2d)
+                        sc._rubber_actor_2d = None
+                        sc._rubber_points_2d = None
+                        sc._rubber_poly_2d = None
+
+                    # Remove 3D rubber band
+                    if hasattr(sc, 'rubber_actor') and sc.rubber_actor:
+                        renderer.RemoveActor(sc.rubber_actor)
+                        sc.rubber_actor = None
+                        sc.rubber_points = None
+                        sc.rubber_poly = None
+
+                    # Reset interactor state
+                    if hasattr(current_style, 'P1'):
+                        current_style.P1 = None
+                    if hasattr(current_style, 'P2'):
+                        current_style.P2 = None
+                    if hasattr(current_style, 'slice_state'):
+                        current_style.slice_state = 0
+
+                    # Restore camera control
+                    from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+                    self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
+
+                    # Uncheck the cross-section button
+                    if hasattr(self, 'cross_action') and self.cross_action.isChecked():
+                        self.cross_action.setChecked(False)
+
+                    self.cross_interactor = None
+                    self.cross_section_active = False
+
+                    # Force render
+                    self.vtk_widget.render()
+
+                    print("✅ Cross-section preview removed")
+                    self.statusBar().showMessage("Cross-section mode canceled", 2000)
+                    handled = True
+
+                # Also check the cancel helper
+                if getattr(self, "cross_interactor", None):
+                    self._cancel_cross_section_tool_only()
+                    print("🛑 Cross-section tool canceled (ESC) - views preserved")
+                    handled = True
+
+            # ══════════════════════════════════════════════════════
+            # PRIORITY 3: Deactivate digitizer tools
+            # ══════════════════════════════════════════════════════
+            if not handled:
+                if hasattr(self, 'digitizer') and self.digitizer:
+                    try:
+                        if hasattr(self.digitizer, 'deactivate_all'):
+                            self.digitizer.deactivate_all()
+                        elif hasattr(self.digitizer, 'current_tool') and self.digitizer.current_tool:
+                            self.digitizer.set_tool(None)
+                        print("   ✅ Digitizer tools deactivated")
+                        handled = True
+                    except Exception as e:
+                        print(f"   ⚠️ Digitizer deactivate failed: {e}")
+
+            # ══════════════════════════════════════════════════════
+            # PRIORITY 4: Deactivate measurement / zoom tools
+            # ══════════════════════════════════════════════════════
+            if not handled:
+                for tool_name in ('measurement_tool', 'select_rectangle_tool', 'zoom_rectangle_tool'):
+                    tool = getattr(self, tool_name, None)
+                    if tool and hasattr(tool, 'deactivate'):
+                        try:
+                            tool.deactivate()
+                            print(f"   ✅ {tool_name} deactivated")
+                            handled = True
+                        except Exception:
+                            pass
+
+            # ══════════════════════════════════════════════════════
+            # FINAL: Restore cursor and show status
+            # ══════════════════════════════════════════════════════
+            self.vtk_widget.setCursor(Qt.ArrowCursor)
+
+            if handled:
+                self.statusBar().showMessage(
+                    "✅ Tools off — Right-click grid labels to load LAZ data", 3000
+                )
+            else:
+                self.statusBar().showMessage("Ready", 2000)    
+    # def _on_main_interactor_keypress(self, obj, evt):
+    #     """
+    #     Handle ESC key in main interactor to cancel cross-section mode.
+    #     """
+    #     key = obj.GetKeySym()
+   
+    #     if key == "Escape":
+    #         # Check what's currently active
+    #         current_style = self.vtk_widget.interactor.GetInteractorStyle()
+           
+    #         # If cross-section interactor is active, deactivate it
+    #         if isinstance(current_style, CrossSectionInteractor):
+    #             print("🛑 ESC pressed - cleaning up cross-section")
+               
+    #             # AGGRESSIVE CLEANUP: Remove ALL preview actors
+    #             renderer = self.vtk_widget.renderer
+    #             sc = self.section_controller
+               
+    #             # Remove 2D centerline
+    #             if hasattr(sc, '_centerline_actor_2d') and sc._centerline_actor_2d:
+    #                 renderer.RemoveActor2D(sc._centerline_actor_2d)
+    #                 sc._centerline_actor_2d = None
+    #                 sc._centerline_points_2d = None
+    #                 sc._centerline_poly_2d = None
+               
+    #             # Remove 2D rectangle
+    #             if hasattr(sc, '_rubber_actor_2d') and sc._rubber_actor_2d:
+    #                 renderer.RemoveActor2D(sc._rubber_actor_2d)
+    #                 sc._rubber_actor_2d = None
+    #                 sc._rubber_points_2d = None
+    #                 sc._rubber_poly_2d = None
+               
+    #             # Remove 3D rubber band
+    #             if hasattr(sc, 'rubber_actor') and sc.rubber_actor:
+    #                 renderer.RemoveActor(sc.rubber_actor)
+    #                 sc.rubber_actor = None
+    #                 sc.rubber_points = None
+    #                 sc.rubber_poly = None
+               
+    #             # Reset interactor state
+    #             if hasattr(current_style, 'P1'):
+    #                 current_style.P1 = None
+    #             if hasattr(current_style, 'P2'):
+    #                 current_style.P2 = None
+    #             if hasattr(current_style, 'slice_state'):
+    #                 current_style.slice_state = 0
+               
+    #             # Restore camera control
+    #             from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+    #             self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
+               
+    #             # Uncheck the cross-section button
+    #             if hasattr(self, 'cross_action') and self.cross_action.isChecked():
+    #                 self.cross_action.setChecked(False)
+               
+    #             self.cross_interactor = None
+    #             self.cross_section_active = False
+               
+    #             # Force render
+    #             self.vtk_widget.render()
+               
+    #             print("✅ Cross-section preview removed")
+                   
+    #             # ✅ CRITICAL: Aggressive cleanup of all section views
+    #             if key == "Escape":
+    #                 if getattr(self, "cross_interactor", None):
+    #                     self._cancel_cross_section_tool_only()
+    #                     print("🛑 Cross-section tool canceled (ESC) - views preserved")
+               
+    #             self.statusBar().showMessage("Cross-section mode canceled", 2000)
+
+    def _normalize_palette_weights(self, palette):
+        """
+        MODIFIED: Commented out the reset logic to allow user-defined 
+        weights to persist after classification.
+        """
+        if not palette:
+            return palette
+            
+        # for code in palette:
+        #     palette[code]["weight"] = 1.0  <-- COMMENT THIS OUT
+            
+        return palette
+
+    def _load_ptc_file(self, path):
+            """Parse TerraScan-style .ptc file and return a class_map dict."""
+            try:
+                with open(path, "r") as f:
+                    lines = [ln.strip() for ln in f if ln.strip()]
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to open .ptc file:\n{e}")
+                return None
+
+            class_map = {}
+            for i in range(0, len(lines), 2):
+                try:
+                    header = lines[i].split("\t")
+                    detail = lines[i + 1].split("\t")
+                    if len(header) < 2 or len(detail) < 5:
+                        continue
+                    code = int(header[0])
+                    desc = header[1]
+                    lvl = header[2] if len(header) > 2 else "0"
+                    draw = detail[1]
+                    rgb = [int(c) for c in detail[3].split(",")]
+                    show = detail[4] == "1"
+                    class_map[code] = {
+                        "show": show,
+                        "description": desc,
+                        "draw": draw,
+                        "lvl": lvl,
+                        "color": tuple(rgb),
+                    }
+                except Exception as e:
+                    print(f"⚠️ Skipping malformed entry at line {i}: {e}")
+                    continue
+            return class_map
+
+    def set_display_mode(self, mode):
+        """
+        MicroStation-style display mode switch.
+        ALL modes write directly into the unified actor's RGB buffer.
+        Zero actor rebuild. DXF/SNT grids always preserved.
+        """
+        if self.data is None:
+            QMessageBox.warning(self, "No Data", "Please load a LiDAR file first.")
+            return
+
+        import time as _time
+        t0 = _time.perf_counter()
+        print(f"\n🎨 Display mode → {mode}")
+
+        self.display_mode = mode
+
+        # Save camera
+        saved_camera = None
+        try:
+            camera = self.vtk_widget.renderer.GetActiveCamera()
+            if camera:
+                saved_camera = {
+                    'position': camera.GetPosition(),
+                    'focal_point': camera.GetFocalPoint(),
+                    'view_up': camera.GetViewUp(),
+                    'view_angle': camera.GetViewAngle(),
+                    'clipping_range': camera.GetClippingRange(),
+                    'parallel_scale': camera.GetParallelScale(),
+                    'parallel_projection': camera.GetParallelProjection()
+                }
+        except Exception:
+            pass
+
+        # Close control docks
+        for dock_name in ('shading_dock', 'class_dock'):
+            dock = getattr(self, dock_name, None)
+            if dock:
+                self.removeDockWidget(dock)
+                setattr(self, dock_name, None)
+
+        # ═══════════════════════════════════════════════════════════════
+        # SHADED CLASS — separate mesh pipeline (triangulated surface)
+        # ═══════════════════════════════════════════════════════════════
+        if mode == "shaded_class":
+            if self.data.get("classification") is None:
+                QMessageBox.warning(self, "No Classification",
+                    "Shaded Classification requires class data.")
+                mode = "class"
+                self.display_mode = "class"
+            else:
+                from .shading_display import ShadingControlPanel, update_shaded_class
+                dock = QDockWidget("Shading Controls", self)
+                dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+                panel = ShadingControlPanel(self)
+                dock.setWidget(panel)
+                dock.setFloating(True)
+                self.addDockWidget(Qt.RightDockWidgetArea, dock)
+                self.shading_dock = dock
+                update_shaded_class(
+                    self,
+                    getattr(self, "last_shade_azimuth", 45.0),
+                    getattr(self, "last_shade_angle", 45.0),
+                    getattr(self, "shade_ambient", 0.2),
+                )
+                self._restore_camera_safe(saved_camera)
+                return
+
+        # ═══════════════════════════════════════════════════════════════
+        # ALL OTHER MODES: Write colors into unified actor RGB buffer
+        # Zero rebuild. MicroStation instant switch.
+        # ═══════════════════════════════════════════════════════════════
+
+        # Remove shaded mesh if switching away from shaded mode
+        if hasattr(self, '_shaded_mesh_actor') and self._shaded_mesh_actor:
+            try:
+                self.vtk_widget.remove_actor("shaded_mesh", render=False)
+            except Exception:
+                pass
+            self._shaded_mesh_actor = None
+
+        # Ensure unified actor exists
+        from gui.unified_actor_manager import (
+            _get_unified_actor, build_unified_actor, _mark_actor_dirty,
+            is_unified_actor_ready, fast_palette_refresh, UNIFIED_ACTOR_NAME
+        )
+        import numpy as np
+        from vtkmodules.util import numpy_support
+
+        actor = _get_unified_actor(self)
+        if actor is None:
+            # Build it for the first time
+            palette = getattr(self, 'class_palette', {})
+            border = float(getattr(self, 'point_border_percent', 0) or 0)
+            build_unified_actor(self, palette=palette, border_percent=border)
+            actor = _get_unified_actor(self)
+
+        if actor is None:
+            print("  ⚠️ Could not create unified actor")
+            self._restore_camera_safe(saved_camera)
+            return
+
+        # Make unified actor visible (it may have been hidden by shading mode)
+        actor.SetVisibility(True)
+
+        rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
+        vtk_ca = getattr(actor, '_naksha_vtk_array', None)
+        gi = getattr(self, '_main_global_indices', None)
+
+        if rgb_ptr is None or vtk_ca is None:
+            print("  ⚠️ RGB buffer not available — falling back to full rebuild")
+            from .pointcloud_display import update_pointcloud
+            update_pointcloud(self, mode)
+            self._restore_camera_safe(saved_camera)
+            return
+
+        # Get visible data
+        xyz = self.data["xyz"]
+        classification = self.data.get("classification")
+        vis_xyz = xyz[gi] if gi is not None else xyz
+        vis_class = classification[gi] if (classification is not None and gi is not None) else classification
+
+        # ── COMPUTE COLORS BASED ON MODE ──
+        if mode == "class":
+            # Classification colors from palette
+            palette = getattr(self, 'class_palette', {})
+            border = float(getattr(self, 'point_border_percent', 0) or 0)
+
+            # Restore border for class mode
+            if hasattr(self, 'display_mode_dialog') and self.display_mode_dialog:
+                saved_border = self.display_mode_dialog.view_borders.get(0, 0)
+                self.point_border_percent = float(saved_border)
+
+            fast_palette_refresh(self, palette=palette, border_percent=border)
+            print(f"  ✅ Class mode: palette applied ({len(palette)} classes)")
+
+        elif mode == "rgb":
+            rgb_data = self.data.get("rgb")
+            if rgb_data is not None:
+                vis_rgb = rgb_data[gi] if gi is not None else rgb_data
+                np.copyto(rgb_ptr, vis_rgb[:len(rgb_ptr)])
+            else:
+                # No RGB data — show white
+                rgb_ptr[:] = 200
+            vtk_ca.Modified()
+            _mark_actor_dirty(actor)
+            self.vtk_widget.render()
+            print(f"  ✅ RGB mode: direct color copy")
+
+        elif mode == "intensity":
+            intensity = self.data.get("intensity")
+            if intensity is not None:
+                vis_int = intensity[gi] if gi is not None else intensity
+                # Normalize intensity to 0-255 range
+                i_min = float(vis_int.min())
+                i_max = float(vis_int.max())
+                if i_max > i_min:
+                    normalized = ((vis_int - i_min) / (i_max - i_min) * 255).astype(np.uint8)
+                else:
+                    normalized = np.full(len(vis_int), 128, dtype=np.uint8)
+                # Grayscale: R=G=B=intensity
+                rgb_ptr[:, 0] = normalized[:len(rgb_ptr)]
+                rgb_ptr[:, 1] = normalized[:len(rgb_ptr)]
+                rgb_ptr[:, 2] = normalized[:len(rgb_ptr)]
+            else:
+                rgb_ptr[:] = 128
+                print("  ⚠️ No intensity data — showing gray")
+            vtk_ca.Modified()
+            _mark_actor_dirty(actor)
+            self.vtk_widget.render()
+            print(f"  ✅ Intensity mode: grayscale applied")
+
+        elif mode == "elevation":
+            # Color by Z (elevation) using a blue→green→red gradient
+            vis_z = vis_xyz[:, 2]
+            z_min = float(vis_z.min())
+            z_max = float(vis_z.max())
+            if z_max > z_min:
+                t = ((vis_z - z_min) / (z_max - z_min)).astype(np.float32)
+                # Blue (low) → Green (mid) → Red (high)
+                r = np.clip(t * 2 - 1, 0, 1)       # 0 at low, 1 at high
+                g = 1 - np.abs(t * 2 - 1)            # peak at mid
+                b = np.clip(1 - t * 2, 0, 1)         # 1 at low, 0 at high
+                rgb_ptr[:, 0] = (r[:len(rgb_ptr)] * 255).astype(np.uint8)
+                rgb_ptr[:, 1] = (g[:len(rgb_ptr)] * 255).astype(np.uint8)
+                rgb_ptr[:, 2] = (b[:len(rgb_ptr)] * 255).astype(np.uint8)
+            else:
+                rgb_ptr[:] = 128
+            vtk_ca.Modified()
+            _mark_actor_dirty(actor)
+            self.vtk_widget.render()
+            print(f"  ✅ Elevation mode: Z range [{z_min:.1f}, {z_max:.1f}]")
+
+        elif mode == "depth":
+            # Depth from camera — compute distance from camera position
+            try:
+                cam = self.vtk_widget.renderer.GetActiveCamera()
+                cam_pos = np.array(cam.GetPosition())
+                dist = np.sqrt(((vis_xyz - cam_pos) ** 2).sum(axis=1))
+                d_min = float(dist.min())
+                d_max = float(dist.max())
+                if d_max > d_min:
+                    t = ((dist - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+                else:
+                    t = np.full(len(dist), 128, dtype=np.uint8)
+                # White (near) → Dark (far)
+                inv_t = 255 - t
+                rgb_ptr[:, 0] = inv_t[:len(rgb_ptr)]
+                rgb_ptr[:, 1] = inv_t[:len(rgb_ptr)]
+                rgb_ptr[:, 2] = inv_t[:len(rgb_ptr)]
+            except Exception:
+                rgb_ptr[:] = 128
+            vtk_ca.Modified()
+            _mark_actor_dirty(actor)
+            self.vtk_widget.render()
+            print(f"  ✅ Depth mode applied")
+
+        else:
+            # Unknown mode — fallback to pointcloud_display
+            try:
+                from .pointcloud_display import update_pointcloud
+                update_pointcloud(self, mode)
+            except Exception as e:
+                print(f"  ⚠️ Fallback display failed: {e}")
+
+        # Restore camera
+        self._restore_camera_safe(saved_camera)
+
+        # ✅ BULLETPROOF: Ensure overlays survive any mode switch
+        self._ensure_overlay_actors()
+
+        elapsed = (_time.perf_counter() - t0) * 1000
+        print(f"  ⚡ Display switch complete: {elapsed:.0f}ms\n")
+
+    def _restore_camera_safe(self, saved_camera):
+        """Restore camera position after display mode switch."""
+        if saved_camera and hasattr(self, 'vtk_widget') and self.vtk_widget.renderer:
+            try:
+                camera = self.vtk_widget.renderer.GetActiveCamera()
+                if camera:
+                    camera.SetPosition(saved_camera['position'])
+                    camera.SetFocalPoint(saved_camera['focal_point'])
+                    camera.SetViewUp(saved_camera['view_up'])
+                    camera.SetViewAngle(saved_camera['view_angle'])
+                    camera.SetClippingRange(saved_camera['clipping_range'])
+                    camera.SetParallelScale(saved_camera['parallel_scale'])
+                    if saved_camera['parallel_projection']:
+                        camera.ParallelProjectionOn()
+                    else:
+                        camera.ParallelProjectionOff()
+                    self.vtk_widget.renderer.ResetCameraClippingRange()
+                    self.vtk_widget.render()
+            except Exception:
+                pass
+
+    def _ensure_overlay_actors(self):
+        """
+        BULLETPROOF: Ensure all DXF/SNT overlay actors are in the renderer.
+        Called after any file load, grid switch, or display mode change.
+        Checks what's actually in the renderer and re-adds anything missing.
+        """
+        if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
+            return
+        try:
+            renderer = self.vtk_widget.renderer
+            # Collect all actors currently in renderer
+            actors_in_renderer = set()
+            vtk_actors = renderer.GetActors()
+            vtk_actors.InitTraversal()
+            for _ in range(vtk_actors.GetNumberOfItems()):
+                a = vtk_actors.GetNextActor()
+                if a:
+                    actors_in_renderer.add(id(a))
+
+            restored = 0
+            for store_name in ('dxf_actors', 'snt_actors'):
+                store = getattr(self, store_name, None)
+                if store:
+                    for entry in store:
+                        for actor in entry.get('actors', []):
+                            if id(actor) not in actors_in_renderer:
+                                renderer.AddActor(actor)
+                                restored += 1
+
+            if restored > 0:
+                self.vtk_widget.render()
+                print(f"   ✅ _ensure_overlay_actors: restored {restored} missing actors")
+        except Exception as e:
+            print(f"   ⚠️ _ensure_overlay_actors failed: {e}")
+
+    
+    def open_display_mode(self):
+        """Open Display Mode dialog with auto-restoration of saved settings"""
+    
+        if not hasattr(self, 'display_mode_dialog') or self.display_mode_dialog is None:
+            from gui.display_mode import DisplayModeDialog
+        
+            print(f"\n{'='*60}")
+            print(f"📂 CREATING DISPLAY MODE DIALOG")
+            print(f"{'='*60}")
+        
+            # Create dialog (connection happens inside __init__)
+            self.display_mode_dialog = DisplayModeDialog(self)
+        
+            # Connect signals
+            self.display_mode_dialog.view_switched.connect(self.activate_dock_by_view)
+        
+            # Connect to Class Picker
+            if hasattr(self, 'class_picker') and self.class_picker:
+                self.display_mode_dialog.classes_loaded.connect(
+                    self.class_picker.on_classes_changed
+                )
+        
+            # Connect to Point Count Widget
+            if hasattr(self, 'point_count_widget') and self.point_count_widget:
+                self.point_count_widget.connect_to_display_mode(self.display_mode_dialog)
+        
+            print(f"{'='*60}\n")
+        else:
+            # ✅ CRITICAL: Dialog already exists - just refresh table from app's palette
+            print(f"\n{'='*60}")
+            print(f"🔄 REOPENING EXISTING DISPLAY MODE DIALOG")
+            print(f"{'='*60}")
+            
+            # Sync table with current app state (preserves weights)
+            if hasattr(self, 'class_palette') and self.class_palette:
+                print(f"   🔄 Syncing table with app.class_palette...")
+                
+                for row in range(self.display_mode_dialog.table.rowCount()):
+                    code = int(self.display_mode_dialog.table.item(row, 1).text())
+                    
+                    if code in self.class_palette:
+                        # Update weight from app's palette
+                        weight = self.class_palette[code].get('weight', 1.0)
+                        weight_item = self.display_mode_dialog.table.item(row, 6)
+                        if weight_item:
+                            weight_item.setText(f"{weight:.2f}")
+                        
+                        # Update checkbox state
+                        show = self.class_palette[code].get('show', True)
+                        chk = self.display_mode_dialog.table.cellWidget(row, 0)
+                        if chk:
+                            chk.setChecked(show)
+                
+                print(f"   ✅ Table synced with existing weights")
+            
+            print(f"{'='*60}\n")
+    
+        # Show dialog
+        self.display_mode_dialog.setModal(False)
+        self.display_mode_dialog.show()
+        self.display_mode_dialog.raise_()
+        self.display_mode_dialog.activateWindow()
+
+
+    def apply_class_map(self, payload):
+        """
+        ⚡ ULTRA-OPTIMIZED: Instant apply button response for any file size.
+        ✅ UNIFIED ACTOR PATH: GPU weight_lut + visibility_lut push (<1ms)
+        ✅ Legacy fast path: GPU color buffer update (when unified actor absent)
+        ✅ Async path: Non-blocking rebuilds for large files
+        """
+
+        if getattr(self, "_is_applying_class_map", False):
+            return
+
+        try:
+            self._is_applying_class_map = True
+            import numpy as np
+            from vtkmodules.util import numpy_support
+            from PySide6.QtCore import QTimer
+
+            # --- 1. Extract Payload ---
+            incoming_palette = payload.get("classes", {})
+            target_view = payload.get("target_view", 0)
+            color_mode = payload.get("color_mode", 0)
+            border_value = payload.get("border_percent", getattr(self, "point_border_percent", 0))
+            force_refresh = payload.get("force_refresh", False)
+            border_only = payload.get("border_only", False)
+
+            # --- 2. Update Internal State ---
+            if not hasattr(self, 'view_palettes'):
+                self.view_palettes = {}
+
+            self.view_palettes[target_view] = {
+                code: {
+                    "show": bool(info.get("show", True)),
+                    "color": tuple(info.get("color", (128, 128, 128))),
+                    "weight": float(info.get("weight", 1.0)),
+                    "description": str(info.get("description", ""))
+                } for code, info in incoming_palette.items()
+            }
+
+            # ============================================================
+            # CASE A: MAIN VIEW (View 0) - ULTRA OPTIMIZED
+            # ============================================================
+            if target_view == 0:
+                self.class_palette = self.view_palettes[0]
+                self.point_border_percent = border_value
+
+                # Quick border-only path
+                if border_only and not force_refresh:
+                    self._update_border_only()
+                    self._is_applying_class_map = False
+                    return
+
+                is_class_mode = (color_mode == 0)
+
+                # ✅ UNIFIED ACTOR FAST PATH (highest priority)
+                # sync_palette_to_gpu pushes BOTH the RGB color buffer AND
+                # weight_lut / visibility_lut to the GPU shader in < 1 ms.
+                # This is the ONLY path that correctly updates point weights.
+                if is_class_mode and not force_refresh:
+                    try:
+                        from gui.unified_actor_manager import (
+                            is_unified_actor_ready,
+                            sync_palette_to_gpu,
+                        )
+                        if is_unified_actor_ready(self):
+                            sync_palette_to_gpu(
+                                self,
+                                slot_idx=0,
+                                palette=self.class_palette,
+                                border=float(border_value),
+                                render=True,
+                            )
+                            self._is_applying_class_map = False
+                            return
+                    except Exception as _unified_err:
+                        print(f"⚠️ unified actor fast-path error, falling back: {_unified_err}")
+
+                # ✅ LEGACY GPU COLOR BUFFER PATH (fallback when no unified actor)
+                use_fast_path = (
+                    is_class_mode and
+                    not force_refresh and
+                    hasattr(self, 'main_pc_actor') and
+                    self.main_pc_actor and
+                    hasattr(self, 'data') and
+                    self.data is not None and
+                    'classification' in self.data
+                )
+
+                if use_fast_path:
+                    try:
+                        polydata = self.main_pc_actor.GetMapper().GetInput()
+                        vtk_colors = polydata.GetPointData().GetScalars()
+
+                        if vtk_colors is not None:
+                            class_arr = self.data["classification"]
+                            max_c = int(class_arr.max())
+
+                            lut = np.zeros((max_c + 1, 3), dtype=np.uint8)
+                            for code, info in self.class_palette.items():
+                                if code <= max_c:
+                                    lut[code] = info.get("color", (128, 128, 128)) if info.get("show", True) else (0, 0, 0)
+
+                            new_rgb = lut[class_arr.astype(int)]
+                            vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
+                            np.copyto(vtk_ptr, new_rgb)
+                            vtk_colors.Modified()
+
+                            if border_value > 0:
+                                try:
+                                    from gui.class_display import apply_border_shader_ring
+                                    for name, actor in self.vtk_widget.actors.items():
+                                        if name.startswith('class_'):
+                                            apply_border_shader_ring(actor, border_value)
+                                except Exception as e:
+                                    print(f"⚠️ Border application failed in fast path: {e}")
+
+                            def deferred_render():
+                                try:
+                                    self.vtk_widget.render()
+                                except: pass
+
+                            QTimer.singleShot(0, deferred_render)
+                            self._is_applying_class_map = False
+                            return
+
+                    except Exception as e:
+                        pass  # Fall through to rebuild
+
+                # 🔄 REBUILD PATH
+                point_count = len(self.data["xyz"]) if hasattr(self, 'data') and self.data and "xyz" in self.data else 0
+
+                def deferred_rebuild():
+                    try:
+                        from gui.class_display import update_class_mode
+                        update_class_mode(self, force_refresh=True)
+                    except Exception as e:
+                        print(f"⚠️ Rebuild error: {e}")
+
+                if point_count > 500_000:
+                    QTimer.singleShot(0, deferred_rebuild)
+                    self._is_applying_class_map = False
+                    return
+                else:
+                    deferred_rebuild()
+
+            # ============================================================
+            # CASE B: CROSS-SECTIONS (Views 1-4) - ASYNC OPTIMIZED
+            # ============================================================
+            elif 1 <= target_view <= 4:
+                section_idx = target_view - 1
+                if not hasattr(self, "view_borders"):
+                    self.view_borders = {}
+                self.view_borders[target_view] = border_value
+            
+                if border_only and not force_refresh:
+                    self._update_section_border_only(section_idx, border_value)
+                    self._is_applying_class_map = False
+                    return
+            
+                # ← REMOVED: self.class_palette = self.view_palettes[target_view]
+                # app.class_palette must always be the MAIN view palette.
+                # Section palettes live in app.view_palettes[slot_idx] only.
+            
+                def deferred_section_update():
+                    try:
+                        self._refresh_single_section_view(section_idx, border_value)
+                        if hasattr(self, 'section_interactors') and section_idx in self.section_interactors:
+                            self.section_interactors[section_idx].setup_picker()
+                    except Exception as e:
+                        print(f"⚠️ Section update error: {e}")
+            
+                QTimer.singleShot(0, deferred_section_update)
+                self._is_applying_class_map = False
+                return  ##
+
+            # ============================================================
+            # CASE C: CUT SECTION (View 5) - ASYNC OPTIMIZED
+            # ============================================================
+            elif target_view == 5:
+                ctrl = getattr(self, 'cut_section_controller', None)
+                if ctrl and getattr(ctrl, 'is_cut_view_active', False):
+                    ctrl.cut_palette = self.view_palettes[5]
+                    if not hasattr(self, "view_borders"):
+                        self.view_borders = {}
+                    self.view_borders[5] = border_value
+
+                    def deferred_cut_update():
+                        try:
+                            if hasattr(ctrl, '_refresh_cut_colors_fast'):
+                                ctrl._refresh_cut_colors_fast()
+                        except Exception as e:
+                            print(f"⚠️ Cut section update error: {e}")
+
+                    QTimer.singleShot(0, deferred_cut_update)
+                    self._is_applying_class_map = False
+                    return
+
+        except Exception as e:
+            print(f"❌ apply_class_map failed: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self._is_applying_class_map = False  ##
+
+
+    # ============================================================
+    # HELPER FUNCTIONS (keep your existing border-only methods)
+    # ============================================================
+
+    def _update_border_only(self):
+        """Fast border-only update without full point cloud refresh."""
+        if not hasattr(self, 'vtk_widget') or self.vtk_widget is None:
+            return
+        
+        try:
+            actors = self.vtk_widget.renderer.GetActors()
+            actors.InitTraversal()
+            
+            border_factor = self.point_border_percent / 100.0
+            
+            actor = actors.GetNextActor()
+            while actor:
+                prop = actor.GetProperty()
+                if prop:
+                    if self.point_border_percent > 0:
+                        prop.EdgeVisibilityOn()
+                        prop.SetLineWidth(max(0.5, border_factor * 2))
+                    else:
+                        prop.EdgeVisibilityOff()
+                actor = actors.GetNextActor()
+            
+            self.vtk_widget.render()
+            
+        except Exception as e:
+            print(f"⚠️ Border update failed: {e}")
+
+
+    def _update_section_border_only(self, section_idx, border_value):
+        """Fast border-only update for cross-section views."""
+        try:
+            if not hasattr(self, 'section_vtks') or section_idx not in self.section_vtks:
+                return
+            
+            vtk_widget = self.section_vtks[section_idx]
+            if not vtk_widget or not hasattr(vtk_widget, 'renderer'):
+                return
+            
+            actors = vtk_widget.renderer.GetActors()
+            actors.InitTraversal()
+            
+            border_factor = border_value / 100.0
+            
+            actor = actors.GetNextActor()
+            while actor:
+                prop = actor.GetProperty()
+                if prop:
+                    if border_value > 0:
+                        prop.EdgeVisibilityOn()
+                        prop.SetLineWidth(max(0.5, border_factor * 2))
+                    else:
+                        prop.EdgeVisibilityOff()
+                actor = actors.GetNextActor()
+            
+            vtk_widget.render()
+            
+        except Exception as e:
+            print(f"⚠️ Section border update failed: {e}")
+            
+    def _refresh_active_cross_section_only(self):
+        """
+        Refresh ONLY the active cross-section view after classification.
+        Uses the ACTIVE VIEW's palette (not global or other views).
+        ✅ FIXED: Proper palette isolation per view
+        """
+        try:
+            app = self.app if hasattr(self, 'app') else self
+            
+            # Get active view index (0-based: 0, 1, 2, 3)
+            active_view = getattr(app.section_controller, 'active_view', None)
+            
+            if active_view is None:
+                print("⚠️ No active view set")
+                return
+            
+            # Convert to Display Mode slot (1-based: 1, 2, 3, 4)
+            target_slot = active_view + 1
+            
+            print(f"\n{'='*60}")
+            print(f"🔄 ISOLATED REFRESH: Cross-Section View {active_view} (Display Mode Slot {target_slot})")
+            
+            # Get the VTK widget for this view
+            if not hasattr(app, 'section_vtks') or active_view not in app.section_vtks:
+                print(f"   ⚠️ View {active_view} not found in section_vtks")
+                print(f"{'='*60}\n")
+                return
+            
+            vtk_widget = app.section_vtks[active_view]
+            
+            # ✅ CRITICAL: Get THIS VIEW's palette from Display Mode dialog
+            view_palette = None
+            
+            if hasattr(app, 'display_mode_dialog'):
+                dialog = app.display_mode_dialog
+                
+                # Check if this view has a stored palette in view_palettes
+                if hasattr(dialog, 'view_palettes') and target_slot in dialog.view_palettes:
+                    view_palette = dialog.view_palettes[target_slot]
+                    print(f"   ✅ Using stored view_palettes[{target_slot}]")
+                else:
+                    # Build palette from Display Mode table for this slot
+                    print(f"   🔄 Building palette from Display Mode slot {target_slot}")
+                    
+                    # Save current slot
+                    original_slot = dialog.current_slot
+                    
+                    # Switch to target slot to read its settings
+                    if dialog.current_slot != target_slot:
+                        dialog.current_slot = target_slot
+                        dialog._load_slot_checkboxes(target_slot)
+                    
+                    # Build palette from current table state
+                    view_palette = {}
+                    table = dialog.table
+                    
+                    for row in range(table.rowCount()):
+                        code = int(table.item(row, 1).text())
+                        chk = table.cellWidget(row, 0)
+                        
+                        if chk and chk.isChecked():  # Only include checked classes
+                            desc = table.item(row, 2).text()
+                            color = table.item(row, 5).background().color().getRgb()[:3]
+                            weight_item = table.item(row, 6)
+                            weight = float(weight_item.text()) if weight_item else 1.0
+                            
+                            view_palette[code] = {
+                                "show": True,
+                                "description": desc,
+                                "color": color,
+                                "weight": weight
+                            }
+                    
+                    # Restore original slot
+                    if original_slot != target_slot:
+                        dialog.current_slot = original_slot
+                        dialog._load_slot_checkboxes(original_slot)
+                    
+                    print(f"   ✅ Built palette with {len(view_palette)} visible classes")
+            
+            # Fallback: use global class_palette if no Display Mode palette exists
+            if not view_palette:
+                print(f"   ⚠️ No Display Mode palette for slot {target_slot}, using global class_palette")
+                if hasattr(app, 'class_palette') and app.class_palette:
+                    view_palette = app.class_palette
+                else:
+                    print("   ❌ No palette available - cannot refresh")
+                    print(f"{'='*60}\n")
+                    return
+            
+            # Get visible classes from THIS VIEW's palette
+            visible = [c for c, v in view_palette.items() if v.get("show", False)]
+            
+            if not visible:
+                print(f"   ⚠️ No visible classes in view {active_view}'s palette")
+                vtk_widget.clear()
+                vtk_widget.render()
+                print(f"{'='*60}\n")
+                return
+            
+            print(f"   📋 Visible classes: {visible}")
+            
+            # Get stored section data for this specific view
+            pts = getattr(app, f"section_{active_view}_core_points", None)
+            buf = getattr(app, f"section_{active_view}_buffer_points", None)
+            core_mask = getattr(app, f"section_{active_view}_core_mask", None)
+            buffer_mask = getattr(app, f"section_{active_view}_buffer_mask", None)
+            
+            if pts is None or core_mask is None:
+                print(f"   ⚠️ No section data for view {active_view}")
+                print(f"{'='*60}\n")
+                return
+            
+            # Get CURRENT classifications from main dataset
+            if not hasattr(app.data, '__getitem__'):
+                current_classes = app.data.get("classification")
+            else:
+                current_classes = app.data["classification"]
+            
+            if current_classes is None:
+                print("   ⚠️ No classification data")
+                print(f"{'='*60}\n")
+                return
+            
+            # Combine core + buffer points
+            import numpy as np
+            if buf is not None and buffer_mask is not None:
+                all_pts = np.vstack([pts, buf])
+                all_cls = np.concatenate([
+                    current_classes[core_mask],
+                    current_classes[buffer_mask & ~core_mask]
+                ])
+            else:
+                all_pts = pts
+                all_cls = current_classes[core_mask]
+            
+            # ✅ CRITICAL: Filter by THIS VIEW's visible classes ONLY
+            mask = np.isin(all_cls, visible)
+            filtered_pts = all_pts[mask]
+            filtered_cls = all_cls[mask]
+            
+            print(f"   📊 Total points: {len(all_pts)}")
+            print(f"   📊 Filtered points: {len(filtered_pts)} (visible classes only)")
+            
+            if len(filtered_pts) == 0:
+                print("   ⚠️ No points after filtering")
+                vtk_widget.clear()
+                vtk_widget.render()
+                print(f"{'='*60}\n")
+                return
+            
+            # ✅ Build color array using THIS VIEW's palette ONLY
+            colors = np.zeros((len(filtered_pts), 3), dtype=np.uint8)
+            for i, cls in enumerate(filtered_cls):
+                entry = view_palette.get(int(cls), {"color": (128, 128, 128)})
+                colors[i] = entry["color"]
+            
+            # Debug: Show unique classes being rendered
+            unique_classes = np.unique(filtered_cls)
+            print(f"   🎨 Rendering classes: {unique_classes}")
+            for cls in unique_classes:
+                count = np.sum(filtered_cls == cls)
+                color = view_palette.get(int(cls), {}).get("color", (128, 128, 128))
+                print(f"      Class {cls}: {count} points, color={color}")
+            
+            # Save camera position
+            cam_pos = vtk_widget.camera_position
+            
+            # Clear and re-render
+            vtk_widget.clear()
+            
+            import pyvista as pv
+            cloud = pv.PolyData(filtered_pts)
+            cloud["RGB"] = colors
+            
+            vtk_widget.add_points(
+                cloud,
+                scalars="RGB",
+                rgb=True,
+                point_size=3,
+                render_points_as_spheres=True
+            )
+            
+            # Restore camera
+            vtk_widget.camera_position = cam_pos
+            vtk_widget.render()
+            
+            print(f"   ✅ View {active_view} refreshed with {len(filtered_pts)} points")
+            print(f"{'='*60}\n")
+            
+        except Exception as e:
+            print(f"   ❌ Isolated refresh failed: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"{'='*60}\n")
+        # ------------------ Classification Tools ------------------
+        
+    def set_classify_tool(self, tool_name):
+            """
+            Activate a classification tool.
+            Works for: cut/cross sections and main view (fallback).
+            ✅ UPDATED: ClassPicker never steals focus
+            """
+            if tool_name is None:
+                self.active_classify_tool = None
+                if hasattr(self, 'skip_main_view_refresh'):
+                    self.skip_main_view_refresh = False
+                if hasattr(self, "class_picker") and self.class_picker:
+                    # self.class_picker.close()
+                    # self.class_picker = None
+                    self.class_picker.hide()
+            # Keep instance alive to preserve selections
+                
+                if hasattr(self, 'digitizer'):
+                    self.digitizer.enabled = True
+                    print("✅ Digitizer re-enabled")
+                return
+    
+            # Brush size dialog
+            if tool_name == "brush":
+                from gui.brush_size_dialog import activate_brush_tool_with_dialog
+                if not activate_brush_tool_with_dialog(self):
+                    return
+                
+              # ✅ LiDAR algorithm dialogs — By Class ribbon buttons
+            if tool_name.startswith("algo_") or tool_name.startswith("byclass_"):
+                try:
+                    from gui.lidar_classification_tools import (
+                        open_classify_low_points, open_classify_isolated_points,
+                        open_classify_ground, open_classify_below_surface,
+                    )
+                    {
+                        "algo_low_points":        open_classify_low_points,
+                        "algo_isolated":          open_classify_isolated_points,
+                        "algo_ground":            open_classify_ground,
+                        "algo_below_surface":     open_classify_below_surface,
+                        "byclass_low_points":     open_classify_low_points,
+                        "byclass_isolated":       open_classify_isolated_points,
+                        "byclass_ground":         open_classify_ground,
+                        "byclass_below_surface":  open_classify_below_surface,
+                    }.get(tool_name, lambda a: None)(self)
+                except Exception as e:
+                    print(f"⚠️ Algorithm dialog failed ({tool_name}): {e}")
+                return  ###    
+            
+            if hasattr(self, 'digitizer'):
+                self.digitizer.enabled = False
+                print("🚫 Digitizer disabled (classification active)")
+    
+            has_cross_section = (hasattr(self, "section_vtks") and len(self.section_vtks) > 0)
+            has_cut_section = (
+                hasattr(self, "cut_section_controller")
+                and self.cut_section_controller.cut_points is not None
+            )
+    
+            # Tools that ONLY make sense in cross-section views
+            section_only_tools = {"above_line", "below_line"}
+    
+            # Tool that ONLY targets cut-section view
+            cut_only_tools = {"cut_section"}
+    
+            # Decide what to attach (can be multiple)
+            do_cut = has_cut_section and tool_name in cut_only_tools
+            do_sections = has_cross_section and tool_name not in cut_only_tools
+            do_main = (tool_name not in cut_only_tools) and (tool_name not in section_only_tools)
+    
+            # If user chose a section-only tool but no section exists, fail early
+            if tool_name in section_only_tools and not has_cross_section:
+                QMessageBox.warning(self, "Cross Section Required", "Open a Cross Section view to use this tool.")
+                return
+    
+            if self.data is None:
+                QMessageBox.warning(self, "No Data", "Please load a LiDAR file first.")
+                return
+    
+            self.skip_main_view_refresh = False
+            self.active_classify_tool = tool_name
+    
+            self.from_classes = getattr(self, "from_classes", None)
+            self.to_class = getattr(self, "to_class", None)
+    
+            # ✅ FIXED: Ensure class picker is ALWAYS visible (even if minimized)
+            from gui.class_picker import ClassPicker
+            if not hasattr(self, "class_picker") or self.class_picker is None:
+                # Create new ClassPicker
+                print("📋 Creating new ClassPicker...")
+                self.class_picker = ClassPicker(self)
+            
+                # ✅ Configure for non-focus mode
+                self.class_picker.configure_for_background_mode()
+            
+                self.class_picker.show()
+                print("✅ ClassPicker created and shown")
+            else:
+                # ✅ CRITICAL FIX: Restore from minimized state
+                print("📋 ClassPicker exists - ensuring visibility...")
+            
+                # First sync the data
+                self.class_picker.sync_with_app()
+            
+                # ✅ NEW: This line fixes the minimized window issue!
+                self.class_picker.ensure_visible()
+            
+                print("✅ ClassPicker is now visible and active")
+    
+            # ✅ CRITICAL: Keep focus on main view
+            if hasattr(self, 'vtk_widget'):
+                self.vtk_widget.setFocus()
+            # Attach interactors
+            try:
+                if do_cut:
+                    self.cut_section_controller.activate_classification_mode()
+                    # don't return — fall through to also attach sections + main
+ 
+                if do_sections:
+                    self.attach_classification_to_all_section_views()
+ 
+                if do_main:
+                    self.attach_classification_to_main()
+ 
+                # ✅ Always re-attach to cut section if cut data exists
+                if has_cut_section:
+                    self.attach_classification_to_cut_section()
+   
+            except Exception as e:
+                print(f"⚠️ Failed to attach classification interactor: {e}")
+                import traceback; traceback.print_exc()
+            
+    def enable_digitizer_mode(self):
+        """Enable digitizer (for drawing tools)."""
+        if hasattr(self, 'digitizer'):
+            self.digitizer.enabled = True
+            print("✅ Digitizer enabled - Ctrl+Z/Y will affect drawings")
+            self.statusBar().showMessage("✏️ Drawing mode - Undo/Redo affects drawings", 2000)
+
+    def disable_digitizer_mode(self):
+        """Disable digitizer (for classification tools)."""
+        if hasattr(self, 'digitizer'):
+            self.digitizer.enabled = False
+            print("🚫 Digitizer disabled - Ctrl+Z/Y will affect classification")
+            self.statusBar().showMessage("🎨 Classification mode - Undo/Redo affects classification", 2000)
+                
+            
+    def attach_classification_to_all_section_views(self):
+        """
+        Attach a ClassificationInteractor to every open cross-section view (1..4).
+        Replaces the view's interactor style so classification works from any dock.
+        """
+        try:
+            from gui.cross_section.interactor_classify import ClassificationInteractor
+        except Exception as e:
+            print(f"⚠️ Cannot import ClassificationInteractor: {e}")
+            return
+
+        if not hasattr(self, "section_vtks") or not self.section_vtks:
+            print("ℹ️ No cross-section views are open")
+            return
+
+        if not hasattr(self, "classify_interactors"):
+            self.classify_interactors = {}
+
+        attached = 0
+        for view_idx, vtk_widget in self.section_vtks.items():
+            try:
+                wrapper = ClassificationInteractor(self, vtk_widget.interactor)
+                vtk_widget.interactor.SetInteractorStyle(wrapper.style)
+                self.classify_interactors[view_idx] = wrapper
+                attached += 1
+            except Exception as e:
+                print(f"⚠️ Attach classify interactor failed for View {view_idx + 1}: {e}")
+
+        print(f"✅ Classification interactor attached to {attached} cross-section view(s)")
+
+    
+    def attach_classification_to_cut_section(self):
+        """Re-attach ClassificationInteractor to cut_vtk after any tool activation."""
+        try:
+            from gui.cross_section.interactor_classify import ClassificationInteractor
+        except Exception as e:
+            print(f"⚠️ Cannot import ClassificationInteractor: {e}")
+            return
+ 
+        cut_ctrl = getattr(self, 'cut_section_controller', None)
+        if cut_ctrl is None:
+            return
+ 
+        cut_vtk = getattr(cut_ctrl, 'cut_vtk', None)
+        if cut_vtk is None:
+            return
+ 
+        # Cleanup any old cut-specific interactor (stored separately)
+        old = getattr(self, 'cut_classify_interactor', None)
+        if old:
+            try: old.cleanup()
+            except Exception: pass
+ 
+        wrapper = ClassificationInteractor(self, cut_vtk.interactor, mode="2d")
+        wrapper.vtk_widget = cut_vtk
+        wrapper.is_cut_section = True
+        cut_vtk.interactor.SetInteractorStyle(wrapper.style)
+ 
+        # Store in SEPARATE attribute — not classify_interactor (which is for main view)
+        self.cut_classify_interactor = wrapper
+ 
+        print("✅ ClassificationInteractor re-attached to Cut Section")    
+ 
+    def preserve_dxf_actors(self):
+        """Forces DXF/SNT actors to stay visible and ON TOP during all zooms."""
+        if not hasattr(self, 'dxf_actors') or not self.dxf_actors: return
+        try:
+            renderer = self.vtk_widget.renderer
+            for dxf_data in self.dxf_actors:
+                for actor in dxf_data.get('actors', []):
+                    if renderer.HasViewProp(actor): renderer.RemoveActor(actor)
+                    renderer.AddActor(actor)
+                   
+                    # 🛡️ THE LOD SHIELD: Force 100% render time allocation
+                    # This prevents the LOD manager from hiding the lines at zoom-out
+                    actor.SetAllocatedRenderTime(1000.0, renderer)
+                   
+                    prop = actor.GetProperty()
+                    prop.SetLineWidth(5.0)     # Thick enough for UTM scale
+                    prop.SetOpacity(0.999)     # Translucent Pass hack
+                    prop.SetLighting(False)    # Glow effect
+                   
+                    mapper = actor.GetMapper()
+                    if mapper:
+                        mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                        # Massive offset to punch through 20M points
+                        mapper.SetRelativeCoincidentTopologyLineOffsetParameters(-50000.0, -50000.0)
+           
+            renderer.ResetCameraClippingRange()
+            self.vtk_widget.render()
+            print("✅ SNT/DXF Shielded and Prioritized.")
+        except Exception as e: print(f"⚠️ Sync failed: {e}")
+ 
+    def deactivate_classification_tool(self, preserve_cross_section=False):
+ 
+        """
+        Properly deactivate classification and unlock all views.
+        Call this when user closes class picker or cancels classification.
+        """
+        print(f"\n{'='*60}")
+        print(f"🛑 DEACTIVATING CLASSIFICATION TOOL")
+        print(f"{'='*60}")
+ 
+        try:
+            from . import session_manager
+            if hasattr(session_manager, "APP_BUSY"):
+                session_manager.APP_BUSY = False
+        except Exception:
+            pass
+       
+        # Clear tool
+        self.active_classify_tool = None
+       
+        # ✅ CRITICAL: Unlock main view
+        self.skip_main_view_refresh = False
+        print("   🔓 Main view refresh UNLOCKED")
+       
+        # Close class picker
+        if hasattr(self, "class_picker") and self.class_picker:
+            try:
+               
+                self.class_picker.hide()
+                print("   ✅ Class picker closed")
+            except:
+                pass
+       
+        # Restore section view interactors
+        if hasattr(self, "section_controller"):
+            try:
+                self.section_controller.unlock_after_classification()
+                print("   ✅ Section controller unlocked")
+            except:
+                pass
+       
+        if hasattr(self, "cut_section_controller"):
+            try:
+                self.cut_section_controller.unlock_after_classification()
+                print("   ✅ Cut section controller unlocked")
+            except:
+                pass
+ 
+        # Restore default 2D interactor on all cross-section views
+        try:
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+            if hasattr(self, "section_vtks") and self.section_vtks:
+                for view_idx, vtk_widget in self.section_vtks.items():
+                    try:
+                        vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
+                    except Exception:
+                        pass
+            if hasattr(self, "classify_interactors"):
+                for ci in self.classify_interactors.values():
+                    try: ci.cleanup()
+                    except Exception: pass
+                self.classify_interactors.clear()
+        except Exception as e:
+            print(f"⚠️ Failed to restore interactor on cross-section views: {e}")
+
+        # Restore the main view interactor and clear any main/cut classification wrappers.
+        try:
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+
+            if hasattr(self, "classify_interactor") and self.classify_interactor:
+                try:
+                    if hasattr(self.classify_interactor, "cleanup"):
+                        self.classify_interactor.cleanup()
+                except Exception:
+                    pass
+                self.classify_interactor = None
+                print("   ✅ Main classification interactor cleared")
+
+            if hasattr(self, "cut_classify_interactor") and self.cut_classify_interactor:
+                try:
+                    if hasattr(self.cut_classify_interactor, "cleanup"):
+                        self.cut_classify_interactor.cleanup()
+                except Exception:
+                    pass
+                self.cut_classify_interactor = None
+                print("   ✅ Cut classification interactor cleared")
+
+            if hasattr(self, "vtk_widget") and self.vtk_widget and hasattr(self.vtk_widget, "interactor"):
+                self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
+                print("   ✅ Main view interactor restored")
+        except Exception as e:
+            print(f"⚠️ Failed to restore main interactor after classification: {e}")
+       
+      
+        # ✅ BETTER: Check if cross-section button is checked, not if interactor exists
+        if (not preserve_cross_section) and hasattr(self, 'cross_action') and self.cross_action.isChecked():
+            print("   🛑 Also deactivating cross-section mode")
+           
+            try:
+                # Clean up cross-section visuals
+                if hasattr(self, 'section_controller'):
+                    self.section_controller.clear()
+               
+                # Uncheck cross-section button (this triggers its deactivation handler)
+                self.cross_action.setChecked(False)
+               
+                # Clear any lingering references
+                if hasattr(self, 'cross_interactor'):
+                    self.cross_interactor = None
+                if hasattr(self, 'cross_section_active'):
+                    self.cross_section_active = False
+               
+                # Restore main view interactor
+                from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+                self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
+               
+                self.vtk_widget.render()
+                print("   ✅ Cross-section mode deactivated")
+            except Exception as e:
+                print(f"   ⚠️ Error deactivating cross-section: {e}")
+ 
+        elif preserve_cross_section and hasattr(self, 'cross_action') and self.cross_action.isChecked():
+            print("   ℹ️ Preserving cross-section mode while deactivating classification")
+       
+        print(f"{'='*60}")
+        print(f"✅ Classification tool fully deactivated - all views unlocked")
+        print(f"{'='*60}\n")
+       
+        self.statusBar().showMessage("✅ Classification tool deactivated", 2000)
+                    
+    def _refresh_view(self, include_overlays=False, fast_color_only=False):
+        """
+        🚀 SENIOR REFACTOR: Smart Redraw.
+        If fast_color_only is True, we skip the 'clear()' and 'add_mesh' pipeline entirely.
+        """
+        # --- NEW FAST PATH ---
+        if fast_color_only:
+            # We don't clear. We don't rebuild. 
+            # We just tell the existing actor to update its colors.
+            from .classification_tools import update_main_view_scalars_direct
+            update_main_view_scalars_direct(self, np.arange(len(self.data["classification"])))
+            return
+
+        # --- SLOW PATH (Only for initial load or toggle overlays) ---
+        print("⚠️ Performing full view refresh (Slow Path)")
+        self.vtk_widget.clear()
+
+        # main dataset
+        if self.data and "xyz" in self.data and self.data["xyz"] is not None:
+            # Ensure update_pointcloud names the actor 'main_points_cloud'
+            update_pointcloud(self, self.display_mode)
+
+        # overlays (Keep this logic for full refreshes only)
+        if include_overlays and self.data and "overlays" in self.data:
+            # ... [Your existing DXF logic] ...
+            pass
+
+        self.vtk_widget.render()
+
+    # --- Status Bar ---
+    def _update_window_title(self, filename, crs_epsg):
+        """Update main window title with filename + CRS."""
+        base_title = "NakshaAI-Lidar"
+
+        if not filename:
+            self.setWindowTitle(base_title)
+            return
+
+        if crs_epsg:
+            try:
+                crs = CRS.from_epsg(crs_epsg)
+                crs_name = crs.to_authority() or crs.to_string()
+                self.setWindowTitle(
+                    f"{base_title} - {os.path.basename(filename)} | EPSG:{crs_epsg} ({crs_name})"
+                )
+            except Exception:
+                self.setWindowTitle(
+                    f"{base_title} - {os.path.basename(filename)} | EPSG:{crs_epsg}"
+                )
+        else:
+            self.setWindowTitle(
+                f"{base_title} - {os.path.basename(filename)} | CRS: Unknown"
+            )
+            
+    def _force_main_view_refresh_after_undo(self, changed_mask):
+        """
+        ✅ NEW METHOD: Guaranteed main view refresh after undo/redo
+        
+        This method ensures the main view ALWAYS updates, regardless of 
+        cross-section state or other factors.
+        """
+        print(f"\n{'='*60}")
+        print(f"🔄 FORCING MAIN VIEW REFRESH AFTER UNDO/REDO")
+        print(f"{'='*60}")
+        
+        try:
+            import numpy as np
+            
+            # Save camera position
+            saved_camera = None
+            if hasattr(self, 'vtk_widget') and self.vtk_widget and self.vtk_widget.renderer:
+                try:
+                    camera = self.vtk_widget.renderer.GetActiveCamera()
+                    if camera:
+                        saved_camera = {
+                            'position': tuple(camera.GetPosition()),
+                            'focal_point': tuple(camera.GetFocalPoint()),
+                            'view_up': tuple(camera.GetViewUp()),
+                            'parallel_scale': camera.GetParallelScale(),
+                            'parallel_projection': camera.GetParallelProjection(),
+                        }
+                        print(f"   📷 Camera saved")
+                except Exception as e:
+                    print(f"   ⚠️ Camera save failed: {e}")
+            
+            # Get affected classes
+            affected_classes = set()
+            
+            # From changed mask
+            if changed_mask is not None:
+                classes = self.data["classification"]
+                affected_classes = set(np.unique(classes[changed_mask]).tolist())
+            
+            # Also check undo stack for old classes
+            if hasattr(self, 'undo_stack') and self.undo_stack:
+                last_undo = self.undo_stack[-1]
+                if 'old_classes' in last_undo:
+                    affected_classes.update(np.unique(last_undo['old_classes']).tolist())
+                if 'new_classes' in last_undo:
+                    affected_classes.update(np.unique(last_undo['new_classes']).tolist())
+            
+            print(f"   📊 Affected classes: {sorted(affected_classes)}")
+            
+            if len(affected_classes) == 0:
+                print(f"   ⚠️ No affected classes detected")
+                print(f"{'='*60}\n")
+                return
+            
+            # ✅ STRATEGY: Remove and re-add ONLY affected class actors
+            if self.display_mode == "class":
+                print(f"   🎨 Class mode - updating {len(affected_classes)} classes")
+                
+                try:
+                    from gui.class_display import update_class_mode
+                    
+                    # Simple approach: Full refresh (most reliable)
+                    update_class_mode(self)
+                    print(f"   ✅ Full refresh complete")
+                    
+                except Exception as e:
+                    print(f"   ❌ Refresh failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            elif self.display_mode == "shaded_class":
+                print(f"   🌗 Shaded mode - full rebuild required")
+                
+                try:
+                    from gui.shading_display import update_shaded_class
+                    
+                    azimuth = getattr(self, "last_shade_azimuth", 45.0)
+                    angle = getattr(self, "last_shade_angle", 45.0)
+                    ambient = getattr(self, "shade_ambient", 0.2)
+                    
+                    update_shaded_class(self, azimuth, angle, ambient)
+                    print(f"   ✅ Shaded mode refreshed")
+                    
+                except Exception as e:
+                    print(f"   ❌ Shaded refresh failed: {e}")
+            
+            else:
+                print(f"   📊 {self.display_mode} mode - standard refresh")
+                
+                try:
+                    from gui.pointcloud_display import update_pointcloud
+                    update_pointcloud(self, self.display_mode)
+                    print(f"   ✅ Refreshed")
+                    
+                except Exception as e:
+                    print(f"   ❌ Refresh failed: {e}")
+            
+            # Restore camera
+            if saved_camera and hasattr(self, 'vtk_widget') and self.vtk_widget.renderer:
+                try:
+                    camera = self.vtk_widget.renderer.GetActiveCamera()
+                    camera.SetPosition(saved_camera['position'])
+                    camera.SetFocalPoint(saved_camera['focal_point'])
+                    camera.SetViewUp(saved_camera['view_up'])
+                    camera.SetParallelScale(saved_camera['parallel_scale'])
+                    
+                    if saved_camera['parallel_projection']:
+                        camera.ParallelProjectionOn()
+                    
+                    self.vtk_widget.renderer.ResetCameraClippingRange()
+                    self.vtk_widget.render()
+                    
+                    print(f"   📷 Camera restored")
+                except Exception as e:
+                    print(f"   ⚠️ Camera restore failed: {e}")
+            
+            # Force immediate render
+            try:
+                if hasattr(self, 'vtk_widget'):
+                    self.vtk_widget.GetRenderWindow().Render()
+                    print(f"   🎨 Forced render complete")
+            except Exception as e:
+                print(f"   ⚠️ Render warning: {e}")
+            
+            # Also refresh cross-sections if they exist
+            if hasattr(self, 'section_vtks') and self.section_vtks:
+                print(f"\n   🔄 Refreshing cross-sections...")
+                for view_idx in sorted(self.section_vtks.keys()):
+                    try:
+                        # Get section data
+                        pts = getattr(self, f'section_{view_idx}_core_points', None)
+                        if pts is not None:
+                            # Trigger refresh
+                            if hasattr(self, 'section_controller'):
+                                self.section_controller.active_view = view_idx
+                                # Simple color refresh
+                                vtk_widget = self.section_vtks[view_idx]
+                                if vtk_widget:
+                                    vtk_widget.render()
+                            print(f"      ✅ View {view_idx + 1} refreshed")
+                    except Exception as e:
+                        print(f"      ⚠️ View {view_idx + 1} error: {e}")
+            
+            print(f"\n{'='*60}")
+            print(f"✅ MAIN VIEW REFRESH COMPLETE")
+            print(f"{'='*60}\n")
+            
+        except Exception as e:
+            print(f"\n❌ CRITICAL ERROR IN MAIN VIEW REFRESH: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"{'='*60}\n")
+            
+    def _smart_refresh_after_undo_redo(self, changed_mask, target_classes, operation="Update", num_points=0):
+                """
+                ✅ SMART REFRESH: Update ONLY affected classes without blinking
+                ✅ FIXED: Border shader preserved - only classification data reverted
+                
+                Strategy:
+                1. Identify which classes were affected (old + new)
+                2. Remove ONLY class actors (preserve DXF, border state, and other overlays)
+                3. Re-add ALL visible classes with updated points
+                4. Apply border shader ONLY if border was previously enabled
+                5. Camera stays locked - no rebuild - NO BLINK
+                """
+                print(f"\n{'='*60}")
+                print(f"{operation} - Processing {num_points:,} points (SMART REFRESH)")
+                print(f"{'='*60}")
+                
+                try:
+                    import numpy as np
+                    import pyvista as pv
+                    
+                    # ========================================================================
+                    # STEP 1: Identify affected classes (both old and new)
+                    # ========================================================================
+                    affected_classes = set()
+                    
+                    # Add target classes (what points became)
+                    if isinstance(target_classes, np.ndarray):
+                        affected_classes.update(np.unique(target_classes).tolist())
+                    elif isinstance(target_classes, (int, np.integer)):
+                        affected_classes.add(int(target_classes))
+                    
+                    # Add old classes from undo stack (what points were before)
+                    if hasattr(self, 'undo_stack') and self.undo_stack:
+                        last_step = self.undo_stack[-1]
+                        old_cls = last_step.get('old_classes')
+                        if isinstance(old_cls, np.ndarray):
+                            affected_classes.update(np.unique(old_cls).tolist())
+                    
+                    # Add current classes in the changed area (belt and suspenders)
+                    current_classes = self.data["classification"][changed_mask]
+                    affected_classes.update(np.unique(current_classes).tolist())
+                    
+                    affected_classes = sorted(list(affected_classes))
+                    print(f"   📊 Affected classes: {affected_classes}")
+                    
+                    if len(affected_classes) == 0:
+                        print(f"   ⚠️ No affected classes detected")
+                        return
+                    
+                    # ========================================================================
+                    # STEP 2: Save camera position and border state
+                    # ========================================================================
+                    saved_camera = None
+                    border_percent = getattr(self, "point_border_percent", 0)
+                    border_enabled = border_percent > 0.0
+                    
+                    if hasattr(self, 'vtk_widget') and self.vtk_widget and self.vtk_widget.renderer:
+                        try:
+                            camera = self.vtk_widget.renderer.GetActiveCamera()
+                            if camera:
+                                saved_camera = {
+                                    'position': tuple(camera.GetPosition()),
+                                    'focal_point': tuple(camera.GetFocalPoint()),
+                                    'view_up': tuple(camera.GetViewUp()),
+                                    'parallel_scale': camera.GetParallelScale(),
+                                    'parallel_projection': camera.GetParallelProjection(),
+                                    'view_angle': camera.GetViewAngle(),
+                                    'clipping_range': camera.GetClippingRange()
+                                }
+                                print(f"   📷 Camera saved")
+                                print(f"   🔳 Border state: {'ENABLED' if border_enabled else 'DISABLED'} ({border_percent}%)")
+                        except Exception as e:
+                            print(f"   ⚠️ Camera save failed: {e}")
+                    
+                    # ========================================================================
+                    # STEP 3: Remove ONLY class actors (preserve border shader state)
+                    # ========================================================================
+                    if not hasattr(self, 'vtk_widget'):
+                        return
+
+                    plotter = self.vtk_widget
+                    actors_removed = 0
+
+                    # Remove ONLY class actors, preserve everything else
+                    if hasattr(plotter, 'actors'):
+                        all_actor_names = list(plotter.actors.keys())
+                        
+                        for actor_name in all_actor_names:
+                            actor_str = str(actor_name)
+                            if actor_str.startswith("class_"):
+                                try:
+                                    plotter.remove_actor(actor_name, render=False)
+                                    actors_removed += 1
+                                except Exception:
+                                    pass
+
+                    print(f"   🗑️ Removed {actors_removed} class actors (preserved border shaders and DXF)")
+                
+                    # ========================================================================
+                    # STEP 4: Re-add ALL visible classes with border shader if enabled
+                    # ========================================================================
+                    palette = getattr(self, "class_palette", {}) or {}
+                    xyz = self.data["xyz"]
+                    classes = self.data["classification"]
+
+                    # Get all visible classes
+                    visible_classes = [c for c, info in palette.items() if info.get("show", True)]
+                    visible_classes.sort()
+
+                    actors_added = 0
+
+                    # Calculate ring for shader if border is enabled
+                    ring = 0.0
+                    if border_enabled:
+                        ring = min(0.45, max(0.0, border_percent / 60.0))
+
+                    # Helper function to apply border shader
+                    def _apply_border_shader_to_actor(actor):
+                        if not border_enabled:
+                            return
+                        try:
+                            sp = actor.GetShaderProperty()
+                            code = f"""
+    //VTK::Color::Impl
+    // ---- Naksha Round Point + Border Ring ----
+    float r = length(gl_PointCoord.xy - vec2(0.5)) * 2.0;
+    if (r > 1.0) {{
+        discard;
+    }}
+
+    float ring = {ring:.6f};
+    if (ring > 0.0) {{
+        float edge = 1.0 - ring;
+        if (r >= edge) {{
+            diffuseColor = vec3(0.0, 0.0, 0.0);
+            ambientColor = vec3(0.0, 0.0, 0.0);
+            opacity = 1.0;
+        }}
+    }}
+    // ---- End Naksha Round Point + Border Ring ----
+    """
+                            sp.AddFragmentShaderReplacement(
+                                "//VTK::Color::Impl",
+                                True,
+                                code,
+                                False
+                            )
+                            actor.Modified()
+                        except Exception as e:
+                            print(f"   ⚠️ Border shader attach failed: {e}")
+
+                    for class_code in visible_classes:
+                        try:
+                            entry = palette.get(int(class_code), {})
+                            
+                            # Get ALL points for this class
+                            class_mask = (classes == class_code)
+                            class_pts = xyz[class_mask]
+                            
+                            if len(class_pts) == 0:
+                                continue
+                            
+                            # Get visual properties
+                            weight = float(entry.get("weight", 1.0))
+                            weight = max(0.1, min(weight, 10.0))
+                            point_size = max(1.5, weight * 3.0)
+                            point_size = min(point_size, 30.0)
+                            
+                            color = np.array(entry.get("color", (128, 128, 128)), dtype=np.uint8)
+                            colors = np.tile(color, (len(class_pts), 1))
+                            
+                            # Create point cloud
+                            cloud = pv.PolyData(class_pts)
+                            cloud["RGB"] = colors
+                            
+                            # Add main actor
+                            actor = plotter.add_points(
+                                cloud,
+                                scalars="RGB",
+                                rgb=True,
+                                point_size=point_size,
+                                render_points_as_spheres=True,
+                                name=f"class_{class_code}",
+                                reset_camera=False,
+                                render=False
+                            )
+                            actors_added += 1
+                            
+                            # Apply border shader if enabled
+                            _apply_border_shader_to_actor(actor)
+                            
+                            # Only print affected classes
+                            if class_code in affected_classes:
+                                print(f"   ✅ Class {class_code}: {len(class_pts):,} points (weight={weight:.2f})")
+                            
+                        except Exception as e:
+                            print(f"   ❌ Class {class_code} failed: {e}")
+                            continue
+
+                    print(f"   🎯 Added {actors_added} class actors for {len(visible_classes)} visible classes")
+                
+                    # ========================================================================
+                    # STEP 5: Restore camera and render ONCE
+                    # ========================================================================
+                    if saved_camera:
+                        try:
+                            camera = self.vtk_widget.renderer.GetActiveCamera()
+                            camera.SetPosition(saved_camera['position'])
+                            camera.SetFocalPoint(saved_camera['focal_point'])
+                            camera.SetViewUp(saved_camera['view_up'])
+                            camera.SetParallelScale(saved_camera['parallel_scale'])
+                            camera.SetViewAngle(saved_camera['view_angle'])
+                            camera.SetClippingRange(saved_camera['clipping_range'])
+                            
+                            if saved_camera['parallel_projection']:
+                                camera.ParallelProjectionOn()
+                            else:
+                                camera.ParallelProjectionOff()
+                            
+                            self.vtk_widget.renderer.ResetCameraClippingRange()
+                            print(f"   📷 Camera restored")
+                        except Exception as e:
+                            print(f"   ⚠️ Camera restore warning: {e}")
+                    
+                    # Single render call (no flicker!)
+                    self.vtk_widget.render()
+                    print(f"   🎨 Single render complete (NO BLINK)")
+                    
+                    # ========================================================================
+                    # STEP 6: Update cross-sections if active
+                    # ========================================================================
+                    if hasattr(self, 'section_vtks') and self.section_vtks:
+                        print(f"\n   🔄 Refreshing {len(self.section_vtks)} cross-section view(s)...")
+                        
+                        # Check if we have the classification interactor
+                        if hasattr(self, 'classify_interactors'):
+                            for view_idx in sorted(self.section_vtks.keys()):
+                                try:
+                                    # Check if interactor exists for this view
+                                    if view_idx in self.classify_interactors:
+                                        interactor = self.classify_interactors[view_idx]
+                                        
+                                        # Use the interactor's refresh method
+                                        if hasattr(interactor, '_refresh_single_view'):
+                                            interactor._refresh_single_view(view_idx)
+                                            print(f"      ✅ View {view_idx + 1}: Refreshed")
+                                        else:
+                                            print(f"      ⚠️ View {view_idx + 1}: No refresh method")
+                                    else:
+                                        print(f"      ⏭️ View {view_idx + 1}: No interactor")
+                                except Exception as e:
+                                    print(f"      ⚠️ View {view_idx + 1} refresh failed: {e}")
+                        else:
+                            print(f"      ⚠️ No classify_interactors found")
+                    
+                    # ========================================================================
+                    # STEP 7: Update statistics
+                    # ========================================================================
+                    if hasattr(self, 'point_count_widget') and self.point_count_widget:
+                        from gui.point_count_widget import refresh_point_statistics
+                        refresh_point_statistics(self)
+                    
+                    # Status feedback
+                    if hasattr(self, 'statusBar'):
+                        self.statusBar().showMessage(f"{operation}: {num_points:,} points", 2000)
+                    
+                    print(f"{'='*60}")
+                    print(f"✅ {operation} COMPLETE - NO BLINK")
+                    print(f"{'='*60}\n")
+                    
+                except Exception as e:
+                    print(f"\n❌ SMART REFRESH ERROR: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print(f"{'='*60}\n")
+
+    def _undo_refresh_main_view_fast(self, affected_classes, changed_mask):  #####
+        """
+        Fast undo/redo refresh: rebuild ONLY affected class actors.
+        Skips untouched classes entirely.
+        """
+        import numpy as np
+        import pyvista as pv
+
+        palette = getattr(self, 'class_palette', {})
+        classifications = self.data['classification']
+        plotter = self.vtk_widget
+
+        # Save camera
+        cam_state = None
+        try:
+            cam = plotter.renderer.GetActiveCamera()
+            cam_state = {
+                "pos": cam.GetPosition(), "fp": cam.GetFocalPoint(),
+                "up": cam.GetViewUp(), "ps": cam.GetParallelScale(),
+                "pp": cam.GetParallelProjection(), "va": cam.GetViewAngle(),
+            }
+        except Exception:
+            pass
+
+        for cls_id in affected_classes:
+            actor_name = f'class_{cls_id}'
+            
+            # Remove old actor for this class
+            if actor_name in plotter.actors:
+                plotter.remove_actor(actor_name, render=False)
+
+            # Get current points for this class
+            mask = (classifications == cls_id)
+            pts = self.data['xyz'][mask]
+            
+            if len(pts) == 0:
+                continue  # Class now empty — actor removed, done
+
+            info = palette.get(cls_id, {})
+            color = info.get('color', (128, 128, 128))
+            weight = float(info.get('weight', 1.0))
+            point_size = max(1.5, min(2.5 * weight, 30.0))
+
+            cloud = pv.PolyData(pts)
+            cloud["RGB"] = np.tile(np.array(color, dtype=np.uint8), (len(pts), 1))
+
+            actor = plotter.add_points(
+                cloud, scalars="RGB", rgb=True,
+                point_size=point_size,
+                render_points_as_spheres=True,
+                name=actor_name,
+                reset_camera=False,
+                render=False
+            )
+            actor.GetProperty().LightingOff()
+
+            # Re-apply border shader if active
+            border_percent = float(getattr(self, 'point_border_percent', 0) or 0.0)
+            if border_percent > 0:
+                try:
+                    from gui.class_display import apply_border_shader_ring
+                    apply_border_shader_ring(actor, border_percent)
+                except Exception:
+                    pass
+
+        # Restore camera
+        if cam_state:
+            try:
+                cam = plotter.renderer.GetActiveCamera()
+                cam.SetPosition(*cam_state["pos"])
+                cam.SetFocalPoint(*cam_state["fp"])
+                cam.SetViewUp(*cam_state["up"])
+                if cam_state["pp"]:
+                    cam.ParallelProjectionOn()
+                    cam.SetParallelScale(cam_state["ps"])
+                else:
+                    cam.ParallelProjectionOff()
+                    cam.SetViewAngle(cam_state["va"])
+                plotter.renderer.ResetCameraClippingRange()
+            except Exception:
+                pass
+
+        plotter.render()
+
+
+
+    def undo_classification(self):
+        """🚀 ZERO-BLINK UNDO: In-place memory swap"""
+        if not self.undo_stack: return
+        step = self.undo_stack.pop()
+        mask = step.get('mask')
+        if mask is None or not mask.any(): return
+
+        old_cls = step.get('old_classes')
+        if old_cls is None: return  # Guard against malformed entry
+
+        # 1. Revert CPU RAM
+        self.data["classification"][mask] = old_cls
+        self.redo_stack.append(step)
+        # Cap redo stack
+        max_steps = getattr(self, '_max_undo_steps', 30)
+        while len(self.redo_stack) > max_steps:
+            from gui.memory_manager import _free_undo_entry
+            _free_undo_entry(self.redo_stack.pop(0))
+
+        # 2. ⚡ FAST GPU POKE: Main View
+        from gui.unified_actor_manager import fast_undo_update
+        fast_undo_update(self, changed_mask=mask)
+
+        # 3. ⚡ FAST GPU POKE: Cross-Sections (The fix for the blink)
+        if hasattr(self, 'section_vtks') and self.section_vtks:
+            from gui.unified_actor_manager import fast_cross_section_update
+            for view_idx in self.section_vtks.keys():
+                # We use the same 'Fast' function used during drawing
+                # This updates the GPU buffer WITHOUT rebuilding the actor
+                fast_cross_section_update(self, view_idx, mask)
+
+        # Refresh shaded mesh if in shaded mode
+        if getattr(self, "display_mode", None) == "shaded_class":
+            try:
+                from gui.shading_display import refresh_shaded_after_undo_fast
+                refresh_shaded_after_undo_fast(self, changed_mask=mask)
+            except Exception as _se:
+                print(f"Warning: Shading undo refresh failed: {_se}")
+                try:
+                    from gui.shading_display import update_shaded_class, clear_shading_cache
+                    clear_shading_cache("undo fallback")
+                    update_shaded_class(self, force_rebuild=True)
+                except Exception:
+                    pass
+
+        # 4. Final Render
+        self.vtk_widget.render()
+
+    def redo_classification(self):
+        """🚀 MICROSTATION REDO: Instant GPU Forward-Patch"""
+        if not self.redo_stack: return
+        step = self.redo_stack.pop()
+        mask = step.get('mask')
+        if mask is None or not mask.any(): return
+
+        new_cls = step.get('new_classes')
+        if new_cls is None: return  # Guard against malformed entry
+
+        # 1. Update RAM
+        self.data["classification"][mask] = new_cls
+        self.undo_stack.append(step)
+        # Cap undo stack
+        max_steps = getattr(self, '_max_undo_steps', 30)
+        while len(self.undo_stack) > max_steps:
+            from gui.memory_manager import _free_undo_entry
+            _free_undo_entry(self.undo_stack.pop(0))
+
+        # 2. ⚡ Direct GPU Patch
+        from gui.unified_actor_manager import fast_undo_update
+        fast_undo_update(self, changed_mask=mask)
+
+        # 3. 📡 CRITICAL: Emit signal
+        # Refresh shaded mesh if in shaded mode
+        if getattr(self, "display_mode", None) == "shaded_class":
+            try:
+                from gui.shading_display import refresh_shaded_after_undo_fast
+                refresh_shaded_after_undo_fast(self, changed_mask=mask)
+            except Exception as _se:
+                print(f"Warning: Shading redo refresh failed: {_se}")
+                try:
+                    from gui.shading_display import update_shaded_class, clear_shading_cache
+                    clear_shading_cache("redo fallback")
+                    update_shaded_class(self, force_rebuild=True)
+                except Exception:
+                    pass
+
+        self.classification_finished.emit(mask)
+        
+        self.vtk_widget.render() ###
+
+
+    def _refresh_main_view_after_undo(self, affected_classes, changed_mask):
+        """
+        ✅ CRITICAL FIX: Rebuild main view actors for affected classes.
+        
+        This prevents void points by ensuring:
+        1. Classes that LOST points have their actors removed if empty
+        2. Classes that GAINED points have their actors rebuilt with new points
+        """
+        import pyvista as pv
+        import numpy as np
+        
+        plotter = getattr(self, 'vtk_widget', None)
+        if plotter is None:
+            print(f"      ⚠️ No VTK widget found")
+            return
+        
+        xyz = self.data["xyz"]
+        classes = self.data["classification"]
+        
+        # Get Main View palette (Slot 0)
+        palette = self._get_main_view_palette()
+        
+        print(f"      🔧 Rebuilding {len(affected_classes)} class actors...")
+        
+        # Save camera position
+        saved_camera = None
+        try:
+            if hasattr(plotter, 'camera_position') and plotter.camera_position is not None:
+                saved_camera = plotter.camera_position
+        except:
+            pass
+        
+        # ════════════════════════════════════════════════════════════════════
+        # Rebuild each affected class
+        # ════════════════════════════════════════════════════════════════════
+        for class_code in affected_classes:
+            class_code = int(class_code)
+            actor_name = f"class_{class_code}"
+            
+            # Check visibility in Main View palette
+            info = palette.get(class_code, {})
+            if not info.get("show", True):
+                # Hidden class - remove actor if exists
+                if actor_name in plotter.actors:
+                    plotter.remove_actor(actor_name, render=False)
+                    print(f"         🚫 Removed hidden class {class_code}")
+                continue
+            
+            # Get all points for this class
+            class_mask = (classes == class_code)
+            class_pts = xyz[class_mask]
+            
+            # Remove old actor
+            if actor_name in plotter.actors:
+                plotter.remove_actor(actor_name, render=False)
+            
+            # If no points, skip
+            if len(class_pts) == 0:
+                print(f"         ✂️ Class {class_code}: No points (removed)")
+                continue
+            
+            # Get styling
+            color = np.array(info.get("color", (128, 128, 128)), dtype=np.uint8)
+            weight = float(info.get("weight", 1.0))
+            point_size = max(1.0, min(weight * 2.5, 30.0))
+            
+            # Create new actor
+            colors = np.tile(color, (len(class_pts), 1))
+            cloud = pv.PolyData(class_pts)
+            cloud["RGB"] = colors
+            
+            actor = plotter.add_points(
+                cloud,
+                scalars="RGB",
+                rgb=True,
+                point_size=point_size,
+                render_points_as_spheres=True,
+                name=actor_name,
+                reset_camera=False,
+                render=False
+            )
+            
+            # Apply border shader if enabled
+            border_percent = getattr(self, "point_border_percent", 0)
+            if border_percent > 0:
+                try:
+                    from gui.class_display import apply_border_shader_ring
+                    apply_border_shader_ring(actor, border_percent)
+                except:
+                    pass
+            
+            print(f"         ✅ Rebuilt class {class_code}: {len(class_pts):,} points")
+        
+        # Restore camera
+        if saved_camera is not None:
+            try:
+                plotter.camera_position = saved_camera
+            except:
+                pass
+        
+        # Single render at the end
+        plotter.render()
+        print(f"      ✅ Main view refreshed")
+
+
+    def _manual_refresh_cross_section(self, view_idx, affected_classes):
+        """
+        ✅ Manual fallback refresh for cross-section after undo.
+        """
+        import pyvista as pv
+        import numpy as np
+        
+        if not hasattr(self, 'section_vtks') or view_idx not in self.section_vtks:
+            print(f"      ⚠️ View {view_idx}: VTK widget not found")
+            return
+        
+        vtk_widget = self.section_vtks[view_idx]
+        slot_idx = view_idx + 1
+        
+        # Get section data
+        core_pts = getattr(self, f'section_{view_idx}_core_points', None)
+        core_mask = getattr(self, f'section_{view_idx}_core_mask', None)
+        buffer_pts = getattr(self, f'section_{view_idx}_buffer_points', None)
+        buffer_mask = getattr(self, f'section_{view_idx}_buffer_mask', None)
+        
+        if core_pts is None or core_mask is None:
+            print(f"      ⏭️ View {view_idx}: No section data stored")
+            return
+        
+        # Get palette for this view
+        palette = self._get_cross_section_palette(slot_idx)
+        visible = [c for c, v in palette.items() if v.get("show", False)]
+        
+        # ✅ CRITICAL: Get FRESH classification data from main array
+        current_classes = self.data["classification"]
+        
+        # Verify we got the updated data
+        if not isinstance(current_classes, np.ndarray):
+            print(f"      ❌ View {view_idx}: Invalid classification data type")
+            return
+        
+        # Extract section classifications using the stored mask
+        try:
+            section_classes = current_classes[core_mask]
+        except Exception as e:
+            print(f"      ❌ View {view_idx}: Failed to extract section classes: {e}")
+            return
+        
+        print(f"      🔄 Manual refresh View {slot_idx}...")
+        print(f"         Core points: {len(core_pts):,}")
+        print(f"         Affected classes: {sorted(affected_classes)}")
+        print(f"         Visible classes: {sorted(visible)}")
+        
+        # Save camera position
+        saved_camera = None
+        try:
+            if hasattr(vtk_widget, 'camera_position'):
+                saved_camera = vtk_widget.camera_position
+        except:
+            pass
+        
+        # Disable interactor during update
+        try:
+            vtk_widget.iren.interactor.Disable()
+        except:
+            pass
+        
+        try:
+            # ════════════════════════════════════════════════════════════════
+            # Rebuild CORE points for affected classes
+            # ════════════════════════════════════════════════════════════════
+            for cls_val in affected_classes:
+                cls_val = int(cls_val)
+                actor_name = f"class_{cls_val}"
+                
+                # Check visibility
+                if cls_val not in visible:
+                    if actor_name in vtk_widget.actors:
+                        vtk_widget.remove_actor(actor_name, render=False)
+                        print(f"         🚫 Removed hidden class {cls_val}")
+                    continue
+                
+                # Get points for this class
+                cls_mask = (section_classes == cls_val)
+                cls_pts = core_pts[cls_mask]
+                
+                # Remove old actor
+                if actor_name in vtk_widget.actors:
+                    vtk_widget.remove_actor(actor_name, render=False)
+                
+                # If no points, skip
+                if len(cls_pts) == 0:
+                    print(f"         ✂️ Class {cls_val}: 0 points (removed)")
+                    continue
+                
+                # Get styling
+                entry = palette.get(cls_val, {})
+                color = tuple(entry.get("color", (128, 128, 128)))
+                weight = float(entry.get("weight", 1.0))
+                point_size = max(1.0, min(10.0, 5.0 * weight))
+                
+                # Create new actor
+                colors = np.array([color] * len(cls_pts), dtype=np.uint8)
+                cloud = pv.PolyData(cls_pts)
+                cloud["RGB"] = colors
+                
+                vtk_widget.add_points(
+                    cloud,
+                    scalars="RGB",
+                    rgb=True,
+                    point_size=point_size,
+                    render_points_as_spheres=True,
+                    reset_camera=False,
+                    name=actor_name,
+                    render=False
+                )
+                
+                print(f"         ✅ Class {cls_val}: {len(cls_pts):,} points rebuilt")
+            
+            # ════════════════════════════════════════════════════════════════
+            # Rebuild BUFFER points for affected classes
+            # ════════════════════════════════════════════════════════════════
+            if buffer_pts is not None and buffer_mask is not None and len(buffer_pts) > 0:
+                try:
+                    buffer_classes = current_classes[buffer_mask]
+                    
+                    for cls_val in affected_classes:
+                        cls_val = int(cls_val)
+                        buffer_name = f"buffer_{cls_val}"
+                        
+                        # Check visibility
+                        if cls_val not in visible:
+                            if buffer_name in vtk_widget.actors:
+                                vtk_widget.remove_actor(buffer_name, render=False)
+                            continue
+                        
+                        # Get buffer points for this class
+                        cls_mask = (buffer_classes == cls_val)
+                        cls_pts = buffer_pts[cls_mask]
+                        
+                        # Remove old buffer actor
+                        if buffer_name in vtk_widget.actors:
+                            vtk_widget.remove_actor(buffer_name, render=False)
+                        
+                        # If no points, skip
+                        if len(cls_pts) == 0:
+                            continue
+                        
+                        # Get styling (buffer uses smaller points)
+                        entry = palette.get(cls_val, {})
+                        color = tuple(entry.get("color", (128, 128, 128)))
+                        point_size = 3.0  # Fixed smaller size for buffer
+                        
+                        # Create buffer actor
+                        colors = np.array([color] * len(cls_pts), dtype=np.uint8)
+                        cloud = pv.PolyData(cls_pts)
+                        cloud["RGB"] = colors
+                        
+                        vtk_widget.add_points(
+                            cloud,
+                            scalars="RGB",
+                            rgb=True,
+                            point_size=point_size,
+                            render_points_as_spheres=True,
+                            reset_camera=False,
+                            name=buffer_name,
+                            render=False
+                        )
+                        
+                        print(f"         🔹 Buffer {cls_val}: {len(cls_pts):,} points")
+                except Exception as e:
+                    print(f"         ⚠️ Buffer refresh failed: {e}")
+            
+        finally:
+            # Re-enable interactor
+            try:
+                vtk_widget.iren.interactor.Enable()
+            except:
+                pass
+            
+            # Restore camera
+            if saved_camera is not None:
+                try:
+                    vtk_widget.camera_position = saved_camera
+                except:
+                    pass
+        
+        # Render the view
+        vtk_widget.render()
+        print(f"      ✅ View {slot_idx} refreshed and rendered")
+
+
+    def _get_main_view_palette(self):
+        """Get Main View (Slot 0) palette."""
+        # Try display mode dialog first
+        if hasattr(self, 'display_mode_dialog') and self.display_mode_dialog:
+            if hasattr(self.display_mode_dialog, 'view_palettes'):
+                if 0 in self.display_mode_dialog.view_palettes:
+                    return self.display_mode_dialog.view_palettes[0]
+        
+        # Try app-level storage
+        if hasattr(self, 'view_palettes') and 0 in self.view_palettes:
+            return self.view_palettes[0]
+        
+        # Fallback to global palette
+        return getattr(self, 'class_palette', {})
+
+
+    def _get_cross_section_palette(self, slot_idx):
+        """Get cross-section palette for a specific slot."""
+        # Try display mode dialog first
+        if hasattr(self, 'display_mode_dialog') and self.display_mode_dialog:
+            if hasattr(self.display_mode_dialog, 'view_palettes'):
+                if slot_idx in self.display_mode_dialog.view_palettes:
+                    return self.display_mode_dialog.view_palettes[slot_idx]
+        
+        # Try app-level storage
+        if hasattr(self, 'view_palettes') and slot_idx in self.view_palettes:
+            return self.view_palettes[slot_idx]
+        
+        # Fallback to global palette
+        return getattr(self, 'class_palette', {})
+    
+    def refresh_after_classification(self, to_class, changed_mask=None): ################
+        """
+        ⚡ MICROSTATION STYLE REFRESH
+        This replaces the slow rebuild logic during active classification.
+        """
+        if changed_mask is None:
+            changed_mask = getattr(self, '_last_changed_mask', None)
+        
+        if changed_mask is None:
+            return self.refresh_all_views() # Fallback to slow path
+
+        # 1. Attempt Instant Main View Update
+        from unified_actor_manager import fast_classify_update, is_unified_actor_ready
+        
+        success = False
+        if is_unified_actor_ready(self):
+            success = fast_classify_update(
+                self, 
+                changed_mask=changed_mask, 
+                to_class=to_class, 
+                palette=self.class_palette,
+                border_percent=self.point_border_percent
+            )
+
+        # 2. Update Cross-Sections (These usually need a partial rebuild because they are small)
+        if hasattr(self, 'section_vtks') and self.section_vtks:
+            for view_idx in self.section_vtks.keys():
+                self._refresh_single_section_view(view_idx)
+
+        # 3. If fast path failed (e.g. first load), do the full rebuild once
+        if not success:
+            from gui.class_display import update_class_mode
+            update_class_mode(self, force_refresh=True)
+
+        # 4. Update stats in background
+        QTimer.singleShot(10, lambda: refresh_point_statistics(self))  ##################
+
+
+
+    def _refresh_all_views_after_change(self, num_points, operation="Update"):
+        """
+        ✅ INTERNAL: Complete rebuild of main view + all cross-sections after classification change
+        
+        Args:
+            num_points: Number of points affected
+            operation: Operation name for logging (e.g., "⏪ Undo", "🔜 Redo")
+        """
+        print(f"\n{'='*60}")
+        print(f"{operation} - Processing {num_points:,} points")
+        print(f"{'='*60}")
+        
+        # 1. Clear refresh guard flags
+        if hasattr(self, '_last_changed_mask'):
+            delattr(self, '_last_changed_mask')
+        if hasattr(self, 'lastchangedmask'):
+            self.lastchangedmask = None
+        self._doing_partial_refresh = False
+        
+        # 2. Save camera state
+        saved_camera = self._save_camera_state()
+        
+        # 3. Rebuild main view
+        self._rebuild_main_view()
+        
+        # 4. Restore camera
+        if saved_camera:
+            self._restore_camera_state(saved_camera)
+        
+        # 5. Force render main view
+        self._force_render_main_view()
+        
+        # 6. Refresh all cross-section views
+        self._refresh_cross_sections()
+        
+        # 7. Process Qt events
+        self._process_qt_events()
+        
+        # 8. Update statistics
+        self._update_statistics()
+        
+        # 9. Update status bar
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage(f"{operation}: {num_points:,} points", 3000)
+        
+        print(f"{'='*60}")
+        print(f"✅ {operation} COMPLETE - All views updated")
+        print(f"{'='*60}\n")
+
+
+    def _save_camera_state(self):
+        """Save current camera state for restoration after rebuild"""
+        if not (hasattr(self, 'vtk_widget') and self.vtk_widget and 
+                hasattr(self.vtk_widget, 'renderer') and self.vtk_widget.renderer):
+            return None
+        
+        try:
+            camera = self.vtk_widget.renderer.GetActiveCamera()
+            if camera:
+                return {
+                    'position': tuple(camera.GetPosition()),
+                    'focal_point': tuple(camera.GetFocalPoint()),
+                    'view_up': tuple(camera.GetViewUp()),
+                    'parallel_scale': camera.GetParallelScale(),
+                    'parallel_projection': camera.GetParallelProjection()
+                }
+        except Exception as e:
+            print(f"⚠️ Camera save failed: {e}")
+        return None
+
+    def _restore_camera_state(self, saved_camera):
+        """Restore previously saved camera state"""
+        if not (hasattr(self, 'vtk_widget') and self.vtk_widget and 
+                hasattr(self.vtk_widget, 'renderer') and self.vtk_widget.renderer):
+            return
+        
+        try:
+            camera = self.vtk_widget.renderer.GetActiveCamera()
+            camera.SetPosition(saved_camera['position'])
+            camera.SetFocalPoint(saved_camera['focal_point'])
+            camera.SetViewUp(saved_camera['view_up'])
+            camera.SetParallelScale(saved_camera['parallel_scale'])
+            if saved_camera['parallel_projection']:
+                camera.ParallelProjectionOn()
+            self.vtk_widget.renderer.ResetCameraClippingRange()
+        except Exception as e:
+            print(f"⚠️ Camera restore failed: {e}")
+
+    def _rebuild_main_view(self):
+        """Complete rebuild of main VTK view"""
+        print("🔄 Rebuilding Main View...")
+        self._preserve_view = True
+        
+        try:
+            # Clear all VTK actors
+            if hasattr(self, 'vtk_widget') and self.vtk_widget:
+                self.vtk_widget.renderer.RemoveAllViewProps()
+                if hasattr(self.vtk_widget, 'actors'):
+                    self.vtk_widget.actors.clear()
+                if hasattr(self.vtk_widget, '_actors'):
+                    self.vtk_widget._actors.clear()
+            
+            # Rebuild based on display mode
+            if self.display_mode == "class":
+                from gui.class_display import update_class_mode
+                update_class_mode(self)
+                print("✅ Main view rebuilt (class)")
+                
+            elif self.display_mode == "shadedclass":
+                from gui.shading_display import updateshadedclass
+                updateshadedclass(self, 
+                                getattr(self, "lastshadeazimuth", 45.0),
+                                getattr(self, "lastshadeangle", 45.0),
+                                getattr(self, "shadeambient", 0.2))
+                print("✅ Main view rebuilt (shaded)")
+                
+            else:
+                from gui.pointcloud_display import updatepointcloud
+                updatepointcloud(self, self.display_mode)
+                print(f"✅ Main view rebuilt ({self.display_mode})")
+                
+        except Exception as e:
+            print(f"❌ Main view rebuild failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _force_render_main_view(self):
+        """Force immediate VTK render of main view"""
+        if hasattr(self, 'vtk_widget') and self.vtk_widget:
+            try:
+                self.vtk_widget.GetRenderWindow().Render()
+            except Exception as e:
+                print(f"⚠️ Main render failed: {e}")
+                
+    def _refresh_cross_sections_async(self):
+        """
+        ✅ Schedule cross-section refresh for next event loop iteration.
+        Prevents UI micro-stutters during classification.
+        """
+        try:
+            from PySide6.QtCore import QTimer
+            # Reduced to 5ms for even faster response
+            QTimer.singleShot(5, self._refresh_cross_sections)
+        except Exception as e:
+            print(f"⚠️ Async scheduling failed: {e}")
+            self._refresh_cross_sections()
+
+    def _refresh_cross_sections(self):
+        """
+        🚀 REFRESH ALL CROSS-SECTIONS
+        Coordinates between the SectionController and the GPU.
+        """
+        if not (hasattr(self, 'section_vtks') and self.section_vtks):
+            return
+        
+        if not (hasattr(self, 'section_controller') and self.section_controller):
+            print(" ❌ ERROR: section_controller not found!")
+            return
+
+        # Use the stored view-specific palettes if they exist
+        palettes = getattr(self, 'view_palettes', {})
+
+        for view_idx in sorted(self.section_vtks.keys()):
+            try:
+                # 1. Update the controller's state
+                old_active = getattr(self.section_controller, 'active_view', None)
+                self.section_controller.active_view = view_idx
+                
+                # 2. Assign the specific palette for THIS view (very important!)
+                # If View 1 has a different palette than View 0, we must respect it.
+                view_palette = palettes.get(view_idx + 1, self.class_palette)
+                
+                # 3. TRIGGER REFRESH
+                # We prioritize the specialized view-specific refresh
+                if hasattr(self.section_controller, 'refresh_colors_for_view'):
+                    # ✅ The controller method should now handle the GPU Buffer Swap
+                    self.section_controller.refresh_colors_for_view(view_idx, palette=view_palette)
+                elif hasattr(self.section_controller, 'refresh_colors'):
+                    self.section_controller.refresh_colors()
+                
+                if old_active is not None:
+                    self.section_controller.active_view = old_active
+                    
+            except Exception as e:
+                print(f" ❌ Cross-section View {view_idx + 1} failed: {e}")
+        
+        # Process events so the screen actually updates
+        try:
+            from PySide6.QtCore import QCoreApplication
+            QCoreApplication.processEvents()
+        except: pass
+
+    def _get_section_dock_widget(self, view_idx):
+        """
+        Get the QDockWidget parent of a cross-section view
+        """
+        try:
+            vtk_widget = self.section_vtks[view_idx]
+            from PySide6.QtWidgets import QDockWidget
+            parent = vtk_widget.parent()
+            
+            # Walk up widget hierarchy to find QDockWidget
+            while parent:
+                if isinstance(parent, QDockWidget):
+                    return parent
+                parent = parent.parent()
+                
+        except Exception as e:
+            print(f"      ⚠️ Could not find dock widget: {e}")
+        
+        return None
+
+    def _force_section_data_update(self, view_idx):
+        """
+        ✅ Force complete data pipeline update for cross-section view
+        This is a fallback when section_controller methods aren't available
+        """
+        vtk_widget = self.section_vtks[view_idx]
+        
+        if not (hasattr(vtk_widget, 'renderer') and vtk_widget.renderer):
+            return
+        
+        # 1. Get all actors and update their data
+        actors = vtk_widget.renderer.GetActors()
+        actors.InitTraversal()
+        
+        updated_count = 0
+        for i in range(actors.GetNumberOfItems()):
+            actor = actors.GetNextActor()
+            if not actor:
+                continue
+                
+            mapper = actor.GetMapper()
+            if not mapper:
+                continue
+            
+            # Get the polydata
+            polydata = mapper.GetInput()
+            if not polydata:
+                continue
+            
+            # ✅ CRITICAL: Update colors from current classification
+            if hasattr(polydata, 'GetPointData'):
+                point_data = polydata.GetPointData()
+                if point_data and point_data.GetScalars():
+                    # Mark scalars as modified
+                    point_data.GetScalars().Modified()
+            
+            # Mark all pipeline components as modified
+            polydata.Modified()
+            mapper.Modified()
+            mapper.Update()
+            actor.Modified()
+            
+            updated_count += 1
+        
+        print(f"      🔄 Updated {updated_count} actor pipeline(s)")
+        
+        # 2. Force render
+        if hasattr(vtk_widget, 'GetRenderWindow'):
+            vtk_widget.GetRenderWindow().Render()
+        elif hasattr(vtk_widget, 'render'):
+            vtk_widget.render()
+
+    def _render_section_view(self, view_idx):
+        """
+        ✅ FIXED: Render a single cross-section view with pipeline update
+        """
+        vtk_widget = self.section_vtks[view_idx]
+        
+        # 1. ✅ CRITICAL: Mark all data sources as modified
+        if hasattr(vtk_widget, 'renderer') and vtk_widget.renderer:
+            actors = vtk_widget.renderer.GetActors()
+            actors.InitTraversal()
+            
+            for i in range(actors.GetNumberOfItems()):
+                actor = actors.GetNextActor()
+                if actor:
+                    mapper = actor.GetMapper()
+                    if mapper:
+                        # Force pipeline update
+                        mapper.Modified()
+                        mapper.Update()
+                        
+                        # Mark input data as modified
+                        input_data = mapper.GetInput()
+                        if input_data:
+                            input_data.Modified()
+        
+        # 2. Force render
+        if hasattr(vtk_widget, 'GetRenderWindow'):
+            vtk_widget.GetRenderWindow().Render()
+        elif hasattr(vtk_widget, 'render'):
+            vtk_widget.render()
+
+    def _process_qt_events(self):
+        """Process pending Qt events to ensure UI updates"""
+        try:
+            from PySide6.QtCore import QCoreApplication
+            QCoreApplication.processEvents()
+            print("✅ Qt events processed")
+        except Exception as e:
+            pass
+
+    def _update_statistics(self):
+        """Update point count statistics widget"""
+        if hasattr(self, 'pointcountwidget') and self.pointcountwidget:
+            try:
+                from gui.point_count_widget import refreshpointstatistics
+                refreshpointstatistics(self)
+                print("✅ Statistics updated")
+            except Exception as e:
+                pass
+
+    def _refresh_changed_points_after_undo_redo(self, changed_mask):
+        """
+        ✅ FIXED: Always refreshes main view, regardless of cross-section state
+        
+        Args:
+            changed_mask: Boolean mask of points that were changed by undo/redo
+        """
+        print(f"\n{'='*60}")
+        print(f"🔄 PARTIAL REFRESH AFTER UNDO/REDO")
+        print(f"   Changed points: {changed_mask.sum():,}")
+        print(f"   Display mode: {getattr(self, 'display_mode', 'unknown')}")
+        print(f"{'='*60}")
+        
+        try:
+            import numpy as np
+            
+            # ========================================================================
+            # STEP 1: ALWAYS Refresh Main View First (most important!)
+            # ========================================================================
+            current_mode = getattr(self, 'display_mode', 'class')
+            print(f"\n🔄 Refreshing Main View...")
+            
+            try:
+                if current_mode == "class":
+                    # ✅ CRITICAL: Always use partial refresh for undo/redo
+                    print(f"   ⚡ Using PARTIAL refresh (undo/redo)")
+                    self._refresh_main_view_partial_with_mask(changed_mask)
+                    print(f"   ✅ Main View PARTIAL refresh complete")
+                    
+                elif current_mode == "shaded_class":
+                    print(f"   🌗 Shaded mode - FULL refresh required")
+                    from gui.shading_display import update_shaded_class
+                    update_shaded_class(
+                        self,
+                        getattr(self, "last_shade_azimuth", 45.0),
+                        getattr(self, "last_shade_angle", 45.0),
+                        getattr(self, "shade_ambient", 0.2)
+                    )
+                    print(f"   ✅ Main View refreshed (shaded_class mode)")
+                    
+                elif current_mode in ["rgb", "intensity", "elevation", "depth"]:
+                    print(f"   📊 {current_mode} mode - FULL refresh")
+                    from gui.pointcloud_display import update_pointcloud
+                    update_pointcloud(self, current_mode)
+                    print(f"   ✅ Main View refreshed ({current_mode} mode)")
+                    
+                else:
+                    print(f"   ⚠️ Unknown mode '{current_mode}' - using class mode")
+                    from gui.class_display import update_class_mode
+                    update_class_mode(self)
+                    
+            except Exception as e:
+                print(f"   ❌ Main View refresh failed: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # ========================================================================
+            # STEP 2: Refresh cross-section views (if any exist)
+            # ========================================================================
+            if hasattr(self, 'section_vtks') and self.section_vtks:
+                if hasattr(self, 'section_controller'):
+                    self.section_controller._last_changed_mask = changed_mask
+                
+                num_views = len(self.section_vtks)
+                print(f"\n🔄 Refreshing {num_views} cross-section view(s)...")
+                
+                for view_idx in sorted(self.section_vtks.keys()):
+                    print(f"   📋 View {view_idx + 1}:")
+                    try:
+                        # Use the single view refresh
+                        self._refresh_single_view_partial(view_idx, changed_mask)
+                    except Exception as e:
+                        print(f"      ⚠️ View {view_idx + 1} refresh failed: {e}")
+            
+            # ========================================================================
+            # STEP 3: Refresh Cut Section (if active)
+            # ========================================================================
+            if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
+                if getattr(self.cut_section_controller, 'is_cut_view_active', False):
+                    print(f"\n🔄 Refreshing Cut Section view...")
+                    try:
+                        if hasattr(self.cut_section_controller, 'on_classification_changed'):
+                            self.cut_section_controller.on_classification_changed()
+                            print(f"   ✅ Cut Section refreshed")
+                    except Exception as e:
+                        print(f"   ⚠️ Cut Section refresh failed: {e}")
+            
+            # ========================================================================
+            # STEP 4: Update Statistics
+            # ========================================================================
+            if hasattr(self, 'point_count_widget') and self.point_count_widget:
+                print(f"\n📊 Updating Point Statistics...")
+                try:
+                    from gui.point_count_widget import refresh_point_statistics
+                    refresh_point_statistics(self)
+                    print(f"   ✅ Point Statistics updated")
+                except Exception as e:
+                    print(f"   ⚠️ Statistics update failed: {e}")
+
+            # ========================================================================
+            # STEP 5: Force Final Render
+            # ========================================================================
+            try:
+                from PySide6.QtCore import QCoreApplication
+                
+                # Process any pending events
+                QCoreApplication.processEvents()
+                
+                # Force immediate render
+                if hasattr(self, 'vtk_widget') and self.vtk_widget:
+                    self.vtk_widget.GetRenderWindow().Render()
+                    print(f"✅ Final render forced")
+                
+            except Exception as e:
+                print(f"⚠️ Final render warning: {e}")
+
+            print(f"\n{'='*60}")
+            print(f"✅ REFRESH COMPLETE")
+            print(f"{'='*60}\n")
+
+        except Exception as e:  # ← This is the OUTER try/except from the function start
+                print(f"\n⚠️ PARTIAL REFRESH ERROR: {e}")
+                import traceback
+                traceback.print_exc()
+                    
+    def _refresh_single_view_partial(self, view_idx, changed_mask):
+        """
+        Helper: Only refresh a specific cross-section view if it contains changed points.
+        """
+        import numpy as np
+        
+        # 1. Get the view's point indices (core + buffer)
+        # We need to know WHICH points are in this view to see if they overlap with changed_mask
+        if not hasattr(self.app, 'section_controller'):
+            return
+        
+        # Robust Fallback: If we can't quickly check intersection, just refresh.
+        # But let's try to use the stored section masks if available.
+        view_indices = None
+        
+        # Example: Accessing stored masks from section controller if they exist
+        # This part depends on your data structure. Assuming standard 'section_indices'
+        if hasattr(self.app.section_controller, "views_data"):
+            vdata = self.app.section_controller.views_data.get(view_idx)
+            if vdata:
+                view_indices = vdata.get("indices")
+        
+        intersect = True
+        if view_indices is not None:
+            # Fast check: Do any of the view's points exist in the changed_mask?
+            # changed_mask is boolean full array, view_indices is list of ints
+            if not np.any(changed_mask[view_indices]):
+                intersect = False
+        
+        if intersect:
+            print(f"      ⚠️ Changed points detected in View {view_idx + 1} - Refreshing")
+            # Call the standard single-view refresh
+            self._refresh_single_view(view_idx)
+        else:
+            print(f"      ⏭️ View {view_idx + 1} unaffected - Skipping")
+
+    def _refresh_single_view_partial(self, view_index, changed_mask):
+        """
+        ✅ Refresh only changed points in a single cross-section view
+        
+        Args:
+            view_index: View index (0-3)
+            changed_mask: Boolean mask of changed points
+        """
+        import numpy as np
+        import pyvista as pv
+        
+        slot = view_index + 1
+        
+        print(f"      Checking for changed points in view data...")
+        
+        # Check if view exists
+        if not hasattr(self, 'section_vtks') or view_index not in self.section_vtks:
+            print(f"         ⏭️ View not found")
+            return
+        
+        vtk_widget = self.section_vtks[view_index]
+        
+        # Check if view has section data
+        pts = getattr(self, f'section_{view_index}_core_points', None)
+        buf = getattr(self, f'section_{view_index}_buffer_points', None)
+        core_mask = getattr(self, f'section_{view_index}_core_mask', None)
+        buffer_mask = getattr(self, f'section_{view_index}_buffer_mask', None)
+        
+        if pts is None or core_mask is None:
+            print(f"         ⏭️ No section data")
+            return
+        
+        # ✅ Check if ANY changed points are in this view
+        view_has_changes = np.any(changed_mask & core_mask)
+        if buf is not None and buffer_mask is not None:
+            view_has_changes |= np.any(changed_mask & buffer_mask)
+        
+        if not view_has_changes:
+            print(f"         ⏭️ No changed points in this view - skipping")
+            return
+        
+        print(f"         ✅ Changed points found - refreshing...")
+        
+        # ✅ Get THIS VIEW's palette from Display Mode
+        view_palette = None
+        
+        if hasattr(self, 'display_mode_dialog'):
+            dialog = self.display_mode_dialog
+            
+            if hasattr(dialog, 'view_palettes') and slot in dialog.view_palettes:
+                view_palette = dialog.view_palettes[slot]
+            elif hasattr(self, 'class_palette'):
+                view_palette = self.class_palette
+        elif hasattr(self, 'class_palette'):
+            view_palette = self.class_palette
+        
+        if not view_palette:
+            print(f"         ❌ No palette available")
+            return
+        
+        # Get visible classes
+        visible = [c for c, v in view_palette.items() if v.get("show", False)]
+        
+        if not visible:
+            print(f"         ⏭️ No visible classes")
+            vtk_widget.clear()
+            vtk_widget.render()
+            return
+        
+        # Get CURRENT classifications
+        current_classes = self.data["classification"]
+        
+        # Combine core + buffer points
+        if buf is not None and buffer_mask is not None:
+            all_pts = np.vstack([pts, buf])
+            all_cls = np.concatenate([
+                current_classes[core_mask],
+                current_classes[buffer_mask & ~core_mask]
+            ])
+        else:
+            all_pts = pts
+            all_cls = current_classes[core_mask]
+        
+        # Filter by visible classes
+        mask = np.isin(all_cls, visible)
+        filtered_pts = all_pts[mask]
+        filtered_cls = all_cls[mask]
+        
+        if len(filtered_pts) == 0:
+            vtk_widget.clear()
+            vtk_widget.render()
+            return
+        
+        # Build colors
+        colors = np.zeros((len(filtered_pts), 3), dtype=np.uint8)
+        for i, cls in enumerate(filtered_cls):
+            entry = view_palette.get(int(cls), {"color": (128, 128, 128)})
+            colors[i] = entry["color"]
+        
+        # Save camera
+        cam_pos = vtk_widget.camera_position
+        
+        # Clear and re-render
+        vtk_widget.clear()
+        
+        cloud = pv.PolyData(filtered_pts)
+        cloud["RGB"] = colors
+        
+        vtk_widget.add_points(
+            cloud,
+            scalars="RGB",
+            rgb=True,
+            point_size=3,
+            render_points_as_spheres=True
+        )
+        
+        # Restore camera
+        vtk_widget.camera_position = cam_pos
+        vtk_widget.render()
+        
+        print(f"         ✅ Refreshed {len(filtered_pts):,} points")
+        
+    def _refresh_main_view_partial_with_mask(self, changed_mask):
+        """
+        ✅ FIXED: Proper weight-based rendering order & Filter Isolation.
+        - Calculates correct point size (psize) even during targeted updates.
+        - Synchronizes border settings with global app state.
+        - Handles Undo/Redo class transitions without leaving 'ghost' points.
+        """
+        import numpy as np
+        import pyvista as pv
+ 
+        self._doing_partial_refresh = True
+        print("\n   🔄 Main View Targeted Refresh (Syncing Weights & Borders)...")
+ 
+        # --- Local Shader Helpers ---
+        def _border_ring_fraction(border_percent: float) -> float:
+            bp = max(0.0, float(border_percent or 0.0))
+            return min(0.45, bp / 60.0)
+ 
+        def _apply_black_ring_shader(actor, border_percent: float) -> None:
+            ring = _border_ring_fraction(border_percent)
+            if ring <= 0.0: return
+            try:
+                sp = actor.GetShaderProperty()
+                code = f"""
+        //VTK::Color::Impl
+        float r = length(gl_PointCoord.xy - vec2(0.5)) * 2.0;
+        if (r > 1.0) {{ discard; }}
+        opacity = 1.0;
+        float ring = {ring:.6f};
+        if (ring > 0.0) {{
+            float edge = 1.0 - ring;
+            if (r >= edge) {{
+                diffuseColor = vec3(0.0, 0.0, 0.0);
+                ambientColor = vec3(0.0, 0.0, 0.0);
+                opacity = 1.0;
+            }}
+        }}
+        """
+                sp.AddFragmentShaderReplacement("//VTK::Color::Impl", True, code, False)
+                actor.Modified()
+            except Exception: pass
+ 
+        try:
+            if self.display_mode != "class":
+                return
+            if self.data is None or "xyz" not in self.data or "classification" not in self.data:
+                return
+ 
+            n = len(self.data["classification"])
+            plotter = self.vtk_widget
+ 
+            # 1. Normalize mask (Handles both boolean arrays and index arrays)
+            undo_mask = None
+            undo_old_classes = None
+            try:
+                if hasattr(self, "undostack") and self.undostack:
+                    last = self.undostack[-1]
+                    m = last.get("mask", None)
+                    if isinstance(m, np.ndarray) and m.dtype == bool and m.shape[0] == n:
+                        undo_mask = m
+                        undo_old_classes = last.get("old_classes") or last.get("oldclasses")
+            except Exception: pass
+ 
+            if isinstance(changed_mask, np.ndarray) and changed_mask.dtype == bool and changed_mask.shape[0] == n:
+                mask_bool = changed_mask
+            else:
+                mask_bool = np.zeros(n, dtype=bool)
+                try:
+                    idx = np.asarray(changed_mask, dtype=np.int64)
+                    mask_bool[idx[(idx >= 0) & (idx < n)]] = True
+                except Exception: pass
+ 
+            if undo_mask is not None and undo_mask.any():
+                if (not mask_bool.any()) or (undo_mask.sum() <= mask_bool.sum()):
+                    mask_bool = undo_mask
+ 
+            if not np.any(mask_bool): return
+ 
+            # 2. Save Camera State
+            saved_camera = None
+            try:
+                cam = plotter.renderer.GetActiveCamera()
+                saved_camera = {
+                    "pos": cam.GetPosition(), "foc": cam.GetFocalPoint(), 
+                    "up": cam.GetViewUp(), "scale": cam.GetParallelScale(),
+                    "proj": cam.GetParallelProjection()
+                }
+            except Exception: pass
+ 
+            # 3. Retrieve Palette & Border Settings (Sync with Main View)
+            palette0 = None
+            dlg = getattr(self, "display_mode_dialog", None)
+            if dlg and hasattr(dlg, "view_palettes") and 0 in dlg.view_palettes:
+                palette0 = dlg.view_palettes[0] 
+            if palette0 is None:
+                palette0 = getattr(self, "class_palette", {}) or {}
+ 
+            # ✅ SYNC: Use global border settings to match the classification tools
+            border_val = float(getattr(self, "point_border_percent", 0) or 0.0)
+ 
+            xyz, classes = self.data["xyz"], self.data["classification"]
+            visible_classes = [c for c, v in palette0.items() if v.get("show", True)]
+            has_custom_weights = any(v.get("weight", 1.0) != 1.0 for v in palette0.values())
+            actor_keys = list(getattr(plotter, "actors", {}).keys())
+            has_per_class_actors = any(str(k).startswith("class_") for k in actor_keys)
+ 
+            # ===================================================================
+            # PATH A: Optimized/LOD pipeline (Single Actor)
+            # ===================================================================
+            if not has_per_class_actors:
+                from gui.performance_optimizations import fast_update_colors_optimized
+                try:
+                    fast_update_colors_optimized(self, mask_bool)
+                except Exception:
+                    from gui.pointcloud_display import fast_update_colors
+                    fast_update_colors(self, mask_bool)
+            # ===================================================================
+            # PATH B: Per-class actors (Handles Weights & Filters)
+            # ===================================================================
+            else:
+                # ✅ Path B1: Full Rebuild for Custom Weights (Prevents Z-fighting)
+                if has_custom_weights:
+                    recent_class = getattr(self, "_last_classified_to_class", None)
+                    for name in list(plotter.actors.keys()):
+                        if str(name).startswith(("class_", "border_")):
+                            plotter.remove_actor(name, render=False)
+ 
+                    # Heaviest at bottom, Recent on top
+                    class_weights = sorted([(c, palette0[c].get("weight", 1.0)) for c in visible_classes if c != recent_class], 
+                                           key=lambda x: x[1], reverse=True)
+                    render_order = [cw[0] for cw in class_weights]
+                    if recent_class in visible_classes: render_order.append(recent_class)
+ 
+                    for code in render_order:
+                        pts = xyz[classes == code]
+                        if pts.size == 0: continue
+                        entry = palette0.get(int(code), {})
+                        # Weight calculation
+                        w = max(0.1, min(float(entry.get("weight", 1.0)), 10.0))
+                        psize = max(1.5, min(2.5 * w, 30.0))
+                        cloud = pv.PolyData(pts)
+                        cloud["RGB"] = np.tile(np.array(entry.get("color", (128,128,128)), dtype=np.uint8), (len(pts), 1))
+                        act = plotter.add_points(cloud, scalars="RGB", rgb=True, point_size=psize, 
+                                               render_points_as_spheres=True, name=f"class_{code}", render=False)
+                        _apply_black_ring_shader(act, border_val)
+ 
+                # ✅ Path B2: Targeted Update (Flicker-Free, Handles specific point size)
+                else:
+                    changed_idx = np.where(mask_bool)[0]
+                    affected = set(np.unique(classes[changed_idx]).tolist())
+                    # Ensure the "from" classes are also refreshed to remove moving points
+                    if isinstance(undo_old_classes, np.ndarray):
+                        affected.update(np.unique(undo_old_classes).tolist())
+ 
+                    for c in affected:
+                        plotter.remove_actor(f"class_{c}", render=False)
+                        if c in visible_classes:
+                            pts = xyz[classes == c]
+                            if pts.size > 0:
+                                entry = palette0.get(int(c), {})
+                                # ✅ FIX: Calculate size from weight instead of hardcoding 2.5
+                                w = max(0.1, min(float(entry.get("weight", 1.0)), 10.0))
+                                psize = max(1.5, min(2.5 * w, 30.0))
+                                cloud = pv.PolyData(pts)
+                                cloud["RGB"] = np.tile(np.array(entry.get("color", (128,128,128)), dtype=np.uint8), (len(pts), 1))
+                                act = plotter.add_points(cloud, scalars="RGB", rgb=True, point_size=psize, 
+                                                       render_points_as_spheres=True, name=f"class_{c}", render=False)
+                                _apply_black_ring_shader(act, border_val)
+ 
+            # 4. Restore Camera
+            if saved_camera:
+                cam = plotter.renderer.GetActiveCamera()
+                cam.SetPosition(saved_camera["pos"])
+                cam.SetFocalPoint(saved_camera["foc"])
+                cam.SetViewUp(saved_camera["up"])
+                cam.SetParallelScale(saved_camera["scale"])
+                if saved_camera["proj"]: cam.ParallelProjectionOn()
+                plotter.renderer.ResetCameraClippingRange()
+ 
+            plotter.render()
+            if hasattr(self, "_last_classified_to_class"):
+                delattr(self, "_last_classified_to_class")
+ 
+        except Exception as e:
+            print(f"❌ Partial Refresh Error: {e}")
+        finally:
+            self._doing_partial_refresh = False
+
+    def _auto_backup(self):
+        """Automatically save a backup copy with custom settings."""
+        try:
+            settings = QSettings("NakshaAI", "LidarApp")
+            
+            # Double-check if enabled
+            if not settings.value("backup_enabled", True, type=bool):
+                return
+            
+            # Skip if no point cloud is loaded
+            if not hasattr(self, "data") or self.data is None:
+                print("⚠️ Auto-backup skipped: no data loaded")
+                return
+
+            # Determine base path of the current file
+            base_path = getattr(self, "last_save_path", None)
+            if base_path is None and hasattr(self, "loaded_file"):
+                base_path = self.loaded_file
+            if base_path is None:
+                print("⚠️ Auto-backup skipped: no file path found")
+                return
+
+            # ✅ Get backup path based on user settings
+            backup_path = self._get_backup_path(base_path)
+
+            # Avoid saving too frequently (< 30 s apart)
+            now = time.time()
+            if now - getattr(self, "last_auto_save_time", 0) < 30:
+                return
+            self.last_auto_save_time = now
+
+            # Perform silent save
+            from .save_pointcloud import save_pointcloud_quick
+            save_pointcloud_quick(self, backup_path)
+
+            msg = f"💾 Auto-backup saved → {backup_path}"   
+            print(msg)
+            if hasattr(self, "statusBar"):
+                self.statusBar().showMessage(msg, 5000)
+
+        except Exception as e:
+            print(f"⚠️ Auto-backup failed: {e}")
+    # ✅ ADD THESE THREE NEW METHODS RIGHT AFTER _auto_backup
+
+    def _load_backup_settings(self):
+        """Load and apply auto-backup settings."""
+        settings = QSettings("NakshaAI", "LidarApp")
+        
+        # Check if enabled
+        backup_enabled = settings.value("backup_enabled", True, type=bool)
+        interval_minutes = settings.value("backup_interval_minutes", 5, type=int)
+        
+        # Stop existing timer
+        if hasattr(self, 'auto_backup_timer'):
+            self.auto_backup_timer.stop()
+        
+        # Start with new interval if enabled
+        if backup_enabled:
+            interval_ms = interval_minutes * 60 * 1000
+            self.auto_backup_timer.start(interval_ms)
+            print(f"✅ Auto-backup enabled: every {interval_minutes} minutes")
+        else:
+            print("⏸️ Auto-backup disabled")
+
+    def open_backup_settings(self):
+        """Open the backup settings dialog."""
+        from gui.backup_settings_dialog import BackupSettingsDialog
+        
+        dialog = BackupSettingsDialog(self)
+        dialog.settings_changed.connect(self._load_backup_settings)
+        dialog.exec()
+
+    def _get_backup_path(self, original_path):
+        """
+        Get the backup file path based on user settings.
+        
+        Args:
+            original_path: Path to the original file
+        
+        Returns:
+            Full path for the backup file
+        """
+        import os
+        from datetime import datetime
+        
+        settings = QSettings("NakshaAI", "LidarApp")
+        
+        # Get folder
+        use_custom = settings.value("backup_use_custom_path", False, type=bool)
+        
+        if use_custom:
+            backup_folder = settings.value("backup_custom_path", "", type=str)
+            if not backup_folder or not os.path.exists(backup_folder):
+                # Fallback to original folder
+                backup_folder = os.path.dirname(original_path)
+        else:
+            backup_folder = os.path.dirname(original_path)
+        
+        # Get filename format
+        filename = os.path.basename(original_path)
+        name, ext = os.path.splitext(filename)
+        
+        naming_format = settings.value("backup_naming_format", 0, type=int)
+        
+        if naming_format == 0:
+            # filename_backup.laz
+            backup_name = f"{name}_backup{ext}"
+        elif naming_format == 1:
+            # filename_YYYYMMDD_HHMMSS.laz
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"{name}_{timestamp}{ext}"
+        else:
+            # filename_autosave.laz
+            backup_name = f"{name}_autosave{ext}"
+        
+        return os.path.join(backup_folder, backup_name)
+    
+    def closeEvent(self, event):
+        """
+        Graceful, production-grade cleanup for a graphics app.
+        ✅ ENHANCED: Closes ALL dialogs and popups without leaving anything behind
+        ✅ FIX: Proper cut section cleanup BEFORE VTK widget destruction
+        """
+        reply = QMessageBox.question(
+            self, "Close Naksha Lidar",
+            "Are you sure you want to exit the application?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        print("🧹 Main window closing - cleaning up child dialogs")
+       
+        # List of dialog attributes to clean up
+        dialog_attrs = [
+            'inside_fence_dialog',
+            'by_class_dialog',
+            'closed_by_class_dialog',
+            'height_convert_dialog',
+            'display_mode_dialog',
+            'display_dialog'
+        ]
+       
+        for attr in dialog_attrs:
+            if hasattr(self, attr):
+                dialog = getattr(self, attr)
+                if dialog:
+                    try:
+                        dialog.close()
+                        print(f"   ✅ Closed {attr}")
+                    except:
+                        pass
+       
+        # Close ribbon dialogs
+        if hasattr(self, 'ribbon_manager') and hasattr(self.ribbon_manager, 'ribbons'):
+            by_class_ribbon = self.ribbon_manager.ribbons.get('by_class')
+            if by_class_ribbon:
+                for attr in ['inside_fence_dialog', 'by_class_dialog', 'closed_by_class_dialog', 'height_convert_dialog']:
+                    if hasattr(by_class_ribbon, attr):
+                        dialog = getattr(by_class_ribbon, attr)
+                        if dialog:
+                            try:
+                                dialog.close()
+                            except:
+                                pass
+       
+        print("✅ Main window cleanup complete")
+        event.accept()
+
+        if reply == QMessageBox.No:
+            event.ignore()
+            print("User cancelled closing the main window")
+            return
+
+        print("=" * 60)
+        print("Main Window Closing - Graceful Cleanup")
+        print("=" * 60)
+
+        try:
+            # Stop memory guard early so its timers do not race with teardown.
+            mem_guard = getattr(self, "_mem_guard", None)
+            if mem_guard is not None:
+                try:
+                    mem_guard.stop()
+                except Exception:
+                    pass
+
+            try:
+                from .memory_manager import ObserverRegistry
+
+                ObserverRegistry.release_all()
+            except Exception:
+                pass
+
+            # ============================================================
+            # SAVE WINDOW STATE AND INDIVIDUAL DOCK GEOMETRIES
+            # ============================================================
+            try:
+                # Save main window state
+                self.settings.setValue("geometry", self.saveGeometry())
+                self.settings.setValue("windowState", self.saveState())
+
+                # ✅ NEW: Save each cross-section dock geometry individually
+                if hasattr(self, 'section_docks') and self.section_docks:
+                    for view_index, dock in self.section_docks.items():
+                        dock_geo_key = f"CrossSectionDock_{view_index}_geometry"
+                        self.settings.setValue(dock_geo_key, dock.saveGeometry())
+                        print(f"   ✅ Saved dock {view_index + 1} geometry")
+                
+                # ✅ NEW: Save cut section dock geometry
+                if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
+                    if hasattr(self.cut_section_controller, 'cut_dock') and self.cut_section_controller.cut_dock:
+                        try:
+                            self.settings.setValue(
+                                "CutSectionDock_geometry",
+                                self.cut_section_controller.cut_dock.saveGeometry()
+                            )
+                            print(f"   ✅ Saved cut section dock geometry")
+                        except Exception as e:
+                            print(f"   ⚠️ Cut dock geometry save failed: {e}")
+
+                print("✓ Window state and dock positions saved")
+            except Exception as e:
+                print(f"Warning: Could not save window state: {e}")
+
+            # ============================================================
+            # ✅ CRITICAL FIX: CLEAN CUT SECTION CONTROLLER FIRST
+            # Must happen BEFORE any VTK widget cleanup
+            # ============================================================
+            print("\n🔧 Cleaning cut section controller...")
+            if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
+                try:
+                    # Mark cut section for forced close
+                    if hasattr(self.cut_section_controller, 'cut_dock') and self.cut_section_controller.cut_dock:
+                        # Create a fake event with _force_close flag
+                        from PySide6.QtGui import QCloseEvent
+                        fake_event = QCloseEvent()
+                        fake_event._force_close = True
+                        
+                        # Trigger safe cleanup
+                        if hasattr(self.cut_section_controller.cut_dock, 'closeEvent'):
+                            self.cut_section_controller.cut_dock.closeEvent(fake_event)
+                    
+                    # Call controller's clear method
+                    self.cut_section_controller.clear()
+                    self.cut_section_controller = None
+                    print("   ✅ Cut section controller cleaned")
+                except Exception as e:
+                    print(f"   ⚠️ Cut section cleanup error: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # ============================================================
+            # CLOSE ALL DIALOGS AND POPUPS (COMPREHENSIVE)
+            # ============================================================
+            print("\n🔒 Closing all dialogs and popups...")
+
+            # ✅ 1. Close the "Select Cross-Section View" dialog
+            if hasattr(self, '_view_selector_dialog') and self._view_selector_dialog:
+                try:
+                    print("   🔒 Closing 'Select Cross-Section View' dialog")
+                    if self._view_selector_dialog.isVisible():
+                        self._view_selector_dialog.close()
+                    self._view_selector_dialog.deleteLater()
+                    self._view_selector_dialog = None
+                    print("   ✅ 'Select Cross-Section View' dialog closed")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to close view selector dialog: {e}")
+
+            # ✅ 2. Close Display Mode dialog
+            if hasattr(self, "display_dialog") and self.display_dialog:
+                try:
+                    print("   🔒 Closing Display Mode dialog")
+                    self.display_dialog.close()
+                    self.display_dialog.deleteLater()
+                    self.display_dialog = None
+                    print("   ✅ Display Mode dialog closed")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to close display dialog: {e}")
+
+            # ✅ 3. Close legacy displaymodedialog (if it exists separately)
+            if hasattr(self, "displaymodedialog") and self.displaymodedialog:
+                try:
+                    print("   🔒 Closing legacy Display Mode dialog")
+                    self.displaymodedialog.close()
+                    self.displaymodedialog.deleteLater()
+                    self.displaymodedialog = None
+                    print("   ✅ Legacy Display Mode dialog closed")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to close legacy display dialog: {e}")
+
+            # ✅ 4. Close Class Picker
+            if hasattr(self, "class_picker") and self.class_picker:
+                try:
+                    print("   🔒 Closing Class Picker")
+                    self.class_picker.close()
+                    self.class_picker.deleteLater()
+                    self.class_picker = None
+                    print("   ✅ Class Picker closed")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to close class picker: {e}")
+
+            # ✅ 5. Close ShortcutManager (Config Tools)
+            try:
+                from gui.shortcut_manager import ShortcutManager
+                if ShortcutManager.instance is not None:
+                    print("   🔒 Closing Shortcut Manager (Config Tools)")
+                    ShortcutManager.instance.close()
+                    ShortcutManager.instance.deleteLater()
+                    ShortcutManager.instance = None
+                    print("   ✅ Shortcut Manager closed")
+            except Exception as e:
+                print(f"   ⚠️ Failed to close ShortcutManager: {e}")
+
+            # ✅ 6. Close any active tool dialog
+            if hasattr(self, "active_tool_dialog") and self.active_tool_dialog:
+                try:
+                    if self.active_tool_dialog.isVisible():
+                        print("   🔒 Closing active tool dialog")
+                        self.active_tool_dialog.close()
+                        self.active_tool_dialog.deleteLater()
+                        self.active_tool_dialog = None
+                        print("   ✅ Active tool dialog closed")
+                except Exception as e:
+                    print(f"   ⚠️ Failed to close active tool dialog: {e}")
+
+            # ✅ 7. Close ALL remaining QDialog instances (catch-all)
+            try:
+                from PySide6.QtWidgets import QDialog
+                all_dialogs = self.findChildren(QDialog)
+                if all_dialogs:
+                    print(f"   🔍 Found {len(all_dialogs)} additional dialog(s)")
+                    for dialog in all_dialogs:
+                        try:
+                            if dialog.isVisible():
+                                dialog_name = dialog.windowTitle() or type(dialog).__name__
+                                print(f"   🔒 Closing: {dialog_name}")
+                                dialog.close()
+                                dialog.deleteLater()
+                        except Exception as e:
+                            print(f"   ⚠️ Failed to close dialog: {e}")
+                    print(f"   ✅ All {len(all_dialogs)} dialog(s) closed")
+            except Exception as e:
+                print(f"   ⚠️ Failed to close remaining dialogs: {e}")
+
+            # ✅ 8. Close ALL QWidget-based popups (if any)
+            try:
+                from PySide6.QtWidgets import QWidget
+                from PySide6.QtCore import Qt
+                all_widgets = self.findChildren(QWidget)
+                popup_widgets = [w for w in all_widgets if w.windowFlags() & Qt.Tool or w.windowFlags() & Qt.Popup]
+                if popup_widgets:
+                    print(f"   🔍 Found {len(popup_widgets)} popup widget(s)")
+                    for widget in popup_widgets:
+                        try:
+                            if widget.isVisible() and widget != self:
+                                widget_name = widget.objectName() or type(widget).__name__
+                                print(f"   🔒 Closing popup: {widget_name}")
+                                widget.close()
+                                widget.deleteLater()
+                        except Exception as e:
+                            print(f"   ⚠️ Failed to close popup widget: {e}")
+                    print(f"   ✅ All {len(popup_widgets)} popup(s) closed")
+            except Exception as e:
+                print(f"   ⚠️ Failed to close popup widgets: {e}")
+
+            print("✅ All dialogs and popups closed\n")
+
+            # ============================================================
+            # STOP BACKGROUND THREADS AND TIMERS
+            # ============================================================
+            import time
+            import gc
+            from PySide6.QtCore import QTimer, QCoreApplication
+
+            # 1. Gracefully stop background threads (wait up to 8 seconds)
+            if hasattr(self, "backupthread"):
+                t = self.backupthread
+                if t and t.isRunning():
+                    print("Waiting for backup thread to finish...")
+                    t.quit()
+                    waited = t.wait(9000)
+                    if not waited:
+                        print("Backup thread did not finish, forcing terminate")
+                        t.terminate()
+                        t.wait()
+                    self.backupthread = None
+                    print("Backup thread closed")
+
+            # 2. Stop ALL timers, waiting for events to flush
+            if hasattr(self, "backuptimer") and self.backuptimer:
+                try:
+                    self.backuptimer.stop()
+                    QCoreApplication.processEvents()
+                    self.backuptimer.deleteLater()
+                    self.backuptimer = None
+                except Exception:
+                    pass
+
+            for timer in self.findChildren(QTimer):
+                try:
+                    if timer.isActive():
+                        timer.stop()
+                    QCoreApplication.processEvents()
+                    timer.deleteLater()
+                except Exception:
+                    pass
+            print("All timers stopped")
+
+            # ============================================================
+            # CLEAN VTK WIDGETS
+            # ============================================================
+            def cleanvtkwidget(vtkwidget, label):
+                """Stop rendertimer CLEANLY if exists"""
+                # ✅ FIX: Safe timer cleanup (PyVistaQt compatibility)
+                if hasattr(vtkwidget, "rendertimer"):
+                    try:
+                        if vtkwidget.rendertimer is not None:
+                            try:
+                                vtkwidget.rendertimer.stop()
+                                QCoreApplication.processEvents()
+                                time.sleep(0.05)
+                                vtkwidget.rendertimer.deleteLater()
+                            except RuntimeError:
+                                # Timer already deleted by Qt - this is OK
+                                pass
+                            vtkwidget.rendertimer = None
+                    except Exception:
+                        vtkwidget.rendertimer = None
+                
+                # ✅ FIX: Safe render window finalization (VTK version compatibility)
+                try:
+                    if hasattr(vtkwidget, "GetRenderWindow"):
+                        rw = vtkwidget.GetRenderWindow()
+                        if rw:
+                            # ✅ Check if SetMapped exists before calling (not all VTK versions have it)
+                            if hasattr(rw, 'SetMapped'):
+                                rw.SetMapped(False)
+                            rw.Finalize()
+                            del rw
+                except Exception as e:
+                    print(f"   ⚠️ RenderWindow finalize warning: {e}")
+                
+                if hasattr(vtkwidget, "SetRenderWindow"):
+                    vtkwidget.SetRenderWindow(None)
+                if hasattr(vtkwidget, "ren") and vtkwidget.ren:
+                    vtkwidget.ren.RemoveAllViewProps()
+                
+                vtkwidget.deleteLater()
+                print(f"{label} VTK widget cleaned")
+
+
+            # Clean cross-section VTK widgets
+            if hasattr(self, "section_vtks") and self.section_vtks:
+                for viewidx, vtkwidget in list(self.section_vtks.items()):
+                    try:
+                        cleanvtkwidget(vtkwidget, f"Cross-section View {viewidx+1}")
+                    except Exception as e:
+                        print(f"Cross-section VTK error: {e}")
+                self.section_vtks.clear()
+                self.section_vtks = None
+
+            # Alternative attribute name check
+            if hasattr(self, "sectionvtks") and self.sectionvtks:
+                for viewidx, vtkwidget in list(self.sectionvtks.items()):
+                    try:
+                        cleanvtkwidget(vtkwidget, f"Cross-section View {viewidx+1}")
+                    except Exception as e:
+                        print(f"Cross-section VTK error: {e}")
+                self.sectionvtks.clear()
+                self.sectionvtks = None
+
+            # ✅ FIX: Cut section VTK cleanup (already handled above, skip duplicate)
+            # Cut section controller was already cleaned at the start
+
+            # Clean main VTK widget
+            if hasattr(self, "vtk_widget") and self.vtk_widget:
+                try:
+                    cleanvtkwidget(self.vtk_widget, "Main")
+                    self.vtk_widget = None
+                except Exception as e:
+                    print(f"Main VTK error: {e}")
+
+            # Alternative attribute name check
+            if hasattr(self, "vtkwidget") and self.vtkwidget:
+                try:
+                    cleanvtkwidget(self.vtkwidget, "Main")
+                    self.vtkwidget = None
+                except Exception as e:
+                    print(f"Main VTK error: {e}")
+
+            # ============================================================
+            # FINAL CLEANUP
+            # ============================================================
+            # Clear data objects
+            if hasattr(self, "data"):
+                self.data = None
+                print("Data references cleared")
+
+            # Suppress VTK warnings (optional)
+            try:
+                import vtk
+                output = vtk.vtkOutputWindow()
+                output.GlobalWarningDisplayOff()
+            except Exception:
+                pass
+
+            # Wait for OS/resource cleanup
+            print("Waiting for OS/resource cleanup (0.5s)...")
+            time.sleep(0.5)
+            gc.collect()
+
+            print("=" * 60)
+            print("Cleanup Complete - Window Closing")
+            print("=" * 60)
+            event.accept()
+
+        except Exception as e:
+            print(f"Critical error in graceful shutdown: {e}")
+            import traceback
+            traceback.print_exc()
+            event.accept()
+
+        super().closeEvent(event)
+    # ------------------------------------------------------------
+    # BORDER CONTROL POPUP
+    # ------------------------------------------------------------
+    def open_border_control(self):
+        """Open the TerraScan-style border control popup."""
+        try:
+            from .border_popup import BorderControlDialog
+            dlg = BorderControlDialog(self)
+            dlg.setModal(False)
+            dlg.show()
+        except Exception as e:
+            print(f"⚠️ Failed to open Border Control dialog: {e}")
+
+
+    def deactivate_all_tools(self):
+        """Disable all interactor observers and reset to default."""
+        if hasattr(self, "sec_vtk") and self.sec_vtk is not None:
+            iren = self.sec_vtk.interactor
+            iren.RemoveObservers("LeftButtonPressEvent")
+            iren.RemoveObservers("MouseMoveEvent")
+            iren.RemoveObservers("LeftButtonReleaseEvent")
+            iren.SetInteractorStyle(None)
+        self.active_tool = None
+        print("🔵 All tools deactivated.")
+
+    def enable_2d_lock(self):
+        """
+        Lock the VTK interactor to 2D mode (no 3D rotation).
+        Allows only pan and zoom — ideal for Plan View.
+        """
+        from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+        interactor = self.vtk_widget.interactor
+
+        # Force orthographic projection
+        cam = self.vtk_widget.renderer.GetActiveCamera()
+        cam.ParallelProjectionOn()
+        cam.SetViewUp(0, 1, 0)
+        cam.SetPosition(0, 0, 1)
+        cam.SetFocalPoint(0, 0, 0)
+        self.vtk_widget.renderer.ResetCamera()
+        self.vtk_widget.render()
+
+        style = vtkInteractorStyleImage()  # pan/zoom only, no rotation
+        interactor.SetInteractorStyle(style)
+        print("🔒 Plan View locked to 2D (rotation disabled).")
+
+    def enable_3d_orbit(self):
+        """
+        Restore normal 3D orbit controls (trackball).
+        """
+        from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
+        interactor = self.vtk_widget.interactor
+        style = vtkInteractorStyleTrackballCamera()
+        interactor.SetInteractorStyle(style)
+
+        cam = self.vtk_widget.renderer.GetActiveCamera()
+        cam.ParallelProjectionOff()
+        self.vtk_widget.render()
+        print("🌀 3D orbit mode re-enabled.")
+
+
+
+    def save_file_with_drawings(self, filepath=None):
+        """
+        Save point cloud AND drawings together.
+        Wrapper that calls both save functions.
+        """
+        # Import the save function
+        from .save_pointcloud import save_pointcloud
+        
+        # Save the point cloud
+        result = save_pointcloud(self, filepath)
+        
+        # If save was successful, also save drawings
+        if result and hasattr(self, 'digitizer') and self.digitizer:
+            # Use the actual saved filepath
+            actual_path = getattr(self, 'last_save_path', filepath)
+            if actual_path:
+                self.digitizer.auto_save_drawings(actual_path)
+        
+        return result
+
+
+
+    def _setup_sidebar_layout(self):
+        """Setup horizontal ribbon layout below top bar"""
+        if not hasattr(self, "ribbon_container"):
+            # Create ribbon container widget
+            self.ribbon_container = QWidget()
+            self.ribbon_container.setObjectName("RibbonContainer")
+        
+        # Clear existing layout
+        if self.ribbon_container.layout():
+            QWidget().setLayout(self.ribbon_container.layout())
+        
+        ribbon_layout = QHBoxLayout(self.ribbon_container)
+        ribbon_layout.setContentsMargins(8, 4, 8, 4)
+        ribbon_layout.setSpacing(0)
+        
+        # Add all ribbons
+        for name, ribbon in self.ribbon_manager.ribbons.items():
+            ribbon.setParent(self.ribbon_container)
+            ribbon_layout.addWidget(ribbon)
+            ribbon.hide()
+        
+        ribbon_layout.addStretch()
+        self.ribbon_container.setFixedHeight(0)  # hidden initially
+        # ------------------------
+                    
+    def _connect_sidebar_actions(self):
+                """Connect ribbon signals to main window actions"""
+        
+                # =========================
+                # File ribbon (FIXED: no double connections)
+                # =========================
+                file_ribbon = self.ribbon_manager.ribbons.get("file") if hasattr(self, "ribbon_manager") else None
+                if file_ribbon:
+                    # Open (disconnect previous, then connect once)
+                    try:
+                        file_ribbon.open_file.disconnect(self.open_file)
+                    except (TypeError, RuntimeError):
+                        pass
+                    file_ribbon.open_file.connect(self.open_file)
+        
+                    # Save As… (dialog)
+                    try:
+                        from .save_pointcloud import save_pointcloud
+                        try:
+                            file_ribbon.save_file.disconnect()
+                        except Exception:
+                            pass
+                        file_ribbon.save_file.connect(lambda: save_pointcloud(self, path=None, show_dialog=True))
+                    except Exception as e:
+                        print(f"⚠️ Failed to connect Save As: {e}")
+        
+                    # Save (no dialog)
+                    if hasattr(file_ribbon, "save_quick"):
+                        try:
+                            file_ribbon.save_quick.disconnect()
+                        except Exception:
+                            pass
+                        file_ribbon.save_quick.connect(self._save_quick_no_dialog)
+        
+                # =========================
+                # Edit ribbon
+                # =========================
+                edit_ribbon = self.ribbon_manager.ribbons['edit']
+                try:
+                    edit_ribbon.edit_action.disconnect()
+                except Exception:
+                    pass
+                edit_ribbon.edit_action.connect(self.handle_edit_action)
+        
+                # =========================
+                # View ribbon
+                # =========================
+                view_ribbon = self.ribbon_manager.ribbons['view']
+                try:
+                    view_ribbon.view_changed.disconnect()
+                except Exception:
+                    pass
+                view_ribbon.view_changed.connect(self.handle_view_change)
+        
+                try:
+                    view_ribbon.display_changed.disconnect()
+                except Exception:
+                    pass
+                view_ribbon.display_changed.connect(self.set_display_mode)
+        
+                try:
+                    view_ribbon.shadow_toggled.disconnect()
+                except Exception:
+                    pass
+                view_ribbon.shadow_toggled.connect(self.toggle_shadow_in_view)
+        
+                try:
+                    view_ribbon.depth_toggled.disconnect()
+                except Exception:
+                    pass
+                view_ribbon.depth_toggled.connect(self.toggle_depth_in_view)
+        
+                try:
+                    view_ribbon.saturation_changed.disconnect()
+                except Exception:
+                    pass
+                view_ribbon.saturation_changed.connect(self.on_saturation_changed)
+        
+                try:
+                    view_ribbon.sharpness_changed.disconnect()
+                except Exception:
+                    pass
+                view_ribbon.sharpness_changed.connect(self.on_sharpness_changed)
+        
+                # =========================
+                # Tools ribbon
+                # =========================
+                tools_ribbon = self.ribbon_manager.ribbons['tools']
+                try:
+                    tools_ribbon.tool_activated.disconnect()
+                except Exception:
+                    pass
+                tools_ribbon.tool_activated.connect(self.handle_tool_activation)
+        
+                # =========================
+                # Classify ribbon
+                # =========================
+                classify_ribbon = self.ribbon_manager.ribbons['classify']
+                try:
+                    classify_ribbon.classify_tool_selected.disconnect()
+                except Exception:
+                    pass
+                classify_ribbon.classify_tool_selected.connect(self.set_classify_tool)
+        
+                # =========================
+                # Display ribbon
+                # =========================
+                display_ribbon = self.ribbon_manager.ribbons['display']
+                try:
+                    display_ribbon.display_mode_clicked.disconnect()
+                except Exception:
+                    pass
+                display_ribbon.display_mode_clicked.connect(self.open_display_mode)
+        
+                try:
+                    display_ribbon.border_width_changed.disconnect()
+                except Exception:
+                    pass
+                display_ribbon.border_width_changed.connect(self.on_border_changed)
+        
+                print("✅ Border slider connected to on_border_changed")
+        
+                # =========================
+                # Draw ribbon
+                # =========================
+                if hasattr(self, 'digitizer'):
+                    draw_ribbon = self.ribbon_manager.ribbons['draw']
+        
+                    def on_draw_tool_selected(tool_name):
+                        # ◀◀◀ NEW: Deactivate curve select mode when drawing
+                        if hasattr(self, 'curve_tool') and self.curve_tool:
+                            if getattr(self.curve_tool, '_select_mode', False):
+                                self.curve_tool.deactivate_select_mode()
+                        
+                        if hasattr(self, 'digitizer'):
+                            self.digitizer.enabled = True
+                            print("✅ Digitizer enabled for drawing")
+                        self.digitizer.set_tool(tool_name)
+        
+                    try:
+                        draw_ribbon.draw_tool_selected.disconnect()
+                    except Exception:
+                        pass
+                    draw_ribbon.draw_tool_selected.connect(on_draw_tool_selected)
+        
+                    try:
+                        draw_ribbon.clear_requested.disconnect()
+                    except Exception:
+                        pass
+                    draw_ribbon.clear_requested.connect(self.digitizer.clear_drawings)
+                    
+                    
+                    try:
+                        draw_ribbon.grid_requested.disconnect()
+                    except Exception:
+                        pass
+                    draw_ribbon.grid_requested.connect(self.activate_grid_tool)
+        
+                # =========================
+                # Measure ribbon
+                # =========================
+                measure_ribbon = self.ribbon_manager.ribbons['measure']
+                try:
+                    measure_ribbon.measure_tool_selected.disconnect()
+                except Exception:
+                    pass
+                measure_ribbon.measure_tool_selected.connect(self.activate_measurement_tool)
+        
+                try:
+                    measure_ribbon.clear_measurements.disconnect()
+                except Exception:
+                    pass
+                measure_ribbon.clear_measurements.connect(self.clear_all_measurements)
+
+
+                # =========================
+                # Curve ribbon (ADD THIS - it's missing!)
+                # =========================
+                curve_ribbon = self.ribbon_manager.ribbons.get('curve')
+                if curve_ribbon:
+                    try:
+                        curve_ribbon.curve_tool_selected.disconnect()
+                    except Exception:
+                        pass
+                    curve_ribbon.curve_tool_selected.connect(self.on_curve_button_clicked)
+                    
+                    try:
+                        curve_ribbon.clear_curves.disconnect()
+                    except Exception:
+                        pass
+                    curve_ribbon.clear_curves.connect(lambda: self.curve_tool.clear_all_curves() if hasattr(self, 'curve_tool') else None)
+                    
+                    print("✅ Curve ribbon connected")
+                
+    def on_saturation_changed(self, value):
+        """Handle saturation slider changes from View Ribbon."""
+        # Convert percentage (0-200) to multiplier (0.0-2.0)
+        self.current_saturation = value / 100.0
+        print(f"🎨 Saturation set to {value}% (multiplier: {self.current_saturation:.2f}x)")
+        
+        # Refresh display if in depth or intensity mode
+        if self.display_mode in ["depth", "intensity"]:
+            from gui.pointcloud_display import update_pointcloud
+            update_pointcloud(self, self.display_mode)
+            self.statusBar().showMessage(f"🎨 Saturation: {value}%", 2000)
+
+    def on_sharpness_changed(self, value):
+        """Handle sharpness slider changes from View Ribbon."""
+        # Convert percentage (0-200) to multiplier (0.0-2.0)
+        self.current_sharpness = value / 100.0
+        print(f"🔪 Sharpness set to {value}% (multiplier: {self.current_sharpness:.2f}x)")
+        
+        # Refresh display if in depth or intensity mode
+        if self.display_mode in ["depth", "intensity"]:
+            from gui.pointcloud_display import update_pointcloud
+            update_pointcloud(self, self.display_mode)
+            self.statusBar().showMessage(f"🔪 Sharpness: {value}%", 2000)
+
+            # In app_window.py - add to Tools ribbon
+    def debug_class_0(self):
+        """Show Class 0 diagnostic info"""
+        if self.data is None:
+            print("No data loaded")
+            return
+        
+        unique_classes = np.unique(self.data["classification"])
+        class_0_count = np.sum(self.data["classification"] == 0)
+        
+        info = f"""
+        ═══════════════════════════════════
+        CLASS 0 DIAGNOSTIC
+        ═══════════════════════════════════
+        Total points: {len(self.data['classification']):,}
+        Class 0 points: {class_0_count:,} ({100*class_0_count/len(self.data['classification']):.1f}%)
+        Unique classes: {unique_classes}
+        
+        Class 0 in palette: {0 in self.class_palette}
+        Class 0 visible: {self.class_palette.get(0, {}).get('show', False)}
+        Class 0 color: {self.class_palette.get(0, {}).get('color', 'NOT SET')}
+        ═══════════════════════════════════
+        """
+        
+        print(info)
+        QMessageBox.information(self, "Class 0 Diagnostic", info)
+
+        
+    def resizeEvent(self, event):
+        """Reposition sidebars on window resize"""
+        super().resizeEvent(event)
+        if hasattr(self, 'sidebar_manager'):
+            for sidebar in self.sidebar_manager.sidebars.values():
+                sidebar.move(self.width() - 280, 0)
+                sidebar.resize(280, self.height())
+
+
+    def handle_view_change(self, mode):
+        """Handle view mode changes from visual panel or sidebar"""
+        
+        # ✅ NEW: Store DXF visibility state
+        dxf_visibility = {}
+        if hasattr(self, 'dxf_actors'):
+            for i, dxf_data in enumerate(self.dxf_actors):
+                dxf_visibility[i] = []
+                for actor in dxf_data['actors']:
+                    dxf_visibility[i].append(actor.GetVisibility())
+        
+        # ✅ CRITICAL: Temporarily disable cross-section interactor BEFORE view change
+        interactor_was_active = False
+        if hasattr(self, 'cross_interactor') and self.cross_interactor:
+            interactor_was_active = True
+            cross_interactor_ref = self.cross_interactor
+            
+            from vtk import vtkInteractorStyleTrackballCamera
+            self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
+        
+        # Change the view (this resets camera)
+        if mode == '3d':
+            self.toggle_view_mode('3d')
+        else:
+            self.toggle_view_mode('2d')
+
+        allow_3d_switch = mode == '3d'
+        previous_allow_3d = getattr(self, "_allow_3d_switch", False)
+        try:
+            if allow_3d_switch:
+                self._allow_3d_switch = True
+            set_view(self, mode)
+        finally:
+            self._allow_3d_switch = previous_allow_3d
+        
+        # ✅ NEW: Restore DXF visibility after view change
+        if hasattr(self, 'dxf_actors') and dxf_visibility:
+            for i, dxf_data in enumerate(self.dxf_actors):
+                if i in dxf_visibility:
+                    for j, actor in enumerate(dxf_data['actors']):
+                        if j < len(dxf_visibility[i]):
+                            actor.SetVisibility(dxf_visibility[i][j])
+        
+        # ✅ CRITICAL: Re-attach interactor AFTER view change with fresh state
+        if interactor_was_active:
+            cross_interactor_ref.P1 = None
+            cross_interactor_ref.P2 = None
+            cross_interactor_ref.slice_state = 0
+            
+            self.vtk_widget.interactor.SetInteractorStyle(cross_interactor_ref)
+            print(f"✅ Cross-section interactor reattached for {mode} view")
+            
+            if hasattr(self, 'section_controller') and self.section_controller:
+                try:
+                    self.section_controller.clear()
+                except Exception as e:
+                    print(f"⚠️ Clear failed: {e}")
+        
+        # Keep existing cross-section windows visible
+        if hasattr(self, 'section_vtks') and self.section_vtks:
+            for view_idx, vtk_widget in self.section_vtks.items():
+                if vtk_widget:
+                    try:
+                        vtk_widget.render()
+                    except Exception as e:
+                        print(f"⚠️ View {view_idx + 1} render failed: {e}")
+        
+        # ✅ NEW: Final render to show DXF
+        self.vtk_widget.GetRenderWindow().Render()
+
+    def _deactivate_digitize_tool(self):
+        """Deactivate any active digitize drawing tool (for mutual exclusion with section tools)."""
+        if hasattr(self, 'digitizer') and self.digitizer and getattr(self.digitizer, 'active_tool', None):
+            try:
+                print("🛑 Deactivating digitize tool before section tool activation")
+                self.digitizer.set_tool(None)
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate digitize tool: {e}")
+
+    def handle_tool_activation(self, tool_name):
+        """Handle tool activation from sidebar"""
+        if tool_name == "cross_section":
+            self.toggle_cross_section_mode(True)
+            self.set_cross_cursor_active(True)
+        elif tool_name == "cut_section":
+            self.cut_section_controller.activate()
+            self.set_cross_cursor_active(True)
+        elif tool_name == "set_cut_width":
+            self._prompt_cut_width()
+            self.set_cross_cursor_active(True)
+        elif tool_name == "cross_settings":
+            self.open_cross_section_settings()
+        elif tool_name == "element_selection":
+            self.open_selection_mode()
+            # self.set_cross_cursor_active(True)
+        elif tool_name == "configure_shortcuts":
+            self.open_shortcut_manager()
+        elif tool_name == "backup_settings":  # ← ADD THIS
+            self.open_backup_settings()
+        elif tool_name == "prj_block_identifier":  # ← ADD THIS
+            from gui.prj_block_identifier import show_block_identifier_dialog
+            self.block_identifier_dialog = show_block_identifier_dialog(self)
+        elif tool_name == "sync_views":
+            # This will eventually open the Synchronize Views dialog
+            self.open_sync_views_dialog()
+
+        else:
+            print(f"⚠️ Unknown tool_name from ToolsRibbon: {tool_name}")
+
+
+
+    def open_cross_section_settings(self):
+        """Open the cross-section line settings dialog"""
+        from gui.cross_section_settings_dialog import CrossSectionSettingsDialog
+       
+        # Create or show existing dialog
+        if not hasattr(self, 'cross_settings_dialog') or self.cross_settings_dialog is None:
+            self.cross_settings_dialog = CrossSectionSettingsDialog(self)
+       
+        self.cross_settings_dialog.show()
+        self.cross_settings_dialog.raise_()
+        self.cross_settings_dialog.activateWindow()
+        
+    def open_sync_views_dialog(self):
+        """Open the Synchronize Views dialog."""
+        from gui.menu_sidebar_system import SyncViewsDialog
+
+        if not hasattr(self, "_sync_views_dialog") or self._sync_views_dialog is None:
+            self._sync_views_dialog = SyncViewsDialog(self, self)
+
+        self._sync_views_dialog._load_from_app_state()  # refresh from current mapping
+        self._sync_views_dialog.show()
+        self._sync_views_dialog.raise_()
+        self._sync_views_dialog.activateWindow()
+       
+   
+    def _load_cross_section_settings(self):
+        """Load saved cross-section line preferences"""
+        from PySide6.QtCore import QSettings
+        from PySide6.QtGui import QColor
+       
+        settings = QSettings("NakshaAI", "LidarApp")
+       
+        # Load color
+        color_name = settings.value("cross_line_color", "#FF00FF")  # Magenta hex
+        qcolor = QColor(color_name)
+        self.cross_line_color = (qcolor.redF(), qcolor.greenF(), qcolor.blueF())
+       
+        # Load width
+        self.cross_line_width = settings.value("cross_line_width", 3, type=int)
+       
+        # Load style
+        self.cross_line_style = settings.value("cross_line_style", "solid", type=str)
+       
+        print(f"✅ Loaded cross-section settings: {color_name}, {self.cross_line_width}px, {self.cross_line_style}")
+           
+
+
+    def handle_edit_action(self, action: str):
+        """Handle edit actions from the Edit Sidebar."""
+        if action == "undo":
+            self.undo_classification()
+        elif action == "redo":
+            self.redo_classification()
+        elif action == "cut":
+            print("✂️ Cut action — not implemented yet")
+        elif action == "copy":
+            print("📋 Copy action — not implemented yet")
+        elif action == "paste":
+            print("📎 Paste action — not implemented yet")
+        elif action == "delete":
+            print("🗑️ Delete action — not implemented yet")
+        elif action == "select_all":
+            print("🔘 Select All — not implemented yet")
+        elif action == "deselect":
+            print("⭕ Deselect All — not implemented yet")
+        else:
+            print(f"⚠️ Unknown edit action: {action}")
+
+
+
+    # ------------------ Shadow---------------------
+    def toggle_shadow_in_view(self, enabled: bool):
+        """Enable or disable simulated shadow effect in shaded view."""
+        if not hasattr(self, "data") or self.data is None:
+            return
+        self.shadow_enabled = enabled
+        print(f"🌗 Shadow {'enabled' if enabled else 'disabled'}")
+
+        # Adjust ambient term: less ambient = stronger shadow
+        ambient = 0.1 if enabled else 0.4
+        
+        # Store ambient for future use
+        self.shade_ambient = ambient
+        
+        from .shading_display import update_shaded_class
+        
+        # ✅ Pass all parameters including quality and speed
+        update_shaded_class(
+            self,
+            azimuth=getattr(self, "last_shade_azimuth", 45.0),
+            angle=getattr(self, "last_shade_angle", 45.0),
+            ambient=ambient,
+            percentile_filter=getattr(self, "shade_quality", 99.0),
+            downsample=getattr(self, "shade_speed", 1)
+        )
+
+
+    def toggle_depth_in_view(self, enabled: bool):
+        """Enable or disable depth-based shading (fake Z falloff)."""
+        if not hasattr(self, "data") or self.data is None:
+            return
+        
+        self.depth_enabled = enabled
+        print(f"🧱 Depth shading {'enabled' if enabled else 'disabled'}")
+
+        if self.display_mode != "shaded_class":
+            print("⚠️ Depth shading only applies to shaded_class mode.")
+            return
+
+        # ✅ Store depth state
+        if enabled:
+            print("✅ Depth shading will be applied during triangulation")
+        else:
+            print("✅ Depth shading disabled")
+        
+        # ✅ Rebuild with depth consideration
+        from .shading_display import update_shaded_class
+        update_shaded_class(
+            self,
+            azimuth=getattr(self, "last_shade_azimuth", 45.0),
+            angle=getattr(self, "last_shade_angle", 45.0),
+            ambient=getattr(self, "shade_ambient", 0.2),
+            percentile_filter=getattr(self, "shade_quality", 99.0),
+            downsample=getattr(self, "shade_speed", 1)
+        )
+
+# ----NEwly added function------
+    # Add this method to your NakshaApp class in app_window.py
+
+    def restore_main_interactor(self):
+        """
+        Restore the default 2D interactor on the main viewer.
+        Call this before activating cut section or other tools.
+        """
+        try:
+            if hasattr(self, 'cross_interactor'):
+                self.cross_interactor = None
+
+            if self.ensure_main_view_2d_interaction(
+                preserve_camera=True,
+                reason="restore_main_interactor",
+            ):
+                print("🔄 Main interactor restored to 2D mode")
+
+        except Exception as e:
+            print(f"⚠️ Failed to restore interactor: {e}")
+        self.set_cross_cursor_active(False)
+
+
+    # def on_border_changed(self, border_percent):
+    #     """Instant update without rebuilding the point cloud."""
+    #     self.point_border_percent = border_percent
+        
+    #     # 🚀 PRODUCTION FIX: Poke GPU directly, no rebuild.
+    #     from gui.unified_actor_manager import sync_palette_to_gpu
+        
+    #     # Update Main View (Slot 0)
+    #     sync_palette_to_gpu(self, slot_idx=0, border=border_percent)
+        
+    #     # Update any active Cross-Sections (Slots 1-4)
+    #     if hasattr(self, 'section_vtks'):
+    #         for view_idx in self.section_vtks.keys():
+    #             sync_palette_to_gpu(self, slot_idx=view_idx+1, border=border_percent)
+
+    #     self.statusBar().showMessage(f"🔳 Border: {border_percent}% (GPU Updated)", 1000)
+
+    def on_border_changed(self, border_percent):
+        """Instant update without rebuilding the point cloud."""
+        self.point_border_percent = border_percent
+        if not hasattr(self, 'view_borders'):
+            self.view_borders = {i: 0 for i in range(6)}
+        self.view_borders[0] = border_percent          # ← keep view_borders in sync
+
+        from gui.unified_actor_manager import sync_palette_to_gpu
+
+        sync_palette_to_gpu(self, slot_idx=0, border=border_percent)
+
+        if hasattr(self, 'section_vtks'):
+            for view_idx in self.section_vtks.keys():
+                b = float(self.view_borders.get(view_idx + 1, 0))
+                sync_palette_to_gpu(self, slot_idx=view_idx + 1, border=b)
+
+        self.statusBar().showMessage(f"🔳 Border: {border_percent}% (GPU Updated)", 1000)  ##
+
+    def apply_classification_signal(self, changed_mask, to_class):
+        """🚀 ZERO-LAG SYNC: Main View + All Sub-views"""
+        # 1. Update Core CPU Memory (26.9M points)
+        self.data["classification"][changed_mask] = to_class
+        
+        # 2. ⚡ POKE MAIN VIEW GPU (13.4M points)
+        from gui.unified_actor_manager import fast_classify_update
+        # This triggers the LOD bridge we added in Fix #1
+        fast_classify_update(self, changed_mask, to_class)
+        
+        # 3. POKE ALL OTHER VIEWPORTS (Signal Bus)
+        self.classification_finished.emit(changed_mask)
+        
+        # 4. Final Render
+        self.vtk_widget.render() ####
+
+    def activate_dock_by_view(self, view_index):
+        """
+        Activate the corresponding dock based on Display Mode view selection.
+        ✅ FIXED: Proper error handling and view activation
+        """
+        try:
+            print(f"\n{'='*60}")
+            print(f"🎯 ACTIVATING VIEW {view_index}")
+            print(f"{'='*60}")
+            
+            if view_index == 0:
+                # Main View - focus on main VTK widget
+                if hasattr(self, 'vtk_widget'):
+                    try:
+                        self.vtk_widget.interactor.GetRenderWindow().GetInteractor().GetRenderWindow().Render()
+                        self.vtk_widget.setFocus()
+                        print(f"✅ Activated Main View")
+                    except Exception as e:
+                        print(f"⚠️ Error activating main view: {e}")
+                else:
+                    print(f"⚠️ vtk_widget not found")
+                    
+            elif view_index >= 1 and view_index <= 4:
+                # Cross Section Views 1-4
+                section_index = view_index - 1  # Convert to 0-based index
+                
+                print(f"   Looking for section_index: {section_index}")
+                print(f"   Available section_docks: {list(getattr(self, 'section_docks', {}).keys())}")
+                
+                if hasattr(self, 'section_docks') and section_index in self.section_docks:
+                    dock = self.section_docks[section_index]
+                    
+                    # Activate the dock window
+                    dock.raise_()
+                    dock.activateWindow()
+                    dock.setFocus()
+                    
+                    # Set as active view in section controller
+                    if hasattr(self, 'section_controller'):
+                        self.section_controller.active_view = section_index
+                        print(f"   Set section_controller.active_view = {section_index}")
+                    
+                    print(f"✅ Activated Cross Section View {view_index}")
+                else:
+                    print(f"⚠️ Cross Section View {view_index} not found")
+                    print(f"   section_docks exists: {hasattr(self, 'section_docks')}")
+                    if hasattr(self, 'section_docks'):
+                        print(f"   Available views: {[i+1 for i in self.section_docks.keys()]}")
+                    
+                    # QMessageBox.information(
+                    #     self,
+                    #     "View Not Open",
+                    #     f"Cross Section View {view_index} is not open.\n"
+                    #     f"Please create it first using Tools → Cross Section."
+                    # )
+            else:
+                print(f"⚠️ Invalid view index: {view_index}")
+            
+            print(f"{'='*60}\n")
+                
+        except Exception as e:
+            print(f"⚠️ Error activating dock for view {view_index}: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"{'='*60}\n")
+
+    def refresh_all_views(self):
+        """
+        Master refresh function - Context Aware
+        ✅ Fixes Issue 1: Preserves Main View filters/weights by preventing state overwrite.
+        ✅ Fixes Issue 2: Prevents Cross-View settings from leaking into the Main View.
+        ✅ OPTIMIZED: Synchronizes Cut-Section using the high-speed GPU buffer path (No 3-4s lag).
+        """
+        try:
+            print("\n" + "="*60)
+            print("🔄 GLOBAL REFRESH - PRESERVING VIEW CONTEXTS")
+            print("="*60)
+            
+            # ✅ 1. Refresh Main View with context protection
+            print(f"📺 Refreshing Main View (mode: {self.display_mode})")
+            
+            if self.display_mode == "class":
+                from gui.class_display import update_class_mode
+                # Pass view_index=-1 to signify this is the Main View.
+                try:
+                    update_class_mode(self, view_index=-1)
+                except TypeError:
+                    # Fallback if update_class_mode doesn't support view_index yet
+                    update_class_mode(self)
+            
+            elif self.display_mode == "shaded_class":
+                from .shading_display import update_shaded_class
+                update_shaded_class(self, getattr(self, "last_shade_azimuth", 45.0),
+                                    getattr(self, "last_shade_angle", 45.0),
+                                    getattr(self, "shade_ambient", 0.2))
+            else:
+                from .pointcloud_display import update_pointcloud
+                update_pointcloud(self, self.display_mode)
+            
+            print("✅ Main View updated (Filters preserved)")
+            
+            # ✅ 2. Refresh ALL cross-section views independently
+            if hasattr(self, 'section_vtks') and hasattr(self, 'section_controller'):
+                if hasattr(self.section_controller, 'refresh_colors'):
+                    self.section_controller.refresh_colors()
+                    
+                    # Force a render on each section vtk to ensure the scalar update is visible
+                    for view_idx, vtk_widget in self.section_vtks.items():
+                        if vtk_widget and hasattr(vtk_widget, 'render'):
+                            vtk_widget.render()
+                    print("✅ Cross-section views updated (Local filters maintained)")
+            
+            # ✅ 3. OPTIMIZED: Refresh cut-section view using fast GPU path
+            if hasattr(self, 'cut_section_controller'):
+                ctrl = self.cut_section_controller
+                # Check if the cut view is active and has data
+                if getattr(ctrl, 'is_cut_view_active', False) and ctrl.cut_points is not None:
+                    print("✂️ [FAST-SYNC] Refreshing Cut Section...")
+                    
+                    # Direct call to the optimized millisecond-refresh method
+                    if hasattr(ctrl, '_refresh_cut_colors_fast'):
+                        ctrl._refresh_cut_colors_fast()
+                    else:
+                        # Fallback to standard refresh if fast method is missing
+                        ctrl.refresh_colors()
+                        
+                    print("✅ Cut Section updated (Sync Complete)")
+            
+            # ✅ 4. Sync Display Mode dialog WITHOUT triggering a re-apply
+            if hasattr(self, 'display_mode_dialog') and self.display_mode_dialog:
+                if hasattr(self.display_mode_dialog, 'sync_with_app_state'):
+                    self.display_mode_dialog.sync_with_app_state()
+                print("✅ Display Mode dialog synced")
+            
+            # ✅ 5. UPDATE STATISTICS
+            if hasattr(self, 'point_count_widget') and self.point_count_widget:
+                refresh_point_statistics(self)
+                print("📊 Statistics updated")
+            
+            # Final Render of Main View
+            if hasattr(self, 'vtk_widget'):
+                self.vtk_widget.render()
+
+            print("="*60)
+            print("✅ GLOBAL REFRESH COMPLETE - NO LEAKAGE")
+            print("="*60 + "\n")
+            
+            if hasattr(self, 'statusBar') and self.statusBar():
+                self.statusBar().showMessage("✅ All views synchronized", 2000)
+            
+        except Exception as e:
+            print(f"⚠️ refresh_all_views failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+# New 
+    def refresh_all_classification_views(self):
+        """
+        ✅ OPTIMIZED: Update ALL views after classification changes.
+        Uses debouncing and vectorized operations for speed.
+        """
+        print(f"\n{'='*60}")
+        print(f"🔄 REFRESHING ALL CLASSIFICATION VIEWS (optimized)")
+        print(f"{'='*60}")
+        
+        # ✅ CRITICAL FIX: Initialize view_palettes if missing
+        if not hasattr(self, 'view_palettes'):
+            self.view_palettes = {}
+            print("⚠️ view_palettes was missing - created it")
+        
+        # ✅ EMERGENCY FALLBACK: If view_palettes is empty, use class_palette
+        if not self.view_palettes or all(not v for v in self.view_palettes.values()):
+            print("⚠️ view_palettes is empty - using class_palette as fallback")
+            if hasattr(self, 'class_palette') and self.class_palette:
+                for i in range(5):
+                    self.view_palettes[i] = self.class_palette.copy()
+                print(f"   ✅ Initialized all views with class_palette ({len(self.class_palette)} classes)")
+        
+        # ✅ Track which views need updating
+        views_to_update = set()
+        
+        if self.display_mode == "class":
+            views_to_update.add(0)  # Main view
+        
+        if hasattr(self, 'section_vtks'):
+            for view_idx in self.section_vtks.keys():
+                views_to_update.add(view_idx + 1)  # Cross-section views
+        
+        if not views_to_update:
+            print("⏭️ No views need updating")
+            print(f"{'='*60}\n")
+            return
+        
+        print(f"📊 Updating {len(views_to_update)} views: {sorted(views_to_update)}")
+        
+        try:
+            # --------------------------------------------------------
+            # 1. Refresh MAIN VIEW (View 0) - if needed
+            # --------------------------------------------------------
+            if 0 in views_to_update:
+                print("   🎨 Refreshing Main View (0)...")
+                
+                # Use Main View's palette if it exists
+                if 0 in self.view_palettes and self.view_palettes[0]:
+                    old_palette = self.class_palette.copy() if hasattr(self, 'class_palette') else {}
+                    self.class_palette = self.view_palettes[0]
+                    
+                    # ✅ Use fast color update if possible
+                    if hasattr(self, '_last_changed_mask') and self._last_changed_mask is not None:
+                        from gui.pointcloud_display import fast_update_colors
+                        fast_update_colors(self, self._last_changed_mask)
+                    else:
+                        from gui.class_display import update_class_mode
+                        update_class_mode(self)
+                    
+                    if old_palette:
+                        self.class_palette = old_palette
+                    
+                    visible = [c for c, v in self.view_palettes[0].items() if v.get("show")]
+                    print(f"   ✅ Main View updated ({len(visible)} visible classes)")
+                else:
+                    print("   ⏭️ Main View using global palette")
+                    from gui.class_display import update_class_mode
+                    update_class_mode(self)
+            
+            # --------------------------------------------------------
+            # 2. Refresh CROSS-SECTION VIEWS (Views 1-4) - if needed
+            # --------------------------------------------------------
+            section_views = [v for v in views_to_update if 1 <= v <= 4]
+            
+            if section_views:
+                import numpy as np
+                import pyvista as pv
+                
+                for target_view in section_views:
+                    view_idx = target_view - 1  # Convert to 0-based
+                    
+                    if view_idx not in self.section_vtks:
+                        continue
+                    
+                    # Use the optimized single-view refresh
+                    self._refresh_single_section_view(view_idx)
+            
+            # --------------------------------------------------------
+            # 3. Refresh CUT SECTION if active
+            # --------------------------------------------------------
+            if hasattr(self, 'cut_section_controller') and self.cut_section_controller.cut_points is not None:
+                print("   🔄 Refreshing Cut Section...")
+                self.cut_section_controller.refresh_colors()
+                print("   ✅ Cut Section updated")
+            
+            print(f"{'='*60}")
+            print(f"✅ ALL VIEWS REFRESHED SUCCESSFULLY")
+            print(f"{'='*60}\n")
+            
+            self.statusBar().showMessage("✅ All views updated", 2000)
+            
+        except Exception as e:
+            print(f"⚠️ Multi-view refresh error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _restore_section_interactors(self):
+        """
+        Fallback method to restore section interactors when controller methods are missing.
+        """
+        try:
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+            
+            if hasattr(self, 'section_vtks') and self.section_vtks:
+                for view_idx, vtk_widget in self.section_vtks.items():
+                    try:
+                        if vtk_widget and hasattr(vtk_widget, 'interactor'):
+                            style = vtkInteractorStyleImage()
+                            vtk_widget.interactor.SetInteractorStyle(style)
+                            print(f"   ✅ View {view_idx + 1}: Interactor restored (fallback)")
+                    except Exception as e:
+                        print(f"   ⚠️ View {view_idx + 1}: Fallback restore failed - {e}")
+            
+            print("   ✅ Section interactors restored (fallback method)")
+            
+        except Exception as e:
+            print(f"   ⚠️ Fallback restore failed: {e}")
+# In class_picker.py    
+    def deactivate_classification(self):
+        """
+        Deactivate classification mode and restore normal interaction.
+        """
+        print(f"\n{'='*60}")
+        print(f"🛑 DEACTIVATING CLASSIFICATION TOOL")
+        print(f"{'='*60}")
+        
+        # Clear tool
+        self.active_classify_tool = None
+        
+        # ✅ CRITICAL: Unlock main view
+        self.skip_main_view_refresh = False
+        print("   🔓 Main view refresh UNLOCKED")
+        
+        # Close class picker
+        if hasattr(self, "class_picker") and self.class_picker:
+            try:
+                # self.class_picker.close()
+                # self.class_picker = None
+                self.class_picker.hide()
+
+                print("   ✅ Class picker closed")
+            except:
+                pass
+        
+        # Restore section view interactors (with safety check)
+        if hasattr(self, "section_controller"):
+            try:
+                if hasattr(self.section_controller, 'unlock_after_classification'):
+                    self.section_controller.unlock_after_classification()
+                    print("   ✅ Section controller unlocked")
+                else:
+                    print("   ⚠️ section_controller missing unlock_after_classification method")
+                    # Fallback: manually restore interactors
+                    self._restore_section_interactors()
+            except Exception as e:
+                print(f"   ⚠️ Section controller unlock failed: {e}")
+                # Fallback: manually restore interactors
+                self._restore_section_interactors()
+        
+        # Restore cut section interactors (with safety check)
+        if hasattr(self, "cut_section_controller"):
+            try:
+                if hasattr(self.cut_section_controller, 'unlock_after_classification'):
+                    self.cut_section_controller.unlock_after_classification()
+                    print("   ✅ Cut section controller unlocked")
+                else:
+                    print("   ⚠️ cut_section_controller missing unlock_after_classification method")
+            except Exception as e:
+                print(f"   ⚠️ Cut section controller unlock failed: {e}")
+
+        # Restore default 2D interactor on all cross-section views
+        try:
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+            if hasattr(self, "section_vtks") and self.section_vtks:
+                for view_idx, vtk_widget in self.section_vtks.items():
+                    try:
+                        vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
+                        print(f"   ✅ View {view_idx + 1}: Interactor restored")
+                    except Exception:
+                        pass
+            if hasattr(self, "classify_interactors"):
+                self.classify_interactors.clear()
+                print("   ✅ Classification interactors cleared")
+        except Exception as e:
+            print(f"⚠️ Failed to restore interactor on cross-section views: {e}")
+        
+        print(f"{'='*60}")
+        print(f"✅ Classification tool fully deactivated - all views unlocked")
+        print(f"{'='*60}\n")
+        
+        self.statusBar().showMessage("✅ Classification tool deactivated", 2000)
+    # def deactivate_classification(self):
+    #     """
+    #     Deactivate classification mode and restore normal interaction.
+    #     """
+    #     self.active_classify_tool = None
+    #     self.skip_main_view_refresh = False
+        
+    #     # Close class picker
+    #     if hasattr(self, "class_picker") and self.class_picker:
+    #         self.class_picker.close()
+    #         self.class_picker = None
+        
+    #     # Restore section view interactor
+    #     if hasattr(self, "section_controller"):
+    #         self.section_controller.unlock_after_classification()
+        
+    #     if hasattr(self, "cut_section_controller"):
+    #         self.cut_section_controller.unlock_after_classification()
+        
+    #     print("✅ Classification tool deactivated")
+    #     self.statusBar().showMessage("✅ Classification tool deactivated", 2000)
+
+
+    def refresh_all_section_views(self):
+            """
+            Refresh ALL cross-section views after main window classification.
+            This ensures all section views show the latest classification colors.
+            """
+            if not hasattr(self, 'section_vtks') or not self.section_vtks:
+                return
+            
+            print(f"\n{'='*60}")
+            print(f"🔄 REFRESHING ALL CROSS-SECTION VIEWS")
+            print(f"{'='*60}")
+            
+            import numpy as np
+            import pyvista as pv
+            
+            for view_idx in self.section_vtks.keys():
+                try:
+                    # Get stored section data for this view
+                    pts = getattr(self, f"section_{view_idx}_core_points", None)
+                    buf = getattr(self, f"section_{view_idx}_buffer_points", None)
+                    core_mask = getattr(self, f"section_{view_idx}_core_mask", None)
+                    buffer_mask = getattr(self, f"section_{view_idx}_buffer_mask", None)
+                    
+                    if pts is None or core_mask is None:
+                        print(f"   ⏭️ View {view_idx + 1}: No data")
+                        continue
+                    
+                    # Combine core + buffer
+                    if buf is not None and buffer_mask is not None:
+                        all_pts = np.vstack([pts, buf])
+                        all_cls = np.concatenate([
+                            self.data["classification"][core_mask],
+                            self.data["classification"][buffer_mask & ~core_mask]
+                        ])
+                    else:
+                        all_pts = pts
+                        all_cls = self.data["classification"][core_mask]
+                    
+                    # Filter by visible classes
+                    visible = [c for c, v in self.class_palette.items() if v.get("show")]
+                    if not visible:
+                        print(f"   ⏭️ View {view_idx + 1}: No visible classes")
+                        continue
+                    
+                    mask = np.isin(all_cls, visible)
+                    filtered_pts = all_pts[mask]
+                    filtered_cls = all_cls[mask]
+                    
+                    # Build color array using LATEST classifications
+                    colors = np.zeros((len(filtered_pts), 3), dtype=np.uint8)
+                    for i, cls in enumerate(filtered_cls):
+                        entry = self.class_palette.get(int(cls), {"color": (128, 128, 128)})
+                        colors[i] = entry["color"]
+                    
+                    # Update VTK widget
+                    vtk_widget = self.section_vtks[view_idx]
+                    
+                    # Save camera
+                    cam_pos = vtk_widget.camera_position
+                    
+                    # Clear and re-render
+                    vtk_widget.clear()
+                    
+                    cloud = pv.PolyData(filtered_pts)
+                    cloud["RGB"] = colors
+                    
+                    vtk_widget.add_points(
+                        cloud,
+                        scalars="RGB",
+                        rgb=True,
+                        point_size=3,
+                        render_points_as_spheres=True
+                    )
+                    
+                    # Restore camera
+                    vtk_widget.camera_position = cam_pos
+                    vtk_widget.render()
+                    
+                    print(f"   ✅ View {view_idx + 1} refreshed ({len(filtered_pts)} points)")
+                    
+                except Exception as e:
+                    print(f"   ⚠️ View {view_idx + 1} refresh failed: {e}")
+            
+            print(f"{'='*60}\n") 
+
+    def schedule_view_update(self, view_indices):
+        """
+        Debounced update - prevents 100 updates/second during brush strokes.
+        Batches rapid updates into single render call.
+        """
+        if not isinstance(view_indices, (list, set)):
+            view_indices = {view_indices}
+        
+        self._pending_view_updates.update(view_indices)
+        
+        # Cancel existing timer
+        if self._update_debounce_timer:
+            self._update_debounce_timer.stop()
+        
+        # Schedule update in 50ms (feels instant but batches updates)
+        from PySide6.QtCore import QTimer
+        self._update_debounce_timer = QTimer()
+        self._update_debounce_timer.setSingleShot(True)
+        self._update_debounce_timer.timeout.connect(self._execute_pending_updates)
+        self._update_debounce_timer.start(50)
+        
+        print(f"📅 Scheduled update for views: {view_indices}")
+    
+    def _execute_pending_updates(self):
+        """Execute batched updates (called after debounce delay)."""
+        if not self._pending_view_updates:
+            return
+        
+        print(f"🔄 Batch updating views: {self._pending_view_updates}")
+        
+        for view_idx in sorted(self._pending_view_updates):
+            if view_idx == 0:
+                # Main view - fast color update only
+                from gui.pointcloud_display import fast_update_colors
+                fast_update_colors(self, self._last_changed_mask)
+            else:
+                # Cross-section view - targeted refresh
+                self._refresh_single_section_view(view_idx - 1)
+        
+        self._pending_view_updates.clear()
+        print("✅ Batch update complete")
+
+    def _refresh_single_section_view(self, view_idx, border_percent=0):
+        """
+        Optimized single cross-section view refresh.
+        ✅ UNIFIED ACTOR PATH: Builds a single _section_X_unified actor per view.
+        This enables sync_palette_to_gpu, undo/redo, and per-view weights to work
+        through the same GPU uniform system as the Main View.
+        """
+        if not hasattr(self, 'section_vtks') or view_idx not in self.section_vtks:
+            print(f"⏭️ View {view_idx} not found")
+            return
+
+        target_view = view_idx + 1  # Convert to 1-based slot (1-4)
+        print(f"   🔄 Refreshing Cross Section View {target_view} (unified actor)...")
+
+        # ── Read border value if not provided ─────────────────────────────
+        if border_percent == 0 and hasattr(self, 'view_borders'):
+            border_percent = self.view_borders.get(target_view, 0)
+
+        # ── Get view-specific palette ─────────────────────────────────────
+        if not hasattr(self, 'view_palettes'):
+            self.view_palettes = {}
+
+        if target_view not in self.view_palettes or not self.view_palettes[target_view]:
+            if hasattr(self, 'class_palette') and self.class_palette:
+                self.view_palettes[target_view] = {}
+                for code, info in self.class_palette.items():
+                    self.view_palettes[target_view][code] = dict(info)
+                print(f"   ℹ️ Initialized View {target_view} palette from class_palette")
+            else:
+                print(f"   ⏭️ No palette available")
+                return
+
+        palette = self.view_palettes[target_view]
+        point_size = float(getattr(self, 'point_size', 3.0))
+
+        # ── Build unified actor (same pattern as Main View) ───────────────
+        try:
+            from gui.unified_actor_manager import build_section_unified_actor
+            actor = build_section_unified_actor(
+                self,
+                view_idx,
+                palette=palette,
+                border_percent=float(border_percent),
+                point_size=point_size,
+            )
+            if actor is not None:
+                print(f"   ✅ View {target_view} unified actor ready")
+            else:
+                print(f"   ⚠️ View {target_view}: build_section_unified_actor returned None")
+        except Exception as e:
+            print(f"   ⚠️ Unified actor build failed for View {target_view}: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+
+    def reset_class_weights(self):
+        """
+        Reset all class weights to 1.0 (normal size).
+        Use this to fix the "giant bubble" issue from extreme weight values.
+        """
+        from PySide6.QtCore import QSettings
+        
+        print(f"\n{'='*60}")
+        print(f"🔄 RESETTING ALL CLASS WEIGHTS TO 1.0")
+        
+        # 1. Reset in-memory palette
+        if hasattr(self, 'class_palette') and self.class_palette:
+            for code in self.class_palette:
+                old_weight = self.class_palette[code].get('weight', 1.0)
+                self.class_palette[code]['weight'] = 1.0
+                if old_weight != 1.0:
+                    print(f"   ✅ Class {code}: {old_weight:.1f}x → 1.0x")
+        
+        # 2. Reset in view_palettes
+        if hasattr(self, 'view_palettes') and self.view_palettes:
+            for view_idx, palette in self.view_palettes.items():
+                if palette:
+                    for code in palette:
+                        palette[code]['weight'] = 1.0
+        
+        # 3. Clear saved weights in QSettings
+        settings = QSettings("NakshaAI", "LidarApp")
+        settings.remove("class_weight_states")
+        settings.sync()
+        print(f"   ✅ Cleared saved weights from settings")
+        
+        # 4. Re-render if data is loaded
+        if hasattr(self, 'data') and self.data is not None:
+            if self.display_mode == "class":
+                from gui.class_display import update_class_mode
+                update_class_mode(self)
+                print(f"   ✅ Re-rendered with normal weights")
+        
+        print(f"{'='*60}\n")
+        
+        if hasattr(self, 'statusBar'):
+            self.statusBar().showMessage("✅ All class weights reset to 1.0x (normal)", 3000)
+
+
+    def sanitize_class_weights(self):
+        """
+        ✅ AUTO-FIX: Clamp any extreme weights to reasonable range (0.5-3.0).
+        Call this right after loading class palette.
+        """
+        fixed_count = 0
+        
+        # Fix class_palette
+        if hasattr(self, 'class_palette') and self.class_palette:
+            for code, info in self.class_palette.items():
+                weight = info.get('weight', 1.0)
+                
+                # Clamp to reasonable range
+                clamped = max(0.5, min(weight, 3.0))
+                
+                if weight != clamped:
+                    info['weight'] = clamped
+                    fixed_count += 1
+                    print(f"⚠️ Fixed Class {code}: {weight:.1f}x → {clamped:.1f}x")
+        
+        # Fix view_palettes
+        if hasattr(self, 'view_palettes') and self.view_palettes:
+            for view_idx, palette in self.view_palettes.items():
+                if palette:
+                    for code, info in palette.items():
+                        weight = info.get('weight', 1.0)
+                        clamped = max(0.5, min(weight, 3.0))
+                        if weight != clamped:
+                            info['weight'] = clamped
+        
+        if fixed_count > 0:
+            print(f"✅ Auto-fixed {fixed_count} extreme weights")
+            
+            # Update QSettings to prevent this on next load
+            from PySide6.QtCore import QSettings
+            settings = QSettings("NakshaAI", "LidarApp")
+            weight_states = settings.value("class_weight_states", {})
+            if isinstance(weight_states, dict):
+                for code_str, weight in weight_states.items():
+                    if isinstance(weight, (int, float)):
+                        weight_states[code_str] = max(0.5, min(float(weight), 3.0))
+                settings.setValue("class_weight_states", weight_states)
+                settings.sync()
+                print(f"✅ Updated saved weights in settings")
+
+
+    def test_display_mode_setup(self):
+        '''Quick test to verify Display Mode signal exists'''
+        if hasattr(self, 'display_dialog') and self.display_dialog:
+            print("="*60)
+            print("🧪 TESTING DISPLAY MODE SETUP")
+            
+            # Test 1: Signal exists
+            has_signal = hasattr(self.display_dialog, 'classes_loaded')
+            print(f"   Signal exists: {'✅ YES' if has_signal else '❌ NO'}")
+            
+            # Test 2: Signal is correct type
+            if has_signal:
+                from PySide6.QtCore import Signal
+                is_signal = isinstance(type(self.display_dialog).classes_loaded, type(Signal()))
+                print(f"   Is valid Signal: {'✅ YES' if is_signal else '❌ NO'}")
+            
+            # Test 3: Can connect to it
+            if has_signal:
+                try:
+                    test_slot = lambda: print("   🎉 Test signal received!")
+                    self.display_dialog.classes_loaded.connect(test_slot)
+                    print(f"   Can connect: ✅ YES")
+                    
+                    # Clean up test connection
+                    self.display_dialog.classes_loaded.disconnect(test_slot)
+                except Exception as e:
+                    print(f"   Can connect: ❌ NO - {e}")
+            
+            print("="*60)
+        else:
+            print("⚠️ Display Mode dialog not created yet")
+
+
+    def normalize_all_class_weights(self):
+        """
+        Reset all class weights to 1.0 on file load.
+        Prevents saved/corrupted weight values from causing size issues.
+        """
+        print("\n" + "="*60)
+        print("🔧 NORMALIZING CLASS WEIGHTS ON LOAD")
+        print("="*60)
+        
+        reset_count = 0
+        
+        # Fix class_palette
+        if hasattr(self, 'class_palette') and self.class_palette:
+            for code in self.class_palette:
+                old_weight = self.class_palette[code].get("weight", 1.0)
+                if old_weight != 1.0:
+                    self.class_palette[code]["weight"] = 1.0
+                    reset_count += 1
+                    print(f"   ✅ Class {code}: {old_weight:.2f}x → 1.0x")
+        
+        # Fix view_palettes
+        if hasattr(self, 'view_palettes') and self.view_palettes:
+            for view_idx, palette in self.view_palettes.items():
+                for code in palette:
+                    old_weight = palette[code].get("weight", 1.0)
+                    if old_weight != 1.0:
+                        palette[code]["weight"] = 1.0
+                        reset_count += 1
+        
+        # Clear saved weights from QSettings
+        from PySide6.QtCore import QSettings
+        settings = QSettings("NakshaAI", "LidarApp")
+        if settings.contains("class_weight_states"):
+            settings.remove("class_weight_states")
+            settings.sync()
+            print("   ✅ Cleared saved weights from settings")
+        
+        if reset_count > 0:
+            print(f"\n   ✅ Reset {reset_count} classes to normal weight")
+        else:
+            print("   ℹ️  All weights already normal")
+        
+        print("="*60 + "\n")
+        
+        
+
+
+
+    def activate_measurement_tool(self, tool_name):
+        """
+        Activate measurement tool with proper coordination.
+        ✅ FIXED: Proper cleanup and priority handling
+        """
+        if not hasattr(self, 'measurement_tool'):
+            from gui.measurement_tools import MeasurementTool
+            self.measurement_tool = MeasurementTool(self.digitizer)
+        
+        # ✅ CRITICAL: Deactivate cross-section COMPLETELY
+        if hasattr(self, 'cross_interactor') and self.cross_interactor:
+            print("🔄 Deactivating cross-section for measurement")
+            
+            # Reset state
+            self.cross_interactor.slice_state = 0
+            self.cross_interactor.P1 = None
+            self.cross_interactor.P2 = None
+            
+            # Remove cross-section observers
+            interactor = self.vtk_widget.interactor
+            interactor.RemoveObservers("LeftButtonPressEvent")
+            interactor.RemoveObservers("MouseMoveEvent")
+            interactor.RemoveObservers("RightButtonPressEvent")
+        
+        # ✅ Deactivate section controller
+        if hasattr(self, 'section_controller'):
+            self.section_controller.deactivate_for_measurement()
+        
+        # ✅ Deactivate digitizer
+        if hasattr(self, 'digitizer'):
+            self.digitizer.active_tool = None
+        
+        # ✅ Now activate measurement (it will add its own observers)
+        self.measurement_tool.activate(mode=tool_name)
+        
+        # Show instructions
+        if tool_name == "measure_line":
+            self.statusBar().showMessage("📏 Click 2 points to measure", 5000)
+        elif tool_name == "measure_path":
+            self.statusBar().showMessage("📏 Click points, right-click to finish", 5000)
+        elif tool_name == "measure_polygon":
+            self.statusBar().showMessage("📏 Click points, right-click to close", 5000)
+            
+    def clear_all_measurements(self):
+        """Clear all measurement lines and labels."""
+        if hasattr(self, 'measurement_tool'):
+            self.measurement_tool.clear_all_measurements()
+            self.statusBar().showMessage("🗑️ Measurements cleared", 2000)
+    def export_measurements(self):
+        """Export measurement report to file."""
+        if not hasattr(self, 'measurement_tool'):
+            return
+        
+        report = self.measurement_tool.export_measurements()
+        
+        if report:
+            from PySide6.QtWidgets import QFileDialog
+            filepath, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Measurements",
+                "",
+                "Text Files (*.txt);;All Files (*)"
+            )
+            
+            if filepath:
+                try:
+                    with open(filepath, 'w') as f:
+                        f.write(report)
+                    print(f"✅ Measurements exported to: {filepath}")
+                    self.statusBar().showMessage(f"✅ Exported to {filepath}", 3000)
+                except Exception as e:
+                    print(f"⚠️ Export failed: {e}")
+
+
+    def ensure_display_mode_dialog(self):
+        """
+        Ensure display mode dialog exists.
+        Creates it if needed, returns True if it exists/was created.
+        """
+        if not hasattr(self, 'display_mode_dialog') or self.display_mode_dialog is None:
+            try:
+                from gui.display_mode import DisplayModeDialog
+                self.display_mode_dialog = DisplayModeDialog(self)
+                self.display_mode_dialog.applied.connect(self.apply_class_map)
+                self.display_mode_dialog.view_switched.connect(self.activate_dock_by_view)
+                
+                # Phase 3: Connect palette_changed → GPU uniform sync
+                self.display_mode_dialog.palette_changed.connect(self._on_palette_changed)
+                
+                # Connect to other systems
+                if hasattr(self, 'class_picker') and self.class_picker:
+                    self.display_mode_dialog.classes_loaded.connect(self.class_picker.on_classes_changed)
+                
+                if hasattr(self, 'point_count_widget') and self.point_count_widget:
+                    self.point_count_widget.connect_to_display_mode(self.display_mode_dialog)
+                
+                print("✅ Display Mode dialog created")
+                return True
+            except Exception as e:
+                print(f"⚠️ Failed to create display mode dialog: {e}")
+                return False
+        
+        return True
+
+    def open_display_mode(self):
+            """
+            Open Display Mode dialog with MAXIMUM visibility enforcement.
+            Works on all platforms (Windows, Linux, macOS).
+            """
+            # Create dialog if needed
+            if not hasattr(self, 'display_mode_dialog') or self.display_mode_dialog is None:
+                from gui.display_mode import DisplayModeDialog
+                self.display_mode_dialog = DisplayModeDialog(self)
+                self.display_mode_dialog.applied.connect(self.apply_class_map)
+                self.display_mode_dialog.view_switched.connect(self.activate_dock_by_view)
+            
+                # Phase 3: Connect palette_changed → GPU uniform sync
+                self.display_mode_dialog.palette_changed.connect(self._on_palette_changed)
+            
+                if hasattr(self, 'class_picker') and self.class_picker:
+                    self.display_mode_dialog.classes_loaded.connect(self.class_picker.on_classes_changed)
+            
+                if hasattr(self, 'point_count_widget') and self.point_count_widget:
+                    self.point_count_widget.connect_to_display_mode(self.display_mode_dialog)
+        
+            # ✅ NUCLEAR OPTION: Force visibility no matter what state
+            from PySide6.QtCore import Qt
+        
+            # Clear any window state flags that might hide it
+            if self.display_mode_dialog.windowState() & Qt.WindowMinimized:
+                self.display_mode_dialog.setWindowState(
+                    self.display_mode_dialog.windowState() & ~Qt.WindowMinimized
+                )
+        
+            # Ensure it's visible
+            self.display_mode_dialog.setHidden(False)
+            self.display_mode_dialog.setVisible(True)
+            self.display_mode_dialog.show()
+        
+            # Force to foreground
+            self.display_mode_dialog.setModal(False)
+            self.display_mode_dialog.raise_()
+            self.display_mode_dialog.activateWindow()
+        
+            # Belt and suspenders: also try native activation
+            try:
+                self.display_mode_dialog.setWindowState(Qt.WindowActive)
+            except:
+                pass
+        
+            print("✅ Display Mode dialog FORCED visible")
+    
+    def load_las_for_grid(self, grid_name):
+        """
+        Load LAZ/LAS file matching the clicked grid name - AUTO-DETECT folder
+        ✅ FIXED: Now actually loads the file using same path as menu bar
+        """
+        try:
+            from pathlib import Path
+            from PySide6.QtWidgets import QFileDialog, QMessageBox
+            from PySide6.QtCore import QSettings, QCoreApplication
+            from gui.progress_dialog import LoadingProgressDialog
+            import os
+            import time
+            import numpy as np
+            
+            print(f"\n{'='*60}")
+            print(f"📂 LOADING LAZ/LAS FOR GRID: {grid_name}")
+            print(f"{'='*60}")
+            
+            settings = QSettings("NakshaAI", "LidarApp")
+            
+            # ============================================================================
+            # STEP 1: FIND THE LAZ FOLDER (your existing logic)
+            # ============================================================================
+            las_folder = None
+            
+            # Strategy 1: Check DXF file locations
+            print(f"\n📋 STRATEGY 1: Check DXF locations")
+            if hasattr(self, 'dxf_actors') and self.dxf_actors:
+                for dxf_data in self.dxf_actors:
+                    filename = dxf_data.get('filename', '') or dxf_data.get('full_path', '')
+                    
+                    if filename:
+                        dxf_path = Path(filename)
+                        
+                        if dxf_path.exists():
+                            dxf_folder = dxf_path.parent
+                            
+                            # Check same folder
+                            las_files = list(dxf_folder.glob("*.laz")) + list(dxf_folder.glob("*.las"))
+                            if las_files:
+                                las_folder = dxf_folder
+                                print(f"   ✅ FOUND in DXF folder: {las_folder}")
+                                break
+                            
+                            # Check subfolders
+                            for subfolder_name in ['lazz', 'LAZZ', 'laz', 'LAZ', 'las', 'LAS']:
+                                potential_folder = dxf_folder / subfolder_name
+                                if potential_folder.exists():
+                                    las_files = list(potential_folder.glob("*.laz")) + list(potential_folder.glob("*.las"))
+                                    if las_files:
+                                        las_folder = potential_folder
+                                        print(f"   ✅ FOUND in subfolder: {las_folder}")
+                                        break
+                            
+                            if las_folder:
+                                break
+            
+            # Strategy 2: Check saved settings
+            if not las_folder:
+                print(f"\n📋 STRATEGY 2: Check saved settings")
+                last_las_path = settings.value("last_las_folder", "")
+                if last_las_path:
+                    path_obj = Path(last_las_path)
+                    if path_obj.exists():
+                        las_folder = path_obj
+                        print(f"   ✅ FOUND: {las_folder}")
+            
+            # Strategy 3: Ask user
+            if not las_folder:
+                print(f"\n📋 STRATEGY 3: Ask user for folder")
+                reply = QMessageBox.question(
+                    self,
+                    "Select LAZ/LAS Folder",
+                    f"Could not auto-detect LAZ/LAS folder for grid '{grid_name}'.\n\n"
+                    f"Would you like to select the folder manually?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    folder = QFileDialog.getExistingDirectory(
+                        self,
+                        "Select LAZ/LAS Folder",
+                        "",
+                        QFileDialog.ShowDirsOnly
+                    )
+                    if folder:
+                        las_folder = Path(folder)
+                        settings.setValue("last_las_folder", str(las_folder))
+                        settings.sync()
+            
+            if not las_folder:
+                QMessageBox.warning(
+                    self,
+                    "Folder Not Found",
+                    f"Could not locate LAZ/LAS folder for grid '{grid_name}'."
+                )
+                return
+            
+            # ============================================================================
+            # STEP 2: FIND MATCHING FILE
+            # ============================================================================
+            print(f"\n🔍 Searching for file matching: {grid_name}")
+            
+            all_files = list(las_folder.glob("*.laz")) + list(las_folder.glob("*.las"))
+            print(f"   Total files in folder: {len(all_files)}")
+            
+            if not all_files:
+                QMessageBox.warning(
+                    self,
+                    "No Files Found",
+                    f"No LAZ/LAS files found in:\n{las_folder}"
+                )
+                return
+            
+            # Extract patterns from grid name
+            patterns = [grid_name]
+            parts = grid_name.replace(' ', '_').split('_')
+            for part in parts:
+                if part:
+                    patterns.append(part)
+                    if part.isdigit():
+                        patterns.append(str(int(part)))
+            
+            # Find matching file
+            las_file = None
+            for pattern in patterns:
+                for file_path in all_files:
+                    filename = file_path.stem
+                    if pattern.lower() in filename.lower() or filename.lower() in pattern.lower():
+                        las_file = file_path
+                        print(f"   ✅ MATCH FOUND: {las_file.name}")
+                        break
+                if las_file:
+                    break
+            
+            # If no match, let user select
+            if not las_file:
+                print(f"   ❌ No automatic match found")
+                
+                file_path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    f"Select LAZ/LAS file for grid {grid_name}",
+                    str(las_folder),
+                    "LiDAR Files (*.laz *.las);;All Files (*.*)"
+                )
+                
+                if not file_path:
+                    return
+                
+                las_file = Path(file_path)
+            
+            # ============================================================================
+            # STEP 3: AUTO-SAVE CURRENT FILE (if exists) - SAME AS MENU BAR
+            # ============================================================================
+            if hasattr(self, 'data') and self.data is not None:
+                save_path = getattr(self, 'last_save_path', None) or getattr(self, 'loaded_file', None)
+                
+                if save_path:
+                    try:
+                        print(f"\n💾 AUTO-SAVING CURRENT FILE")
+                        from gui.save_pointcloud import save_pointcloud_quick
+                        result = save_pointcloud_quick(self, save_path)
+                        if result:
+                            print(f"   ✅ Saved successfully")
+                    except Exception as e:
+                        print(f"   ⚠️ Save failed: {e}")
+            
+            # ============================================================================
+            # STEP 4: CLEAR CURRENT PROJECT - SAME AS MENU BAR
+            # ============================================================================
+            print(f"\n🧹 CLEARING CURRENT PROJECT")
+            
+            # Backup DXF actors
+            dxf_backup = []
+            if hasattr(self, 'dxf_actors') and self.dxf_actors:
+                for dxf_data in self.dxf_actors:
+                    for actor in dxf_data.get('actors', []):
+                        dxf_backup.append(actor)
+                
+                if dxf_backup:
+                    renderer = self.vtk_widget.renderer
+                    for actor in dxf_backup:
+                        renderer.RemoveActor(actor)
+                    print(f"   💾 Backed up {len(dxf_backup)} DXF actors")
+            
+            # Backup SNT actors (same pattern as DXF)
+            snt_backup = []
+            if hasattr(self, 'snt_actors') and self.snt_actors:
+                renderer = self.vtk_widget.renderer
+                for snt_data in self.snt_actors:
+                    for actor in snt_data.get('actors', []):
+                        snt_backup.append(actor)
+                        try:
+                            renderer.RemoveActor(actor)
+                        except Exception:
+                            pass
+                if snt_backup:
+                    print(f"   💾 Backed up {len(snt_backup)} SNT actors")
+            
+            # Clear VTK
+            if hasattr(self, "vtk_widget") and self.vtk_widget:
+                renderer = self.vtk_widget.renderer
+                renderer.RemoveAllViewProps()
+                
+                if hasattr(self.vtk_widget, 'actors'):
+                    self.vtk_widget.actors.clear()
+                if hasattr(self.vtk_widget, '_actors'):
+                    self.vtk_widget._actors.clear()
+                
+                self.vtk_widget.render()
+            
+            # Clear cross-sections
+            if hasattr(self, 'section_vtks') and self.section_vtks:
+                for view_idx, vtk_widget in self.section_vtks.items():
+                    try:
+                        vtk_widget.renderer.RemoveAllViewProps()
+                        if hasattr(vtk_widget, 'actors'):
+                            vtk_widget.actors.clear()
+                        vtk_widget.render()
+                    except:
+                        pass
+            
+            # Clear internal state
+            self.data = None
+            self.loaded_file = None
+            self.last_save_path = None
+            self.class_palette = {}
+            
+            if hasattr(self, "view_palettes"):
+                self.view_palettes.clear()
+            if hasattr(self, 'undo_stack'):
+                self.undo_stack.clear()
+            if hasattr(self, 'redo_stack'):
+                self.redo_stack.clear()
+            if hasattr(self, 'spatial_index'):
+                self.spatial_index = None
+            
+            # Clear grid tracking
+            if hasattr(self, 'grid_label_manager'):
+                self.grid_label_manager.loaded_grids.clear()
+            
+            QCoreApplication.processEvents()
+            
+            # Restore DXF actors
+            if dxf_backup:
+                renderer = self.vtk_widget.renderer
+                for actor in dxf_backup:
+                    renderer.AddActor(actor)
+                self.vtk_widget.render()
+                QCoreApplication.processEvents()
+                print(f"   ✅ Restored {len(dxf_backup)} DXF actors")
+            
+            # Restore SNT actors
+            if snt_backup:
+                renderer = self.vtk_widget.renderer
+                for actor in snt_backup:
+                    renderer.AddActor(actor)
+                self.vtk_widget.render()
+                print(f"   ✅ Restored {len(snt_backup)} SNT actors")
+            
+            print(f"   ✅ Clear complete")
+            
+            # ============================================================================
+            # STEP 5: LOAD FILE - SAME AS MENU BAR
+            # ============================================================================
+            print(f"\n📂 LOADING: {las_file.name}")
+            
+            progress = LoadingProgressDialog(self, show_cancel=False)
+            progress.set_filename(las_file.name)
+            progress.show()
+            
+            def update_progress(percent, status):
+                progress.set_progress(percent)
+                progress.set_status(status)
+                QCoreApplication.processEvents()
+            
+            load_start = time.time()
+            
+            try:
+                update_progress(10, "Loading file...")
+                
+                from gui.data_loader import load_lidar_file
+                tile_data = load_lidar_file(str(las_file), parent=self)
+                
+                if not tile_data:
+                    progress.finish_error("Load cancelled or failed")
+                    return
+                
+                total_points = len(tile_data.get('xyz', []))
+                print(f"   ✅ Loaded {total_points:,} points")
+                
+                # Set data
+                update_progress(50, "Setting data...")
+                
+                self.data = {
+                    "xyz": tile_data["xyz"],
+                    "classification": tile_data["classification"]
+                }
+                
+                if tile_data.get("rgb") is not None:
+                    self.data["rgb"] = tile_data["rgb"]
+                if tile_data.get("intensity") is not None:
+                    self.data["intensity"] = tile_data["intensity"]
+                
+                # Set CRS
+                if tile_data.get("crs_epsg"):
+                    self.project_crs_epsg = tile_data["crs_epsg"]
+                    self.project_crs_wkt = tile_data.get("crs_wkt")
+                    try:
+                        from pyproj import CRS
+                        self.crs = CRS.from_epsg(tile_data["crs_epsg"])
+                    except:
+                        pass
+                
+                # Store as layer
+                layer = {
+                    "type": "laz_tile",
+                    "filename": str(las_file),
+                    "xyz": tile_data["xyz"],
+                    "classification": tile_data.get("classification"),
+                    "rgb": tile_data.get("rgb"),
+                    "intensity": tile_data.get("intensity"),
+                    "crs_epsg": tile_data.get("crs_epsg"),
+                    "visible": True,
+                }
+                
+                if hasattr(self, 'layers'):
+                    self.layers.append(layer)
+                if hasattr(self, 'layers_dock') and self.layers_dock:
+                    self.layers_dock.add_layer(layer)
+                
+                self.loaded_file = str(las_file)
+                self.last_save_path = str(las_file)
+                
+                # Build DEM
+                try:
+                    from gui.shading_display import build_base_dem_mesh
+                    build_base_dem_mesh(self, percentile_filter=99.9, downsample=2)
+                except:
+                    pass
+                
+                # Build spatial index
+                if total_points > 50_000:
+                    try:
+                        update_progress(70, "Building spatial index...")
+                        from gui.performance_optimizations import SpatialIndex
+                        self.spatial_index = SpatialIndex(self.data["xyz"])
+                    except:
+                        self.spatial_index = None
+                
+                # Restore settings
+                update_progress(75, "Restoring settings...")
+                try:
+                    from gui.display_mode import restore_display_settings_for_file
+                    restore_display_settings_for_file(self, str(las_file))
+                except:
+                    pass
+                
+                self.display_mode = "class"
+                
+                # Get palette
+                update_progress(80, "Loading palette...")
+                palette_to_apply = None
+                if hasattr(self, '_get_palette_for_file'):
+                    palette_to_apply = self._get_palette_for_file(str(las_file))
+                
+                # Apply palette - SAME AS MENU BAR
+                if palette_to_apply:
+                    visible_count = len([c for c, v in palette_to_apply.items() if v.get("show")])
+                    update_progress(85, f"Rendering {visible_count} classes...")
+                    
+                    self.apply_class_map({
+                        "classes": palette_to_apply,
+                        "slot": 0,
+                        "color_mode": 0,
+                        "target_view": 0
+                    })
+                else:
+                    # Build palette from classification
+                    try:
+                        from gui.class_display import build_class_palette
+                        self.class_palette = build_class_palette(tile_data['classification'])
+                        
+                        self.apply_class_map({
+                            "classes": self.class_palette,
+                            "slot": 0,
+                            "color_mode": 0,
+                            "target_view": 0
+                        })
+                    except:
+                        from gui.pointcloud_display import update_pointcloud
+                        update_pointcloud(self, "class")
+                
+                # Finalize drawings
+                try:
+                    from gui.save_pointcloud import finalize_drawing_render
+                    finalize_drawing_render(self)
+                except:
+                    pass
+                
+                # Finalize
+                update_progress(95, "Finalizing...")
+                
+                try:
+                    from gui.pointcloud_display import force_interactor_ready
+                    force_interactor_ready(self, delay_ms=300)
+                except:
+                    pass
+                
+                if hasattr(self, 'toggle_view_mode'):
+                    self.toggle_view_mode("2d")
+                
+                # Update title
+                self._update_window_title(
+                    f"{grid_name} ({total_points:,} pts)",
+                    getattr(self, 'project_crs_epsg', None)
+                )
+                
+                # Auto-load drawings
+                if hasattr(self, "digitizer") and self.digitizer:
+                    try:
+                        self.digitizer.auto_load_drawings(str(las_file))
+                    except:
+                        pass
+                
+                # Update statistics
+                if hasattr(self, 'point_count_widget') and self.point_count_widget:
+                    try:
+                        from gui.point_count_widget import refresh_point_statistics
+                        refresh_point_statistics(self)
+                    except:
+                        pass
+                
+                # Track grid
+                if hasattr(self, 'grid_label_manager'):
+                    grid_indices = np.arange(total_points)
+                    self.grid_label_manager.loaded_grids[grid_name] = grid_indices
+                    
+                    if not hasattr(self, 'original_file_paths'):
+                        self.original_file_paths = {}
+                    self.original_file_paths[grid_name] = str(las_file)
+                
+                total_time = time.time() - load_start
+                
+                print(f"\n{'='*60}")
+                print(f"✅ GRID LOAD COMPLETE")
+                print(f"   Grid: {grid_name}")
+                print(f"   Points: {total_points:,}")
+                print(f"   Time: {total_time:.1f}s")
+                print(f"{'='*60}\n")
+                
+                # ✅ BULLETPROOF: Re-ensure all overlay actors are in renderer
+                self._ensure_overlay_actors()
+                
+                progress.finish_success(f"Loaded {total_points:,} points")
+                
+                QMessageBox.information(
+                    self,
+                    "Grid Loaded",
+                    f"✅ Loaded: {grid_name}\n\n"
+                    f"File: {las_file.name}\n"
+                    f"Points: {total_points:,}"
+                )
+                
+            except Exception as e:
+                print(f"❌ Load failed: {e}")
+                import traceback
+                traceback.print_exc()
+                progress.finish_error(f"Load failed: {e}")
+                QMessageBox.critical(self, "Load Error", f"Failed to load: {e}")
+                
+        except Exception as e:
+            print(f"⚠️ Failed to load LAZ/LAS for {grid_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            QMessageBox.critical(
+                self,
+                "Load Error",
+                f"Failed to load LAZ/LAS for grid '{grid_name}':\n{str(e)}"
+            )
+        
+    def rebuild_shortcuts(self):
+        """
+        Rebuild the shortcuts dictionary from current configuration.
+        Call this whenever classification settings are changed.
+        """
+        self.shortcuts = {}
+        
+        # Load shortcuts from your configuration
+        # This depends on where you store your shortcut configuration
+        # Example assuming you have a config object:
+        
+        if hasattr(self, 'config') and 'shortcuts' in self.config:
+            shortcut_config = self.config['shortcuts']
+            
+            for shortcut_def in shortcut_config:
+                # Parse the shortcut definition
+                # Example format: {"key": "F1", "modifier": "ctrl", "tool": "classify", "from": "A", "to": "B"}
+                
+                mod = shortcut_def.get('modifier', 'none').lower()
+                key = shortcut_def.get('key', '').upper()
+                tool = shortcut_def.get('tool')
+                from_cls = shortcut_def.get('from')
+                to_cls = shortcut_def.get('to')
+                
+                combo = (mod, key)
+                self.shortcuts[combo] = {
+                    'tool': tool,
+                    'from': from_cls,
+                    'to': to_cls
+                }
+        
+        print(f"🔄 Shortcuts rebuilt: {len(self.shortcuts)} shortcuts loaded")
+        print(f"📋 Current shortcuts: {self.shortcuts}")
+
+    # Also add this method to be called whenever settings are saved:
+    def save_classification_settings(self):
+        """
+        Call this after user modifies classification settings in the UI.
+        """
+        # Your existing save logic here
+        # ...
+        
+        # ✅ ADD THIS LINE: Rebuild shortcuts after settings change
+        self.rebuild_shortcuts()
+        
+        print("✅ Classification settings saved and shortcuts reloaded")
+
+    def _on_magnifier_changed(self, text):
+        """Handle magnifier zoom level changes."""
+        try:
+            val_str = text.strip().replace('%', '')
+            if not val_str:
+                return
+                
+            new_zoom = float(val_str)
+            if new_zoom <= 0.01:
+                return
+
+            if not hasattr(self, "vtk_widget") or not self.vtk_widget:
+                return
+            
+            if not hasattr(self, "_current_zoom_level"):
+                self._current_zoom_level = 100.0
+
+            ratio = new_zoom / self._current_zoom_level
+            self._current_zoom_level = new_zoom
+
+            cam = self.vtk_widget.renderer.GetActiveCamera()
+            cam.Zoom(ratio)
+            self.vtk_widget.render()
+        except ValueError:
+            pass # Ignore incomplete or invalid text inputs like 'a'
+        except Exception as e:
+            print(f"⚠️ Magnifier Error: {e}")
+
+    def fit_view(self):
+            """
+            Fit main view to visible data INCLUDING DXF grids.
+            Camera-only operation.
+            Safe to call anytime.
+            """
+            try:
+                import numpy as np
+                
+                # Reset zoom level tracker when fitting view
+                self._current_zoom_level = 100.0
+                if hasattr(self, 'magnifier_combo'):
+                    self.magnifier_combo.blockSignals(True)
+                    self.magnifier_combo.setCurrentText("100%")
+                    self.magnifier_combo.blockSignals(False)
+                
+                print(f"\n{'='*60}")
+                print(f"🧲 FIT VIEW (Point Cloud + DXF)")
+                print(f"{'='*60}")
+                
+                # ============================================================
+                # 1. Get point cloud bounds
+                # ============================================================
+                bounds_list = []
+                
+                if hasattr(self, 'data') and self.data is not None:
+                    xyz = self.data.get('xyz')
+                    if xyz is not None and len(xyz) > 0:
+                        # Get visible points only (based on class_palette)
+                        if hasattr(self, 'class_palette') and self.class_palette:
+                            visible_classes = [c for c, v in self.class_palette.items() if v.get('show', True)]
+                            
+                            if visible_classes and 'classification' in self.data:
+                                classes = self.data['classification']
+                                mask = np.isin(classes, visible_classes)
+                                
+                                if np.any(mask):
+                                    visible_xyz = xyz[mask]
+                                    bounds_list.append({
+                                        'xmin': visible_xyz[:, 0].min(),
+                                        'xmax': visible_xyz[:, 0].max(),
+                                        'ymin': visible_xyz[:, 1].min(),
+                                        'ymax': visible_xyz[:, 1].max(),
+                                    })
+                                    print(f"   ✅ Point cloud bounds added")
+                        else:
+                            # No palette - use all points
+                            bounds_list.append({
+                                'xmin': xyz[:, 0].min(),
+                                'xmax': xyz[:, 0].max(),
+                                'ymin': xyz[:, 1].min(),
+                                'ymax': xyz[:, 1].max(),
+                            })
+                            print(f"   ✅ Point cloud bounds added (all points)")
+                
+                # ============================================================
+                # 2. Get DXF grid bounds
+                # ============================================================
+                if hasattr(self, 'dxf_actors') and self.dxf_actors:
+                    print(f"   📐 Checking {len(self.dxf_actors)} DXF grids...")
+                    
+                    for i, dxf_data in enumerate(self.dxf_actors):
+                        try:
+                            # Check if DXF is visible
+                            actors = dxf_data.get('actors', [])
+                            if not actors:
+                                continue
+                            
+                            # Check first actor's visibility
+                            if not actors[0].GetVisibility():
+                                print(f"      ⏭️ DXF {i}: Hidden - skipping")
+                                continue
+                            
+                            # Get DXF bounds
+                            dxf_bounds = dxf_data.get('bounds')
+                            
+                            if dxf_bounds:
+                                bounds_list.append({
+                                    'xmin': dxf_bounds[0],
+                                    'xmax': dxf_bounds[1],
+                                    'ymin': dxf_bounds[2],
+                                    'ymax': dxf_bounds[3],
+                                })
+                                print(f"      ✅ DXF {i}: Bounds added")
+                            else:
+                                print(f"      ⚠️ DXF {i}: No bounds data")
+                                
+                        except Exception as e:
+                            print(f"      ⚠️ DXF {i}: Error - {e}")
+
+                # ============================================================
+                # 3. Get SNT grid bounds
+                # ============================================================
+                if hasattr(self, 'snt_actors') and self.snt_actors:
+                    print(f"   🗂️ Checking {len(self.snt_actors)} SNT grids...")
+
+                    for i, snt_data in enumerate(self.snt_actors):
+                        try:
+                            # Check if SNT is visible
+                            actors = snt_data.get('actors', [])
+                            if not actors:
+                                continue
+
+                            # Check first actor's visibility
+                            if not actors[0].GetVisibility():
+                                print(f"      ⏭️ SNT {i}: Hidden - skipping")
+                                continue
+
+                            # Get SNT bounds
+                            snt_bounds = snt_data.get('bounds')
+
+                            if snt_bounds:
+                                bounds_list.append({
+                                    'xmin': snt_bounds[0],
+                                    'xmax': snt_bounds[1],
+                                    'ymin': snt_bounds[2],
+                                    'ymax': snt_bounds[3],
+                                })
+                                print(f"      ✅ SNT {i}: Bounds added")
+                            else:
+                                print(f"      ⚠️ SNT {i}: No bounds data")
+
+                        except Exception as e:
+                            print(f"      ⚠️ SNT {i}: Error - {e}")
+
+
+                # ============================================================
+                # 3. Calculate combined bounds
+                # ============================================================
+                if not bounds_list:
+                    print(f"   ⚠️ No visible data to fit")
+                    print(f"{'='*60}\n")
+                    return
+                
+                # Find overall min/max
+                xmin = min(b['xmin'] for b in bounds_list)
+                xmax = max(b['xmax'] for b in bounds_list)
+                ymin = min(b['ymin'] for b in bounds_list)
+                ymax = max(b['ymax'] for b in bounds_list)
+                
+                print(f"\n   📊 Combined bounds:")
+                print(f"      X: {xmin:.2f} → {xmax:.2f} (width: {xmax-xmin:.2f})")
+                print(f"      Y: {ymin:.2f} → {ymax:.2f} (height: {ymax-ymin:.2f})")
+                
+                # ============================================================
+                # 4. Set camera to fit combined bounds
+                # ============================================================
+                if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
+                    print(f"   ⚠️ No VTK widget")
+                    return
+                
+                renderer = self.vtk_widget.renderer
+                camera = renderer.GetActiveCamera()
+                
+                # Calculate center and size
+                center_x = (xmin + xmax) / 2.0
+                center_y = (ymin + ymax) / 2.0
+                width = xmax - xmin
+                height = ymax - ymin
+                
+                # Add 10% margin
+                margin = 1.1
+                max_dim = max(width, height) * margin
+                center_z = 0.0
+                if hasattr(self, 'data') and self.data is not None:
+                    xyz = self.data.get('xyz')
+                    if xyz is not None and len(xyz) > 0:
+                        center_z = float(np.median(xyz[:, 2]))
+
+                # Set camera for top view
+                camera.SetPosition(center_x, center_y, center_z + 5000)
+                camera.SetFocalPoint(center_x, center_y, center_z)
+                camera.SetViewUp(0, 1, 0)
+                camera.ParallelProjectionOn()
+                camera.SetParallelScale(max_dim / 2.0)
+
+                # Update clipping range
+                renderer.ResetCameraClippingRange()
+                
+                # Render
+                self.vtk_widget.render()
+                
+                print(f"   ✅ Camera fitted to combined bounds")
+                print(f"{'='*60}\n")
+                
+                if hasattr(self, 'statusBar'):
+                    self.statusBar().showMessage("🧲 View fitted to all visible data", 2000)
+                
+            except Exception as e:
+                print(f"⚠️ Fit view failed: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    def _save_quick_no_dialog(self):
+        from .save_pointcloud import save_pointcloud
+
+        # Save to last path if possible, otherwise fallback to Save As dialog
+        path = getattr(self, "last_save_path", None)
+        if not path:
+            save_pointcloud(self, path=None, show_dialog=True)
+            return
+
+        save_pointcloud(
+            self,
+            path=path,
+            file_format=getattr(self, "last_save_format", None),
+            las_version=getattr(self, "last_save_version", None),
+            show_dialog=False
+        )
+
+
+    def activate_grid_tool(self):
+        """Activate grid creation tool"""
+        if not hasattr(self, 'grid_tool'):
+            from gui.grid_tool import GridTool
+            self.grid_tool = GridTool(self)
+        
+        self.grid_tool.activate()
+        
+    def on_view_mode_toggled(self, new_mode):
+        self.cross_view_mode = new_mode
+        # Notify all interactors to reset their projection math
+        for interactor in self.classify_interactors.values():
+            if hasattr(interactor, '_invalidate_coord_cache'):
+                interactor._invalidate_coord_cache()
+        self.refresh_all_views() # Ensure the screen updates
+
+    def cleanup_camera_sync_on_shutdown(self):
+        """
+        Cleanup camera sync resources on app close.
+        Call this in your closeEvent() method.
+        """
+        print("🧹 Cleaning up camera sync...")
+        
+        # Stop all debounce timers
+        if hasattr(self, '_camera_debounce_timers'):
+            for timer in self._camera_debounce_timers.values():
+                try:
+                    timer.stop()
+                except:
+                    pass
+            self._camera_debounce_timers.clear()
+        
+        # Clear pending states
+        if hasattr(self, '_pending_camera_states'):
+            self._pending_camera_states.clear()
+        
+        # Set sync flag to prevent new syncs
+        self._syncing_camera = True
+        
+        # Clear sync map
+        if hasattr(self, 'view_sync_map'):
+            self.view_sync_map.clear()
+        
+        # Clear camera states
+        if hasattr(self, '_last_camera_states'):
+            self._last_camera_states.clear()
+        
+        print("✅ Camera sync cleanup complete")       
+
+    def on_curve_tool_selected(self, tool_name):
+        """Handle curve tool selection from ribbon"""
+        if tool_name == "curve_point":
+            # Deactivate other tools first
+            if hasattr(self, 'digitizer') and self.digitizer:
+                self.digitizer.deactivate_all()
+           
+            # Activate curve tool
+            if hasattr(self, 'curvetool'):
+                self.curvetool.activate()
+                print(f"🔮 Curve tool '{tool_name}' activated")
+ 
+    def on_curve_button_clicked(self):
+        """Activate the curve drawing tool"""
+        # Deactivate other tools first (safe checks)
+        if hasattr(self, 'measurement_tool'):
+            try:
+                self.measurement_tool.deactivate()
+            except:
+                pass
+       
+        if hasattr(self, 'select_rectangle_tool'):
+            try:
+                self.select_rectangle_tool.deactivate()
+            except:
+                pass
+       
+        if hasattr(self, 'zoom_rectangle_tool'):
+            try:
+                self.zoom_rectangle_tool.deactivate()
+            except:
+                pass
+       
+        # Activate curve tool
+        self.curve_tool.activate()
+        print("🔮 Curve tool activated")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 3: GPU Uniform Sync handler (palette_changed → sync_palette_to_gpu)
+    # ═══════════════════════════════════════════════════════════════════
+    # def _on_palette_changed(self, slot_idx: int):
+    #     """
+    #     Instant GPU uniform poke — O(1) palette update.
+    #     Connected to DisplayModeDialog.palette_changed signal.
+    #     """
+    #     try:
+    #         from gui.unified_actor_manager import sync_palette_to_gpu
+    #         sync_palette_to_gpu(self, slot_idx)
+    #     except ImportError:
+    #         pass
+    #     except Exception as e:
+    #         print(f"⚠️ _on_palette_changed: {e}")
+
+    def _on_palette_changed(self, slot_idx: int):
+        """
+        🚀 MASTER GPU SYNC HANDLER
+        Triggered by Display Mode Dialog (Signal: palette_changed).
+        Updates GPU uniforms and buffers at O(1) speed without rebuilding actors.
+        """
+        try:
+            from gui.unified_actor_manager import sync_palette_to_gpu, is_unified_actor_ready
+            
+            # 1. Validation: Ensure we have data and the view is valid
+            if self.data is None:
+                return
+
+            # 2. Get the correct border value for this specific slot
+            # Main View (Slot 0) uses the global point_border_percent
+            # Cross-Sections (1-4) use the view_borders dictionary
+            if slot_idx == 0:
+                border = float(getattr(self, "point_border_percent", 0.0))
+            else:
+                # Fallback to 0 if not found
+                border = float(getattr(self, "view_borders", {}).get(slot_idx, 0.0))
+
+            # 3. Perform the GPU Sync
+            # This handles weights, visibility, and color LUTs in one pass
+            success = sync_palette_to_gpu(
+                self, 
+                slot_idx=slot_idx, 
+                palette=None, # sync_palette_to_gpu will auto-fetch the correct slot palette
+                border=border, 
+                render=True
+            )
+
+            if success:
+                # Subtle console log for debugging, kept quiet for production
+                # print(f"⚡ GPU Sync Success: Slot {slot_idx} updated.")
+                pass
+            else:
+                print(f"⚠️ GPU Sync skipped for slot {slot_idx} (Actor not initialized)")
+
+        except Exception as e:
+            print(f"❌ Error in _on_palette_changed (Slot {slot_idx}): {e}")  ###
+
+    # Add this inside the NakshaApp class
+    def _on_classification_finished(self, changed_mask):
+        """
+        🚀 MASTER VIEW SYNC: Triggered after any classification or Undo/Redo.
+
+        CRITICAL FIX: when called after a real classification (not undo),
+        changed_mask is a boolean array marking the newly re-classified points.
+        We must call fast_cross_section_update (which reads from the already-
+        updated master classification array) — NOT sync_palette_to_gpu (which
+        re-paints from the stale _naksha_section_class mirror and wipes the change).
+        """
+        try:
+            from gui.unified_actor_manager import fast_cross_section_update, sync_palette_to_gpu
+
+            # ── 1. Update all active Cross-Sections (Slots 1-4) ──────────────────
+            if hasattr(self, 'section_vtks') and self.section_vtks:
+                for view_idx in self.section_vtks.keys():
+
+                    if (changed_mask is not None
+                            and isinstance(changed_mask, np.ndarray)
+                            and changed_mask.dtype == bool):
+                        # Real classification: poke only the changed points via the
+                        # master array (already updated by apply_classification_signal).
+                        # This also keeps _naksha_section_class mirror in sync.
+                        fast_cross_section_update(self, view_idx, changed_mask)
+                    else:
+                        # Fallback (e.g. undo/redo emits None or a different type):
+                        # full palette repaint is safe here because undo already
+                        # wrote the correct values back into _naksha_section_class
+                        # before this signal fires.
+                        sync_palette_to_gpu(self, slot_idx=view_idx + 1, render=True)
+
+            # ── 2. Update Cut Section (Slot 5) ────────────────────────────────────
+            if hasattr(self, 'cut_section_controller'):
+                ctrl = self.cut_section_controller
+                if getattr(ctrl, 'is_cut_view_active', False):
+                    b = float(getattr(self, 'view_borders', {}).get(5, 0))
+                    sync_palette_to_gpu(self, slot_idx=5, border=b, render=True)  ##
+
+            # ── 3. Refresh Point Statistics UI ───────────────────────────────────
+            from gui.point_count_widget import refresh_point_statistics
+            refresh_point_statistics(self)
+
+            print("⚡ Global Sync: All viewports updated via GPU uniforms.")
+
+        except Exception as e:
+            print(f"⚠️ Global Sync Error: {e}")
+            import traceback
+            traceback.print_exc()  ##
+
+    def ensure_main_view_2d_interaction(self, preserve_camera=True, reason=None):
+        """
+        Force the main viewer back to 2D pan/zoom without refitting or losing zoom.
+        Keeps the current framing intact and removes accidental 3D orbit behavior.
+        """
+        try:
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+
+            if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
+                return False
+
+            interactor = getattr(self.vtk_widget, 'interactor', None)
+            renderer = getattr(self.vtk_widget, 'renderer', None)
+            if interactor is None or renderer is None:
+                return False
+
+            camera = renderer.GetActiveCamera()
+            if camera is None:
+                return False
+
+            saved_camera = None
+            if preserve_camera:
+                saved_camera = {
+                    'position': tuple(camera.GetPosition()),
+                    'focal_point': tuple(camera.GetFocalPoint()),
+                    'view_up': tuple(camera.GetViewUp()),
+                    'parallel_scale': camera.GetParallelScale(),
+                }
+
+            style = interactor.GetInteractorStyle()
+            style_name = style.GetClassName() if style is not None else "None"
+            if style_name != "vtkInteractorStyleImage":
+                style_2d = vtkInteractorStyleImage()
+                try:
+                    style_2d.SetInteractionModeToImageSlicing()
+                except Exception:
+                    pass
+                interactor.SetInteractorStyle(style_2d)
+
+            camera.ParallelProjectionOn()
+            if saved_camera:
+                camera.SetPosition(saved_camera['position'])
+                camera.SetFocalPoint(saved_camera['focal_point'])
+                camera.SetViewUp(saved_camera['view_up'])
+                camera.SetParallelScale(saved_camera['parallel_scale'])
+
+            renderer.ResetCameraClippingRange()
+            self.is_3d_mode = False
+            self.vtk_widget.render()
+
+            suffix = f" ({reason})" if reason else ""
+            print(f"🔒 Main view kept in 2D interaction mode{suffix}")
+            return True
+
+        except Exception as e:
+            print(f"⚠️ Failed to enforce 2D main interaction: {e}")
+            return False        

@@ -1,0 +1,696 @@
+================================================================================
+PATCH: Add Custom Draw Settings Presets & Tool Activation to Shortcut Manager
+================================================================================
+Files Modified:
+  1. gui\shortcut_manager.py
+  2. gui\global_shortcuts.py
+================================================================================
+
+
+================================================================================
+FILE: gui\shortcut_manager.py
+================================================================================
+
+
+--- CHANGE 1: Add "DrawSettings" to TOOLS list (line ~16) ---
+
+OLD BLOCK:
+    TOOLS = [
+        "AboveLine", "BelowLine", "Rectangle", "Circle",
+        "Polygon", "Freehand", "Brush", "Point",
+        "CrossSectionRect","CutSectionRect",
+        "CutFromCross", "CutFromCut",
+        "TopView",
+        "DisplayMode",
+        "ShadingMode", "Depth",
+        "RGB",
+        "Intensity",
+        "Elevation",
+        "Class"
+    ]
+
+UPDATED BLOCK:
+    TOOLS = [
+        "AboveLine", "BelowLine", "Rectangle", "Circle",
+        "Polygon", "Freehand", "Brush", "Point",
+        "CrossSectionRect","CutSectionRect",
+        "CutFromCross", "CutFromCut",
+        "TopView",
+        "DisplayMode",
+        "ShadingMode", "Depth",
+        "RGB",
+        "Intensity",
+        "Elevation",
+        "Class",
+        "DrawSettings"
+    ]
+
+
+--- CHANGE 2: Add encode_draw_preset, decode_draw_preset, DrawSettingsPicker (after decode_shading_preset) ---
+
+OLD BLOCK:
+        except Exception:
+            return None
+
+
+    class ClassVisibilityPicker(QDialog):
+
+UPDATED BLOCK:
+        except Exception:
+            return None
+
+
+    def encode_draw_preset(payload: dict) -> str:
+        """Encode draw tool styles into JSON"""
+        try:
+            tools = payload.get("tools", {}) or {}
+            tools_json = {}
+            for tool_key, style in tools.items():
+                tools_json[str(tool_key)] = {
+                    "color": list(style.get("color", (1.0, 0.0, 0.0))),
+                    "width": int(style.get("width", 2)),
+                    "style": str(style.get("style", "solid")),
+                }
+            preset = {
+                "__type__": "draw_settings_preset",
+                "active_tool": str(payload.get("active_tool", "smartline")),
+                "tools": tools_json,
+            }
+            return json.dumps(preset)
+        except Exception as e:
+            print(f"❌ encode_draw_preset error: {e}")
+            return json.dumps({"__type__": "draw_settings_preset", "tools": {}})
+
+
+    def decode_draw_preset(text: str):
+        """Decode draw settings preset from JSON"""
+        try:
+            data = json.loads(text)
+            if not isinstance(data, dict) or data.get("__type__") != "draw_settings_preset":
+                return None
+            tools = {}
+            for tool_key, style in (data.get("tools", {}) or {}).items():
+                tools[str(tool_key)] = {
+                    "color": tuple(style.get("color", (1.0, 0.0, 0.0))),
+                    "width": int(style.get("width", 2)),
+                    "style": str(style.get("style", "solid")),
+                }
+            return {"active_tool": str(data.get("active_tool", "smartline")), "tools": tools}
+        except Exception as e:
+            print(f"❌ decode_draw_preset error: {e}")
+            return None
+
+
+    class DrawSettingsPicker(QDialog):
+        """Lightweight dialog to configure draw tool styles for a shortcut preset."""
+
+        def __init__(self, app_window, parent=None):
+            super().__init__(parent)
+            self.app_window = app_window
+            self.setWindowTitle("Configure Draw Settings Preset")
+            self.setModal(False)
+            self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+            self.resize(560, 480)
+
+            from gui.draw_settings_dialog import (
+                DEFAULT_DRAW_STYLES, TOOL_ORDER, TOOL_DISPLAY_NAMES,
+                vtk_color_to_qcolor, qcolor_to_vtk, load_draw_settings,
+            )
+            self._TOOL_ORDER = TOOL_ORDER
+            self._TOOL_DISPLAY_NAMES = TOOL_DISPLAY_NAMES
+            self._vtk_to_q = vtk_color_to_qcolor
+            self._q_to_vtk = qcolor_to_vtk
+
+            # Working copy
+            if (hasattr(app_window, 'digitizer') and
+                    hasattr(app_window.digitizer, 'draw_tool_styles')):
+                self._styles = {k: dict(v) for k, v in app_window.digitizer.draw_tool_styles.items()}
+            else:
+                try:
+                    self._styles = load_draw_settings()
+                except Exception:
+                    self._styles = {k: dict(v) for k, v in DEFAULT_DRAW_STYLES.items()}
+
+            self._build_ui()
+            self.setStyleSheet(DARK_STYLESHEET)
+
+        def _build_ui(self):
+            from PySide6.QtWidgets import QGridLayout, QScrollArea, QGroupBox
+            layout = QVBoxLayout(self)
+
+            info = QLabel("Configure draw tool styles for this shortcut:")
+            info.setStyleSheet("color: #cccccc; font-style: italic;")
+            layout.addWidget(info)
+
+            # ── Tool selector ──────────────────────────────────────────────
+            tool_row = QHBoxLayout()
+            tool_row.addWidget(QLabel("Activate Tool:"))
+            self._active_tool_combo = QComboBox()
+            for key in self._TOOL_ORDER:
+                self._active_tool_combo.addItem(
+                    self._TOOL_DISPLAY_NAMES.get(key, key), key
+                )
+            self._active_tool_combo.setCurrentIndex(0)
+            self._active_tool_combo.setStyleSheet(
+                "QComboBox { padding: 4px; font-weight: bold; }"
+            )
+            tool_row.addWidget(self._active_tool_combo, stretch=1)
+            layout.addLayout(tool_row)
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll_w = QWidget()
+            grid = QGridLayout(scroll_w)
+
+            for col, header in enumerate(["Tool", "Color", "Width", "Style"]):
+                lbl = QLabel(header)
+                lbl.setStyleSheet("font-weight: bold; color: #cccccc;")
+                grid.addWidget(lbl, 0, col)
+
+            self._color_buttons = {}
+            self._width_combos = {}
+            self._style_combos = {}
+
+            for idx, key in enumerate(self._TOOL_ORDER):
+                row = idx + 1
+                style = self._styles.get(key, {"color": (1, 0, 0), "width": 2, "style": "solid"})
+
+                grid.addWidget(QLabel(self._TOOL_DISPLAY_NAMES.get(key, key)), row, 0)
+
+                color_btn = QPushButton()
+                color_btn.setFixedSize(40, 24)
+                qc = self._vtk_to_q(style["color"])
+                color_btn.setStyleSheet(
+                    f"background-color: {qc.name()}; border: 2px solid #fff; border-radius: 4px;"
+                )
+                color_btn.setCursor(Qt.PointingHandCursor)
+                color_btn.clicked.connect(lambda checked=False, k=key: self._pick_color(k))
+                self._color_buttons[key] = color_btn
+                grid.addWidget(color_btn, row, 1)
+
+                w_combo = QComboBox()
+                w_combo.addItems([str(i) for i in range(1, 11)])
+                w_combo.setCurrentText(str(style.get("width", 2)))
+                self._width_combos[key] = w_combo
+                grid.addWidget(w_combo, row, 2)
+
+                s_combo = QComboBox()
+                s_combo.addItems(["solid", "dashed", "dotted", "dash-dot", "dash-dot-dot"])
+                s_combo.setCurrentText(style.get("style", "solid"))
+                self._style_combos[key] = s_combo
+                grid.addWidget(s_combo, row, 3)
+
+            scroll.setWidget(scroll_w)
+            layout.addWidget(scroll, stretch=1)
+
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            ok_btn = QPushButton("OK")
+            cancel_btn = QPushButton("Cancel")
+            ok_btn.clicked.connect(self.accept)
+            cancel_btn.clicked.connect(self.reject)
+            btn_layout.addWidget(ok_btn)
+            btn_layout.addWidget(cancel_btn)
+            layout.addLayout(btn_layout)
+
+        def _pick_color(self, tool_key):
+            from PySide6.QtWidgets import QColorDialog
+            cur = self._vtk_to_q(self._styles.get(tool_key, {}).get("color", (1, 0, 0)))
+            color = QColorDialog.getColor(cur, self, f"Choose color for {tool_key}")
+            if color.isValid():
+                self._styles[tool_key]["color"] = self._q_to_vtk(color)
+                self._color_buttons[tool_key].setStyleSheet(
+                    f"background-color: {color.name()}; border: 2px solid #fff; border-radius: 4px;"
+                )
+
+        def get_preset(self) -> dict:
+            """Return the configured draw styles as a preset dict."""
+            tools = {}
+            for key in self._TOOL_ORDER:
+                tools[key] = {
+                    "color": self._styles.get(key, {}).get("color", (1, 0, 0)),
+                    "width": int(self._width_combos[key].currentText()),
+                    "style": self._style_combos[key].currentText(),
+                }
+            active_tool = self._active_tool_combo.currentData() or self._TOOL_ORDER[0]
+            return {"active_tool": active_tool, "tools": tools}
+
+        def set_preset(self, preset: dict):
+            """Load an existing preset into the UI."""
+            # Active tool
+            active = preset.get("active_tool", self._TOOL_ORDER[0])
+            idx = self._active_tool_combo.findData(active)
+            if idx >= 0:
+                self._active_tool_combo.setCurrentIndex(idx)
+
+            tools = preset.get("tools", {})
+            for key in self._TOOL_ORDER:
+                if key not in tools:
+                    continue
+                style = tools[key]
+                self._styles[key] = dict(style)
+                # Update color button
+                qc = self._vtk_to_q(style.get("color", (1, 0, 0)))
+                self._color_buttons[key].setStyleSheet(
+                    f"background-color: {qc.name()}; border: 2px solid #fff; border-radius: 4px;"
+                )
+                # Update width
+                self._width_combos[key].setCurrentText(str(style.get("width", 2)))
+                # Update style
+                self._style_combos[key].setCurrentText(style.get("style", "solid"))
+
+
+    class ClassVisibilityPicker(QDialog):
+
+
+--- CHANGE 3: _toggle_class_cell — add DrawSettings block (after ShadingMode return) ---
+
+OLD BLOCK:
+                if not self._is_loading_shortcuts:
+                    self._open_shading_mode_for_row(row)
+                return
+
+            # Default tools: keep existing class mapping behavior
+            item = QTableWidgetItem("Any → Any")
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setData(Qt.UserRole, encode_classes(None, None))
+            self.table.setItem(row, 3, item)
+
+UPDATED BLOCK:
+                if not self._is_loading_shortcuts:
+                    self._open_shading_mode_for_row(row)
+                return
+
+            if tool_text == "DrawSettings":
+                item = QTableWidgetItem("Click/Double-click to configure draw preset")
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setData(Qt.UserRole, encode_draw_preset({"tools": {}}))
+                self.table.setItem(row, 3, item)
+
+                if not self._is_loading_shortcuts:
+                    self._open_draw_settings_for_row(row)
+                return
+
+            # Default tools: keep existing class mapping behavior
+            item = QTableWidgetItem("Any → Any")
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setData(Qt.UserRole, encode_classes(None, None))
+            self.table.setItem(row, 3, item)
+
+
+--- CHANGE 4: on_class_edit — add DrawSettings routing (after ShadingMode return) ---
+
+OLD BLOCK:
+            if tool == "ShadingMode":
+                self._open_shading_mode_for_row(row)
+                return
+
+            # Only drawing tools with class mapping reach here
+
+UPDATED BLOCK:
+            if tool == "ShadingMode":
+                self._open_shading_mode_for_row(row)
+                return
+
+            if tool == "DrawSettings":
+                self._open_draw_settings_for_row(row)
+                return
+
+            # Only drawing tools with class mapping reach here
+
+
+--- CHANGE 5: Add _open_draw_settings_for_row method (after _open_shading_mode_for_row) ---
+
+OLD BLOCK:
+            picker.show()
+            picker.raise_()
+            picker.activateWindow()
+
+
+        def _capture_display_mode_preset(self, payload: dict):
+
+UPDATED BLOCK:
+            picker.show()
+            picker.raise_()
+            picker.activateWindow()
+
+
+        def _open_draw_settings_for_row(self, row: int):
+            """Open draw settings picker for a shortcut row."""
+            cell = self.table.item(row, 3)
+            existing_preset = decode_draw_preset(cell.data(Qt.UserRole)) if cell else None
+
+            if hasattr(self, '_draw_picker') and self._draw_picker is not None:
+                try:
+                    self._draw_picker.close()
+                    self._draw_picker.deleteLater()
+                except Exception:
+                    pass
+
+            self._draw_picker = DrawSettingsPicker(self.app_window, parent=self)
+            picker = self._draw_picker
+
+            if existing_preset:
+                picker.set_preset(existing_preset)
+
+            def on_accepted():
+                preset = picker.get_preset()
+                active_tool = preset.get("active_tool", "smartline")
+                tools = preset.get("tools", {})
+
+                from gui.draw_settings_dialog import vtk_color_to_qcolor
+                parts = []
+                # Highlight active tool first if present
+                if active_tool in tools:
+                    st = tools[active_tool]
+                    qc = vtk_color_to_qcolor(st.get("color", (1, 0, 0)))
+                    parts.append(f"[{active_tool.upper()}] {qc.name()}, {st.get('width', 2)}px")
+                for tk, st in tools.items():
+                    if tk == active_tool: continue
+                    qc = vtk_color_to_qcolor(st.get("color", (1, 0, 0)))
+                    parts.append(f"{tk}: {qc.name()}")
+                summary = "; ".join(parts) if parts else "Draw preset"
+                if len(summary) > 80:
+                    summary = summary[:77] + "..."
+
+                item = QTableWidgetItem(summary)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                item.setData(Qt.UserRole, encode_draw_preset(preset))
+                self.table.setItem(row, 3, item)
+
+                print(f"✅ Saved DrawSettings preset into row {row + 1}: {summary}")
+                picker.close()
+                picker.deleteLater()
+                self._draw_picker = None
+
+            def on_rejected():
+                print("❌ Draw settings configuration cancelled")
+                picker.close()
+                picker.deleteLater()
+                self._draw_picker = None
+
+            picker.accepted.connect(on_accepted)
+            picker.rejected.connect(on_rejected)
+
+            picker.show()
+            picker.raise_()
+            picker.activateWindow()
+
+
+        def _capture_display_mode_preset(self, payload: dict):
+
+
+--- CHANGE 6: on_apply — add DrawSettings block (after ShadingMode continue) ---
+
+OLD BLOCK:
+                    shortcuts[(mod, key)] = {"tool": "ShadingMode", "preset": preset_payload}
+                    print(f"   Row {row}: {mod}+{key} → ShadingMode preset saved")
+                    continue
+
+                # ✅ Handle simple tools (including display modes)
+
+UPDATED BLOCK:
+                    shortcuts[(mod, key)] = {"tool": "ShadingMode", "preset": preset_payload}
+                    print(f"   Row {row}: {mod}+{key} → ShadingMode preset saved")
+                    continue
+
+                if tool == "DrawSettings":
+                    cell = self.table.item(row, 3)
+                    preset_payload = decode_draw_preset(cell.data(Qt.UserRole)) if cell else None
+                    shortcuts[(mod, key)] = {"tool": "DrawSettings", "preset": preset_payload}
+                    print(f"   Row {row}: {mod}+{key} → DrawSettings preset saved")
+                    continue
+
+                # ✅ Handle simple tools (including display modes)
+
+
+--- CHANGE 7: save_mnu_as — add DrawSettings block (after ShadingMode continue) ---
+
+OLD BLOCK:
+                if tool == "ShadingMode":
+                    preset_json = cell.data(Qt.UserRole) if cell else ""
+                    shading_text = cell.text() if cell else ""
+                    f.write(f"{mod}\t{key}\t{tool}\t{preset_json}\t{shading_text}\n")
+                    continue
+
+                # ✅ Handle simple tools (including display modes)
+
+UPDATED BLOCK:
+                if tool == "ShadingMode":
+                    preset_json = cell.data(Qt.UserRole) if cell else ""
+                    shading_text = cell.text() if cell else ""
+                    f.write(f"{mod}\t{key}\t{tool}\t{preset_json}\t{shading_text}\n")
+                    continue
+
+                if tool == "DrawSettings":
+                    preset_json = cell.data(Qt.UserRole) if cell else ""
+                    draw_text = cell.text() if cell else ""
+                    f.write(f"{mod}\t{key}\t{tool}\t{preset_json}\t{draw_text}\n")
+                    continue
+
+                # ✅ Handle simple tools (including display modes)
+
+
+--- CHANGE 8: load_mnu — add DrawSettings block (after ShadingMode continue) ---
+
+OLD BLOCK:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        self.table.setItem(row, 3, item)
+                        continue
+
+                    # Classes cell for other tools
+
+UPDATED BLOCK (after the ShadingMode continue block):
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        self.table.setItem(row, 3, item)
+                        continue
+
+                    if parts[2] == "DrawSettings":
+                        if len(parts) > 3 and parts[3].strip():
+                            preset_payload = decode_draw_preset(parts[3])
+                            saved_text = parts[4] if len(parts) > 4 else ""
+                            if saved_text:
+                                item = QTableWidgetItem(saved_text)
+                                item.setData(Qt.UserRole, parts[3])
+                            elif preset_payload:
+                                item = QTableWidgetItem("Draw preset")
+                                item.setData(Qt.UserRole, parts[3])
+                            else:
+                                item = QTableWidgetItem("Click/Double-click to configure draw preset")
+                                item.setData(Qt.UserRole, encode_draw_preset({"tools": {}}))
+                        else:
+                            item = QTableWidgetItem("Click/Double-click to configure draw preset")
+                            item.setData(Qt.UserRole, encode_draw_preset({"tools": {}}))
+
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        self.table.setItem(row, 3, item)
+                        continue
+
+                    # Classes cell for other tools
+
+
+--- CHANGE 9: auto_load_shortcuts — add DrawSettings block (after ShadingMode continue) ---
+
+OLD BLOCK (in auto_load_shortcuts, after ShadingMode handling):
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        self.table.setItem(row, 3, item)
+                        continue
+
+                    if tool in ("CrossSectionRect", "CutSectionRect", ...):
+
+UPDATED BLOCK:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        self.table.setItem(row, 3, item)
+                        continue
+
+                    # ✅ Handle DrawSettings presets
+                    if tool == "DrawSettings":
+                        preset_payload = entry.get("draw_preset")
+                        saved_text = entry.get("draw_text", "")
+
+                        if preset_payload and saved_text:
+                            item = QTableWidgetItem(saved_text)
+                            item.setData(Qt.UserRole, encode_draw_preset(preset_payload))
+                        elif preset_payload:
+                            item = QTableWidgetItem("Draw preset")
+                            item.setData(Qt.UserRole, encode_draw_preset(preset_payload))
+                        else:
+                            item = QTableWidgetItem("Click/Double-click to configure draw preset")
+                            item.setData(Qt.UserRole, encode_draw_preset({"tools": {}}))
+
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        self.table.setItem(row, 3, item)
+                        continue
+
+                    if tool in ("CrossSectionRect", "CutSectionRect", ...):
+
+
+--- CHANGE 10: auto_save_shortcuts — add DrawSettings block (after ShadingMode continue) ---
+
+OLD BLOCK:
+            if tool == "ShadingMode":
+                cell = self.table.item(row, 3)
+                preset_payload = decode_shading_preset(cell.data(Qt.UserRole)) if cell else None
+                entry["shading_preset"] = preset_payload
+                entry["shading_text"] = cell.text() if cell else ""
+                entry["from_classes"] = None
+                entry["to_class"] = None
+                shortcuts_list.append(entry)
+                continue
+            # ----------------------------------------
+
+UPDATED BLOCK:
+            if tool == "ShadingMode":
+                cell = self.table.item(row, 3)
+                preset_payload = decode_shading_preset(cell.data(Qt.UserRole)) if cell else None
+                entry["shading_preset"] = preset_payload
+                entry["shading_text"] = cell.text() if cell else ""
+                entry["from_classes"] = None
+                entry["to_class"] = None
+                shortcuts_list.append(entry)
+                continue
+
+            if tool == "DrawSettings":
+                cell = self.table.item(row, 3)
+                preset_payload = decode_draw_preset(cell.data(Qt.UserRole)) if cell else None
+                entry["draw_preset"] = preset_payload
+                entry["draw_text"] = cell.text() if cell else ""
+                entry["from_classes"] = None
+                entry["to_class"] = None
+                shortcuts_list.append(entry)
+                continue
+            # ----------------------------------------
+
+
+--- CHANGE 11: apply_shortcuts_from_settings — add DrawSettings block (after ShadingMode continue) ---
+
+OLD BLOCK:
+                if tool == "ShadingMode":
+                    preset_payload = entry.get("shading_preset")
+                    ...
+                    continue
+
+                # Handle simple tools
+
+UPDATED BLOCK:
+                if tool == "ShadingMode":
+                    preset_payload = entry.get("shading_preset")
+                    ...
+                    continue
+
+                # Handle DrawSettings presets
+                if tool == "DrawSettings":
+                    preset_payload = entry.get("draw_preset")
+                    if preset_payload:
+                        shortcuts[(mod, key_upper)] = {
+                            "tool": "DrawSettings",
+                            "preset": preset_payload
+                        }
+                        print(f"      ✅ {mod}+{key_upper} → DrawSettings preset")
+                    continue
+
+                # Handle simple tools
+
+
+================================================================================
+FILE: gui\global_shortcuts.py
+================================================================================
+
+
+--- CHANGE 12: Add DrawSettings runtime handler with tool activation (after ShadingMode return True) ---
+
+OLD BLOCK:
+                    return True
+                    ####
+
+                if not shortcut:
+                   return False
+
+UPDATED BLOCK:
+                    return True
+                    ####
+
+                if tool == "DrawSettings":
+                    preset = shortcut.get("preset")
+                    print(f"✅ SHORTCUT MATCH: {combo} → DrawSettings")
+
+                    if not preset:
+                        print("⚠️ DrawSettings shortcut has no preset")
+                        return True
+
+                    try:
+                        print(f"\n{'='*60}")
+                        print(f"🎨 APPLYING DRAW SETTINGS PRESET FROM SHORTCUT")
+                        print(f"{'='*60}")
+
+                        tools = preset.get("tools", {})
+
+                        # Apply to digitizer
+                        if hasattr(self.app_window, 'digitizer') and \
+                                hasattr(self.app_window.digitizer, 'draw_tool_styles'):
+                            for tool_key, style in tools.items():
+                                self.app_window.digitizer.draw_tool_styles[tool_key] = dict(style)
+                            print(f"   ✅ Applied {len(tools)} tool styles to digitizer")
+                        else:
+                            print("   ⚠️ Digitizer not available, styles saved to QSettings only")
+
+                        # Persist to QSettings
+                        from gui.draw_settings_dialog import save_draw_settings
+                        save_draw_settings(tools)
+                        print(f"   ✅ Saved to QSettings")
+
+                        # ✅ Activate the digitizer and set the chosen tool
+                        active_tool = preset.get("active_tool", "smartline")
+                        if hasattr(self.app_window, 'digitizer') and self.app_window.digitizer:
+                            digi = self.app_window.digitizer
+                            # Enable digitizer if not already enabled
+                            if hasattr(digi, 'enable'):
+                                digi.enable(True)
+                            elif hasattr(digi, 'enabled'):
+                                digi.enabled = True
+
+                            # Activate the user's chosen tool
+                            if hasattr(digi, 'set_tool'):
+                                digi.set_tool(active_tool)
+                                print(f"   ✅ Activated digitizer with tool: {active_tool}")
+                            elif hasattr(digi, 'active_tool'):
+                                digi.active_tool = active_tool
+                                print(f"   ✅ Set digitizer active_tool: {active_tool}")
+                            else:
+                                print(f"   ✅ Digitizer enabled (set_tool not available)")
+                        else:
+                            print("   ⚠️ Digitizer not found, only styles saved")
+
+                        # Refresh DrawToolSettingsDialog if open
+                        if hasattr(self.app_window, 'draw_settings_dialog') and \
+                                self.app_window.draw_settings_dialog is not None and \
+                                self.app_window.draw_settings_dialog.isVisible():
+                            try:
+                                self.app_window.draw_settings_dialog._load_styles()
+                                print(f"   ✅ Refreshed Draw Settings dialog")
+                            except Exception:
+                                pass
+
+                        if hasattr(self.app_window, 'statusBar'):
+                            self.app_window.statusBar().showMessage(
+                                f"🎨 DrawSettings applied + {active_tool} activated ({len(tools)} tools updated)",
+                                2500
+                            )
+
+                        print(f"   ✅ DrawSettings shortcut complete")
+                        print(f"{'='*60}\n")
+
+                    except Exception as e:
+                        print(f"⚠️ Failed to apply DrawSettings preset: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                    return True
+
+                if not shortcut:
+                   return False
+
+
+================================================================================
+END OF PATCH
+================================================================================

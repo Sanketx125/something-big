@@ -1,0 +1,50 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .monitor-fill { fill: #E6F1FB; }
+    .monitor-line { stroke: #185FA5; }
+    .row-icon     { fill: #185FA5; }
+    .row-track    { stroke: #185FA5; }
+    .row-dot      { fill: #185FA5; }
+
+    @media (prefers-color-scheme: dark) {
+      .monitor-fill { fill: #0C447C; }
+      .monitor-line { stroke: #378ADD; }
+      .row-icon     { fill: #85B7EB; }
+      .row-track    { stroke: #85B7EB; }
+      .row-dot      { fill: #85B7EB; }
+    }
+  </style>
+
+  <!-- Monitor / display frame -->
+  <rect x="2" y="2" width="20" height="15" rx="2"
+        class="monitor-fill monitor-line" stroke-width="0.9"/>
+
+  <!-- Monitor stand stem -->
+  <line x1="12" y1="17" x2="12" y2="20"
+        class="monitor-line" stroke-width="1" stroke-linecap="round"/>
+
+  <!-- Monitor stand base -->
+  <line x1="9" y1="20" x2="15" y2="20"
+        class="monitor-line" stroke-width="1" stroke-linecap="round"/>
+
+  <!-- ── Row 1: FILTER ── funnel icon left, track + value dot right -->
+  <path d="M4 5.5 L6.5 8.5 L6.5 11 L7.5 11 L7.5 8.5 L10 5.5Z"
+        class="row-icon" opacity="0.55"/>
+  <line x1="11.5" y1="8" x2="20" y2="8"
+        class="row-track" stroke-width="0.75" stroke-linecap="round" opacity="0.4"/>
+  <circle cx="19" cy="8" r="1.2" class="row-dot" opacity="0.85"/>
+
+  <!-- ── Row 2: WEIGHT ── thick line left (stroke weight swatch), track + dot right -->
+  <line x1="4" y1="11.5" x2="10" y2="11.5"
+        class="row-track" stroke-width="2.2" stroke-linecap="round" opacity="0.55"/>
+  <line x1="11.5" y1="11.5" x2="20" y2="11.5"
+        class="row-track" stroke-width="0.75" stroke-linecap="round" opacity="0.4"/>
+  <circle cx="14" cy="11.5" r="1.2" class="row-dot" opacity="0.85"/>
+
+  <!-- ── Row 3: BORDER ── empty rect outline left (border preview), track + dot right -->
+  <rect x="4" y="13.5" width="6" height="2" rx="0.4"
+        fill="none" class="row-track" stroke-width="1" opacity="0.55"/>
+  <line x1="11.5" y1="14.5" x2="20" y2="14.5"
+        class="row-track" stroke-width="0.75" stroke-linecap="round" opacity="0.4"/>
+  <circle cx="17" cy="14.5" r="1.2" class="row-dot" opacity="0.85"/>
+</svg>

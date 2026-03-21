@@ -1,0 +1,31 @@
+<svg width="64" height="72" viewBox="0 0 40 46" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .doc  { fill:#FFFFFF; stroke:#B8CCB8; }
+    .fold { fill:#E8F0E8; stroke:#B8CCB8; }
+    .glob { stroke:#3B6D11; }
+    .band { fill:#3B6D11; }
+    .txt  { fill:#FFFFFF; }
+    @media(prefers-color-scheme:dark){
+      .doc  { fill:#101810; stroke:#1E3018; }
+      .fold { fill:#162214; stroke:#1E3018; }
+      .glob { stroke:#97C459; }
+      .band { fill:#639922; }
+      .txt  { fill:#FFFFFF; }
+    }
+  </style>
+  <rect x="1.5" y="1.5" width="37" height="43" rx="4" class="doc" stroke-width="1"/>
+  <path d="M27 1.5 L38.5 13 H28a1 1 0 0 1-1-1Z" class="fold" stroke-width=".8"/>
+  <!-- Globe / CRS projection grid -->
+  <circle cx="16" cy="16" r="9" fill="none" class="glob" stroke-width=".9" opacity=".40"/>
+  <line   x1="7"  y1="16" x2="25" y2="16" class="glob" stroke-width=".75" opacity=".38"/>
+  <line   x1="16" y1="7"  x2="16" y2="25" class="glob" stroke-width=".75" opacity=".38"/>
+  <path d="M9  12 Q16 9.5 23 12"  fill="none" class="glob" stroke-width=".65" opacity=".32"/>
+  <path d="M9  20 Q16 22.5 23 20" fill="none" class="glob" stroke-width=".65" opacity=".32"/>
+  <path d="M16 7  Q12.5 16 16 25" fill="none" class="glob" stroke-width=".65" opacity=".32"/>
+  <path d="M16 7  Q19.5 16 16 25" fill="none" class="glob" stroke-width=".65" opacity=".32"/>
+  <!-- Bold color band bottom -->
+  <path d="M1.5 29H38.5V42a3.5 3.5 0 0 1-3.5 3.5H5A3.5 3.5 0 0 1 1.5 42Z" class="band"/>
+  <text x="20" y="38.5" text-anchor="middle" dominant-baseline="central"
+        font-family="Arial Black,Arial,Helvetica,sans-serif"
+        font-size="11.5" font-weight="900" class="txt" letter-spacing="1.2">PRJ</text>
+</svg>

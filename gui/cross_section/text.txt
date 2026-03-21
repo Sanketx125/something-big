@@ -1,0 +1,16 @@
+-----------teractor_classify-----
+
+        section_indices, section_points = _get_cut_section_or_default(self.app, mask, section_points)
+        
+        if section_indices is None or section_points is None:
+            print("⚠️ No section data available")
+            self._clear_all_previews()
+            self.P1 = None
+            return
+
+        print(f"📊 Section data: {len(section_points)} points, {len(section_indices)} indices")
+
+        # ✅ Apply viewport visibility filter
+        viewport_mask = _get_visible_mask_from_viewport(self.app, section_points, section_indices)
+        if viewport_mask is None:
+            viewport_mask = np.ones(len(section_points), dtype=bool)

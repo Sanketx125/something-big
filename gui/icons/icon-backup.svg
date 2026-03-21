@@ -1,0 +1,45 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .cloud-fill { fill: #E6F1FB; }
+    .cloud-line { stroke: #185FA5; }
+    .arrow      { stroke: #185FA5; }
+    .history    { stroke: #185FA5; }
+
+    @media (prefers-color-scheme: dark) {
+      .cloud-fill { fill: #0C447C; }
+      .cloud-line { stroke: #378ADD; }
+      .arrow      { stroke: #85B7EB; }
+      .history    { stroke: #85B7EB; }
+    }
+  </style>
+
+  <!-- Cloud body -->
+  <path d="M6 16.5C4.067 16.5 2.5 14.933 2.5 13
+           C2.5 11.25 3.8 9.8 5.5 9.55
+           C5.5 7.015 7.515 5 10 5
+           C11.8 5 13.36 6.02 14.13 7.5
+           C14.4 7.47 14.7 7.45 15 7.45
+           C17.485 7.45 19.5 9.465 19.5 11.95
+           C19.5 12.05 19.49 12.15 19.48 12.25
+           C20.67 12.7 21.5 13.85 21.5 15.2
+           C21.5 16.96 20.06 18.4 18.3 18.4H6Z"
+        class="cloud-fill cloud-line"
+        stroke-width="0.9" stroke-linejoin="round"/>
+
+  <!-- Upload arrow shaft — pointing up into cloud -->
+  <line x1="12" y1="21" x2="12" y2="13"
+        class="arrow" stroke-width="1.4" stroke-linecap="round"/>
+
+  <!-- Arrow head pointing up -->
+  <polyline points="9,15.5 12,13 15,15.5"
+            fill="none" class="arrow"
+            stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- History / restore arc — bottom-left corner (communicates versioned backup) -->
+  <path d="M5.5 20.5 A4 4 0 0 1 9.5 17"
+        fill="none" class="history"
+        stroke-width="1.1" stroke-linecap="round"/>
+  <polyline points="5.5,17.8 5.5,20.5 8.2,20.5"
+            fill="none" class="history"
+            stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

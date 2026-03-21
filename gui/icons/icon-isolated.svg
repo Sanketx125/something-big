@@ -1,0 +1,26 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .cluster  { fill: #185FA5; }
+    .outlier  { fill: #E24B4A; }
+    .dist     { stroke: #E24B4A; }
+    @media (prefers-color-scheme: dark) {
+      .cluster  { fill: #85B7EB; }
+      .outlier  { fill: #F09595; }
+      .dist     { stroke: #F09595; }
+    }
+  </style>
+  <!-- main cluster -->
+  <circle cx="14" cy="11" r="0.85" class="cluster" opacity="0.65"/>
+  <circle cx="16" cy="9"  r="0.85" class="cluster" opacity="0.65"/>
+  <circle cx="18" cy="11" r="0.85" class="cluster" opacity="0.65"/>
+  <circle cx="15" cy="13" r="0.85" class="cluster" opacity="0.65"/>
+  <circle cx="17" cy="13" r="0.85" class="cluster" opacity="0.65"/>
+  <circle cx="19" cy="9"  r="0.85" class="cluster" opacity="0.6"/>
+  <circle cx="20" cy="14" r="0.85" class="cluster" opacity="0.6"/>
+  <!-- isolated outlier -->
+  <circle cx="5" cy="5" r="1.1" class="outlier" opacity="0.95"/>
+  <!-- halo ring -->
+  <circle cx="5" cy="5" r="3.2" fill="none" class="dist" stroke-width="0.8" stroke-dasharray="1.5 1.5" opacity="0.5"/>
+  <!-- distance dashed connector -->
+  <line x1="6.5" y1="6.5" x2="13.5" y2="10.5" class="dist" stroke-width="0.8" stroke-dasharray="1.5 1.5" stroke-linecap="round" opacity="0.6"/>
+</svg>

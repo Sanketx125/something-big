@@ -1,0 +1,20 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .cloud { fill: #185FA5; }
+    .dim   { stroke: #EF9F27; }
+    .dot   { fill: #EF9F27; }
+    @media (prefers-color-scheme: dark) {
+      .cloud { fill: #0C447C; }
+      .dim   { stroke: #FAC775; }
+      .dot   { fill: #FAC775; }
+    }
+  </style>
+  <circle cx="4"  cy="14" r="0.8" class="cloud" opacity="0.35"/>
+  <circle cx="8"  cy="12" r="0.8" class="cloud" opacity="0.35"/>
+  <circle cx="12" cy="15" r="0.8" class="cloud" opacity="0.35"/>
+  <circle cx="17" cy="11" r="0.8" class="cloud" opacity="0.35"/>
+  <line x1="5" y1="17" x2="19" y2="9"   class="dim" stroke-width="1.4" stroke-linecap="round"/>
+  <line x1="3.5" y1="15.2" x2="6.5" y2="18.8" class="dim" stroke-width="1.1" stroke-linecap="round"/>
+  <line x1="17.5" y1="7.2" x2="20.5" y2="10.8" class="dim" stroke-width="1.1" stroke-linecap="round"/>
+  <circle cx="12" cy="13" r="1.1" class="dot"/>
+</svg>

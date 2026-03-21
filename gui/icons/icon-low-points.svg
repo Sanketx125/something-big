@@ -1,0 +1,29 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .cloud  { fill: #185FA5; }
+    .low    { fill: #E24B4A; }
+    .thresh { stroke: #E24B4A; }
+    @media (prefers-color-scheme: dark) {
+      .cloud  { fill: #0C447C; }
+      .low    { fill: #F09595; }
+      .thresh { stroke: #F09595; }
+    }
+  </style>
+  <!-- main cloud -->
+  <circle cx="5"  cy="8"  r="0.85" class="cloud" opacity="0.5"/>
+  <circle cx="9"  cy="6"  r="0.85" class="cloud" opacity="0.5"/>
+  <circle cx="13" cy="7"  r="0.85" class="cloud" opacity="0.5"/>
+  <circle cx="17" cy="6"  r="0.85" class="cloud" opacity="0.5"/>
+  <circle cx="7"  cy="11" r="0.85" class="cloud" opacity="0.5"/>
+  <circle cx="11" cy="10" r="0.85" class="cloud" opacity="0.5"/>
+  <circle cx="15" cy="11" r="0.85" class="cloud" opacity="0.5"/>
+  <circle cx="19" cy="10" r="0.85" class="cloud" opacity="0.5"/>
+  <!-- threshold line -->
+  <line x1="3" y1="15" x2="21" y2="15" class="thresh" stroke-width="0.9" stroke-dasharray="2 1.5" stroke-linecap="round" opacity="0.7"/>
+  <!-- low outlier points -->
+  <circle cx="6"  cy="18" r="1.0" class="low" opacity="0.9"/>
+  <circle cx="12" cy="20" r="1.0" class="low" opacity="0.9"/>
+  <circle cx="18" cy="17" r="1.0" class="low" opacity="0.9"/>
+  <!-- arrow down -->
+  <polyline points="10,17 12,20 14,17" fill="none" class="thresh" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

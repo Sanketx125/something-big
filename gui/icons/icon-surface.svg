@@ -1,0 +1,43 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .cloud      { fill: #185FA5; }
+    .surf-fill  { fill: #1D9E75; }
+    .surf-line  { stroke: #1D9E75; }
+    .surf-dot   { fill: #1D9E75; }
+    @media (prefers-color-scheme: dark) {
+      .cloud      { fill: #0C447C; }
+      .surf-fill  { fill: #1D9E75; }
+      .surf-line  { stroke: #5DCAA5; }
+      .surf-dot   { fill: #5DCAA5; }
+    }
+  </style>
+  <!-- point cloud beneath the surface -->
+  <circle cx="5"  cy="14" r="0.8" class="cloud" opacity="0.45"/>
+  <circle cx="9"  cy="12" r="0.8" class="cloud" opacity="0.45"/>
+  <circle cx="12" cy="15" r="0.8" class="cloud" opacity="0.45"/>
+  <circle cx="15" cy="11" r="0.8" class="cloud" opacity="0.45"/>
+  <circle cx="19" cy="13" r="0.8" class="cloud" opacity="0.45"/>
+  <!-- surface mesh fill -->
+  <path d="M3 15 Q7 10 12 13 Q16 9 21 12 L21 8 Q16 5 12 8 Q7 5 3 9 Z"
+        class="surf-fill" fill-opacity="0.15"/>
+  <!-- mesh top edge -->
+  <polyline points="3,9 12,8 21,8"
+            fill="none" class="surf-line" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.75"/>
+  <!-- mesh bottom edge -->
+  <polyline points="3,15 12,13 21,12"
+            fill="none" class="surf-line" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.75"/>
+  <!-- vertical mesh lines -->
+  <line x1="3"  y1="9"  x2="3"  y2="15" class="surf-line" stroke-width="0.8" stroke-linecap="round" opacity="0.65"/>
+  <line x1="12" y1="8"  x2="12" y2="13" class="surf-line" stroke-width="0.8" stroke-linecap="round" opacity="0.65"/>
+  <line x1="21" y1="8"  x2="21" y2="12" class="surf-line" stroke-width="0.8" stroke-linecap="round" opacity="0.65"/>
+  <!-- diagonal mesh lines -->
+  <line x1="3"  y1="9"  x2="12" y2="13" class="surf-line" stroke-width="0.7" stroke-linecap="round" opacity="0.5"/>
+  <line x1="12" y1="8"  x2="21" y2="12" class="surf-line" stroke-width="0.7" stroke-linecap="round" opacity="0.5"/>
+  <!-- mesh vertex nodes -->
+  <circle cx="3"  cy="9"  r="1.1" class="surf-dot" opacity="0.85"/>
+  <circle cx="12" cy="8"  r="1.1" class="surf-dot" opacity="0.85"/>
+  <circle cx="21" cy="8"  r="1.1" class="surf-dot" opacity="0.85"/>
+  <circle cx="3"  cy="15" r="1.1" class="surf-dot" opacity="0.85"/>
+  <circle cx="12" cy="13" r="1.1" class="surf-dot" opacity="0.85"/>
+  <circle cx="21" cy="12" r="1.1" class="surf-dot" opacity="0.85"/>
+</svg>

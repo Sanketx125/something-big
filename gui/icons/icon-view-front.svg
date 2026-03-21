@@ -1,0 +1,45 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .top-face    { fill: #B5D4F4; stroke: #185FA5; opacity: 0.5; }
+    .right-face  { fill: #85B7EB; stroke: #185FA5; opacity: 0.45; }
+    .front-fill  { fill: #E6F1FB; }
+    .front-line  { stroke: #185FA5; }
+    .grid-line   { stroke: #185FA5; }
+    .eye-ring    { stroke: #185FA5; }
+    .eye-dot     { fill: #185FA5; }
+
+    @media (prefers-color-scheme: dark) {
+      .top-face    { fill: #0C447C; stroke: #378ADD; opacity: 0.6; }
+      .right-face  { fill: #042C53; stroke: #378ADD; opacity: 0.7; }
+      .front-fill  { fill: #185FA5; }
+      .front-line  { stroke: #85B7EB; }
+      .grid-line   { stroke: #B5D4F4; }
+      .eye-ring    { stroke: #85B7EB; }
+      .eye-dot     { fill: #85B7EB; }
+    }
+  </style>
+
+  <!-- Top face — receding upward -->
+  <polygon points="4,8 8,4 20,4 16,8"
+           class="top-face" stroke-width="0.8" stroke-linejoin="round"/>
+
+  <!-- Right face — receding rightward -->
+  <polygon points="16,8 20,4 20,16 16,20"
+           class="right-face" stroke-width="0.8" stroke-linejoin="round"/>
+
+  <!-- Front face — highlighted, flat, facing viewer -->
+  <rect x="4" y="8" width="12" height="12"
+        class="front-fill front-line" stroke-width="1.1"/>
+
+  <!-- Subtle grid — communicates flat orthographic projection -->
+  <line x1="4"  y1="14" x2="16" y2="14"
+        class="grid-line" stroke-width="0.6" stroke-linecap="round" opacity="0.3"/>
+  <line x1="10" y1="8"  x2="10" y2="20"
+        class="grid-line" stroke-width="0.6" stroke-linecap="round" opacity="0.3"/>
+
+  <!-- Orthographic eye symbol — bottom-right -->
+  <circle cx="21" cy="20" r="2"
+          fill="none" class="eye-ring" stroke-width="0.9" opacity="0.75"/>
+  <circle cx="21" cy="20" r="0.7"
+          class="eye-dot" opacity="0.75"/>
+</svg>
