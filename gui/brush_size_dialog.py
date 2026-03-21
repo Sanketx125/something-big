@@ -39,42 +39,123 @@ class BrushSizeDialog(QDialog):
         self._settings_changed = True
 
     def _apply_styles(self):
-        """Apply theme-aware styles for the brush dialog."""
-        from gui.theme_manager import get_dialog_stylesheet, ThemeColors
-        c = ThemeColors
-        self.setStyleSheet(get_dialog_stylesheet() + f"""
+        """Apply the green-accented dark theme with an outer highlight border."""
+        # Theme Color: Emerald Green #27ae60 or #1db954 (Based on screenshots)
+        # Using #2ecc71 / #1abc9c style green for high visibility
+        green_accent = "#1abc9c" 
+        green_hover = "#16a085"
+        
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: #000000;
+                color: #ffffff;
+                border: 2px solid #22252a; /* Outer border */
+            }}
+            QLabel {{
+                color: #ffffff;
+                font-family: 'Segoe UI', sans-serif;
+            }}
             QGroupBox {{
-                color: {c.get('accent')};
-                background-color: {c.get('bg_secondary')};
+                border: 1px solid #22252a;
+                border-radius: 8px;
+                margin-top: 1.2em;
+                font-weight: bold;
+                color: {green_accent};
+                padding-top: 15px;
+                background-color: #0c0d0e;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 5px;
+            }}
+            QRadioButton {{
+                color: #e0e0e0;
+                padding: 10px;
+                font-size: 13px;
+                background: transparent;
+            }}
+            QRadioButton::indicator {{
+                width: 22px;
+                height: 22px;
+                border-radius: 11px;
+                border: 2px solid #373a40;
+                background: #1a1b1e;
+            }}
+            QRadioButton::indicator:checked {{
+                background-color: {green_accent};
+                border: 2px solid {green_accent};
+            }}
+            QRadioButton::indicator:hover {{
+                border-color: {green_accent};
+            }}
+            QSlider::groove:horizontal {{
+                border: 1px solid #373a40;
+                height: 4px;
+                background: #1a1b1e;
+                margin: 2px 0;
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {green_accent};
+                border: none;
+                width: 14px;
+                height: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }}
+            QDoubleSpinBox {{
+                background-color: #1a1b1e;
+                color: #ffffff;
+                border: 1px solid #373a40;
+                border-radius: 4px;
+                padding: 4px 8px;
+                min-width: 90px;
+                selection-background-color: {green_accent};
+                selection-color: #000000;
+            }}
+            QPushButton {{
+                background-color: #25262b;
+                color: #ffffff;
+                border: 1px solid #373a40;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{
+                background-color: #2c2e33;
+                border-color: #5c5f66;
             }}
             QPushButton#okButton {{
-                background-color: {c.get('accent')};
-                color: {c.get('text_on_active')};
+                background-color: {green_accent};
+                color: #000000;
                 border: none;
                 padding: 8px 20px;
                 font-weight: bold;
             }}
             QPushButton#okButton:hover {{
-                background-color: {c.get('accent_hover')};
+                background-color: {green_hover};
             }}
             #previewPanel {{
-                background-color: {c.get('bg_secondary')};
-                border: 1px solid {c.get('border')};
+                background-color: #080808;
+                border: 1px solid #22252a;
                 border-radius: 4px;
-                color: {c.get('text_secondary')};
+                color: #cccccc;
                 font-size: 11px;
                 font-weight: 600;
+                letter-spacing: 0.5px;
                 margin-top: 10px;
             }}
             #presetContainer {{
-                background-color: {c.get('bg_secondary')};
+                background-color: #0c0d0e;
                 border-radius: 6px;
                 padding: 5px;
             }}
             #presetLabel {{
-                font-size: 9px;
-                font-weight: bold;
-                color: {c.get('text_muted')};
+                font-size: 9px; 
+                font-weight: bold; 
+                color: #5c5f66;
+                letter-spacing: 1px;
             }}
         """)
 
@@ -87,11 +168,11 @@ class BrushSizeDialog(QDialog):
         header_layout = QVBoxLayout()
         header_layout.setSpacing(2)
         title = QLabel("BRUSH CONFIGURATION")
-        from gui.theme_manager import ThemeColors
-        title.setStyleSheet(f"font-weight: 800; font-size: 14px; color: {ThemeColors.get('accent')}; letter-spacing: 0.5px;")
-
+        # Color updated to green
+        title.setStyleSheet("font-weight: 800; font-size: 14px; color: #1abc9c; letter-spacing: 0.5px;")
+        
         desc = QLabel("Adjust tool properties for point cloud classification.")
-        desc.setStyleSheet(f"color: {ThemeColors.get('text_muted')}; font-size: 11px;")
+        desc.setStyleSheet("color: #666666; font-size: 11px;")
         
         header_layout.addWidget(title)
         header_layout.addWidget(desc)
@@ -131,7 +212,7 @@ class BrushSizeDialog(QDialog):
         slider_row = QHBoxLayout()
         slider_label = QLabel("Scale")
         slider_label.setFixedWidth(50)
-        slider_label.setStyleSheet(f"color: {ThemeColors.get('text_secondary')};")
+        slider_label.setStyleSheet("color: #bbbbbb;")
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setMinimum(1)
         self.slider.setMaximum(100)
@@ -144,7 +225,7 @@ class BrushSizeDialog(QDialog):
         spin_row = QHBoxLayout()
         spin_label = QLabel("Radius")
         spin_label.setFixedWidth(50)
-        spin_label.setStyleSheet(f"color: {ThemeColors.get('text_secondary')};")
+        spin_label.setStyleSheet("color: #bbbbbb;")
         self.spinbox = QDoubleSpinBox()
         self.spinbox.setRange(0.1, 10.0)
         self.spinbox.setSingleStep(0.1)

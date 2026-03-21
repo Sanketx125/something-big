@@ -1,3 +1,4 @@
+
 ###
 import importlib as _importlib
 import sys as _sys
@@ -673,19 +674,21 @@ class DisplayModeDialog(QDialog):
             }
 
         for view_idx in range(6):
-            self.view_palettes[view_idx] = {}
-            self.slot_shows[view_idx]    = {}
-            # default_weight = 1.0 if view_idx == 0 else 0.5
-            default_weight = 1.0   # same weight for all slots
+            if view_idx not in self.view_palettes:
+                self.view_palettes[view_idx] = {}
+            if view_idx not in self.slot_shows:
+                self.slot_shows[view_idx] = {}
+
             for code, info in default_palette_template.items():
-                self.view_palettes[view_idx][code] = {
-                    "show":        info["show"],
-                    "description": str(info["description"]),
-                    "lvl":         str(info.get("lvl", "")),
-                    "color":       tuple(info["color"]),
-                    "weight":      default_weight
-                }
-                self.slot_shows[view_idx][code] = info["show"]
+                if code not in self.view_palettes[view_idx]:
+                    self.view_palettes[view_idx][code] = {
+                        "show":        info["show"],
+                        "description": str(info["description"]),
+                        "lvl":         str(info.get("lvl", "")),
+                        "color":       tuple(info["color"]),
+                        "weight":      info.get("weight", 1.0)
+                    }
+                self.slot_shows[view_idx][code] = self.view_palettes[view_idx][code].get("show", info["show"])
 
         self._check_pending_restores()
 
@@ -986,16 +989,17 @@ class DisplayModeDialog(QDialog):
                 self.view_palettes = {}
 
             for view_idx in range(6):
-                self.view_palettes[view_idx] = {}
+                if view_idx not in self.view_palettes:
+                    self.view_palettes[view_idx] = {}
+                    
                 for code, info in master_palette.items():
-                    if view_idx == 0:
-                        weight_to_use = float(info.get("weight", 1.0))
+                    # Preserve existing view-specific weight if already loaded/synced
+                    if code in self.view_palettes[view_idx]:
+                        weight_to_use = float(self.view_palettes[view_idx][code].get('weight', info.get("weight", 1.0)))
                     else:
-                        if (view_idx in self.view_palettes and
-                                code in self.view_palettes[view_idx]):
-                            weight_to_use = self.view_palettes[view_idx][code].get('weight', 0.5)
-                        else:
-                            weight_to_use = 0.5
+                        # Inherit from master palette
+                        weight_to_use = float(info.get("weight", 1.0))
+                        
                     self.view_palettes[view_idx][code] = {
                         "show":        bool(info["show"]),
                         "description": str(info["description"]),
@@ -1198,6 +1202,13 @@ class DisplayModeDialog(QDialog):
             else:
                 app._main_view_borders_active = False
                 app.point_border_percent      = 0
+
+        # ── Track that this slot was explicitly Applied by the user ──────────
+        # _get_slot_palette uses this to decide whether to trust the weight
+        # stored in view_palettes[slot] vs reset to 1.0 (base).
+        if not hasattr(app, '_slot_weights_applied'):
+            app._slot_weights_applied = set()
+        app._slot_weights_applied.add(self.current_slot)
 
         # palette_changed emit moved to AFTER GPU push below —
         # emitting here caused sync_palette_to_gpu to fire with border=0
@@ -1661,6 +1672,11 @@ class EditClassDialog(QDialog):
                     _uam_refresh_section(app, view_idx, palette, border)
 
                 # Final hardware poke to force the shader to re-read the LUT
+                # Mark slot as explicitly weight-applied
+                if not hasattr(app, '_slot_weights_applied'):
+                    app._slot_weights_applied = set()
+                app._slot_weights_applied.add(current_slot)
+
                 self.parent_dialog.palette_changed.emit(current_slot)
                 print(f"⚡ GPU Uniform Poke: Slot {current_slot} weights synchronized")
 

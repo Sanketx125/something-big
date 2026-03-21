@@ -24,13 +24,13 @@ class BackupSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("BackupSettingsDialog")
-        self.setWindowTitle("Auto-Backup Settings")
+        self.setWindowTitle("⚙️ Auto-Backup Settings")
         self.setFixedSize(620, 340)
 
         # Load settings object
         self.settings = QSettings("NakshaAI", "LidarApp")
 
-        # Apply theme-aware style
+        # Apply local style so global theme.qss can't break layout
         self._apply_local_style()
 
         # Build UI
@@ -43,19 +43,58 @@ class BackupSettingsDialog(QDialog):
     #  LOCAL STYLE (override global theme inside this dialog only)
     # ------------------------------------------------------------------ #
     def _apply_local_style(self):
-        from gui.theme_manager import get_dialog_stylesheet, ThemeColors
-        c = ThemeColors
-        self.setStyleSheet(get_dialog_stylesheet() + f"""
-        QPushButton#saveButton {{
-            background-color: {c.get('success')};
-            color: white;
-            border: 1px solid {c.get('success')};
+        self.setStyleSheet("""
+        #BackupSettingsDialog {
+            background-color: #202020;
+        }
+        #BackupSettingsDialog QLabel {
+            color: #f0f0f0;
+        }
+        #BackupSettingsDialog QGroupBox {
+            border: 1px solid #555;
+            border-radius: 4px;
+            margin-top: 8px;
+        }
+        #BackupSettingsDialog QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 3px;
+            color: #f0f0f0;
+        }
+        #BackupSettingsDialog QCheckBox,
+        #BackupSettingsDialog QRadioButton {
+            color: #f0f0f0;
+            spacing: 6px;
+        }
+        #BackupSettingsDialog QLineEdit,
+        #BackupSettingsDialog QSpinBox,
+        #BackupSettingsDialog QComboBox {
+            background-color: #151515;
+            border: 1px solid #555;
+            border-radius: 3px;
+            color: #f0f0f0;
+            min-height: 22px;
+            padding: 2px 6px;
+        }
+        #BackupSettingsDialog QPushButton {
+            background-color: #3c3c3c;
+            color: #f0f0f0;
+            border-radius: 3px;
+            border: 1px solid #555;
+            padding: 4px 10px;
+        }
+        #BackupSettingsDialog QPushButton:hover {
+            background-color: #505050;
+        }
+        #BackupSettingsDialog QPushButton#saveButton {
+            background-color: #2e7d32;
+            border-color: #1b5e20;
             font-weight: bold;
             padding: 6px 16px;
-        }}
-        QPushButton#saveButton:hover {{
-            background-color: {c.get('accent')};
-        }}
+        }
+        #BackupSettingsDialog QPushButton#saveButton:hover {
+            background-color: #1b5e20;
+        }
         """)
 
     # ------------------------------------------------------------------ #
@@ -71,7 +110,7 @@ class BackupSettingsDialog(QDialog):
         # ============================================
         self.enable_checkbox = QCheckBox("Enable Auto-Backup")
         self.enable_checkbox.setStyleSheet(
-            "QCheckBox { font-weight: bold; font-size: 11pt; }"
+            "QCheckBox { font-weight: bold; font-size: 11pt; color: #f0f0f0; }"
         )
         layout.addWidget(self.enable_checkbox)
 

@@ -22,10 +22,13 @@ __pycache__/
 *.las
 *.ptc
 *_backup.*
+!S.MARIA000004.laz
 
 # Installers / packages
 *.msi
 *.whl
+!ODAFileConverter_QT6_vc16_amd64dll_26.12.msi
+!gui/snt_core-1.2.0-cp310-cp310-win_amd64 (2).whl
 
 # OS / editor noise
 .DS_Store

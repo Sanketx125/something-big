@@ -387,9 +387,7 @@ def update_pointcloud(app, mode="rgb"):
         point_size=np.mean(point_sizes),
     )
 
-    from gui.theme_manager import ThemeManager
-    bg_color = "white" if ThemeManager.current() == "light" else "black"
-    app.vtk_widget.set_background(bg_color)
+    app.vtk_widget.set_background("black")
     from gui.views import set_view
     set_view(app, app.current_view)
 
@@ -433,7 +431,7 @@ def update_pointcloud(app, mode="rgb"):
             slice_cloud = pv.PolyData(slice_xyz)
             slice_cloud["RGB"] = slice_colors
             app.sec_vtk.add_points(slice_cloud, scalars="RGB", rgb=True, point_size=2)
-            app.sec_vtk.set_background(bg_color)
+            app.sec_vtk.set_background("black")
 
     # Restore camera
     try:

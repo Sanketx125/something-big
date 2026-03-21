@@ -279,14 +279,13 @@ class GridLabelManager:
             }
         """)
         
-        if grid_name:
-            # Point belongs to a tracked grid
-            point_count = len(self.loaded_grids[grid_name])
-            clear_action = QAction(f"🧹 Clear Grid: {grid_name} ({point_count:,} pts)", self.app)
-            clear_action.triggered.connect(lambda: self.clear_grid_data(grid_name))
-            menu.addAction(clear_action)
+        # if grid_name:
+        #     # Point belongs to a tracked grid
+        #     point_count = len(self.loaded_grids[grid_name])
+        #     clear_action = QAction(f"🧹 Clear Grid: {grid_name} ({point_count:,} pts)", self.app)
+        #     clear_action.triggered.connect(lambda: self.clear_grid_data(grid_name))
+        #     menu.addAction(clear_action)
 
-        
         menu.exec(QCursor.pos())
         
     def _find_grid_for_point(self, point_id):

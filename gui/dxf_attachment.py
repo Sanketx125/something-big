@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal , QCoreApplication
 from PySide6.QtGui import QFont, QColor, QIcon
-from gui.theme_manager import get_dialog_stylesheet, get_progress_dialog_stylesheet, get_title_banner_style, get_file_item_row_style, get_badge_style, get_icon_button_style, ThemeColors
 
 try:
     import ezdxf
@@ -264,50 +263,102 @@ class DXFFileItem(QWidget):
         layout.setSpacing(8)
 
         # Checkbox + file name  (default: checked)
-        self.checkbox = QCheckBox(f"{self.dxf_path.name}")
+        self.checkbox = QCheckBox(f"📄 {self.dxf_path.name}")
         self.checkbox.setChecked(True)
-        self.checkbox.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-weight:bold; font-size:10px;")
+        self.checkbox.setStyleSheet("color: #2196f3; font-weight: bold; font-size: 10px;")
         self.checkbox.stateChanged.connect(self.on_checkbox_changed)
         layout.addWidget(self.checkbox, 1)
 
         # PRJ status indicator
         if self.prj_exists:
-            prj_label = QLabel("PRJ")
-            prj_label.setStyleSheet(get_badge_style("success"))
+            prj_label = QLabel("✅ PRJ")
+            prj_label.setStyleSheet("""
+                QLabel {
+                    color: #4caf50;
+                    background-color: #1b5e20;
+                    padding: 2px 6px;
+                    border-radius: 3px;
+                    font-size: 9px;
+                    font-weight: bold;
+                }
+            """)
         else:
-            prj_label = QLabel("No PRJ")
-            prj_label.setStyleSheet(get_badge_style("warning"))
+            prj_label = QLabel("⚠️ No PRJ")
+            prj_label.setStyleSheet("""
+                QLabel {
+                    color: #ff9800;
+                    background-color: #e65100;
+                    padding: 2px 6px;
+                    border-radius: 3px;
+                    font-size: 9px;
+                    font-weight: bold;
+                }
+            """)
         layout.addWidget(prj_label)
 
         # Entity count (will be updated after loading)
         self.count_label = QLabel("...")
-        self.count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:9px;")
+        self.count_label.setStyleSheet("color: #888888; font-size: 9px;")
         layout.addWidget(self.count_label)
         # Layer selection button
-        layers_btn = QPushButton("L")
+        layers_btn = QPushButton("📋")
         layers_btn.setFixedSize(26, 26)
         layers_btn.setToolTip("Select layers/levels")
-        layers_btn.setStyleSheet(get_icon_button_style("default"))
+        layers_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7b1fa2;
+                color: white;
+                border: none;
+                border-radius: 13px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #9c27b0; }
+        """)
         layers_btn.clicked.connect(self.open_layer_selection)
         layout.addWidget(layers_btn)
                 
 
         # Display options button
-        options_btn = QPushButton("O")
+        options_btn = QPushButton("⚙")
         options_btn.setFixedSize(26, 26)
         options_btn.setToolTip("Display options")
-        options_btn.setStyleSheet(get_icon_button_style("settings"))
+        options_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #455a64;
+                color: white;
+                border: none;
+                border-radius: 13px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #607d8b; }
+        """)
         options_btn.clicked.connect(self.open_display_options)
         layout.addWidget(options_btn)
 
         # Red remove button
-        remove_btn = QPushButton("X")
+        remove_btn = QPushButton("✖")
         remove_btn.setFixedSize(26, 26)
-        remove_btn.setStyleSheet(get_icon_button_style("danger"))
+        remove_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                color: white;
+                border: none;
+                border-radius: 13px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover { background-color: #f44336; }
+        """)
         remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
         layout.addWidget(remove_btn)
 
-        self.setStyleSheet(get_file_item_row_style())
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #1e1e1e;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+            }
+        """)
 
     def cache_dxf_data(self, dxf_doc, processed_entities):
         """Cache the parsed DXF data for fast re-use"""
@@ -318,7 +369,7 @@ class DXFFileItem(QWidget):
         """Update the entity count display"""
         self.entity_count = count
         self.count_label.setText(f"{count} entities")
-        self.count_label.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:7px; font-weight:bold;")
+        self.count_label.setStyleSheet("color: #2196f3; font-size: 7px; font-weight: bold;")
 
     def is_checked(self) -> bool:
         """Return whether this DXF file is selected for attachment."""
@@ -488,20 +539,20 @@ class DXFFileItem(QWidget):
     #                 # No layers selected - treat as "All Off" (show nothing)
     #                 self.selected_layers = set()  # Empty set = show nothing
     #                 self.count_label.setText(f"{self.entity_count} entities | 0 layers ✓")
-    #                 self.count_label.setStyleSheet(f"color:{ThemeColors.get('danger')}; font-size:7px; font-weight:bold;")
+    #                 self.count_label.setStyleSheet("color: #f44336; font-size: 7px; font-weight: bold;")
     #                 print(f"📋 DXF '{self.dxf_path.name}' → 0 layers selected (nothing will show)")
     #             elif len(selected) == total_layers:
     #                 # All layers selected - optimize by setting None
     #                 self.selected_layers = None  # None = show all (no filtering)
     #                 self.count_label.setText(f"{self.entity_count} entities")
-    #                 self.count_label.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:7px; font-weight:bold;")
+    #                 self.count_label.setStyleSheet("color: #2196f3; font-size: 7px; font-weight: bold;")
     #                 print(f"📋 DXF '{self.dxf_path.name}' → All {total_layers} layers selected")
     #             else:
     #                 # Some layers selected - store the set
     #                 self.selected_layers = selected
     #                 layer_count = len(selected)
     #                 self.count_label.setText(f"{self.entity_count} entities | {layer_count} layers ✓")
-    #                 self.count_label.setStyleSheet(f"color:{ThemeColors.get('text_secondary')}; font-size:7px; font-weight:bold;")
+    #                 self.count_label.setStyleSheet("color: #9c27b0; font-size: 7px; font-weight: bold;")
     #                 print(f"📋 DXF '{self.dxf_path.name}' → {layer_count} of {total_layers} layers selected")
                 
     #             # Clear cached entities since layer selection changed
@@ -552,14 +603,14 @@ class DXFFileItem(QWidget):
                     # No layers selected - hide everything
                     self.selected_layers = set()  # Empty set = show nothing
                     self.count_label.setText(f"{self.entity_count} entities (0 layers)")
-                    self.count_label.setStyleSheet(f"color:{ThemeColors.get('danger')}; font-size:7px; font-weight:bold;")
+                    self.count_label.setStyleSheet("color: #f44336; font-size: 7px; font-weight: bold;")
                     print(f"📦 DXF '{self.dxf_path.name}': 0 layers selected - nothing will show")
                     
                 elif len(selected) == total_layers:
                     # All layers selected - show everything
                     self.selected_layers = None  # None = show all (no filtering)
                     self.count_label.setText(f"{self.entity_count} entities")
-                    self.count_label.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:7px; font-weight:bold;")
+                    self.count_label.setStyleSheet("color: #2196f3; font-size: 7px; font-weight: bold;")
                     print(f"📦 DXF '{self.dxf_path.name}': All {total_layers} layers selected")
                     
                 else:
@@ -567,7 +618,7 @@ class DXFFileItem(QWidget):
                     self.selected_layers = selected
                     layer_count = len(selected)
                     self.count_label.setText(f"{self.entity_count} entities ({layer_count} layers)")
-                    self.count_label.setStyleSheet(f"color:{ThemeColors.get('text_secondary')}; font-size:7px; font-weight:bold;")
+                    self.count_label.setStyleSheet("color: #9c27b0; font-size: 7px; font-weight: bold;")
                     print(f"📦 DXF '{self.dxf_path.name}': {layer_count} of {total_layers} layers selected")
                 
                 # ⚡ INSTANT: Update layer visibility
@@ -686,7 +737,7 @@ class MultiDXFAttachmentDialog(QDialog):
         self.project_crs = None
         
         self.setWindowTitle("Attach Multiple DXF Files")
-        self.setStyleSheet(get_dialog_stylesheet())
+        self.setStyleSheet(self.naksha_dark_theme())
         self.setGeometry(150, 150, 700, 800)
         
         self.init_ui()
@@ -699,25 +750,43 @@ class MultiDXFAttachmentDialog(QDialog):
         layout.setSpacing(12)
         
         # Title
-        title = QLabel("Attach Multiple DXF Files")
-        title.setStyleSheet(get_title_banner_style())
+        title = QLabel("📎 Attach Multiple DXF Files")
+        title.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                font-weight: bold;
+                color: #ffffff;
+                padding: 10px;
+                background-color: #2196f3;
+                border-radius: 6px;
+            }
+        """)
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
         # Step 1: File Selection
         file_group = QGroupBox("Select DXF Files")
+        file_group.setStyleSheet("QGroupBox { font-weight: bold; color: #2196f3; }")
         file_layout = QVBoxLayout()
         
-        select_btn = QPushButton("Browse and Add DXF Files...")
-        select_btn.setObjectName("primaryBtn")
+        select_btn = QPushButton("📂 Browse and Add DXF Files...")
         select_btn.clicked.connect(self.select_dxf_files)
+        select_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1976d2;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+            }
+        """)
         file_layout.addWidget(select_btn)
         
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
         
         # Step 2: Selected Files List
-        list_group = QGroupBox("Selected DXF Files (Click X to remove)")
+        list_group = QGroupBox("Selected DXF Files (Click ✖ to remove)")
+        list_group.setStyleSheet("QGroupBox { font-weight: bold; color: #2196f3; }")
         list_layout = QVBoxLayout()
         
         # Scroll area for file items
@@ -725,6 +794,13 @@ class MultiDXFAttachmentDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setMinimumHeight(200)
         scroll.setMaximumHeight(300)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                background-color: #121212;
+            }
+        """)
         
         self.file_list_widget = QWidget()
         self.file_list_layout = QVBoxLayout(self.file_list_widget)
@@ -737,7 +813,7 @@ class MultiDXFAttachmentDialog(QDialog):
         
         # File count label
         self.file_count_label = QLabel("No files selected")
-        self.file_count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px; padding:5px;")
+        self.file_count_label.setStyleSheet("color: #888888; font-size: 10px; padding: 5px;")
         list_layout.addWidget(self.file_count_label)
         
         list_group.setLayout(list_layout)
@@ -746,16 +822,35 @@ class MultiDXFAttachmentDialog(QDialog):
         # Action buttons
         button_row = QHBoxLayout()
         
-        clear_btn = QPushButton("Clear All")
-        clear_btn.setObjectName("dangerBtn")
+        clear_btn = QPushButton("🗑️ Clear All")
+        clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                color: white;
+                font-size: 11px;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover { background-color: #f44336; }
+        """)
         clear_btn.clicked.connect(self.clear_all_files)
         button_row.addWidget(clear_btn)
         
         button_row.addStretch()
 
         
-        attach_btn = QPushButton("Attach All DXF Files")
-        attach_btn.setObjectName("primaryBtn")
+        attach_btn = QPushButton("📎 Attach All DXF Files")
+        attach_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2e7d32;
+                color: white;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 10px 20px;
+                border-radius: 5px;
+            }
+            QPushButton:hover { background-color: #388e3c; }
+        """)
         attach_btn.clicked.connect(self.attach_all_dxf)
         button_row.addWidget(attach_btn)
         
@@ -811,7 +906,37 @@ class MultiDXFAttachmentDialog(QDialog):
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
-        progress.setStyleSheet(get_progress_dialog_stylesheet())
+        progress.setStyleSheet("""
+            QProgressDialog {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+                min-width: 400px;
+            }
+            QLabel {
+                color: #2196f3;
+                font-size: 11pt;
+                padding: 10px;
+            }
+            QProgressBar {
+                border: 2px solid #3a3a3a;
+                border-radius: 5px;
+                text-align: center;
+                background-color: #121212;
+                color: #ffffff;
+                min-height: 25px;
+                font-size: 10pt;
+            }
+            QProgressBar::chunk {
+                background-color: #2196f3;
+                border-radius: 3px;
+            }
+            QPushButton {
+                background-color: #d32f2f;
+                color: white;
+                padding: 8px 16px;
+                border-radius: 4px;
+            }
+        """)
         
         # Create worker thread
         self.load_worker = DXFLoadWorker(file_paths)
@@ -849,8 +974,8 @@ class MultiDXFAttachmentDialog(QDialog):
                     item.set_crs(item_data['crs'])
                 print(f"✅ Added: {dxf_path.name} (PRJ: {prj_exists})")
             elif 'error' in item_data:
-                item.count_label.setText("Error")
-                item.count_label.setStyleSheet(f"color:{ThemeColors.get('danger')}; font-size:9px;")
+                item.count_label.setText("❌ Error")
+                item.count_label.setStyleSheet("color: #f44336; font-size: 9px;")
         
         def on_finished():
             if total_files > 1:
@@ -938,8 +1063,8 @@ class MultiDXFAttachmentDialog(QDialog):
             QCoreApplication.processEvents()
             
             # Show loading indicator on item
-            item.count_label.setText("Loading...")
-            item.count_label.setStyleSheet(f"color:{ThemeColors.get('warning')}; font-size:9px;")
+            item.count_label.setText("⏳ Loading...")
+            item.count_label.setStyleSheet("color: #FFA726; font-size: 9px;")
             
             # ✅ FORCE UI UPDATE TO SHOW "Loading..."
             QCoreApplication.processEvents()
@@ -980,7 +1105,7 @@ class MultiDXFAttachmentDialog(QDialog):
             
         except Exception as e:
             print(f"  ⚠️ DXF load failed: {e}")
-            item.count_label.setText("Error")
+            item.count_label.setText("❌ Error")
             item.count_label.setStyleSheet("color: #f44336; font-size: 9px;")
             QCoreApplication.processEvents()
 
@@ -1112,15 +1237,15 @@ class MultiDXFAttachmentDialog(QDialog):
         count = len(self.dxf_items)
         if count == 0:
             self.file_count_label.setText("No files selected")
-            self.file_count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px; padding:5px;")
+            self.file_count_label.setStyleSheet("color: #888888; font-size: 10px; padding: 5px;")
         else:
             total_entities = sum(item.entity_count for item in self.dxf_items)
             prj_count = sum(1 for item in self.dxf_items if item.prj_exists)
             self.file_count_label.setText(
-                f"{count} file(s) selected | {total_entities} total entities | "
+                f"📊 {count} file(s) selected | {total_entities} total entities | "
                 f"{prj_count} with PRJ"
             )
-            self.file_count_label.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:10px; font-weight:bold; padding:5px;")
+            self.file_count_label.setStyleSheet("color: #2196f3; font-size: 10px; font-weight: bold; padding: 5px;")
     
     def detect_project_crs(self):
         """Detect the project's coordinate system (silent detection)"""
@@ -1295,7 +1420,33 @@ class MultiDXFAttachmentDialog(QDialog):
         progress.setValue(0)
         progress.setAutoClose(True)
         progress.setAutoReset(True)
-        progress.setStyleSheet(get_progress_dialog_stylesheet())
+        progress.setStyleSheet("""
+            QProgressDialog {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+                min-width: 500px;
+            }
+            QLabel {
+                color: #2196f3;
+                font-size: 12pt;
+                font-weight: bold;
+                padding: 15px;
+            }
+            QProgressBar {
+                border: 2px solid #3a3a3a;
+                border-radius: 5px;
+                text-align: center;
+                background-color: #121212;
+                color: #ffffff;
+                min-height: 30px;
+                font-size: 11pt;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background-color: #2196f3;
+                border-radius: 3px;
+            }
+        """)
         progress.show()
         progress.forceShow()
         QCoreApplication.processEvents()

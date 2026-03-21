@@ -76,8 +76,7 @@ class LoadingProgressDialog(QDialog):
         # Points counter label
         self.points_label = QLabel("")
         self.points_label.setAlignment(Qt.AlignCenter)
-        from gui.theme_manager import ThemeColors
-        self.points_label.setStyleSheet(f"color: {ThemeColors.get('accent')}; font-size: 11px; font-weight: bold;")
+        self.points_label.setStyleSheet("color: #ffaa00; font-size: 11px; font-weight: bold;")
         layout.addWidget(self.points_label)
         
         # Cancel button (optional)

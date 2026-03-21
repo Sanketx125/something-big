@@ -2014,12 +2014,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QProgressDialog,
 )
 
-from gui.theme_manager import (
-    get_dialog_stylesheet, get_progress_dialog_stylesheet,
-    get_title_banner_style, get_file_item_row_style,
-    get_badge_style, get_icon_button_style, ThemeColors,
-)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -2564,7 +2558,6 @@ class SNTDisplayOptionsDialog(QDialog):
         self.setWindowTitle("SNT Display Options")
         self.setModal(True)
         self.resize(300, 180)
-        self.setStyleSheet(get_dialog_stylesheet())
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -2633,18 +2626,16 @@ class SNTLayerSelectionDialog(QDialog):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        self.setStyleSheet(get_dialog_stylesheet())
-
-        title = QLabel("Select Layers to Display")
-        title.setStyleSheet(f"font-weight:bold; font-size:11pt; color:{ThemeColors.get('accent')}; padding:5px;")
+        title = QLabel("📋 Select Layers to Display")
+        title.setStyleSheet("font-weight:bold; font-size:11pt; color:#2196f3; padding:5px;")
         layout.addWidget(title)
 
         self.layer_list = QListWidget()
-        self.layer_list.setStyleSheet(f"""
-            QListWidget {{ background:{ThemeColors.get('bg_input')}; border:1px solid {ThemeColors.get('border_light')}; border-radius:4px; }}
-            QListWidget::item {{ padding:5px; border-bottom:1px solid {ThemeColors.get('border')}; }}
-            QListWidget::item:hover    {{ background:{ThemeColors.get('bg_button')}; }}
-            QListWidget::item:selected {{ background:{ThemeColors.get('accent')}; }}
+        self.layer_list.setStyleSheet("""
+            QListWidget { background:#1e1e1e; border:1px solid #3a3a3a; border-radius:4px; }
+            QListWidget::item { padding:5px; border-bottom:1px solid #2a2a2a; }
+            QListWidget::item:hover    { background:#2a2a2a; }
+            QListWidget::item:selected { background:#1976d2; }
         """)
         layout.addWidget(self.layer_list)
 
@@ -2660,9 +2651,10 @@ class SNTLayerSelectionDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         ok_btn = QPushButton("OK")
-        ok_btn.setObjectName("primaryBtn")
+        ok_btn.setStyleSheet("background-color:#2e7d32; padding:8px 16px;")
         ok_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet("background-color:#555555; padding:8px 16px;")
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(ok_btn)
         btn_row.addWidget(cancel_btn)
@@ -2754,43 +2746,56 @@ class SNTFileItem(QWidget):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(8)
 
-        self.checkbox = QCheckBox(f"{self.snt_path.name}")
+        self.checkbox = QCheckBox(f"📄 {self.snt_path.name}")
         self.checkbox.setChecked(True)
-        self.checkbox.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-weight:bold; font-size:10px;")
+        self.checkbox.setStyleSheet("color:#00ff50; font-weight:bold; font-size:10px;")
         self.checkbox.stateChanged.connect(self._on_checkbox_changed)
         layout.addWidget(self.checkbox, 1)
 
-        badge = QLabel("SNT")
-        badge.setStyleSheet(get_badge_style("success"))
+        badge = QLabel("✅ SNT")
+        badge.setStyleSheet("""
+            QLabel { color:#4caf50; background-color:#1b5e20;
+                     padding:2px 6px; border-radius:3px; font-size:9px; font-weight:bold; }
+        """)
         layout.addWidget(badge)
 
         self.count_label = QLabel("...")
-        self.count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:9px;")
+        self.count_label.setStyleSheet("color:#888888; font-size:9px;")
         layout.addWidget(self.count_label)
 
-        for icon, tip, slot, role in [
-            ("📋", "Select layers",   self._open_layer_selection, "default"),
-            ("⚙",  "Display options", self._open_display_options, "settings"),
+        for icon, tip, slot, bg, hover in [
+            ("📋", "Select layers",   self._open_layer_selection, "#7b1fa2", "#9c27b0"),
+            ("⚙",  "Display options", self._open_display_options, "#455a64", "#607d8b"),
         ]:
             btn = QPushButton(icon)
             btn.setFixedSize(26, 26)
             btn.setToolTip(tip)
-            btn.setStyleSheet(get_icon_button_style(role))
+            btn.setStyleSheet(f"""
+                QPushButton {{ background:{bg}; color:white; border:none;
+                              border-radius:13px; font-size:14px; }}
+                QPushButton:hover {{ background:{hover}; }}
+            """)
             btn.clicked.connect(slot)
             layout.addWidget(btn)
 
         rm_btn = QPushButton("✖")
         rm_btn.setFixedSize(26, 26)
-        rm_btn.setStyleSheet(get_icon_button_style("danger"))
+        rm_btn.setStyleSheet("""
+            QPushButton { background:#d32f2f; color:white; border:none;
+                          border-radius:13px; font-weight:bold; font-size:12px; }
+            QPushButton:hover { background:#f44336; }
+        """)
         rm_btn.clicked.connect(lambda: self.remove_requested.emit(self))
         layout.addWidget(rm_btn)
 
-        self.setStyleSheet(get_file_item_row_style())
+        self.setStyleSheet("""
+            QWidget { background:#1e1e1e; border:1px solid #3a3a3a; border-radius:4px; }
+        """)
 
     def update_entity_count(self, count: int):
         self.entity_count = count
         self.count_label.setText(f"{count} entities")
-        self.count_label.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:7px; font-weight:bold;")
+        self.count_label.setStyleSheet("color:#00ff50; font-size:7px; font-weight:bold;")
 
     def is_checked(self) -> bool:
         return self.checkbox.isChecked()
@@ -2875,16 +2880,16 @@ class SNTFileItem(QWidget):
             if len(selected) == 0:
                 self.selected_layers = set()
                 self.count_label.setText(f"{self.entity_count} entities (0 layers)")
-                self.count_label.setStyleSheet(f"color:{ThemeColors.get('danger')}; font-size:7px; font-weight:bold;")
+                self.count_label.setStyleSheet("color:#f44336; font-size:7px; font-weight:bold;")
             elif len(selected) == total_layers:
                 self.selected_layers = None
                 self.count_label.setText(f"{self.entity_count} entities")
-                self.count_label.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:7px; font-weight:bold;")
+                self.count_label.setStyleSheet("color:#00ff50; font-size:7px; font-weight:bold;")
             else:
                 self.selected_layers = selected
                 self.count_label.setText(
                     f"{self.entity_count} entities ({len(selected)} layers)")
-                self.count_label.setStyleSheet(f"color:{ThemeColors.get('text_secondary')}; font-size:7px; font-weight:bold;")
+                self.count_label.setStyleSheet("color:#9c27b0; font-size:7px; font-weight:bold;")
 
             if self.actor_cache and self.checkbox.isChecked():
                 for layer_name, actors in self.actor_cache.items():
@@ -2951,7 +2956,7 @@ class MultiSNTAttachmentDialog(QDialog):
         self._load_worker:   Optional[SNTLoadWorker] = None
 
         self.setWindowTitle("Attach SNT Files  —  NakshaApp Native Format")
-        self.setStyleSheet(get_dialog_stylesheet())
+        self.setStyleSheet(self._naksha_dark_theme())
         self.setGeometry(150, 150, 700, 780)
         self._init_ui()
 
@@ -2962,36 +2967,47 @@ class MultiSNTAttachmentDialog(QDialog):
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(12)
 
-        title = QLabel("Attach SNT Files (NakshaApp Native Format)")
-        title.setStyleSheet(get_title_banner_style())
+        title = QLabel("🗂️ Attach SNT Files  (NakshaApp Native Format)")
+        title.setStyleSheet("""
+            QLabel { font-size:16px; font-weight:bold; color:#ffffff;
+                     padding:10px; background-color:#2e7d32; border-radius:6px; }
+        """)
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
         info = QLabel(
-            "SNT loads 10-50x faster than DXF  |  "
-            "Colours & layers preserved  |  Grid pipeline fully compatible")
+            "✅  SNT loads 10-50× faster than DXF  •  "
+            "Colours & layers preserved  •  Grid pipeline fully compatible")
         info.setStyleSheet(
-            f"color:{ThemeColors.get('text_secondary')}; font-size:9pt; padding:6px;"
-            f"background:{ThemeColors.get('bg_secondary')}; border-radius:4px;")
+            "color:#80e27e; font-size:9pt; padding:6px;"
+            "background:#1b3a1b; border-radius:4px;")
         info.setAlignment(Qt.AlignCenter)
         layout.addWidget(info)
 
         file_group = QGroupBox("Select SNT Files")
+        file_group.setStyleSheet("QGroupBox { font-weight:bold; color:#00ff50; }")
         file_layout = QVBoxLayout()
-        browse_btn  = QPushButton("Browse and Add SNT Files...")
-        browse_btn.setObjectName("primaryBtn")
+        browse_btn  = QPushButton("📂 Browse and Add SNT Files...")
         browse_btn.clicked.connect(self._select_snt_files)
+        browse_btn.setStyleSheet("""
+            QPushButton { background:#1b5e20; color:white; font-weight:bold; padding:10px; }
+            QPushButton:hover { background:#2e7d32; }
+        """)
         file_layout.addWidget(browse_btn)
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
 
-        list_group = QGroupBox("Selected SNT Files  (click X to remove)")
+        list_group = QGroupBox("Selected SNT Files  (click ✖ to remove)")
+        list_group.setStyleSheet("QGroupBox { font-weight:bold; color:#00ff50; }")
         list_layout = QVBoxLayout()
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setMinimumHeight(200)
         scroll.setMaximumHeight(320)
+        scroll.setStyleSheet("""
+            QScrollArea { border:1px solid #3a3a3a; border-radius:4px; background:#121212; }
+        """)
         self.file_list_widget = QWidget()
         self.file_list_layout = QVBoxLayout(self.file_list_widget)
         self.file_list_layout.setSpacing(5)
@@ -3001,19 +3017,27 @@ class MultiSNTAttachmentDialog(QDialog):
         list_layout.addWidget(scroll)
 
         self.file_count_label = QLabel("No files selected")
-        self.file_count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px; padding:5px;")
+        self.file_count_label.setStyleSheet("color:#888888; font-size:10px; padding:5px;")
         list_layout.addWidget(self.file_count_label)
         list_group.setLayout(list_layout)
         layout.addWidget(list_group)
 
         btn_row = QHBoxLayout()
-        clear_btn = QPushButton("Clear All")
-        clear_btn.setObjectName("dangerBtn")
+        clear_btn = QPushButton("🗑️ Clear All")
+        clear_btn.setStyleSheet("""
+            QPushButton { background:#d32f2f; color:white;
+                          font-size:11px; padding:10px; border-radius:5px; }
+            QPushButton:hover { background:#f44336; }
+        """)
         clear_btn.clicked.connect(self._clear_all)
         btn_row.addWidget(clear_btn)
         btn_row.addStretch()
-        attach_btn = QPushButton("Attach All SNT Files")
-        attach_btn.setObjectName("primaryBtn")
+        attach_btn = QPushButton("📎 Attach All SNT Files")
+        attach_btn.setStyleSheet("""
+            QPushButton { background:#1b5e20; color:white; font-size:11px;
+                          font-weight:bold; padding:10px 20px; border-radius:5px; }
+            QPushButton:hover { background:#2e7d32; }
+        """)
         attach_btn.clicked.connect(self._attach_all)
         btn_row.addWidget(attach_btn)
         layout.addLayout(btn_row)
@@ -3040,7 +3064,7 @@ class MultiSNTAttachmentDialog(QDialog):
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
-        progress.setStyleSheet(get_progress_dialog_stylesheet())
+        progress.setStyleSheet(self._progress_style())
         progress.show()
         QCoreApplication.processEvents()
 
@@ -3063,8 +3087,8 @@ class MultiSNTAttachmentDialog(QDialog):
                 item.cached_parsed = item_data["parsed"]
                 item.update_entity_count(item_data["entity_count"])
             else:
-                item.count_label.setText("Error")
-                item.count_label.setStyleSheet(f"color:{ThemeColors.get('danger')}; font-size:9px;")
+                item.count_label.setText("❌ Error")
+                item.count_label.setStyleSheet("color:#f44336; font-size:9px;")
 
         def on_finished():
             if not indeterminate:
@@ -3219,13 +3243,13 @@ class MultiSNTAttachmentDialog(QDialog):
         count = len(self.snt_items)
         if count == 0:
             self.file_count_label.setText("No files selected")
-            self.file_count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px; padding:5px;")
+            self.file_count_label.setStyleSheet("color:#888888; font-size:10px; padding:5px;")
         else:
             total_ent = sum(it.entity_count for it in self.snt_items)
             self.file_count_label.setText(
-                f"{count} file(s)  |  {total_ent:,} total entities")
+                f"📊 {count} file(s)  •  {total_ent:,} total entities")
             self.file_count_label.setStyleSheet(
-                f"color:{ThemeColors.get('accent')}; font-size:10px; font-weight:bold; padding:5px;")
+                "color:#00ff50; font-size:10px; font-weight:bold; padding:5px;")
 
     # ── Attach all ────────────────────────────────────────────────────────
 
@@ -3250,7 +3274,7 @@ class MultiSNTAttachmentDialog(QDialog):
                     print(f"✅ Current file saved successfully")
                     if hasattr(self.app, "statusBar"):
                         self.app.statusBar().showMessage(
-                            f"Saved: {os.path.basename(save_path)}", 2000)
+                            f"💾 Saved: {os.path.basename(save_path)}", 2000)
                         QCoreApplication.processEvents()
                 except Exception as e:
                     print(f"⚠️ Failed to auto-save: {e}")
@@ -3265,8 +3289,8 @@ class MultiSNTAttachmentDialog(QDialog):
         # ── Confirmation ───────────────────────────────────────────────────
         msg = f"Attach {len(selected_items)} SNT file(s)?\n\n"
         if hasattr(self.app, "data") and self.app.data is not None:
-            msg += "WARNING: Current point cloud will be CLEARED\n"
-            msg += "You can reload LAZ files after SNT attachment\n"
+            msg += "⚠️ Current point cloud will be CLEARED\n"
+            msg += "✅ You can reload LAZ files after SNT attachment\n"
 
         if QMessageBox.question(
             self, "Confirm SNT Attachment", msg,
@@ -3319,7 +3343,7 @@ class MultiSNTAttachmentDialog(QDialog):
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
-        progress.setStyleSheet(get_progress_dialog_stylesheet())
+        progress.setStyleSheet(self._progress_style())
         progress.show()
         progress.forceShow()
         QCoreApplication.processEvents()
@@ -3373,9 +3397,9 @@ class MultiSNTAttachmentDialog(QDialog):
             total_ent = sum(len(a["entities"]) for a in all_attachments)
             QMessageBox.information(
                 self, "SNT Attached",
-                f"Attached {len(all_attachments)} SNT file(s)\n"
-                f"Total entities: {total_ent:,}\n\n"
-                f"You can now load LAZ files for the grids.")
+                f"✅ Attached {len(all_attachments)} SNT file(s)\n"
+                f"📊 Total entities: {total_ent:,}\n\n"
+                f"💡 You can now load LAZ files for the grids.")
             try:
                 self.app._update_window_title(
                     f"SNT Grid ({len(all_attachments)} files)", None)

@@ -21,95 +21,185 @@ class PointCountWidget(QWidget):
         self.is_expanded = False
         self.parent_window = parent  # ✅ Store parent for event filter
         self.init_ui()
-        self.hide()  
-        # Make it a normal widget (panel floats on its own)
-        # self.setWindowFlags(Qt.Widget | Qt.FramelessWindowHint)
-        # self.setAttribute(Qt.WA_TranslucentBackground)
-        # self.setAttribute(Qt.WA_NoSystemBackground)
-        # self.raise_()
+        self.panel.hide()  
+        
+        # Make it float on top
+        self.setWindowFlags(Qt.Widget | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.raise_()
 
     def eventFilter(self, obj, event):
-        """No longer handle parent window resize events as we are not floating."""
+        """Handle parent window resize events (ribbon system method)."""
+        if obj == self.parent_window and event.type() == QEvent.Resize:
+            # Reposition on window resize
+            self.position_in_ribbon_system(self.parent_window)
         return super().eventFilter(obj, event)
 
     def position_in_ribbon_system(self, parent_window):
-        """No longer actively position widget."""
-        pass
+        """Position widget using ribbon system method (setGeometry)."""
+        if parent_window:
+            # Get window dimensions
+            window_width = parent_window.width()
+            
+            # Calculate position: far right with 10px margin
+            x = window_width - self.toggle_btn.width() - 10
+            y = 10
+            
+            # Use setGeometry (ribbon system method)
+            self.setGeometry(x, y, self.toggle_btn.width(), self.toggle_btn.height())
 
     def init_ui(self):
         """Initialize the UI layout."""
-        # Make the widget itself a movable tool window
-        self.setWindowFlags(Qt.Tool | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setWindowTitle("Point Statistics")
-        self.setMinimumSize(320, 420)  
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
        
-        panel_layout = QVBoxLayout(self)
+        # ===== COMPACT BUTTON =====
+        self.toggle_btn = QPushButton("Stats")
+        self.toggle_btn.setFixedSize(90, 32)  
+        self.toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.toggle_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2c2c2c;
+                color: #f0f0f0;
+                font-weight: bold;
+                font-size: 10px;
+                border: 2px solid #3c3c3c;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #3c3c3c;
+                border-color: #4c4c4c;
+            }
+            QPushButton:pressed {
+                background-color: #ffaa00;
+                color: black;
+            }
+        """)
+        self.toggle_btn.clicked.connect(self.toggle_panel)
+        layout.addWidget(self.toggle_btn, alignment=Qt.AlignTop)
+       
+        # ===== PANEL (FIXED PARENTING) =====
+        # ✅ FIX: Use self.parent_window so it attaches to the main software
+        # This ensures it minimizes and closes along with the app.
+        parent = self.parent_window if self.parent_window else self
+        self.panel = QWidget(parent)
+       
+        # ✅ Qt.Tool makes it a floating palette that stays on top but belongs to the app
+        self.panel.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
+       
+        self.panel.setFixedSize(320, 420)  
+        self.panel.setStyleSheet("""
+            QWidget {
+                background-color: #1e1e1e;
+                border: 2px solid #3c3c3c;
+                border-radius: 8px;
+            }
+        """)
+       
+        panel_layout = QVBoxLayout(self.panel)
         panel_layout.setContentsMargins(10, 10, 10, 10)
         panel_layout.setSpacing(8)
        
+        # Title
+        title = QLabel("Point Statistics")
+        title.setStyleSheet("""
+            QLabel {
+                font-weight: bold;
+                font-size: 12px;
+                color: #f0f0f0;
+                padding: 4px 0px;
+            }
+        """)
+        panel_layout.addWidget(title)
+       
         # Total count
         self.total_label = QLabel("Total: 0")
-        self.total_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        self.total_label.setStyleSheet("""
+            QLabel {
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 4px 0px;
+            }
+        """)
         panel_layout.addWidget(self.total_label)
        
         # Separator
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
+        line.setStyleSheet("background-color: #3c3c3c;")
+        line.setFixedHeight(1)
         panel_layout.addWidget(line)
        
         # Scrollable area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        
-        # Professional small scrollbar style
         scroll.setStyleSheet("""
-            QScrollBar:vertical {
+            QScrollArea {
                 border: none;
-                background: transparent;
-                width: 6px;
-                margin: 0px 0px 0px 0px;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                background: #1e1e1e;
+                width: 8px;
             }
             QScrollBar::handle:vertical {
-                background: rgba(150, 150, 150, 0.5);
-                min-height: 20px;
-                border-radius: 3px;
+                background: #3c3c3c;
+                border-radius: 4px;
             }
             QScrollBar::handle:vertical:hover {
-                background: rgba(150, 150, 150, 0.8);
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                background: none;
+                background: #4c4c4c;
             }
         """)
        
         self.stats_container = QWidget()
         self.stats_layout = QVBoxLayout(self.stats_container)
         self.stats_layout.setContentsMargins(0, 0, 0, 0)
-        self.stats_layout.setSpacing(4)
+        self.stats_layout.setSpacing(2)
         self.stats_layout.setAlignment(Qt.AlignTop)
        
         scroll.setWidget(self.stats_container)
         panel_layout.addWidget(scroll)
        
-        self.hide()  
+        # Close button
+        close_btn = QPushButton("✕ Close")
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2c2c2c;
+                color: #f0f0f0;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 6px;
+                border-radius: 4px;
+                border: 1px solid #3c3c3c;
+            }
+            QPushButton:hover {
+                background-color: #d32f2f;
+                color: white;
+            }
+        """)
+        close_btn.clicked.connect(self.toggle_panel)
+        panel_layout.addWidget(close_btn)
+       
+        self.panel.hide()  
     
-    def toggle_panel(self, btn_widget=None):
-        """Toggle the statistics panel. Optionally positions it near btn_widget."""
-        if self.isHidden():
-            if btn_widget:
-                btn_global = btn_widget.mapToGlobal(btn_widget.rect().bottomLeft())
-                self.move(btn_global.x(), btn_global.y() + 5)
-            self.show()
-            self.raise_()
-            self.activateWindow()
+    def toggle_panel(self):
+        """Toggle the statistics panel."""
+        self.is_expanded = not self.is_expanded
+        
+        if self.is_expanded:
+            btn_global = self.mapToGlobal(self.toggle_btn.geometry().bottomLeft())
+            self.panel.move(btn_global.x(), btn_global.y() + 5)
+            self.panel.show()
+            self.panel.raise_()
+            self.toggle_btn.setText("Stats ▼")
             self.update_statistics()
         else:
-            self.hide()
+            self.toggle_btn.setText("Stats")
+            self.panel.hide()
     
     def set_app(self, app):
         """Set the main application reference and connect signals."""
@@ -150,15 +240,7 @@ class PointCountWidget(QWidget):
     
     def _delayed_update(self):
         """Delayed update after debouncing."""
-        # Always update the footer total, even if panel is hidden
-        if self.app and hasattr(self.app, 'total_points_label'):
-            if self.app.data and self.app.data.get("xyz") is not None:
-                total_points = len(self.app.data.get("xyz"))
-                self.app.total_points_label.setText(f"Total Points: {total_points:,}")
-            else:
-                self.app.total_points_label.setText("Total Points: 0")
-                
-        if self.isVisible():
+        if self.is_expanded:
             self.update_statistics()
 
     def get_class_info_from_ptc(self):
@@ -272,14 +354,10 @@ class PointCountWidget(QWidget):
         
         if xyz is None or len(xyz) == 0:
             self.total_label.setText("Total: 0")
-            if self.app and hasattr(self.app, 'total_points_label'):
-                self.app.total_points_label.setText("Total Points: 0")
             return
         
         total_points = len(xyz)
         self.total_label.setText(f"Total: {total_points:,}")
-        if self.app and hasattr(self.app, 'total_points_label'):
-            self.app.total_points_label.setText(f"Total Points: {total_points:,}")
         
         class_info = self.get_class_info_from_ptc()
         
@@ -319,67 +397,60 @@ class PointCountWidget(QWidget):
         """
         ✅ FIXED: Properly displays LVL (Level/Class Name) prominently
         """
-        widget = QFrame()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(10)
-        
-        r, g, b = color if color else (80, 80, 80)
-        
-        # Color bullet
-        color_bullet = QLabel()
-        color_bullet.setFixedSize(12, 12)
-        color_bullet.setStyleSheet(f"background-color: rgb({r}, {g}, {b}); border-radius: 6px;")
-        layout.addWidget(color_bullet)
-        
-        # Text details
-        text_layout = QVBoxLayout()
-        text_layout.setContentsMargins(0, 0, 0, 0)
-        text_layout.setSpacing(2)
-        
-        STANDARD_LEVELS = {
-            0: "Created", 1: "Ground", 2: "Low vegetation", 3: "Medium vegetation",
-            4: "High vegetation", 5: "Buildings", 6: "Water", 7: "Railways",
-            8: "Railways (structure)", 9: "Type 1 Street", 10: "Type 2 Street",
-            11: "Type 3 Street", 12: "Type 4 Street", 13: "Bridge",
-            14: "Bare Conductors", 15: "Elicord Overhead Cables", 16: "Pylons or Poles",
-            17: "HV Overhead Lines", 18: "MV Overhead Lines", 19: "LV Overhead Lines",
-        }
-        
-        # Determine the level name (fallback to standard levels)
-        lvl_str = str(lvl).strip() if lvl else ""
-        if not lvl_str or lvl_str == "-":
-            lvl_str = STANDARD_LEVELS.get(code, str(code))
-            
-        desc_str = description.strip() if description else ""
-        
-        # Format exactly like Class Picker: "Code - Lvl" or "Code - Lvl (Desc)"
-        if desc_str and desc_str != f"Class {code}":
-            title_text = f"{code} - {lvl_str} ({desc_str})"
-        else:
-            title_text = f"{code} - {lvl_str}"
-            
-        title_lbl = QLabel(title_text)
-        # User requested no bold inside the stats block
-        text_layout.addWidget(title_lbl)
-            
-        layout.addLayout(text_layout)
-        layout.addStretch()
-        
-        count_text = f"{count:,}" if count > 0 else "0"
-        count_lbl = QLabel(count_text)
-        layout.addWidget(count_lbl)
-        
-        # Styling
-        if count == 0 or not visible:
-            widget.setStyleSheet("QFrame { background-color: rgba(128, 128, 128, 0.05); border-radius: 4px; color: palette(mid); }")
-            title_lbl.setStyleSheet("color: palette(mid);")
-            count_lbl.setStyleSheet("color: palette(mid);")
-        else:
-            widget.setStyleSheet("QFrame { background-color: rgba(128, 128, 128, 0.1); border-radius: 4px; }")
+        label = QLabel()
 
-        widget.setProperty('class_code', code)
-        return widget
+        r, g, b = color if color else (80, 80, 80)
+        bg_color = f"rgba({r}, {g}, {b}, 0.25)"
+        count_text = f"({count:,})" if count > 0 else "(0)"
+        
+        # ✅ Handle level display - show if available
+        if lvl and lvl not in (None, "", " ", "-"):
+            # ✅ Show both class name/level
+            html = f"""
+            <table width="100%" cellspacing="0" cellpadding="0" style="border: none;">
+            <tr>
+                <td style="text-align: left;">
+                    <div style="color: #ffffff; font-weight: 900;">[{code}] {description}</div>
+                    <div style="color: #ffaa00; font-size: 10px; font-weight: bold; margin-top: 2px;">→ {lvl}</div>
+                </td>
+                <td style="text-align: right; color: #ffffff; width: 70px; vertical-align: middle;">
+                    {count_text}
+                </td>
+            </tr>
+            </table>
+            """
+        else:
+            # No level - simpler layout
+            html = f"""
+            <table width="100%" cellspacing="0" cellpadding="0" style="border: none;">
+            <tr>
+                <td style="text-align: left; color: #ffffff;">
+                    <span style="font-weight: 900;">[{code}]</span> {description}
+                </td>
+                <td style="text-align: right; color: #ffffff; width: 70px;">
+                    {count_text}
+                </td>
+            </tr>
+            </table>
+            """
+
+        label.setText(html)
+        label.setTextFormat(Qt.RichText)
+
+        opacity = "1.0" if visible and count > 0 else "0.4"
+
+        label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {bg_color};
+                padding: 8px 10px;
+                border-radius: 3px;
+                font-size: 11px;
+                opacity: {opacity};
+            }}
+        """)
+
+        label.setProperty('class_code', code)
+        return label
 
 
 # ===== HELPER FUNCTIONS =====

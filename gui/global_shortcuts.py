@@ -173,10 +173,33 @@ class GlobalShortcutFilter(QObject):
                                 print(f"⚠️ Curve redo failed: {e}")
                             return True
 
+                    # ✅ Curve tool completed-operation undo/redo (when tool is inactive but has history)
+                    elif hasattr(self.app_window, 'curve_tool') and \
+                         not getattr(self.app_window.curve_tool, 'active', False) and \
+                         (getattr(self.app_window.curve_tool, 'history_stack', []) or
+                          getattr(self.app_window.curve_tool, 'history_redo_stack', [])):
+
+                        if event.key() == Qt.Key_Z:
+                            print("🎨 Ctrl+Z → Curve Tool Undo Completed Curve")
+                            try:
+                                self.app_window.curve_tool.undo_curve()
+                            except Exception as e:
+                                print(f"⚠️ Curve undo failed: {e}")
+                            return True
+
+                        elif event.key() == Qt.Key_Y:
+                            print("🎨 Ctrl+Y → Curve Tool Redo Completed Curve")
+                            try:
+                                self.app_window.curve_tool.redo_curve()
+                            except Exception as e:
+                                print(f"⚠️ Curve redo failed: {e}")
+                            return True
+
                     # ✅ Measurement undo/redo — when measurement tool is active
                     elif hasattr(self.app_window, 'measurement_tool') and \
                          hasattr(self.app_window.measurement_tool, 'active') and \
                          self.app_window.measurement_tool.active:
+
                         measurement_tool = self.app_window.measurement_tool
 
                         if event.key() == Qt.Key_Z:
@@ -256,58 +279,68 @@ class GlobalShortcutFilter(QObject):
                                     saved_slot = self.app_window.display_mode_dialog.current_slot
                                     print(f"   💾 Current view: {saved_slot}")
                                 
-                                # ✅ If Display Mode dialog exists, apply its settings
-                                if hasattr(self.app_window, 'display_mode_dialog') and \
-                                self.app_window.display_mode_dialog is not None:
-                                    
-                                    print("   📋 Applying settings from Display Mode dialog...")
-                                    
-                                    dialog = self.app_window.display_mode_dialog
-                                    
-                                    # ✅ FIXED: Apply settings WITHOUT forcing weights
-                                    # The dialog already has the correct weights - just apply them
-                                    dialog.on_apply()
-                                    
-                                    # ❌ REMOVED: No longer force weights to 1.0
-                                    # Let the dialog's existing weights remain unchanged
-                                    
-                                    # Restore slot selection
-                                    if saved_slot is not None:
-                                        dialog.current_slot = saved_slot
-                                        dialog.slot_box.setCurrentIndex(saved_slot)
-                                    
-                                    if hasattr(self.app_window, 'statusBar'):
-                                        self.app_window.statusBar().showMessage(
-                                            "✅ Display settings applied (Ctrl+Shift+D)",
-                                            2500
-                                        )
-                                    print("   ✅ Settings applied (weights preserved)")
-                                
-                                # ✅ If no dialog exists, CREATE IT SILENTLY
-                                else:
+                                # ── Ensure dialog exists ──────────────────────────────
+                                if not (hasattr(self.app_window, 'display_mode_dialog') and
+                                        self.app_window.display_mode_dialog is not None):
                                     print("   🔧 Creating Display Mode dialog silently...")
-                                    
                                     from gui.display_mode import DisplayModeDialog
-                                    
                                     self.app_window.display_mode_dialog = DisplayModeDialog(self.app_window)
-                                    
-                                    print("   ⚡ Auto-applying loaded settings...")
-                                    self.app_window.display_mode_dialog.on_apply()
-                                    
-                                    # ❌ REMOVED: No weight enforcement
-                                    # The dialog loaded weights from PTC/settings - use those
-                                    
-                                    print("   🎨 Force rendering...")
-                                    from gui.class_display import update_class_mode
-                                    update_class_mode(self.app_window)
-                                    
-                                    if hasattr(self.app_window, 'statusBar'):
-                                        num_classes = self.app_window.display_mode_dialog.table.rowCount()
-                                        self.app_window.statusBar().showMessage(
-                                            f"✅ Display applied: {num_classes} classes from PTC (Ctrl+Shift+D)",
-                                            2500
+
+                                dialog = self.app_window.display_mode_dialog
+
+                                # ── MicroStation Ctrl+Shift+D: push CURRENT PTC palette ──
+                                # to EVERY active view via GPU uniform poke ONLY.
+                                # Zero actor rebuild / remove / create.
+                                # Each view keeps its OWN weight LUT — main-view weights
+                                # are NOT forced onto cross-section views.
+                                print("   📋 Ctrl+Shift+D: GPU-poke all active views with current PTC...")
+
+                                from gui.unified_actor_manager import sync_palette_to_gpu
+
+                                app = self.app_window
+                                views_synced = []
+
+                                # ── Slot 0: Main View ─────────────────────────────────
+                                main_palette = getattr(app, 'class_palette', {})
+                                border0 = float(getattr(app, 'point_border_percent', 0) or 0.0)
+                                if sync_palette_to_gpu(app, 0, main_palette, border0, render=False):
+                                    views_synced.append("Main")
+
+                                # ── Slots 1-4: Cross-section views ───────────────────
+                                if hasattr(app, 'section_vtks'):
+                                    for view_idx, vtk_w in app.section_vtks.items():
+                                        if vtk_w is None:
+                                            continue
+                                        slot_idx = view_idx + 1
+                                        # Use this view's own palette (preserves per-view weights)
+                                        from gui.unified_actor_manager import _get_slot_palette
+                                        sec_palette = _get_slot_palette(app, slot_idx)
+                                        if not sec_palette:
+                                            sec_palette = main_palette
+                                        border_s = float(
+                                            getattr(dialog, 'view_borders', {}).get(slot_idx, 0) or 0
                                         )
-                                    print(f"   ✅ Applied {num_classes} classes from PTC file")
+                                        if sync_palette_to_gpu(app, slot_idx, sec_palette, border_s, render=False):
+                                            views_synced.append(f"V{slot_idx}")
+
+                                # ── Single batched render pass ────────────────────────
+                                try:
+                                    app.vtk_widget.render()
+                                except Exception:
+                                    pass
+                                if hasattr(app, 'section_vtks'):
+                                    for vtk_w in app.section_vtks.values():
+                                        if vtk_w:
+                                            try:
+                                                vtk_w.render()
+                                            except Exception:
+                                                pass
+
+                                msg = f"✅ Ctrl+Shift+D applied to: {', '.join(views_synced)}" \
+                                      if views_synced else "⚠️ No active views to sync"
+                                if hasattr(app, 'statusBar'):
+                                    app.statusBar().showMessage(msg, 2500)
+                                print(f"   {msg}")
                                 
                             except Exception as e:
                                 print(f"⚠️ Display shortcut failed: {e}")

@@ -1,23 +1,22 @@
 def set_view(app, mode):
-    # If we are in a preserve-camera pass (e.g., switching display mode),
-    # do not touch the camera. Just record the requested view.
+    # If we are in a “preserve camera” pass (e.g., switching display mode),
+    # do NOT touch the camera. Just record the requested view.
     preserve = getattr(app, "_preserve_view", False)
     already_in_3d = getattr(app, "current_view", None) == "3d"
 
-    # Hard block: prevent entering 3D unless explicitly allowed.
+    # ✅ HARD BLOCK: Prevent entering 3D unless explicitly allowed
     if mode == "3d" and not (
         getattr(app, "_allow_3d_switch", False) or already_in_3d
     ):
-        # Do not change current_view.
-        print("Blocked auto-switch to 3D (use View -> 3D button)")
+        # Do NOT change current_view
+        print("🚫 Blocked auto-switch to 3D (use View → 3D button)")
         try:
             if hasattr(app, "statusBar"):
-                app.statusBar().showMessage("3D blocked (use View -> 3D)", 2000)
+                app.statusBar().showMessage("🚫 3D blocked (use View → 3D)", 2000)
         except Exception:
             pass
         return
-
-    # Only set current_view after passing the guard.
+    # Only set current_view AFTER passing the guard
     app.current_view = mode
     if preserve:
         return
@@ -52,7 +51,7 @@ def set_view(app, mode):
                     interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
 
             renderer = app.vtk_widget.renderer
-            cam = renderer.GetActiveCamera()
+            cam = app.vtk_widget.renderer.GetActiveCamera()
             cam.ParallelProjectionOff()
 
             bounds = renderer.ComputeVisiblePropBounds()
@@ -97,8 +96,5 @@ def set_view(app, mode):
                 app.vtk_widget.isometric_view()
             except Exception:
                 pass
-
-    elif mode == "dynamic":
-        pass
 
     app.vtk_widget.render()

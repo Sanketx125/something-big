@@ -108,8 +108,7 @@ class DrawPreviewWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        from gui.theme_manager import ThemeColors
-        painter.fillRect(self.rect(), QColor(ThemeColors.get("bg_secondary")))
+        painter.fillRect(self.rect(), QColor("#2b2b2b"))
         painter.setRenderHint(QPainter.Antialiasing)
 
         pen = QPen(self.dialog.current_color)
@@ -173,6 +172,27 @@ class DrawToolSettingsDialog(QDialog):
 
         self.tool_list = QListWidget()
         self.tool_list.setFixedWidth(170)
+        self.tool_list.setStyleSheet("""
+            QListWidget {
+                background-color: #252525;
+                color: #dddddd;
+                border: 1px solid #444;
+                border-radius: 6px;
+                font-size: 13px;
+                outline: none;
+            }
+            QListWidget::item {
+                padding: 8px 6px;
+                border-bottom: 1px solid #333;
+            }
+            QListWidget::item:selected {
+                background-color: #0078d7;
+                color: white;
+            }
+            QListWidget::item:hover {
+                background-color: #333;
+            }
+        """)
 
         # Add per-tool entries
         for key in TOOL_ORDER:
@@ -181,7 +201,7 @@ class DrawToolSettingsDialog(QDialog):
             self.tool_list.addItem(item)
 
         # Add "All Tools (Global)" entry
-        global_item = QListWidgetItem("All Tools (Global)")
+        global_item = QListWidgetItem("🌐  All Tools (Global)")
         global_item.setData(Qt.UserRole, "__global__")
         self.tool_list.addItem(global_item)
 
@@ -194,10 +214,25 @@ class DrawToolSettingsDialog(QDialog):
         right_box = QVBoxLayout()
 
         self.tool_title = QLabel(TOOL_DISPLAY_NAMES[self.selected_tool_key])
-        self.tool_title.setStyleSheet("font-size: 15px; font-weight: bold; margin-bottom: 4px;")
+        self.tool_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #ffffff; margin-bottom: 4px;")
         right_box.addWidget(self.tool_title)
 
         settings_group = QGroupBox("Appearance")
+        settings_group.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid #444;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 14px;
+                color: #ccc;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+            }
+        """)
         form = QVBoxLayout()
 
         # Color row
@@ -249,15 +284,15 @@ class DrawToolSettingsDialog(QDialog):
 
         # Buttons
         btn_row = QHBoxLayout()
-        apply_btn = QPushButton("Apply")
+        apply_btn = QPushButton("✅ Apply")
         apply_btn.clicked.connect(self._apply_settings)
         btn_row.addWidget(apply_btn)
 
-        reset_btn = QPushButton("Reset")
+        reset_btn = QPushButton("🔄 Reset")
         reset_btn.clicked.connect(self._reset_settings)
         btn_row.addWidget(reset_btn)
 
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton("❌ Close")
         close_btn.clicked.connect(self.close)
         btn_row.addWidget(close_btn)
 
@@ -274,7 +309,7 @@ class DrawToolSettingsDialog(QDialog):
         key = current.data(Qt.UserRole)
         if key == "__global__":
             self.selected_tool_key = "__global__"
-            self.tool_title.setText("All Tools (Global)")
+            self.tool_title.setText("🌐  All Tools (Global)")
             # Show first tool's settings as a starting point
             s = self._working_styles[TOOL_ORDER[0]]
         else:
@@ -408,5 +443,49 @@ class DrawToolSettingsDialog(QDialog):
 
     # ── Dark Theme ──────────────────────────────────────────────────────
     def _apply_dark_theme(self):
-        from gui.theme_manager import get_dialog_stylesheet
-        self.setStyleSheet(get_dialog_stylesheet())
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #dddddd;
+                font-size: 13px;
+            }
+            QPushButton {
+                background-color: #333333;
+                color: white;
+                border: 1px solid #444;
+                padding: 6px 12px;
+                border-radius: 6px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #444444;
+            }
+            QPushButton:pressed {
+                background-color: #555555;
+            }
+            QComboBox {
+                background-color: #2b2b2b;
+                color: white;
+                border: 1px solid #444;
+                padding: 4px;
+                border-radius: 4px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2b2b2b;
+                color: white;
+                selection-background-color: #0078d7;
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #444;
+            }
+            QSlider::handle:horizontal {
+                background: #888;
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+        """)

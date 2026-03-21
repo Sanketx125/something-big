@@ -3925,9 +3925,7 @@ class CutSectionController:
 
             # Create DEDICATED VTK widget for cut section
             self.cut_vtk = QtInteractor(container)
-            from gui.theme_manager import ThemeManager
-            bg_color = "white" if ThemeManager.current() == "light" else "black"
-            self.cut_vtk.set_background(bg_color)
+            self.cut_vtk.set_background("black")
             layout.addWidget(self.cut_vtk.interactor)
 
             # Modern bottom bar with inline depth control

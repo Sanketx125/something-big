@@ -9,10 +9,8 @@ from PySide6.QtWidgets import (
     QCheckBox, QSpinBox, QDoubleSpinBox, QSizePolicy, QDialog, QDialogButtonBox,
     QComboBox, QMessageBox, QAbstractItemView, QApplication, QRadioButton  # ✅ ADD THIS
 )
-from PySide6.QtCore import Qt, Signal, QPropertyAnimation, QEasingCurve, QEvent, QSize, QSettings
+from PySide6.QtCore import Qt, Signal, QPropertyAnimation, QEasingCurve , QEvent 
 from PySide6.QtGui import QFont, QPixmap, QIcon, QColor
-from html import escape
-import json
 import numpy as np
 from scipy.spatial import cKDTree
 from gui.prj_block_identifier import show_block_identifier_dialog
@@ -21,486 +19,49 @@ from .curve_ribbon import CurveRibbon
 from .curve_tools import CurveTool
 from .digitize_tools import LineArrowSettingsDialog, PolylineSettingsDialog
 from .draw_settings_dialog import DrawToolSettingsDialog
-from .icon_provider import get_button_icon
 
 # from gui.menu_sidebar_system import InsideFenceDialog
-RIBBON_TOOLTIP_META = {
-    ("FileRibbon", "File", "Open"): {
-        "title": "Open File",
-        "description": "Load point-cloud or project data into the current workspace.",
-    },
-    ("FileRibbon", "File", "Save"): {
-        "title": "Save",
-        "description": "Quick-save the current project to its active file.",
-    },
-    ("FileRibbon", "File", "Save As…"): {
-        "title": "Save As",
-        "description": "Save the current project to a new file or location.",
-    },
-    ("FileRibbon", "Vectors", "Export"): {
-        "title": "Export Drawings",
-        "description": "Export drawings to supported vector formats such as DXF, GeoJSON, or Shapefile.",
-    },
-    ("FileRibbon", "Vectors", "Import"): {
-        "title": "Import Drawings",
-        "description": "Import drawings from supported vector files into the current project.",
-    },
-    ("FileRibbon", "Attachments", "Attach DXF"): {
-        "title": "Attach DXF",
-        "description": "Attach one or more DXF overlay files to the current project.",
-    },
-    ("FileRibbon", "Attachments", "PRJ Loader"): {
-        "title": "PRJ Block Identifier",
-        "description": "Load a PRJ file and identify matching DXF block labels.",
-    },
-    ("FileRibbon", "Attachments", "Verify Labels"): {
-        "title": "Verify Grid Labels",
-        "description": "Compare DXF grid labels against the loaded LAZ or LAS coverage.",
-    },
-    ("FileRibbon", "Attachments", "Attach DWG"): {
-        "title": "Attach DWG",
-        "description": "Attach one or more DWG overlay files to the current project.",
-    },
-    ("FileRibbon", "Attachments", "Attach SNT"): {
-        "title": "Attach SNT",
-        "description": "Attach one or more SNT overlay files to the current project.",
-    },
-    ("FileRibbon", "Project", "Clear"): {
-        "title": "Clear Project",
-        "description": "Remove the current data and reset the workspace to a clean state.",
-    },
-    ("EditRibbon", "History", "Undo"): {
-        "title": "Undo",
-        "description": "Undo the most recent action.",
-    },
-    ("EditRibbon", "History", "Redo"): {
-        "title": "Redo",
-        "description": "Redo the last undone action.",
-    },
-    ("EditRibbon", "Clipboard", "Cut"): {
-        "title": "Cut",
-        "description": "Cut the current selection to the clipboard.",
-    },
-    ("EditRibbon", "Clipboard", "Copy"): {
-        "title": "Copy",
-        "description": "Copy the current selection to the clipboard.",
-    },
-    ("EditRibbon", "Clipboard", "Paste"): {
-        "title": "Paste",
-        "description": "Paste clipboard content into the current context.",
-    },
-    ("EditRibbon", "Delete", "Delete"): {
-        "title": "Delete",
-        "description": "Delete the current selection.",
-    },
-    ("ViewRibbon", "Views", "Top"): {
-        "title": "Top View",
-        "description": "Switch the main canvas to a top-down orthographic view.",
-        "shortcut_tools": ("TopView",),
-    },
-    ("ViewRibbon", "Views", "Front"): {
-        "title": "Front View",
-        "description": "Switch the main canvas to a front orthographic view.",
-    },
-    ("ViewRibbon", "Views", "Side"): {
-        "title": "Side View",
-        "description": "Switch the main canvas to a side orthographic view.",
-    },
-    ("ViewRibbon", "Views", "3D"): {
-        "title": "3D View",
-        "description": "Switch the main canvas to the 3D perspective view.",
-    },
-    ("ViewRibbon", "Display", "Depth"): {
-        "title": "Depth Display",
-        "description": "Color the scene using depth-based shading.",
-        "shortcut_tools": ("Depth",),
-    },
-    ("ViewRibbon", "Display", "RGB"): {
-        "title": "RGB Display",
-        "description": "Show point colors using the RGB values from the source data.",
-        "shortcut_tools": ("RGB",),
-    },
-    ("ViewRibbon", "Display", "Intensity"): {
-        "title": "Intensity Display",
-        "description": "Show points using grayscale intensity values.",
-        "shortcut_tools": ("Intensity",),
-    },
-    ("ViewRibbon", "Display", "Elevation"): {
-        "title": "Elevation Display",
-        "description": "Color points by elevation.",
-        "shortcut_tools": ("Elevation",),
-    },
-    ("ViewRibbon", "Display", "Class"): {
-        "title": "Class Display",
-        "description": "Color points using the active classification palette.",
-        "shortcut_tools": ("Class",),
-    },
-    ("ViewRibbon", "Display", "Shading"): {
-        "title": "Shading Preset",
-        "description": "Apply a saved shading preset to the current project.",
-        "shortcut_tools": ("ShadingMode",),
-    },
-    ("ViewRibbon", "Navigate", "Fit"): {
-        "title": "Fit View",
-        "description": "Fit the active view to all visible project content.",
-    },
-    ("ToolsRibbon", "Sections", "Cross"): {
-        "title": "Cross Section",
-        "description": "Create a cross-section from the main view.",
-        "shortcut_tools": ("CrossSectionRect",),
-    },
-    ("ToolsRibbon", "Sections", "Cut Section"): {
-        "title": "Cut Section",
-        "description": "Create a cut section from the current view.",
-        "shortcut_tools": ("CutSectionRect", "CutFromCross", "CutFromCut"),
-    },
-    ("ToolsRibbon", "Sections", "Width"): {
-        "title": "Section Width",
-        "description": "Set the buffer width used for cross and cut sections.",
-    },
-    ("ToolsRibbon", "Sync", "Views"): {
-        "title": "Synchronize Views",
-        "description": "Open view synchronization controls for linked navigation.",
-    },
-    ("ToolsRibbon", "Selection", "Config"): {
-        "title": "Shortcut Configuration",
-        "description": "Open the shortcut manager to create or edit custom shortcuts.",
-    },
-    ("ToolsRibbon", "Settings", "Backup"): {
-        "title": "Backup Settings",
-        "description": "Open backup settings for project safety and recovery.",
-    },
-    ("ToolsRibbon", "Settings", "Preferences"): {
-        "title": "Cross-Section Preferences",
-        "description": "Adjust cross-section display and behavior settings.",
-    },
-    ("ClassifyRibbon", "Lines", "Above"): {
-        "title": "Classify Above Line",
-        "description": "Classify points that lie above a drawn line.",
-        "shortcut_tools": ("AboveLine",),
-    },
-    ("ClassifyRibbon", "Lines", "Below"): {
-        "title": "Classify Below Line",
-        "description": "Classify points that lie below a drawn line.",
-        "shortcut_tools": ("BelowLine",),
-    },
-    ("ClassifyRibbon", "Shapes", "Rect"): {
-        "title": "Rectangle Selection",
-        "description": "Classify points using a rectangular selection.",
-        "shortcut_tools": ("Rectangle",),
-    },
-    ("ClassifyRibbon", "Shapes", "Circle"): {
-        "title": "Circle Selection",
-        "description": "Classify points using a circular selection.",
-        "shortcut_tools": ("Circle",),
-    },
-    ("ClassifyRibbon", "Shapes", "Free"): {
-        "title": "Freehand Selection",
-        "description": "Classify points using a freehand selection path.",
-        "shortcut_tools": ("Freehand",),
-    },
-    ("ClassifyRibbon", "Points", "Brush"): {
-        "title": "Brush Selection",
-        "description": "Paint classifications onto points with a brush.",
-        "shortcut_tools": ("Brush",),
-    },
-    ("ClassifyRibbon", "Points", "Point"): {
-        "title": "Point Selection",
-        "description": "Classify individual points directly.",
-        "shortcut_tools": ("Point",),
-    },
-    ("DisplayRibbon", "Config", "Display"): {
-        "title": "Display Mode",
-        "description": "Open the display mode dialog and manage saved display presets.",
-        "shortcut_tools": ("DisplayMode",),
-    },
-    ("MeasurementRibbon", "Distance", "Measure Line"): {
-        "title": "Measure Line",
-        "description": "Measure straight-line distance between two points.",
-    },
-    ("MeasurementRibbon", "Distance", "Measure Path"): {
-        "title": "Measure Path",
-        "description": "Measure total distance along a multi-point path.",
-    },
-    ("MeasurementRibbon", "Actions", "Clear"): {
-        "title": "Clear Measurements",
-        "description": "Remove all measurements from the scene.",
-    },
-    ("IdentificationRibbon", "Identify", "Identify"): {
-        "title": "Identify Point",
-        "description": "Inspect the class and coordinates of a clicked point.",
-    },
-    ("IdentificationRibbon", "Identify", "Zoom"): {
-        "title": "Zoom Rectangle",
-        "description": "Zoom to a rectangle drawn on the current view.",
-    },
-    ("IdentificationRibbon", "Identify", "Select"): {
-        "title": "Rectangle Selection",
-        "description": "Select points and overlay entities inside a rectangle.",
-    },
-    ("ByClassRibbon", "By Class", "Convert"): {
-        "title": "By Class Conversion",
-        "description": "Convert one class to another using class-based rules.",
-    },
-    ("ByClassRibbon", "By Class", "Close"): {
-        "title": "Closed Feature Conversion",
-        "description": "Convert points around closed features using the closed-shape workflow.",
-    },
-    ("ByClassRibbon", "By Class", "Height"): {
-        "title": "Height Conversion",
-        "description": "Convert points based on height thresholds.",
-    },
-    ("ByClassRibbon", "By Class", "Fence"): {
-        "title": "Fence Conversion",
-        "description": "Convert points inside a selected fence or boundary.",
-    },
-    ("ByClassRibbon", "Algorithms", "Low Points"): {
-        "title": "Low Points",
-        "description": "Find and classify unusually low outlier points.",
-    },
-    ("ByClassRibbon", "Algorithms", "Isolated"): {
-        "title": "Isolated Points",
-        "description": "Detect and classify isolated outlier points.",
-    },
-    ("ByClassRibbon", "Algorithms", "Ground"): {
-        "title": "Ground Classification",
-        "description": "Run the ground classification workflow.",
-    },
-    ("ByClassRibbon", "Algorithms", "Surface"): {
-        "title": "Below Surface",
-        "description": "Classify points that fall below a derived surface.",
-    },
-}
-
-
-def _ribbon_scope_label(ribbon_scope: str) -> str:
-    if not ribbon_scope:
-        return "Ribbon"
-    return ribbon_scope.replace("Ribbon", "") or "Ribbon"
-
-
-def _normalize_button_text(button_text: str) -> str:
-    return button_text.replace("\n", " ").strip()
-
-
-def _get_ribbon_tooltip_meta(ribbon_scope: str, section_title: str, button_text: str) -> dict:
-    normalized = _normalize_button_text(button_text)
-    meta = RIBBON_TOOLTIP_META.get((ribbon_scope, section_title, normalized))
-    if meta:
-        return meta
-    return {
-        "title": normalized,
-        "description": f"{normalized} tool.",
-    }
-
-
-def _format_shortcut_label(modifier: str, key: str) -> str:
-    key = (key or "").strip()
-    modifier = (modifier or "none").strip().lower()
-    labels = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "meta": "Meta"}
-    parts = []
-    if modifier and modifier != "none":
-        for chunk in modifier.split("+"):
-            chunk = chunk.strip().lower()
-            if chunk:
-                parts.append(labels.get(chunk, chunk.title()))
-    key_label = "Space" if key == " " else key.upper()
-    return "+".join(parts + [key_label]) if parts else key_label
-
-
-def _collect_shortcuts_from_settings() -> list[tuple[str, str, str]]:
-    settings = QSettings("NakshaAI", "LidarApp")
-    shortcuts_data = settings.value("shortcuts", None)
-    if shortcuts_data is None:
-        return []
-    try:
-        entries = json.loads(shortcuts_data) if isinstance(shortcuts_data, str) else shortcuts_data
-    except Exception:
-        return []
-
-    results = []
-    for entry in entries or []:
-        if not isinstance(entry, dict):
-            continue
-        tool = entry.get("tool")
-        key = entry.get("key", "")
-        modifier = entry.get("modifier", "none")
-        if tool and key:
-            results.append((str(tool), str(modifier), str(key)))
-    return results
-
-
-def _collect_shortcuts_from_app(app_window) -> list[tuple[str, str, str]]:
-    results = []
-    shortcuts = getattr(app_window, "shortcuts", {}) if app_window is not None else {}
-    for combo, shortcut_info in shortcuts.items():
-        try:
-            modifier, key = combo
-        except Exception:
-            continue
-        if not isinstance(shortcut_info, dict):
-            continue
-        tool = shortcut_info.get("tool")
-        if tool and key:
-            results.append((str(tool), str(modifier), str(key)))
-    return results
-
-
-def _get_tooltip_shortcuts(app_window, shortcut_tools) -> list[str]:
-    if not shortcut_tools:
-        return []
-    target_tools = {tool for tool in shortcut_tools if tool}
-    matches = set()
-
-    for tool, modifier, key in _collect_shortcuts_from_app(app_window):
-        if tool in target_tools:
-            matches.add(_format_shortcut_label(modifier, key))
-
-    for tool, modifier, key in _collect_shortcuts_from_settings():
-        if tool in target_tools:
-            matches.add(_format_shortcut_label(modifier, key))
-
-    return sorted(matches)
-
-
 class RibbonSection(QWidget):
     """A single section in the ribbon with toggle-capable buttons"""
 
     def __init__(self, title, parent=None):
         super().__init__(parent)
         self.setObjectName("ribbonSection")
-        self.section_title = title
-        self.ribbon_scope = parent.__class__.__name__ if parent is not None else None
-        from PySide6.QtCore import Qt
-        self.setAttribute(Qt.WA_StyledBackground, True)  # Required to render QSS box/borders
         self.active_button = None  # track which button is active
-        self._button_count = 0
         self.setup_ui(title)
     
 
     def setup_ui(self, title):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 3, 2, 2)
-        layout.setSpacing(1)
-        layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
-        self.setMinimumHeight(78)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(4)
 
         title_label = QLabel(title)
         title_label.setObjectName("ribbonSectionTitle")
+        title_label.setFont(QFont("Segoe UI", 8))
         title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
 
-        self.button_box = QWidget()
-        self.button_box.setObjectName("ribbonSectionBox")
-        self.button_box.setAttribute(Qt.WA_StyledBackground, True)
-
-        self.button_layout = QHBoxLayout(self.button_box)
-        self.button_layout.setSpacing(7)
-        self.button_layout.setContentsMargins(6, 5, 6, 5)
-        self.button_layout.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.button_box)
-
-    def _find_app_window(self):
-        widget = self.window()
-        if widget is not None and hasattr(widget, "ribbon_manager"):
-            return widget
-
-        widget = self.parentWidget()
-        while widget is not None:
-            if hasattr(widget, "ribbon_manager"):
-                return widget
-            widget = widget.parentWidget()
-        return None
-
-    def _build_button_tooltip(self, btn: QPushButton) -> str:
-        from gui.theme_manager import ThemeColors
-
-        button_text = btn.property("ribbonText") or btn.text() or ""
-        section_title = btn.property("ribbonSection") or self.section_title
-        ribbon_scope = btn.property("ribbonScope") or self.ribbon_scope
-
-        meta = _get_ribbon_tooltip_meta(ribbon_scope, section_title, button_text)
-        title = meta.get("title", _normalize_button_text(button_text))
-        description = meta.get("description", "")
-        shortcut_items = _get_tooltip_shortcuts(
-            self._find_app_window(),
-            meta.get("shortcut_tools", ()),
-        )
-
-        title_color = ThemeColors.get("text_primary")
-        body_color = ThemeColors.get("text_primary")
-        muted_color = ThemeColors.get("text_secondary")
-        divider_color = ThemeColors.get("border_light")
-
-        shortcut_html = ""
-        if shortcut_items:
-            shortcut_label = "Shortcut" if len(shortcut_items) == 1 else "Shortcuts"
-            shortcut_html = (
-                f"<div style='margin-top:5px; padding-top:4px; "
-                f"border-top:1px solid {divider_color};'>"
-                f"<span style='font-size:7.6pt; color:{muted_color};'>{shortcut_label}</span>"
-                f"<div style='font-size:8.6pt; font-weight:600; color:{title_color}; margin-top:1px;'>"
-                f"{escape(', '.join(shortcut_items))}</div></div>"
-            )
-
-        return (
-            f"<div style='min-width:188px;'>"
-            f"<div style='font-size:9.8pt; font-weight:700; color:{title_color};'>{escape(title)}</div>"
-            f"<div style='font-size:8.6pt; color:{body_color}; margin-top:3px; line-height:1.24;'>"
-            f"{escape(description)}</div>"
-            f"{shortcut_html}</div>"
-        )
-
-    def _refresh_button_tooltip(self, btn: QPushButton):
-        btn.setToolTip(self._build_button_tooltip(btn))
-
-    def eventFilter(self, obj, event):
-        if isinstance(obj, QPushButton) and event.type() in (QEvent.Enter, QEvent.ToolTip):
-            self._refresh_button_tooltip(obj)
-        return super().eventFilter(obj, event)
+        self.button_layout = QHBoxLayout()
+        self.button_layout.setSpacing(4)
+        layout.addLayout(self.button_layout)
 
     def add_button(self, text, icon_text, callback=None, toggleable=True):
         """
         Add a button to this ribbon section.
         - toggleable=True: button can stay pressed green
         - toggleable=False: acts like a simple push
-        Uses SVG icons from icon_provider when available, falls back to text.
         """
-        icon_size = 28
-
-        btn = QPushButton()
+        btn = QPushButton(f"{icon_text}\n{text}")
         btn.setObjectName("ribbonButton")
-        btn.setProperty("ribbonText", text)
-        btn.setProperty("ribbonSection", self.section_title)
-        btn.setProperty("ribbonScope", self.ribbon_scope)
-
-        icon = get_button_icon(
-            text,
-            section_title=self.section_title,
-            ribbon_scope=self.ribbon_scope,
-            size=icon_size,
-        )
-        if not icon.isNull():
-            btn.setIcon(icon)
-            btn.setIconSize(QSize(icon_size, icon_size))
-        else:
-            # Fallback to text (for any unmapped buttons)
-            btn.setText(icon_text)
-            font = btn.font()
-            font.setPointSize(16)
-            btn.setFont(font)
-
-        btn.setFixedSize(36, 36)
+        btn.setFixedSize(68, 55)
         btn.setCheckable(toggleable)
-        self._refresh_button_tooltip(btn)
-        btn.installEventFilter(self)
+        btn.setStyleSheet(self._inactive_style())
 
         if callback:
             btn.clicked.connect(lambda checked, b=btn: self._on_button_click(b, callback))
 
         self.button_layout.addWidget(btn)
-
-        self._button_count += 1
         return btn
 
     def _on_button_click(self, btn, callback):
@@ -508,17 +69,41 @@ class RibbonSection(QWidget):
         # Deactivate previously active button if it’s not this one
         if self.active_button and self.active_button != btn:
             self.active_button.setChecked(False)
+            self.active_button.setStyleSheet(self._inactive_style())
 
         # Toggle this button
         if btn.isChecked():
+            btn.setStyleSheet(self._active_style())
             self.active_button = btn
         else:
+            btn.setStyleSheet(self._inactive_style())
             self.active_button = None
 
         # Emit or call connected function
         callback()
 
+    def _active_style(self):
+        return """
+        QPushButton {
+            background-color: #004d40;
+            color: white;
+            font-weight: bold;
+            border: 1px solid #1b5e20;
+            border-radius: 6px;
+        }
+        """
 
+    def _inactive_style(self):
+        return """
+        QPushButton {
+            background-color: #2c2c2c;
+            color: #f0f0f0;
+            border-radius: 6px;
+        }
+        QPushButton:hover {
+            background-color: #3c3c3c;
+        }
+        """
 class FileRibbon(QWidget):
     open_file = Signal()
     save_file = Signal()          # keep: we will use this for "Save As..."
@@ -533,10 +118,10 @@ class FileRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(10)
         
         # File Operations
-        file_ops = RibbonSection("File", self)
+        file_ops = RibbonSection("📂 File", self)
 
         file_ops.add_button("Open", "📂", self.open_file.emit, toggleable=False)
 
@@ -549,22 +134,31 @@ class FileRibbon(QWidget):
         layout.addWidget(file_ops)
         
         # Vector Export/Import Section
-        vector_ops = RibbonSection("Vectors", self)
+        vector_ops = RibbonSection("📐 Vectors", self)
         vector_ops.add_button("Export", "📤", self._export_drawings)
         vector_ops.add_button("Import", "📥", self._import_drawings)
         layout.addWidget(vector_ops)
 
-        # Combined attachment tools
-        attachments = RibbonSection("Attachments", self)
-        attachments.add_button("Attach DXF", "📎", self._attach_dxf)
-        attachments.add_button("PRJ Loader", "📋", self._identify_blocks)
-        attachments.add_button("Verify Labels", "🔍", self._verify_grid_labels)
-        attachments.add_button("Attach DWG", "📐", self._attach_dwg, toggleable=False)
-        attachments.add_button("Attach SNT", "🗂️", self._attach_snt, toggleable=False)
-        layout.addWidget(attachments)
+        # DXF Attachment Section
+        dxf_ops = RibbonSection("📎 DXF", self)
+        dxf_ops.add_button("Attach", "📎", self._attach_dxf)
+        dxf_ops.add_button("Define", "📋", self._identify_blocks)  # ✅ NEW
+        dxf_ops.add_button("Verify Labels", "🔍", self._verify_grid_labels)
+        # dxf_ops.add_button("List Text", "📝", self._list_dxf_text)
+        layout.addWidget(dxf_ops)
+
+        # DWG Attachment Section  ← ADD THIS BLOCK
+        dwg_ops = RibbonSection("📐 DWG", self)
+        dwg_ops.add_button("Attach", "📐", self._attach_dwg, toggleable=False)
+        layout.addWidget(dwg_ops)
+
+        #SNT Attachment 
+        snt_ops = RibbonSection("🗂️ SNT", self)
+        snt_ops.add_button("Attach", "🗂️", self._attach_snt, toggleable=False)
+        layout.addWidget(snt_ops)
 
         # Project
-        project = RibbonSection("Project", self)
+        project = RibbonSection("🗂️ Project", self)
         project.add_button("Clear", "🧹", self._clear_project)
         layout.addWidget(project)
         
@@ -797,30 +391,30 @@ class EditRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(10)
         
         # Undo/Redo
-        history = RibbonSection("History", self)
+        history = RibbonSection("↶ History", self)
         history.add_button("Undo", "↶", lambda: self.edit_action.emit("undo"))
         history.add_button("Redo", "↷", lambda: self.edit_action.emit("redo"))
         layout.addWidget(history)
         
         # Clipboard
-        clipboard = RibbonSection("Clipboard", self)
+        clipboard = RibbonSection("📋 Clipboard", self)
         clipboard.add_button("Cut", "✂️", lambda: self.edit_action.emit("cut"))
         clipboard.add_button("Copy", "📋", lambda: self.edit_action.emit("copy"))
         clipboard.add_button("Paste", "📎", lambda: self.edit_action.emit("paste"))
         layout.addWidget(clipboard)
         
         # Delete
-        delete_sec = RibbonSection("Delete", self)
+        delete_sec = RibbonSection("🗑️ Delete", self)
         delete_sec.add_button("Delete", "🗑️", lambda: self.edit_action.emit("delete"))
         layout.addWidget(delete_sec)
         
         layout.addStretch()
 
 class ViewRibbon(QWidget):
-    """Ribbon for View menu with compact amplifier controls."""
+    """Ribbon for View menu with increment/decrement amplifier controls"""
 
     view_changed = Signal(str)
     display_changed = Signal(str)
@@ -840,10 +434,10 @@ class ViewRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(10)
 
         # 📸 View Modes
-        views = RibbonSection("Views", self)
+        views = RibbonSection("📸 Views", self)
         views.add_button("Top", "⬇️", lambda: self.view_changed.emit("top"))
         views.add_button("Front", "➡️", lambda: self.view_changed.emit("front"))
         views.add_button("Side", "⬅️", lambda: self.view_changed.emit("side"))
@@ -851,7 +445,7 @@ class ViewRibbon(QWidget):
         layout.addWidget(views)
 
         # 🎨 Display Modes
-        display = RibbonSection("Display", self)
+        display = RibbonSection("🎨 Display", self)
         self.depth_btn = display.add_button("Depth", "🧱", self.toggle_depth)
         display.add_button("RGB", "🌈", lambda: self._switch_display_mode("rgb"))
         display.add_button("Intensity", "💡", lambda: self._switch_display_mode("intensity"))
@@ -859,8 +453,29 @@ class ViewRibbon(QWidget):
         display.add_button("Class", "🏷️", lambda: self._switch_display_mode("class"))
         display.add_button("Shading", "🌓", lambda: self._switch_display_mode("shaded_class"))
         layout.addWidget(display)
+        
+        
+        # ✅ NEW: 🎚️ Frequency Amplifier (Increment/Decrement Buttons)
+        amplifier = QWidget()
+        amplifier.setObjectName("amplifierWidget")
+        amp_layout = QVBoxLayout(amplifier)
+        amp_layout.setContentsMargins(8, 4, 8, 4)
+        amp_layout.setSpacing(4)
+        
+        # Title
+        amp_title = QLabel("🎚️ Amplifier")  
+        amp_title.setObjectName("ribbonSectionTitle") 
+        amp_title.setFont(QFont("Segoe UI", 8))        
+        amp_title.setAlignment(Qt.AlignCenter)
+        amp_title.setStyleSheet("")       
+        amp_layout.addWidget(amp_title)
 
-        navigate = RibbonSection("Navigate", self)
+        layout.addStretch()
+        
+        # ============================================================
+        # 🔍 FIT VIEW (Right-aligned)
+        # ============================================================
+        navigate = RibbonSection("🔍 Navigate", self)
         navigate.add_button(
             "Fit",
             "🧲",
@@ -869,50 +484,121 @@ class ViewRibbon(QWidget):
         )
         layout.addWidget(navigate)
 
-        amplifier = RibbonSection("Amplifier", self)
-        amplifier.button_layout.setContentsMargins(6, 5, 6, 5)
-        amplifier.button_layout.setSpacing(6)
-
-        amp_surface = QWidget()
-        amp_surface.setObjectName("ampControlSurface")
-        amp_surface.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        amp_surface.setFixedSize(126, 32)
-
-        amp_layout = QHBoxLayout(amp_surface)
-        amp_layout.setContentsMargins(8, 0, 8, 0)
-        amp_layout.setSpacing(6)
-        amp_layout.setAlignment(Qt.AlignVCenter)
-
-        self.sharp_slider = QSlider(Qt.Horizontal)
-        self.sharp_slider.setObjectName("ampSlider")
-        self.sharp_slider.setFixedSize(66, 18)
-        self.sharp_slider.setRange(0, 200)
-        self.sharp_slider.setSingleStep(10)
-        self.sharp_slider.setPageStep(10)
-        self.sharp_slider.setTracking(True)
-        self.sharp_slider.setValue(self.current_sharpness)
-        self.sharp_slider.setToolTip("Adjust sharpness from 0% to 200%")
-        self.sharp_slider.valueChanged.connect(self._on_sharpness_changed)
-        amp_layout.addWidget(self.sharp_slider)
-
+     # ============================================================
+        # 🔪 SHARPNESS Control (+/- buttons)
+        # ============================================================
+        sharp_container = QWidget()
+        sharp_layout = QHBoxLayout(sharp_container)
+        sharp_layout.setContentsMargins(0, 0, 0, 0)
+        sharp_layout.setSpacing(4)
+        
+        # Label
+        sharp_label = QLabel("Sharp:")
+        sharp_label.setFixedWidth(30)
+        sharp_label.setStyleSheet("color: #ffffff; font-size: 10px; font-weight: bold; text-shadow: 0px 1px 2px #000;")
+        sharp_layout.addWidget(sharp_label)
+        
+        # Minus button
+        sharp_minus_btn = QPushButton("−")
+        sharp_minus_btn.setFixedSize(28, 26)
+        sharp_minus_btn.setToolTip("Decrease sharpness by 10%")
+        sharp_minus_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1a1a1a;
+                color: #ffffff;
+                border: 2px solid #444;
+                border-radius: 4px;
+                font-size: 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #2a2a2a;
+                border: 2px solid #00aaff;
+                box-shadow: 0px 0px 8px #00aaff;
+            }
+            QPushButton:pressed {
+                background-color: #00aaff;
+                color: black;
+                border: 2px solid #00aaff;
+            }
+        """)
+        sharp_minus_btn.clicked.connect(lambda: self._adjust_sharpness(-10))
+        sharp_layout.addWidget(sharp_minus_btn)
+        
+        # Value display
         self.sharp_value_label = QLabel("100%")
-        self.sharp_value_label.setFixedSize(38, 24)
+        self.sharp_value_label.setFixedWidth(50)
         self.sharp_value_label.setAlignment(Qt.AlignCenter)
-        self.sharp_value_label.setObjectName("ampValueLabel")
-        amp_layout.addWidget(self.sharp_value_label)
-
-        reset_btn = QPushButton("Reset")
-        reset_btn.setFixedSize(50, 32)
-        reset_btn.setObjectName("ampResetBtn")
-        reset_btn.setToolTip("Reset sharpness to 100%")
+        self.sharp_value_label.setStyleSheet("""
+            QLabel {
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: bold;
+                background-color: #1a1a1a;
+                border: 2px solid #444;
+                border-radius: 4px;
+                padding: 2px;
+            }
+        """)
+        sharp_layout.addWidget(self.sharp_value_label)
+        
+        # Plus button
+        sharp_plus_btn = QPushButton("+")
+        sharp_plus_btn.setFixedSize(28, 26)
+        sharp_plus_btn.setToolTip("Increase sharpness by 10%")
+        sharp_plus_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3c3c3c;
+                color: #00aaff;
+                border: 2px solid #555;
+                border-radius: 5px;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #4c4c4c;
+                border: 2px solid #00aaff;
+            }
+            QPushButton:pressed {
+                background-color: #00aaff;
+                color: black;
+            }
+        """)
+        sharp_plus_btn.clicked.connect(lambda: self._adjust_sharpness(10))
+        sharp_layout.addWidget(sharp_plus_btn)
+        
+        amp_layout.addWidget(sharp_container)
+        
+        # ============================================================
+        # Reset button
+        # ============================================================
+        reset_btn = QPushButton("🔄 Reset")
+        reset_btn.setFixedHeight(22)
+        reset_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #41613d;
+                color: #f0f0f0;
+                border: 1px solid #3c3c3c;
+                border-radius: 3px;
+                font-size: 9px;
+                font-weight: bold;
+                padding: 2px;
+            }
+            QPushButton:hover {
+                background-color: #3c3c3c;
+                border: 1px solid #ffaa00;
+            }
+            QPushButton:pressed {
+                background-color: #ffaa00;
+                color: black;
+            }
+        """)
         reset_btn.clicked.connect(self._reset_amplifiers)
-
-        amplifier.button_layout.addWidget(amp_surface)
-        amplifier.button_layout.addWidget(reset_btn)
+        amp_layout.addWidget(reset_btn)
+        
         layout.addWidget(amplifier)
-
-        layout.addStretch()
-
+        
+        
     def _switch_to_non_class_mode(self, mode):
         """
         Switch to non-classification mode and disable borders.
@@ -932,15 +618,6 @@ class ViewRibbon(QWidget):
         # Emit the display change
         self.display_changed.emit(mode)
 
-    def _toggle_theme(self):
-        """Toggle the application theme."""
-        widget = self
-        while widget:
-            if hasattr(widget, "toggle_theme"):
-                widget.toggle_theme()
-                return
-            widget = widget.parent()
-
     def _fit_view(self):
         widget = self
         while widget:
@@ -949,20 +626,22 @@ class ViewRibbon(QWidget):
                 return
             widget = widget.parent()
 
-    def _on_sharpness_changed(self, value):
-        """Update the amplifier display and emit the active sharpness."""
-        self.current_sharpness = value
-        if hasattr(self, "sharp_value_label"):
-            self.sharp_value_label.setText(f"{value}%")
-
-        self.sharpness_changed.emit(value)
-        print(f"🔪 Sharpness: {value}%")
-
+    # ============================================================
+    # ✅ SHARPNESS Adjustment (±10% increments)
+    # ============================================================
     def _adjust_sharpness(self, delta):
-        """Adjust sharpness by delta (kept for compatibility)."""
-        if hasattr(self, "sharp_slider"):
-            new_value = max(0, min(200, self.sharp_slider.value() + delta))
-            self.sharp_slider.setValue(new_value)
+        """Adjust sharpness by delta (±10)."""
+        new_value = max(0, min(200, self.current_sharpness + delta))
+        
+        if new_value != self.current_sharpness:
+            self.current_sharpness = new_value
+            self.sharp_value_label.setText(f"{new_value}%")
+            
+            # Map: 0% -> 0, 100% -> 200 (current max), 200% -> 400 (double current max)
+            actual_value = new_value * 2
+            
+            self.sharpness_changed.emit(actual_value)
+            print(f"🔪 Sharpness: {new_value}% (actual: {actual_value})")
 
     # ============================================================
     # ✅ Reset Both Amplifiers
@@ -972,13 +651,11 @@ class ViewRibbon(QWidget):
         self.current_saturation = 100
         self.current_sharpness = 100
         
+        self.sat_value_label.setText("100%")
+        self.sharp_value_label.setText("100%")
+        
         self.saturation_changed.emit(100)
-        if hasattr(self, "sharp_slider"):
-            self.sharp_slider.setValue(100)
-        else:
-            if hasattr(self, "sharp_value_label"):
-                self.sharp_value_label.setText("100%")
-            self.sharpness_changed.emit(100)
+        self.sharpness_changed.emit(100)
         
         print("🔄 Amplifiers reset to 100%")
 
@@ -1045,11 +722,27 @@ class ViewRibbon(QWidget):
 
     def _update_button_style(self, button, active: bool):
         """Highlight button when active."""
-        from gui.theme_manager import get_active_button_style, get_inactive_button_style
         if active:
-            button.setStyleSheet(get_active_button_style())
+            button.setStyleSheet("""
+                QPushButton {
+                    background-color: #41613d;
+                    color: white;
+                    font-weight: bold;
+                    border: 1px solid #1b5e20;
+                    border-radius: 6px;
+                }
+            """)
         else:
-            button.setStyleSheet(get_inactive_button_style())
+            button.setStyleSheet("""
+                QPushButton {
+                    background-color: #2c2c2c;
+                    color: #f0f0f0;
+                    border-radius: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #3c3c3c;
+                }
+            """)
 
 
 
@@ -1066,15 +759,15 @@ class ToolsRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(10)
         
         # ------------------------
         # ✂️ Sections: Cross / Cut / Width
         # ------------------------
-        sections = RibbonSection("Sections", self)
+        sections = RibbonSection("✂️ Sections", self)
         sections.add_button("Cross", "📐",
                             lambda: self.tool_activated.emit("cross_section"))
-        sections.add_button("Cut Section", "🔪",
+        sections.add_button("Cut", "🔪",
                             lambda: self.tool_activated.emit("cut_section"))
         sections.add_button("Width", "📏",
                             lambda: self.tool_activated.emit("set_cut_width"))
@@ -1083,7 +776,7 @@ class ToolsRibbon(QWidget):
         # ------------------------
         # 🔄 Sync: (for Sync Views dialog – single button)
         # ------------------------
-        sync_sec = RibbonSection("Sync", self)
+        sync_sec = RibbonSection("🔄 Sync", self)
         # For now just one button that will open the Synchronize Views dialog
         sync_sec.add_button("Views", "🔄",
                             lambda: self.tool_activated.emit("sync_views"),
@@ -1093,7 +786,7 @@ class ToolsRibbon(QWidget):
         # ------------------------
         # 🎯 Selection
         # ------------------------
-        selection = RibbonSection("Selection", self)
+        selection = RibbonSection("🎯 Selection", self)
         # selection.add_button("Select", "🖱️",
         #                      lambda: self.tool_activated.emit("element_selection"))
         selection.add_button("Config", "⌨️", self._configure_shortcuts)
@@ -1102,7 +795,7 @@ class ToolsRibbon(QWidget):
         # ------------------------
         # ⚙️ Settings
         # ------------------------
-        settings = RibbonSection("Settings", self)
+        settings = RibbonSection("⚙️ Settings", self)
         settings.add_button("Backup", "💾",
                             lambda: self.tool_activated.emit("backup_settings"))
         settings.add_button("Preferences", "🎛️",
@@ -1159,16 +852,16 @@ class ClassifyRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(10)
         
         # Line Tools
-        lines = RibbonSection("Lines", self)
+        lines = RibbonSection("📏 Lines", self)
         lines.add_button("Above", "⬆️", lambda: self.classify_tool_selected.emit("above_line"))
         lines.add_button("Below", "⬇️", lambda: self.classify_tool_selected.emit("below_line"))
         layout.addWidget(lines)
         
         # Shape Selection
-        shapes = RibbonSection("Shapes", self)
+        shapes = RibbonSection("🔷 Shapes", self)
         shapes.add_button("Rect", "⬜", lambda: self.classify_tool_selected.emit("rectangle"))
         shapes.add_button("Circle", "⭕", lambda: self.classify_tool_selected.emit("circle"))
         # shapes.add_button("Polygon", "⬡", lambda: self.classify_tool_selected.emit("polygon"))
@@ -1176,11 +869,17 @@ class ClassifyRibbon(QWidget):
         layout.addWidget(shapes)
         
         # Point Tools
-        points = RibbonSection("Points", self)
+        points = RibbonSection("🖌️ Points", self)
         points.add_button("Brush", "🖌️", lambda: self.classify_tool_selected.emit("brush"))
         points.add_button("Point", "📍", lambda: self.classify_tool_selected.emit("point"))
         layout.addWidget(points)
-
+        
+      
+        # ✅ NEW: Settings Section
+        settings = RibbonSection("⚙️ Settings", self)
+        settings.add_button("Backup", "💾", lambda: self.tool_activated.emit("backup_settings"))
+        layout.addWidget(settings)
+        
         layout.addStretch()
 
 class DisplayRibbon(QWidget):
@@ -1201,10 +900,10 @@ class DisplayRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(10)
         
         # Config
-        config = RibbonSection("Config", self)
+        config = RibbonSection("⚙️ Config", self)
         config.add_button("Display", "🎛️", self.display_mode_clicked.emit)
         layout.addWidget(config)
         layout.addStretch()
@@ -1221,7 +920,7 @@ class DisplayRibbon(QWidget):
     def update_border_display(self):
         """Update the display and emit signal with immediate re-render"""
         value = self.current_border_value
-        self.border_label.setText(f"Border: {value}%")
+        self.border_label.setText(f"🔳 Border: {value}%")
         self.value_display.setText(f"{value}%")
         
         print(f"🔵 Border changed to: {value}%")
@@ -1309,7 +1008,7 @@ class DrawRibbon(QWidget):
     #     layout.addWidget(tools)
  
     #     # Actions
-    #     actions = RibbonSection("Actions", self)
+    #     actions = RibbonSection("🗑️ Actions", self)
     #     actions.add_button("Clear", "🗑️", self.clear_requested.emit)
     #     layout.addWidget(actions)
        
@@ -1318,10 +1017,10 @@ class DrawRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(10)
         
         # Draw Tools
-        tools = RibbonSection("Tools", self)
+        tools = RibbonSection("🖊️ Tools", self)
         
         tools.add_button("Smart\nLine", "🔮", lambda: self._handle_smartline_click())
         tools.add_button("Line", "📏", lambda: self._handle_line_click())
@@ -1342,7 +1041,7 @@ class DrawRibbon(QWidget):
         # ══════════════════════════════════════════════════════════
         # ◀◀◀ NEW SECTION: Selection Tools
         # ══════════════════════════════════════════════════════════
-        select_section = RibbonSection("Select", self)
+        select_section = RibbonSection("🎯 Select", self)
         
         select_section.add_button(
             "Select\nDrawing", "🎯",
@@ -1357,14 +1056,14 @@ class DrawRibbon(QWidget):
         layout.addWidget(select_section)
 
         # Actions
-        actions = RibbonSection("Actions", self)
+        actions = RibbonSection("🗑️ Actions", self)
         actions.add_button("Clear", "🗑️", self._handle_clear_click)
         layout.addWidget(actions)
 
         # ══════════════════════════════════════════════════════════
         # ◀◀◀ NEW SECTION: Draw Settings
         # ══════════════════════════════════════════════════════════
-        settings_section = RibbonSection("Settings", self)
+        settings_section = RibbonSection("⚙️ Settings", self)
         settings_section.add_button(
             "Draw\nSettings", "⚙️",
             lambda: self._show_draw_settings(),
@@ -1394,6 +1093,30 @@ class DrawRibbon(QWidget):
             print("🗑️ Clear: non-classified drawings cleared, showing fence picker...")
             self._show_clear_fence_dialog(digitizer, classified_fences)
 
+
+    def _show_draw_settings(self):
+        """Open the Draw Tool Settings dialog."""
+        try:
+            # Walk up to find the actual NakshaApp main window with digitizer
+            main_window = self.window()
+            widget = self
+            while widget:
+                if hasattr(widget, 'digitizer'):
+                    main_window = widget
+                    break
+                widget = widget.parent()
+            
+            print(f"🔧 Draw Settings: app={type(main_window).__name__}, has digitizer={hasattr(main_window, 'digitizer')}")
+            dialog = DrawToolSettingsDialog(main_window, parent=main_window)
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            
+        except Exception as e:
+            print(f"⚠️ Failed to open Draw Settings: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _show_clear_fence_dialog(self, digitizer, classified_fences):
         """Show a popup letting user choose which classified fences to keep or delete."""
         from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -1410,26 +1133,35 @@ class DrawRibbon(QWidget):
         dialog.setWindowTitle("Clear Classified Fences")
         dialog.setWindowModality(Qt.ApplicationModal)
         dialog.resize(420, 400)
-        from gui.theme_manager import get_dialog_stylesheet, ThemeColors
-        dialog.setStyleSheet(get_dialog_stylesheet())
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+                color: #eeeeee;
+            }
+        """)
 
         layout = QVBoxLayout(dialog)
         layout.setSpacing(8)
 
         # Title
         title = QLabel("Select classified fences to DELETE")
-        title.setStyleSheet(f"color: {ThemeColors.get('danger')}; font-weight: bold; font-size: 13px; padding: 8px;")
+        title.setStyleSheet("color: #f44336; font-weight: bold; font-size: 13px; padding: 8px;")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
         subtitle = QLabel("Unchecked fences will be kept. Checked fences will be removed.")
-        subtitle.setStyleSheet(f"color: {ThemeColors.get('text_secondary')}; font-size: 10px; padding: 0 8px 8px 8px;")
+        subtitle.setStyleSheet("color: #aaaaaa; font-size: 10px; padding: 0 8px 8px 8px;")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
 
         # Scroll area for fence list
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("""
+            QScrollArea { border: 1px solid #3a3a3a; border-radius: 4px; background: #1e1e1e; }
+            QScrollBar:vertical { width: 8px; background: #1e1e1e; }
+            QScrollBar::handle:vertical { background: #555; border-radius: 4px; }
+        """)
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout(scroll_widget)
         scroll_layout.setSpacing(4)
@@ -1453,42 +1185,42 @@ class DrawRibbon(QWidget):
 
             # Row widget
             row = QWidget()
-            row.setStyleSheet(f"""
-                QWidget {{
-                    background-color: {ThemeColors.get('bg_button')};
-                    border: 1px solid {ThemeColors.get('border')};
+            row.setStyleSheet("""
+                QWidget {
+                    background-color: #2a2a2a;
+                    border: 1px solid #3a3a3a;
                     border-radius: 6px;
                     padding: 6px;
-                }}
-                QWidget:hover {{
-                    background-color: {ThemeColors.get('bg_button_hover')};
-                    border: 1px solid {ThemeColors.get('border_light')};
-                }}
+                }
+                QWidget:hover {
+                    background-color: #3c3c3c;
+                    border: 1px solid #555555;
+                }
             """)
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(8, 6, 8, 6)
 
             cb = QCheckBox()
-            cb.setStyleSheet(f"""
-                QCheckBox::indicator {{
+            cb.setStyleSheet("""
+                QCheckBox::indicator {
                     width: 18px; height: 18px;
-                    border-radius: 3px; border: 1px solid {ThemeColors.get('border_light')};
-                    background-color: {ThemeColors.get('bg_input')};
-                }}
-                QCheckBox::indicator:checked {{
-                    background-color: {ThemeColors.get('danger')}; border: 1px solid {ThemeColors.get('danger')};
-                }}
+                    border-radius: 3px; border: 1px solid #555555;
+                    background-color: #1e1e1e;
+                }
+                QCheckBox::indicator:checked {
+                    background-color: #f44336; border: 1px solid #f44336;
+                }
             """)
             row_layout.addWidget(cb)
 
-            # Fence indicator
+            # Cyan fence indicator
             indicator = QFrame()
             indicator.setFixedSize(8, 30)
-            indicator.setStyleSheet(f"background-color: {ThemeColors.get('accent')}; border-radius: 2px;")
+            indicator.setStyleSheet("background-color: #00ffff; border-radius: 2px;")
             row_layout.addWidget(indicator)
 
             label = QLabel(f"{icon} #{idx+1}: {shape_type.capitalize()}\n{coord_count} pts | {size_text}")
-            label.setStyleSheet(f"color: {ThemeColors.get('text_primary')}; font-size: 10px; background: transparent; padding-left: 4px;")
+            label.setStyleSheet("color: #eeeeee; font-size: 10px; background: transparent; padding-left: 4px;")
             row_layout.addWidget(label, 1)
 
             # Make row clickable to toggle checkbox
@@ -1510,11 +1242,20 @@ class DrawRibbon(QWidget):
         btn_row = QHBoxLayout()
 
         select_all_btn = QPushButton("Select All")
-        select_all_btn.setObjectName("dangerBtn")
+        select_all_btn.setStyleSheet("""
+            QPushButton { background-color: #d32f2f; color: white; padding: 6px 16px;
+                          border-radius: 4px; font-weight: bold; font-size: 11px; }
+            QPushButton:hover { background-color: #b71c1c; }
+        """)
         select_all_btn.clicked.connect(lambda: [cb.setChecked(True) for cb, _ in checkboxes])
         btn_row.addWidget(select_all_btn)
 
         clear_all_btn = QPushButton("Clear All")
+        clear_all_btn.setStyleSheet("""
+            QPushButton { background-color: #555555; color: white; padding: 6px 16px;
+                          border-radius: 4px; font-weight: bold; font-size: 11px; }
+            QPushButton:hover { background-color: #666666; }
+        """)
         clear_all_btn.clicked.connect(lambda: [cb.setChecked(False) for cb, _ in checkboxes])
         btn_row.addWidget(clear_all_btn)
 
@@ -1522,12 +1263,20 @@ class DrawRibbon(QWidget):
 
         keep_btn = QPushButton("Keep Selected")
         keep_btn.setToolTip("Close without deleting any fences")
-        keep_btn.setObjectName("primaryBtn")
+        keep_btn.setStyleSheet("""
+            QPushButton { background-color: #388E3C; color: white; padding: 8px 20px;
+                          border-radius: 4px; font-weight: bold; font-size: 11px; }
+            QPushButton:hover { background-color: #2E7D32; }
+        """)
         keep_btn.clicked.connect(dialog.reject)
         btn_row.addWidget(keep_btn)
 
         delete_btn = QPushButton("Delete Checked")
-        delete_btn.setObjectName("dangerBtn")
+        delete_btn.setStyleSheet("""
+            QPushButton { background-color: #d32f2f; color: white; padding: 8px 20px;
+                          border-radius: 4px; font-weight: bold; font-size: 11px; }
+            QPushButton:hover { background-color: #b71c1c; }
+        """)
         btn_row.addWidget(delete_btn)
 
         layout.addLayout(btn_row)
@@ -1574,29 +1323,6 @@ class DrawRibbon(QWidget):
 
         delete_btn.clicked.connect(on_delete)
         dialog.exec()
-
-    def _show_draw_settings(self):
-        """Open the Draw Tool Settings dialog."""
-        try:
-            # Walk up to find the actual NakshaApp main window with digitizer
-            main_window = self.window()
-            widget = self
-            while widget:
-                if hasattr(widget, 'digitizer'):
-                    main_window = widget
-                    break
-                widget = widget.parent()
-            
-            print(f"🔧 Draw Settings: app={type(main_window).__name__}, has digitizer={hasattr(main_window, 'digitizer')}")
-            dialog = DrawToolSettingsDialog(main_window, parent=main_window)
-            dialog.show()
-            dialog.raise_()
-            dialog.activateWindow()
-            
-        except Exception as e:
-            print(f"⚠️ Failed to open Draw Settings: {e}")
-            import traceback
-            traceback.print_exc()
 
     def _handle_select_drawing_click(self):
         """Enter selection mode for curves/drawings."""
@@ -1885,6 +1611,7 @@ class RibbonManager:
             for section in self.ribbons[self.current_ribbon].findChildren(RibbonSection):
                 if section.active_button:
                     section.active_button.setChecked(False)
+                    section.active_button.setStyleSheet(section._inactive_style())
                     section.active_button = None
 
 
@@ -1901,17 +1628,17 @@ class MeasurementRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(10)
         
         # 📏 Distance Tools
-        distance = RibbonSection("Distance", self)
-        distance.add_button("Measure Line", "📐", lambda: self.measure_tool_selected.emit("measure_line"))
-        distance.add_button("Measure Path", "🛤️", lambda: self.measure_tool_selected.emit("measure_path"))
+        distance = RibbonSection("📏 Distance", self)
+        distance.add_button("Line", "📐", lambda: self.measure_tool_selected.emit("measure_line"))
+        distance.add_button("Path", "🛤️", lambda: self.measure_tool_selected.emit("measure_path"))
         layout.addWidget(distance)
     
         
         # 🗑️ Actions
-        actions = RibbonSection("Actions", self)
+        actions = RibbonSection("🗑️ Actions", self)
         actions.add_button("Clear", "🗑️", self.clear_measurements.emit)
         layout.addWidget(actions)
         
@@ -1934,12 +1661,12 @@ class IdentificationRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(10)
        
         # 🔍 Identification Tools
         # ✅ RibbonSection should be defined in the same file (menu_sidebar_system.py)
         # No import needed if it's in the same module
-        identify = RibbonSection("Identify", self)
+        identify = RibbonSection("🔍 Identify", self)
         self.identify_btn = identify.add_button("Identify", "🔍", self.toggle_identify, toggleable=True)
         self.zoom_rect_btn = identify.add_button("Zoom", "⬚", self.toggle_zoom_rectangle, toggleable=True) 
         self.select_rect_btn = identify.add_button("Select", "☑️", self.toggle_select_rectangle, toggleable=True)  # ✅ NEW
@@ -1953,7 +1680,7 @@ class IdentificationRibbon(QWidget):
         info_layout.setSpacing(2)
        
         # Title
-        info_title = QLabel("Point Info")
+        info_title = QLabel("ℹ️ Point Info")
         info_title.setObjectName("ribbonSectionTitle")
         info_title.setFont(QFont("Segoe UI", 8))
         info_title.setAlignment(Qt.AlignCenter)
@@ -1963,22 +1690,45 @@ class IdentificationRibbon(QWidget):
         self.status_label = QLabel("Click on point cloud")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setWordWrap(True)  # ✅ Allow multi-line text
-        self.status_label.setObjectName("paramLabel")
+        self.status_label.setStyleSheet("""
+            QLabel {
+                color: #aaaaaa;
+                font-size: 9px;
+                padding: 4px;
+                background-color: #2c2c2c;
+                border-radius: 3px;
+            }
+        """)
         info_layout.addWidget(self.status_label)
         
         
         
-        self.delete_btn = QPushButton("Delete Selected")
+        self.delete_btn = QPushButton("🗑️ Delete Selected")
         self.delete_btn.setFixedHeight(28)
         self.delete_btn.setVisible(False)  # Hidden until points are selected
-        self.delete_btn.setObjectName("sidebarButtonDanger")
+        self.delete_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                color: white;
+                font-size: 9px;
+                font-weight: bold;
+                border: 1px solid #b71c1c;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QPushButton:hover {
+                background-color: #f44336;
+                border: 1px solid #d32f2f;
+            }
+            QPushButton:pressed {
+                background-color: #b71c1c;
+            }
+        """)
         self.delete_btn.clicked.connect(self.delete_selected_points)
         info_layout.addWidget(self.delete_btn)
     
         layout.addWidget(info)
         layout.addStretch()
-        self._reset_status_label()
-        
         
     def toggle_select_rectangle(self):
         """Toggle select rectangle mode on/off"""
@@ -1989,16 +1739,32 @@ class IdentificationRibbon(QWidget):
             self._deactivate_zoom_rectangle()
             
             # Style the select button as active
-            from gui.theme_manager import get_active_button_style
-            self.select_rect_btn.setStyleSheet(get_active_button_style())
+            self.select_rect_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #ff6f00;
+                    color: white;
+                    font-weight: bold;
+                    border: 1px solid #e65100;
+                    border-radius: 6px;
+                }
+            """)
             self.status_label.setText("Draw rectangle to select points")
-            self.status_label.setStyleSheet("color: #ff9800; font-weight: bold;")
+            self.status_label.setStyleSheet("""
+                QLabel {
+                    color: #ffb74d;
+                    font-size: 9px;
+                    font-weight: bold;
+                    padding: 4px;
+                    background-color: #e65100;
+                    border-radius: 3px;
+                }
+            """)
             
             # Activate select rectangle tool
             if self.app and hasattr(self.app, 'select_rectangle_tool'):
                 self.app.select_rectangle_tool.activate()
             else:
-                print("❌ ERROR: Cannot find select_rectangle_tool!")
+                print("ERROR: Cannot find select_rectangle_tool!")
                 
         else:
             self._deactivate_select_rectangle()
@@ -2006,15 +1772,29 @@ class IdentificationRibbon(QWidget):
 
     def _reset_button_style(self, button):
         """Reset button to default style"""
-        from gui.theme_manager import get_inactive_button_style
-        button.setStyleSheet(get_inactive_button_style())
+        button.setStyleSheet("""
+            QPushButton {
+                background-color: #2c2c2c;
+                color: #f0f0f0;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #3c3c3c;
+            }
+        """)
 
     def _reset_status_label(self):
         """Reset ribbon status to the default idle state."""
-        from gui.theme_manager import get_status_label_style
-
         self.status_label.setText("Click on point cloud")
-        self.status_label.setStyleSheet(get_status_label_style())
+        self.status_label.setStyleSheet("""
+            QLabel {
+                color: #aaaaaa;
+                font-size: 9px;
+                padding: 4px;
+                background-color: #2c2c2c;
+                border-radius: 3px;
+            }
+        """)
 
     def _deactivate_identify(self):
         """Ensure the Identify tool is fully turned off."""
@@ -2047,11 +1827,20 @@ class IdentificationRibbon(QWidget):
     def update_selected_count(self, count):
         """Update status label with number of selected points"""
         if count > 0:
-            self.status_label.setText(f"{count:,} points selected")
-            self.status_label.setStyleSheet("color: #ff9800; font-weight: bold;")
+            self.status_label.setText(f"🟧 {count:,} points selected")
+            self.status_label.setStyleSheet("""
+                QLabel {
+                    color: #ffb74d;
+                    font-size: 9px;
+                    font-weight: bold;
+                    padding: 4px;
+                    background-color: #e65100;
+                    border-radius: 3px;
+                }
+            """)
             self.delete_btn.setVisible(True)
         else:
-            self.status_label.setText("Draw rectangle to select points")
+            self.status_label.setText("🟧 Draw rectangle to select points")
             self.delete_btn.setVisible(False)
 
     def delete_selected_points(self):
@@ -2068,24 +1857,38 @@ class IdentificationRibbon(QWidget):
             self._deactivate_select_rectangle()
        
         if self.identify_active:
-            from gui.theme_manager import get_active_button_style
-            self.identify_btn.setStyleSheet(get_active_button_style())
+            self.identify_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2e7d32;
+                    color: white;
+                    font-weight: bold;
+                    border: 1px solid #1b5e20;
+                    border-radius: 6px;
+                }
+            """)
             self.status_label.setText("Active")
-            self.status_label.setStyleSheet("color: #4caf50; font-weight: bold;")
+            self.status_label.setStyleSheet("""
+                QLabel {
+                    color: #4caf50;
+                    font-size: 9px;
+                    font-weight: bold;
+                    padding: 4px;
+                    background-color: #1b5e20;
+                    border-radius: 3px;
+                }
+            """)
            
             # Activate the identification tool
             if self.app and hasattr(self.app, 'identification_tool'):
                 self.app.identification_tool.activate()
             else:
-                print("❌ ERROR: Cannot find identification_tool!")
+                print("ERROR: Cannot find identification_tool!")
                
         else:
             self._deactivate_identify()
             self._reset_status_label()
        
-        self.identify_toggled.emit(self.identify_active)
-        
-        
+        self.identify_toggled.emit(self.identify_active)            
         
     def toggle_zoom_rectangle(self):
         """Toggle zoom rectangle mode on/off"""
@@ -2094,17 +1897,35 @@ class IdentificationRibbon(QWidget):
         if self.zoom_rectangle_active:
             self._deactivate_identify()
             self._deactivate_select_rectangle()
-
+            
             # Style the zoom button as active
-            from gui.theme_manager import get_active_button_style
-            self.zoom_rect_btn.setStyleSheet(get_active_button_style())
+            self.zoom_rect_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #1976d2;
+                    color: white;
+                    font-weight: bold;
+                    border: 1px solid #0d47a1;
+                    border-radius: 6px;
+                }
+            """)
             self.status_label.setText("Draw rectangle & right-click")
-            self.status_label.setStyleSheet("color: #2196f3; font-size: 9px; font-weight: bold; padding: 4px;")
-
+            self.status_label.setStyleSheet("""
+                QLabel {
+                    color: #2196f3;
+                    font-size: 9px;
+                    font-weight: bold;
+                    padding: 4px;
+                    background-color: #0d47a1;
+                    border-radius: 3px;
+                }
+            """)
+            
             # Activate zoom rectangle tool
             if self.app and hasattr(self.app, 'zoom_rectangle_tool'):
                 self.app.zoom_rectangle_tool.activate()
-
+            else:
+                print("ERROR: Cannot find zoom_rectangle_tool!")
+                
         else:
             self._deactivate_zoom_rectangle()
             self._reset_status_label()
@@ -2230,10 +2051,10 @@ class ByClassRibbon(QWidget):
         """Build the ribbon UI"""
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(10)
         
         # 🔄 By Class Section
-        by_class_section = RibbonSection("By Class", self)
+        by_class_section = RibbonSection("🔄 By Class", self)
         
         self.convert_btn = by_class_section.add_button(
             "Convert", 
@@ -2262,7 +2083,7 @@ class ByClassRibbon(QWidget):
                     
         layout.addWidget(by_class_section)
         
-        algo_section = RibbonSection("Algorithms", self)
+        algo_section = RibbonSection("🔬 Algorithms", self)
         algo_section.add_button("Low Points", "⬇️", self.open_low_points_dialog,    toggleable=False)
         algo_section.add_button("Isolated",   "🔴", self.open_isolated_dialog,      toggleable=False)
         algo_section.add_button("Ground",     "🏔️", self.open_ground_dialog,        toggleable=False)
@@ -2277,7 +2098,7 @@ class ByClassRibbon(QWidget):
         info_layout.setSpacing(2)
         
         # Title
-        info_title = QLabel("Conversion Info")
+        info_title = QLabel("ℹ️ Conversion Info")
         info_title.setObjectName("ribbonSectionTitle")
         info_title.setFont(QFont("Segoe UI", 8))
         info_title.setAlignment(Qt.AlignCenter)
@@ -2582,7 +2403,7 @@ class ByClassDialog(QDialog):
         self.ribbon_parent = ribbon_parent
         
         self.setWindowTitle("Convert Classes")
-        # self.setStyleSheet(self.naksha_dark_theme()) # Inherits global theme
+        self.setStyleSheet(self.naksha_dark_theme())
         self.setGeometry(200, 200, 380, 420)
 
         # Shortcuts
@@ -3699,7 +3520,7 @@ class ClosedByClassDialog(QDialog):
         self.manual_selection_indices = None
         
         self.setWindowTitle("Closed By Class Conversion")
-        # self.setStyleSheet(self.naksha_dark_theme()) # Inherits global theme
+        self.setStyleSheet(self.naksha_dark_theme())
         self.setGeometry(200, 200, 450, 650)
         
         # Shortcuts - same approach as ByClassDialog
@@ -5151,7 +4972,7 @@ class ByClassHeightDialog(QDialog):
         self.ribbon_parent = ribbon_parent
         
         self.setWindowTitle("By Class Height - Height-Based Classification")
-        # self.setStyleSheet(self.naksha_dark_theme()) # Inherits global theme
+        self.setStyleSheet(self.naksha_dark_theme())
         self.setGeometry(200, 200, 450, 400)
         
         self.setFocusPolicy(Qt.StrongFocus)
@@ -7121,7 +6942,7 @@ class InsideFenceDialog(QDialog):
         self.permanent_fence_mode = False
         
         self.setWindowTitle("Inside Fence - Convert Points Within Shape")
-        # self.setStyleSheet(self.naksha_dark_theme()) # Inherits global theme
+        self.setStyleSheet(self.naksha_dark_theme())
         self.setGeometry(200, 200, 500, 700)
         
         # ... (rest of your init code: shortcuts, init_ui, connections) ...
@@ -7914,7 +7735,7 @@ class InsideFenceDialog(QDialog):
             dialog.setWindowTitle("Select Fence(s)")
 
             dialog.setWindowModality(Qt.NonModal)  # ← CRITICAL: Non-modal
-            # dialog.setStyleSheet(self.naksha_dark_theme()) # Inherits global theme
+            dialog.setStyleSheet(self.naksha_dark_theme())
             dialog.resize(400, 500)
             
             print("   ✅ Dialog created successfully")
@@ -10087,10 +9908,10 @@ class AIRibbon(QWidget):
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(10)
         
         # AI Classification
-        ai_section = RibbonSection("AI", self)
+        ai_section = RibbonSection("🤖 AI", self)
         ai_section.add_button(
             "Start",
             "🚀",
@@ -10126,15 +9947,57 @@ class AIRibbon(QWidget):
 
 class VertexInsertSettingsDialog(QDialog):
     """Settings dialog for Vertex insertion tool"""
-
+   
     def __init__(self, current_auto_drag=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Vertex Tool Settings")
         self.setModal(True)
         self.resize(350, 180)
-
-        from gui.theme_manager import get_dialog_stylesheet
-        self.setStyleSheet(get_dialog_stylesheet())
+       
+        # Apply dark theme
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QGroupBox {
+                border: 1px solid #555555;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+            QRadioButton {
+                color: #ffffff;
+                padding: 8px;
+            }
+            QPushButton {
+                background-color: #0078d7;
+                color: #ffffff;
+                border: none;
+                border-radius: 3px;
+                padding: 8px 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1084d8;
+            }
+            QPushButton:pressed {
+                background-color: #006cc1;
+            }
+            QPushButton#cancel_btn {
+                background-color: #555555;
+            }
+            QPushButton#cancel_btn:hover {
+                background-color: #666666;
+            }
+        """)
        
         layout = QVBoxLayout()
         mode_group = QGroupBox("Insertion Mode")
@@ -10170,15 +10033,57 @@ class VertexInsertSettingsDialog(QDialog):
 
 class VertexMoveSettingsDialog(QDialog):
     """Settings dialog for Vertex Move tool"""
-
+   
     def __init__(self, current_mode='click', parent=None):
         super().__init__(parent)
         self.setWindowTitle("Vertex Move Settings")
         self.setModal(True)
         self.resize(350, 200)
-
-        from gui.theme_manager import get_dialog_stylesheet
-        self.setStyleSheet(get_dialog_stylesheet())
+       
+        # Apply dark theme (same as other dialogs)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QGroupBox {
+                border: 1px solid #555555;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+            QRadioButton {
+                color: #ffffff;
+                padding: 8px;
+            }
+            QPushButton {
+                background-color: #0078d7;
+                color: #ffffff;
+                border: none;
+                border-radius: 3px;
+                padding: 8px 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1084d8;
+            }
+            QPushButton:pressed {
+                background-color: #006cc1;
+            }
+            QPushButton#cancel_btn {
+                background-color: #555555;
+            }
+            QPushButton#cancel_btn:hover {
+                background-color: #666666;
+            }
+        """)
        
         layout = QVBoxLayout()
         mode_group = QGroupBox("Move Mode")

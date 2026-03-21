@@ -41,6 +41,10 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         self.undo_stack = []  # Stores removed points
         self.redo_stack = []  # Stores re-added points
 
+        # Undo/Redo stacks for completed curves (whole-operation undo after right-click)
+        self.history_stack = []       # List of (curve_data, dig_entry) after each finalization
+        self.history_redo_stack = []  # For redo after undoing a completed curve
+
         # Selection
         self.selected_curve = None     # Currently selected curve actor
         self.selected_curve_data = None # Store curve info for editing
@@ -628,6 +632,12 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
                 'interpolated': curve_points.tolist() if curve_points is not None else None
             })
             print("   💾 Curve saved to digitizer")
+
+        # Save to history for whole-operation undo/redo after completion
+        if curve_points is not None:
+            dig_entry = self.app.digitizer.drawings[-1] if hasattr(self.app, 'digitizer') else None
+            self.history_stack.append((curve_data, dig_entry))
+            self.history_redo_stack.clear()
         
         # Clear preview and reset
         self._clear_preview()
@@ -706,7 +716,7 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
                 f"↷ Redo: {len(self.points)} points",
                 2000
             )
-                     
+               
     def _select_curve_at_click(self, event):
         """Select a curve by clicking on it"""
         pos = event.pos()
@@ -1012,6 +1022,8 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         self.points = []
         self.undo_stack = []
         self.redo_stack = []
+        self.history_stack = []
+        self.history_redo_stack = []
 
         # ✅ 4. Clear selection
         self.selected_curve = None
@@ -1021,3 +1033,60 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         self.app.vtk_widget.render()
 
         print("✅ All curves + previews cleared")
+
+
+    def undo_curve(self):
+        """Undo the last completed curve (whole-operation undo after right-click)."""
+        if not self.history_stack:
+            print("⚠️ No completed curve to undo")
+            return
+
+        curve_data, dig_entry = self.history_stack.pop()
+
+        # Save to redo stack
+        self.history_redo_stack.append((curve_data, dig_entry))
+
+        # Remove actor from renderer and finalized list
+        try:
+            self.finalized_actors.remove(curve_data)
+        except ValueError:
+            pass
+        self.app.vtk_widget.renderer.RemoveActor(curve_data['actor'])
+
+        # Remove from digitizer drawings
+        if dig_entry is not None and hasattr(self.app, 'digitizer'):
+            try:
+                self.app.digitizer.drawings.remove(dig_entry)
+            except ValueError:
+                pass
+
+        self.app.vtk_widget.render()
+        print(f"↶ Undo completed curve (history: {len(self.history_stack)})")
+
+        if hasattr(self.app, 'statusBar'):
+            self.app.statusBar().showMessage("↶ Curve undone | Ctrl+Y to redo", 2000)
+
+    def redo_curve(self):
+        """Redo the last undone completed curve."""
+        if not self.history_redo_stack:
+            print("⚠️ Nothing to redo")
+            return
+
+        curve_data, dig_entry = self.history_redo_stack.pop()
+
+        # Push back to history
+        self.history_stack.append((curve_data, dig_entry))
+
+        # Re-add actor and finalized entry
+        self.finalized_actors.append(curve_data)
+        self.app.vtk_widget.renderer.AddActor(curve_data['actor'])
+
+        # Re-add to digitizer drawings
+        if dig_entry is not None and hasattr(self.app, 'digitizer'):
+            self.app.digitizer.drawings.append(dig_entry)
+
+        self.app.vtk_widget.render()
+        print(f"↷ Redo completed curve (history: {len(self.history_stack)})")
+
+        if hasattr(self.app, 'statusBar'):
+            self.app.statusBar().showMessage("↷ Curve redone", 2000)    

@@ -83,15 +83,15 @@ class CrossSectionSettingsDialog(QDialog):
         
         # 5. Buttons
         button_row = QHBoxLayout()
-        apply_btn = QPushButton("Apply")
+        apply_btn = QPushButton("✅ Apply")
         apply_btn.clicked.connect(self.apply_settings)
         button_row.addWidget(apply_btn)
-
-        reset_btn = QPushButton("Reset")
+        
+        reset_btn = QPushButton("🔄 Reset")
         reset_btn.clicked.connect(self.reset_settings)
         button_row.addWidget(reset_btn)
-
-        close_btn = QPushButton("Close")
+        
+        close_btn = QPushButton("❌ Close")
         close_btn.clicked.connect(self.close)
         button_row.addWidget(close_btn)
         
@@ -99,8 +99,53 @@ class CrossSectionSettingsDialog(QDialog):
         
         
     def apply_dark_theme(self):
-        from gui.theme_manager import get_dialog_stylesheet
-        self.setStyleSheet(get_dialog_stylesheet())
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+                color: #ffffff;
+            }
+
+            QLabel {
+                color: #dddddd;
+                font-size: 13px;
+            }
+
+            QPushButton {
+                background-color: #333333;
+                color: white;
+                border: 1px solid #444;
+                padding: 6px 10px;
+                border-radius: 6px;
+            }
+
+            QPushButton:hover {
+                background-color: #444444;
+            }
+
+            QPushButton:pressed {
+                background-color: #555555;
+            }
+
+            QComboBox {
+                background-color: #2b2b2b;
+                color: white;
+                border: 1px solid #444;
+                padding: 4px;
+                border-radius: 4px;
+            }
+
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #444;
+            }
+
+            QSlider::handle:horizontal {
+                background: #888;
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+        """)
       
     def choose_color(self):
         color = QColorDialog.getColor(self.current_color, self)
@@ -239,8 +284,7 @@ class LinePreviewWidget(QWidget):
         
     def paintEvent(self, event):
         painter = QPainter(self)
-        from gui.theme_manager import ThemeColors
-        painter.fillRect(self.rect(), QColor(ThemeColors.get("bg_secondary")))
+        painter.fillRect(self.rect(), QColor("#2b2b2b"))  # dark background
         painter.setRenderHint(QPainter.Antialiasing)
 
         pen = QPen(self.dialog.current_color)

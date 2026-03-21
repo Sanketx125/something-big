@@ -71,15 +71,14 @@ class ObserverRegistry:
     def count(cls) -> int:
         return sum(len(entry["ids"]) for entry in cls._registry.values())
 
-
 def _free_undo_entry(entry: dict) -> None:
     if not isinstance(entry, dict):
         return
-    for key in ("mask", "old_classes", "new_classes", "old", "new", "classification"):
+    for key in ("mask", "old_classes", "new_classes", "oldclasses", "newclasses",
+                "old", "new", "classification"):
         arr = entry.pop(key, None)
         if arr is not None:
             del arr
-
 
 def trim_undo_stack(app, max_steps: int = MAX_UNDO_STEPS) -> None:
     """Trim undo/redo stacks and free arrays from dropped entries."""
@@ -94,7 +93,6 @@ def trim_undo_stack(app, max_steps: int = MAX_UNDO_STEPS) -> None:
 
     while len(undo) > max_steps:
         _free_undo_entry(undo.pop(0))
-
 
 def release_data_arrays(app) -> None:
     """Release project arrays and memory-heavy structures."""
