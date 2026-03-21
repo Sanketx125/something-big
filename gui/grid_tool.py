@@ -39,7 +39,8 @@ class GridConfigDialog(QDialog):
         
         # Title
         title = QLabel("Configure Grid Parameters")
-        title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ff6f00;")
+        from gui.theme_manager import ThemeColors
+        title.setStyleSheet(f"font-size: 14pt; font-weight: bold; color: {ThemeColors.get('accent')};")
         layout.addWidget(title)
         
         # # Grid Type Selection

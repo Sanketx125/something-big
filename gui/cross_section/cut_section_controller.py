@@ -1321,6 +1321,8 @@ class CutSectionController:
         elif self.cut_dock.isHidden():
             print("      → Showing hidden dock")
             self.cut_dock.show()
+            ThemeManager.apply_native_window_theme(self.cut_dock)
+            ThemeManager.refresh_runtime_surfaces(self.app)
         else:
             self.cut_dock.setVisible(True)  # Ensure visible
         
@@ -2209,10 +2211,13 @@ class CutSectionController:
                 print("🔄 Cut view active - asking user for cut source...")
                 
                 from PySide6.QtWidgets import QMessageBox
+                from gui.theme_manager import get_dialog_stylesheet
                 
                 msg = QMessageBox(self.app)
                 msg.setWindowTitle("Cut Tool Activate")
-                msg.setText("")
+                msg.setText("Choose where the next cut should start from.")
+                msg.setInformativeText("Use the current cross-section or continue cutting from the active cut section.")
+                msg.setStyleSheet(get_dialog_stylesheet())
                 msg.setWindowFlags(msg.windowFlags() | Qt.WindowCloseButtonHint)
                 
                 btn_cross = msg.addButton("Cross Section", QMessageBox.ActionRole)
@@ -3925,7 +3930,9 @@ class CutSectionController:
 
             # Create DEDICATED VTK widget for cut section
             self.cut_vtk = QtInteractor(container)
-            self.cut_vtk.set_background("black")
+            from gui.theme_manager import ThemeManager
+            bg_color = "white" if ThemeManager.current() == "light" else "black"
+            self.cut_vtk.set_background(bg_color)
             layout.addWidget(self.cut_vtk.interactor)
 
             # Modern bottom bar with inline depth control

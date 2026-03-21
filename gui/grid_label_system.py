@@ -279,13 +279,14 @@ class GridLabelManager:
             }
         """)
         
-        # if grid_name:
-        #     # Point belongs to a tracked grid
-        #     point_count = len(self.loaded_grids[grid_name])
-        #     clear_action = QAction(f"🧹 Clear Grid: {grid_name} ({point_count:,} pts)", self.app)
-        #     clear_action.triggered.connect(lambda: self.clear_grid_data(grid_name))
-        #     menu.addAction(clear_action)
+        if grid_name:
+            # Point belongs to a tracked grid
+            point_count = len(self.loaded_grids[grid_name])
+            clear_action = QAction(f"🧹 Clear Grid: {grid_name} ({point_count:,} pts)", self.app)
+            clear_action.triggered.connect(lambda: self.clear_grid_data(grid_name))
+            menu.addAction(clear_action)
 
+        
         menu.exec(QCursor.pos())
         
     def _find_grid_for_point(self, point_id):
@@ -628,6 +629,13 @@ class GridLabelManager:
         print(f"   File: {las_file.name}")
         print(f"{'='*70}")
 
+        from gui.data_loader import prompt_lidar_import_options
+
+        import_options = prompt_lidar_import_options(str(las_file), parent=self.app)
+        if import_options is None:
+            print("   User cancelled import setup")
+            return
+
         # ============================================================================
         # STEP 1: AUTO-SAVE CURRENT FILE (if exists) - SAME AS MENU BAR
         # ============================================================================
@@ -787,8 +795,13 @@ class GridLabelManager:
             update_progress(10, "Loading file...", force=True)
             
             from gui.data_loader import load_lidar_file
-            
-            tile_data = load_lidar_file(str(las_file), parent=self.app)
+
+            tile_data = load_lidar_file(
+                str(las_file),
+                parent=self.app,
+                import_options=import_options,
+                prompt_user=False,
+            )
             
             if not tile_data:
                 progress.finish_error("Load cancelled or failed")

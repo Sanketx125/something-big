@@ -636,10 +636,15 @@ def show_export_dialog(app):
     Show export format selection dialog and perform export.
     """
     from PySide6.QtWidgets import QDialog, QVBoxLayout, QRadioButton, QDialogButtonBox
+    from PySide6.QtCore import Qt
+    from gui.theme_manager import ThemeManager, get_dialog_stylesheet
     
     dialog = QDialog(app)
+    dialog.setProperty("themeStyledDialog", True)
     dialog.setWindowTitle("Export Drawings")
     dialog.setModal(True)
+    dialog.setStyleSheet(get_dialog_stylesheet())
+    ThemeManager.apply_native_window_theme(dialog)
     
     layout = QVBoxLayout()
     
@@ -655,6 +660,17 @@ def show_export_dialog(app):
     buttons = QDialogButtonBox(
         QDialogButtonBox.Ok | QDialogButtonBox.Cancel
     )
+    ok_btn = buttons.button(QDialogButtonBox.Ok)
+    cancel_btn = buttons.button(QDialogButtonBox.Cancel)
+    if ok_btn:
+        ok_btn.setObjectName("primaryBtn")
+        ok_btn.setAutoDefault(False)
+        ok_btn.setDefault(False)
+        ok_btn.setFocusPolicy(Qt.NoFocus)
+    if cancel_btn:
+        cancel_btn.setAutoDefault(False)
+        cancel_btn.setDefault(False)
+        cancel_btn.setFocusPolicy(Qt.NoFocus)
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
@@ -1093,10 +1109,14 @@ def show_import_dialog(app):
     )
     from PySide6.QtCore import Qt, QCoreApplication
     from pathlib import Path
+    from gui.theme_manager import ThemeManager, get_dialog_stylesheet
     
     dialog = QDialog(app)
+    dialog.setProperty("themeStyledDialog", True)
     dialog.setWindowTitle("Import Drawings")
     dialog.setModal(True)
+    dialog.setStyleSheet(get_dialog_stylesheet())
+    ThemeManager.apply_native_window_theme(dialog)
     
     layout = QVBoxLayout()
     
@@ -1115,6 +1135,17 @@ def show_import_dialog(app):
     buttons = QDialogButtonBox(
         QDialogButtonBox.Ok | QDialogButtonBox.Cancel
     )
+    ok_btn = buttons.button(QDialogButtonBox.Ok)
+    cancel_btn = buttons.button(QDialogButtonBox.Cancel)
+    if ok_btn:
+        ok_btn.setObjectName("primaryBtn")
+        ok_btn.setAutoDefault(False)
+        ok_btn.setDefault(False)
+        ok_btn.setFocusPolicy(Qt.NoFocus)
+    if cancel_btn:
+        cancel_btn.setAutoDefault(False)
+        cancel_btn.setDefault(False)
+        cancel_btn.setFocusPolicy(Qt.NoFocus)
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)

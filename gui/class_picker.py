@@ -7,6 +7,8 @@ from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QBrush, QPen, QLinea
 from PySide6.QtGui import QPixmap, QIcon, QColor
 import os
 
+from gui.theme_manager import ThemeColors, get_dialog_stylesheet
+
 def make_color_icon(rgb):
     """Creates a high-fidelity color pill icon with a subtle glow."""
     pix = QPixmap(32, 32)
@@ -145,125 +147,78 @@ class ClassPicker(QWidget):
         self.from_list.itemSelectionChanged.connect(self._on_from_changed)
         self.to_combo.currentIndexChanged.connect(self._on_to_changed)
         invert_btn.clicked.connect(self._invert_classes)
+        invert_btn.setObjectName("secondaryBtn")
+        invert_btn.setAutoDefault(False)
+        invert_btn.setDefault(False)
+        invert_btn.setFocusPolicy(Qt.NoFocus)
 
         # Default size
         self.setGeometry(200, 200, 320, 280)
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #0d0d0d;
-                color: #e0e0e0;
-                font-family: 'Inter', 'Segoe UI', sans-serif;
-            }
-            
-            QLabel#sectionLabel {
-                color: #666666;
-                font-size: 10px;
-                font-weight: 800;
-                letter-spacing: 1.5px;
-                margin-bottom: -4px;
-            }
-
-            QListWidget {
-                background-color: #141414;
-                border: 1px solid #252525;
+        self.setObjectName("ClassPickerRoot")
+        self.setProperty("themeStyledWindow", True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.refresh_theme()
+    def refresh_theme(self):
+        c = ThemeColors
+        self.setStyleSheet(
+            get_dialog_stylesheet()
+            + f"""
+            QWidget#ClassPickerRoot {{
+                background-color: {c.get('bg_secondary')};
+            }}
+            QWidget#ClassPickerRoot QLabel {{
+                color: {c.get('text_primary')};
+            }}
+            QWidget#ClassPickerRoot QListWidget {{
+                background-color: {c.get('bg_input')};
+                border: 1px solid {c.get('border_light')};
                 border-radius: 10px;
-                padding: 5px;
-                outline: none;
-            }
-            
-            QListWidget::item {
-                background-color: #1a1a1a;
-                border-radius: 6px;
-                padding: 10px;
+                padding: 4px;
+            }}
+            QWidget#ClassPickerRoot QListWidget::item {{
+                padding: 8px 10px;
                 margin: 2px 4px;
+                border-radius: 7px;
                 border: 1px solid transparent;
-            }
-            
-            QListWidget::item:hover {
-                background-color: #222222;
-                border: 1px solid #333333;
-            }
-
-            QListWidget::item:selected {
-                background-color: #004d40;
-                color: #00ffa2;
-                border: 1px solid #00796b;
-            }
-
-            QComboBox {
-                background-color: #141414;
-                border: 1px solid #252525;
-                border-radius: 8px;
-                padding: 10px 15px;
-                min-height: 20px;
-            }
-            
-            QComboBox:hover {
-                border-color: #444444;
-            }
-
-            QComboBox::drop-down {
-                border: none;
-                width: 30px;
-            }
-
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid #666666;
-            }
-
-            QComboBox QAbstractItemView {
-                background-color: #141414;
-                border: 1px solid #252525;
-                selection-background-color: #004d40;
-                selection-color: #00ffa2;
-                outline: none;
-                border-radius: 8px;
-            }
-
-            QPushButton {
-                background-color: #1a1a1a;
-                border: 1px solid #2a2a2a;
-                border-radius: 8px;
-                color: #ffffff;
-                padding: 12px;
-                font-weight: 700;
-                font-size: 11px;
-                letter-spacing: 1px;
-            }
-
-            QPushButton:hover {
-                background-color: #00aa88;
-                border-color: #00ffa2;
-                color: #000000;
-            }
-
-            QPushButton:pressed {
-                background-color: #008866;
-                transform: translateY(1px);
-            }
-            
-            QScrollBar:vertical {
-                border: none;
-                background: #0d0d0d;
+            }}
+            QWidget#ClassPickerRoot QListWidget::item:hover {{
+                background-color: {c.get('bg_button_hover')};
+                border-color: {c.get('border_light')};
+            }}
+            QWidget#ClassPickerRoot QListWidget::item:selected {{
+                background-color: {c.get('dialog_selection')};
+                color: {c.get('text_primary')};
+                border-color: {c.get('dialog_primary_border')};
+            }}
+            QWidget#ClassPickerRoot QComboBox {{
+                min-height: 22px;
+                padding: 8px 12px;
+            }}
+            QWidget#ClassPickerRoot QComboBox QAbstractItemView {{
+                selection-background-color: {c.get('dialog_selection')};
+                selection-color: {c.get('text_primary')};
+            }}
+            QWidget#ClassPickerRoot QScrollBar:vertical {{
+                background: {c.get('bg_secondary')};
                 width: 10px;
                 margin: 0px;
-            }
-            QScrollBar::handle:vertical {
-                background: #2a2a2a;
-                min-height: 30px;
+            }}
+            QWidget#ClassPickerRoot QScrollBar::handle:vertical {{
+                background: {c.get('border_light')};
+                min-height: 28px;
                 border-radius: 5px;
                 margin: 2px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: #3a3a3a;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            }}
+            QWidget#ClassPickerRoot QScrollBar::handle:vertical:hover {{
+                background: {c.get('dialog_primary_border')};
+            }}
+            QWidget#ClassPickerRoot QScrollBar::add-line:vertical,
+            QWidget#ClassPickerRoot QScrollBar::sub-line:vertical {{
                 height: 0px;
-            }
-        """)
+            }}
+            """
+        )
+
     def _create_logo_header(self, logo_path):
         """Create a header widget with logo and title."""
         if not os.path.exists(logo_path):
@@ -296,6 +251,8 @@ class ClassPicker(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        from gui.theme_manager import ThemeManager
+        ThemeManager.apply_native_window_theme(self)
         if self.isMinimized():
             self.showNormal()
         self.raise_()

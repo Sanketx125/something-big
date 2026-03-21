@@ -11,6 +11,11 @@ from PySide6.QtCore import Qt
 import os
 from PySide6.QtGui import QColor
 from pathlib import Path
+from gui.theme_manager import (
+    get_dialog_stylesheet,
+    get_title_banner_style,
+    get_notice_banner_style,
+)
 
 class PRJBlockIdentifierDialog(QDialog):
     """Dialog to load PRJ file and identify DXF blocks"""
@@ -47,9 +52,10 @@ class PRJBlockIdentifierDialog(QDialog):
         self.app = app
         self.prj_data = []
         self.current_dxf_path = None
-        self.current_prj_path = None 
-        
-        self.setWindowTitle("🔍 PRJ Block Identifier")
+        self.current_prj_path = None
+        self.setProperty("themeStyledDialog", True)
+
+        self.setWindowTitle("PRJ Block Identifier")
         self.setMinimumSize(800, 600)
         self._apply_dark_theme()
         self.setup_ui()
@@ -57,173 +63,36 @@ class PRJBlockIdentifierDialog(QDialog):
         self.current_directory = None
       
     def _apply_dark_theme(self):
-            """Apply dark theme styling to match the main application."""
-            self.setStyleSheet("""
-                QDialog {
-                    background-color: #2b2b2b;
-                    color: #e0e0e0;
-                }
-                
-                QLabel {
-                    color: #e0e0e0;
-                    font-size: 12px;
-                }
-                
-                QLabel#infoLabel {
-                    background: #1e3a5f;
-                    color: #ffffff;
-                    padding: 10px;
-                    border-radius: 5px;
-                    border: 1px solid #3a5f7f;
-                }
-                
-                QPushButton {
-                    background-color: #3a3a3a;
-                    color: #e0e0e0;
-                    border: 1px solid #555555;
-                    border-radius: 4px;
-                    padding: 6px 12px;
-                    font-size: 12px;
-                    min-height: 28px;
-                }
-                
-                QPushButton:hover {
-                    background-color: #4a4a4a;
-                    border: 1px solid #666666;
-                }
-                
-                QPushButton:pressed {
-                    background-color: #2a2a2a;
-                }
-                
-                QPushButton#loadBtn {
-                    background-color: #3a5f7f;
-                    color: white;
-                    font-weight: bold;
-                }
-                
-                QPushButton#loadBtn:hover {
-                    background-color: #4a6f8f;
-                }
-                
-                QPushButton#identifyBtn {
-                background-color: #00ff00;  /* Bright green */
-                color: black;
-                font-weight: bold;
-            }
-
-            QPushButton#identifyBtn:hover {
-                background-color: #33ff33;
-            }
-                        
-                QPushButton#removeBtn {
-                    background-color: #d32f2f;
-                    color: white;
-                }
-                
-                QPushButton#removeBtn:hover {
-                    background-color: #e33f3f;
-                }
-                
-                QPushButton#closeBtn {
-                    background-color: #555555;
-                    color: white;
-                }
-                
-                QPushButton#closeBtn:hover {
-                    background-color: #666666;
-                }
-                
-                QTableWidget {
-                background-color: #000000;  /* Pure black */
-                color: #e0e0e0;
-                gridline-color: #3a3a3a;
-                border: 1px solid #3a3a3a;
-                selection-background-color: #3a5f7f;
-                selection-color: white;
-                alternate-background-color: #0a0a0a;
-            }
-                
-                QTableWidget::item {
-                padding: 5px;
-                border-bottom: 1px solid #2a2a2a;
-                background-color: #000000;  /* Ensure black background */
-            }
-                
-                QTableWidget::item:selected {
-                    background-color: #3a5f7f;
-                    color: white;
-                }
-                
-                QTableWidget::item:hover {
-                    background-color: #2a2a2a;
-                }
-                
-                QHeaderView::section {
-                    background-color: #2a2a2a;
-                    color: #e0e0e0;
-                    padding: 6px;
-                    border: 1px solid #3a3a3a;
-                    font-weight: bold;
-                }
-                
-                QHeaderView::section:hover {
-                    background-color: #3a3a3a;
-                }
-                
-                QScrollBar:vertical {
-                    background-color: #2a2a2a;
-                    width: 14px;
-                    border: none;
-                }
-                
-                QScrollBar::handle:vertical {
-                    background-color: #555555;
-                    border-radius: 7px;
-                    min-height: 20px;
-                }
-                
-                QScrollBar::handle:vertical:hover {
-                    background-color: #666666;
-                }
-                
-                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                    height: 0px;
-                }
-                
-                QScrollBar:horizontal {
-                    background-color: #2a2a2a;
-                    height: 14px;
-                    border: none;
-                }
-                
-                QScrollBar::handle:horizontal {
-                    background-color: #555555;
-                    border-radius: 7px;
-                    min-width: 20px;
-                }
-                
-                QScrollBar::handle:horizontal:hover {
-                    background-color: #666666;
-                }
-                
-                QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                    width: 0px;
-                }
-            """)
+            """Apply the shared application dialog theme."""
+            self.setStyleSheet(get_dialog_stylesheet())
         
     def setup_ui(self):
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("PRJ Block Identifier")
+        title.setStyleSheet(get_title_banner_style())
+        title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(title)
+
+        intro = QLabel(
+            "Load a PRJ file, review detected blocks, and identify matching regions "
+            "inside the currently loaded DXF data."
+        )
+        intro.setStyleSheet(get_notice_banner_style("info"))
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
         
         # Header with file info
         header = QHBoxLayout()
-        self.dxf_label = QLabel("📎 No PRJ loaded")
-        self.dxf_label.setStyleSheet("font-weight: bold;")
+        self.dxf_label = QLabel("No PRJ loaded")
+        self.dxf_label.setObjectName("dialogSectionLabel")
         header.addWidget(self.dxf_label)
         header.addStretch()
         
-        load_btn = QPushButton("📂 Load PRJ File")
-        load_btn.setObjectName("loadBtn")
+        load_btn = QPushButton("Load PRJ File")
+        load_btn.setObjectName("primaryBtn")
         load_btn.clicked.connect(self.load_prj_file)
         header.addWidget(load_btn)
         layout.addLayout(header)
@@ -254,6 +123,7 @@ class PRJBlockIdentifierDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.setAlternatingRowColors(True)
         self.table.itemDoubleClicked.connect(self.identify_selected_block)
         layout.addWidget(self.table)
         # ✅ Single-click to clear highlight
@@ -264,18 +134,17 @@ class PRJBlockIdentifierDialog(QDialog):
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
 
-        identify_btn = QPushButton("🔍 Identify Selected Block")
-        identify_btn.setObjectName("identifyBtn")
+        identify_btn = QPushButton("Identify Selected Block")
+        identify_btn.setObjectName("primaryBtn")
         identify_btn.clicked.connect(self.identify_selected_block)
         btn_layout.addWidget(identify_btn)
 
-        remove_btn = QPushButton("🗑️ Remove File")
-        remove_btn.setObjectName("removeBtn")
+        remove_btn = QPushButton("Remove File")
+        remove_btn.setObjectName("dangerBtn")
         remove_btn.clicked.connect(self.remove_prj_file)
         btn_layout.addWidget(remove_btn)
 
         close_btn = QPushButton("Close")
-        close_btn.setObjectName("closeBtn")
         close_btn.clicked.connect(self.close)
         btn_layout.addWidget(close_btn)
 
@@ -290,7 +159,7 @@ class PRJBlockIdentifierDialog(QDialog):
                 if hasattr(first_layer, 'dxf_path'):
                     self.current_dxf_path = first_layer.dxf_path
                     dxf_name = os.path.basename(self.current_dxf_path)
-                    self.dxf_label.setText(f"📎 DXF: {dxf_name}")
+                    self.dxf_label.setText(f"DXF: {dxf_name}")
                     self.auto_load_prj()
                     return
             
@@ -336,7 +205,7 @@ class PRJBlockIdentifierDialog(QDialog):
             self.current_prj_path = file_path
             self.current_directory = os.path.dirname(file_path)
             prj_filename = os.path.basename(file_path)
-            self.dxf_label.setText(f"📎 PRJ: {prj_filename}")
+            self.dxf_label.setText(f"PRJ: {prj_filename}")
                         
             print(f"✅ Stored PRJ path: {file_path}")
             self.prj_data = []
@@ -1078,7 +947,7 @@ class PRJBlockIdentifierDialog(QDialog):
             self.current_prj_path = None
             
             # Update status label
-            self.dxf_label.setText("📎 No DXF loaded")
+            self.dxf_label.setText("No DXF loaded")
             # ✅ Clear all highlights
             if hasattr(self, '_highlight_actors') and self._highlight_actors:
                 if hasattr(self.app, 'vtk_widget') and self.app.vtk_widget:
@@ -1096,7 +965,7 @@ class PRJBlockIdentifierDialog(QDialog):
             self._highlighted_blocks = {}
             
             # Update status label
-            self.dxf_label.setText("📎 No DXF loaded")
+            self.dxf_label.setText("No DXF loaded")
                 
             print(f"✅ Removed PRJ file: {filename}")
             

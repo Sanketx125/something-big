@@ -2748,8 +2748,6 @@ class DigitizeManager:
         print(f"↶ Undo (undo stack: {len(self.undo_stack)}, redo stack: {len(self.redo_stack)})")
 
 
-
-
     def redo(self):
         """Redo previously undone operation (Ctrl+Y)."""
         if self.active_tool in ("smartline", "line", "polyline") and getattr(self, "_temp_redo_stack", None):
@@ -2760,7 +2758,6 @@ class DigitizeManager:
             self._rebuild_active_vertex_markers()
             self._rebuild_active_preview()
             return
-        
         if not self.redo_stack:
             print("⚠️ Nothing to redo")
             return
@@ -2774,6 +2771,8 @@ class DigitizeManager:
         self._restore_state(next_state)
 
         print(f"↷ Redo (undo stack: {len(self.undo_stack)}, redo stack: {len(self.redo_stack)})")
+
+
 
     def _unhighlight_all_lines(self):
         """Restore all highlighted lines to normal appearance."""
@@ -3205,7 +3204,7 @@ class DigitizeManager:
                 self.renderer.RemoveActor2D(actor)
             except Exception:
                 pass
-            setattr(self, attr_name, None)
+            setattr(self, attr_name, None) 
 
     def deactivate_all(self):
         """Exit the current digitize tool while preserving completed drawings."""

@@ -1,6 +1,3 @@
-
-
-###
 import numpy as np
 import pyvista as pv
 import vtk
@@ -36,44 +33,12 @@ class SectionController:
         self.cut_controller = CutSectionController(self.app)
         self.is_cut_mode = False
         self._is_initial_section_plot = True
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # PERFORMANCE FIX: Pre-computed index mapping for O(1) lookup
-        # Instead of O(n²) np.where().tolist().index() per point
-        # ═══════════════════════════════════════════════════════════════════
-        self._global_to_vtk_idx = {}
-        self._vtk_idx_dirty = True
-        
-        # PERFORMANCE: Cached coordinate converter
-        self._coord_converter = vtk.vtkCoordinate()
-        self._coord_converter.SetCoordinateSystemToDisplay()
-        
     # ---------------------------------------------------------------------------
         if interactor is not None:
             self._attach_observers(interactor)
         
         print("✅ SectionController initialized")
         # ------------------------------------------------------------------------------------------
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # PERFORMANCE FIX: Build global→VTK index mapping for O(1) lookup
-    # ═══════════════════════════════════════════════════════════════════════════
-    def _rebuild_index_mapping(self):
-        """
-        Build hashmap from global index → VTK actor index.
-        Call once when section changes, then use for all partial updates.
-        
-        OLD: O(n²) - np.where().tolist().index() called PER POINT
-        NEW: O(n) build once, O(1) lookup per point
-        """
-        if not hasattr(self.app, 'section_core_mask') or self.app.section_core_mask is None:
-            self._global_to_vtk_idx = {}
-            return
-        
-        core_indices = np.where(self.app.section_core_mask)[0]
-        self._global_to_vtk_idx = {int(g): v for v, g in enumerate(core_indices)}
-        self._vtk_idx_dirty = False
-        print(f"   📊 Index mapping rebuilt: {len(self._global_to_vtk_idx)} entries (O(1) lookup ready)")
                
     def is_classification_active(self):
         """Check if classification tool is active (blocks section drawing)"""
@@ -123,16 +88,16 @@ class SectionController:
         
     def _display_to_world_no_snap(self, x, y, z_lock=None):
         """
-        OPTIMIZED: TRUE cursor-following conversion using cached converter.
+        TRUE cursor-following conversion.
         No snapping, no picking, zoom-safe.
         """
         ren = self.app.vtk_widget.renderer
  
-        # ═══════════════════════════════════════════════════════════════════
-        # PERFORMANCE FIX: Use cached converter instead of creating new one
-        # ═══════════════════════════════════════════════════════════════════
-        self._coord_converter.SetValue(float(x), float(y), 0.0)
-        world = self._coord_converter.GetComputedWorldValue(ren)
+        coord = vtk.vtkCoordinate()
+        coord.SetCoordinateSystemToDisplay()
+        coord.SetValue(float(x), float(y), 0.0)
+ 
+        world = coord.GetComputedWorldValue(ren)
         P = np.array(world, dtype=np.float64)
  
         if z_lock is not None:
@@ -430,13 +395,6 @@ class SectionController:
         self.rubber_points = None
         self.rubber_poly = None
         self._section_actor = None
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # PERFORMANCE FIX: Reset index mapping when section cleared
-        # ═══════════════════════════════════════════════════════════════════
-        self._vtk_idx_dirty = True
-        self._global_to_vtk_idx = {}
-        
         self.app.vtk_widget.render()
 
     # ---------------- RECTANGLE INIT ----------------
@@ -1946,7 +1904,9 @@ class SectionController:
    
         # --- Viewer ---
         self.app.sec_vtk = QtInteractor(self.app.section_frame)
-        self.app.sec_vtk.set_background("black")
+        from gui.theme_manager import ThemeManager
+        bg_color = "white" if ThemeManager.current() == "light" else "black"
+        self.app.sec_vtk.set_background(bg_color)
         sec_layout.addWidget(self.app.sec_vtk.interactor)
    
         # ✅ Install shortcut filter here (now sec_vtk exists)
@@ -2669,12 +2629,8 @@ class SectionController:
 
     def update_section_colors_partial(self, changed_indices):
         """
-        OPTIMIZED: Update only colors of points whose classification changed.
+        Update only the colors of the points whose classification changed.
         No full refresh, no actor rebuild.
-        
-        PERFORMANCE FIX:
-        OLD: O(n²) - np.where().tolist().index() called per point
-        NEW: O(1) - hashmap lookup per point
         """
         vtk_widget = self._get_active_vtk()
         if vtk_widget is None:
@@ -2699,19 +2655,12 @@ class SectionController:
             print("⚠️ No RGB array found")
             return
 
-        # ═══════════════════════════════════════════════════════════════════
-        # PERFORMANCE FIX: Rebuild index mapping if needed (once per section)
-        # ═══════════════════════════════════════════════════════════════════
-        if self._vtk_idx_dirty or not self._global_to_vtk_idx:
-            self._rebuild_index_mapping()
-
         # Current palette
         palette = self._get_view_palette(self.active_view)
 
         # Update only modified points
         cls = self.app.data["classification"]
 
-        updated_count = 0
         for idx in changed_indices:
             if idx >= len(self.app.section_core_mask):
                 continue
@@ -2719,27 +2668,20 @@ class SectionController:
             if not self.app.section_core_mask[idx]:
                 continue
 
-            # ═══════════════════════════════════════════════════════════════════
-            # CRITICAL FIX: O(1) hashmap lookup instead of O(n²) list search
-            # OLD: vtk_i = np.where(self.app.section_core_mask)[0].tolist().index(idx)
-            # NEW: vtk_i = self._global_to_vtk_idx.get(idx)
-            # ═══════════════════════════════════════════════════════════════════
-            vtk_i = self._global_to_vtk_idx.get(idx)
-            if vtk_i is None:
-                continue  # Not in section
+            # VTK index in core actor
+            vtk_i = np.where(self.app.section_core_mask)[0].tolist().index(idx)
 
             code = int(cls[idx])
             entry = palette.get(code, {"color": (128,128,128)})
 
             color = entry["color"]
             rgb_array.SetTuple3(vtk_i, color[0], color[1], color[2])
-            updated_count += 1
 
         rgb_array.Modified()
         poly.Modified()
 
         vtk_widget.render()
-        print(f"🔄 Partial refresh: {updated_count} points (O(1) lookup)")
+        print(f"🔄 Partial refresh applied to {len(changed_indices)} points")
 
     def unlock_after_classification(self):
         """

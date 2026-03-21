@@ -1,3 +1,139 @@
+# """
+# GPU Support Module - Naksha LiDAR
+
+# Auto-detects and enables GPU acceleration when available
+
+# ✅ FEATURES:
+# - Auto-detect GPU availability
+# - Enable VTK GPU rendering (OpenGL 4.x+)
+# - Fallback to CPU rendering gracefully
+# - Expected improvement: 3-5x faster for 100M+ points
+# """
+
+# import os
+# import logging
+
+# logger = logging.getLogger(__name__)
+
+
+# class GPUSupport:
+#     """Manage GPU acceleration for VTK rendering"""
+    
+#     def __init__(self):
+#         self.gpu_available = False
+#         self.gpu_name = "Unknown"
+#         self.gpu_memory_mb = 0
+#         self.rendering_backend = "CPU"
+
+
+#     def detect_gpu(self):
+#         """Detect GPU and enable acceleration if available"""
+#         try:
+#             import vtk
+            
+#             print("\n" + "="*60)
+#             print("🖥️ GPU DETECTION & INITIALIZATION")
+#             print("="*60)
+            
+#             # Try to get GPU information
+#             try:
+#                 import GPUtil
+#                 gpus = GPUtil.getGPUs()
+#                 if gpus:
+#                     gpu = gpus[0]
+#                     self.gpu_available = True
+#                     self.gpu_name = gpu.name
+#                     self.gpu_memory_mb = gpu.memoryTotal
+#                     print(f"✅ GPU Detected: {self.gpu_name}")
+#                     print(f"   Memory: {self.gpu_memory_mb} MB")
+#             except ImportError:
+#                 print("⚠️ GPUtil not installed, using VTK detection")
+#                 # Fallback: Check VTK GPU capabilities
+#                 try:
+#                     from vtkmodules.vtkRenderingOpenGL2 import vtkGenericOpenGLRenderWindow
+#                     print("✅ VTK OpenGL2 backend available")
+#                     self.gpu_available = True
+#                 except (ImportError, AttributeError):
+#                     print("⚠️ OpenGL backend not detected")
+
+#             # Enable GPU if available
+#             if self.gpu_available:
+#                 print("\n🚀 Enabling GPU acceleration...")
+                
+#                 # Enable VTK GPU acceleration
+#                 os.environ['VTK_GRAPHICS_FACTORY'] = 'OpenGL2'
+#                 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+                
+#                 self.rendering_backend = "GPU"
+#                 print("✅ GPU acceleration ENABLED")
+#                 self.log_gpu_config()
+#             else:
+#                 print("⚠️ GPU not available, using CPU rendering")
+#                 print("   (Performance will be slower on large datasets)")
+#                 self.rendering_backend = "CPU"
+            
+#             print("="*60 + "\n")
+            
+#         except Exception as e:
+#             logger.warning(f"GPU detection failed: {e}")
+#             print(f"⚠️ GPU initialization failed: {e}")
+#             print("   Falling back to CPU rendering")
+#             self.rendering_backend = "CPU"
+    
+#     def log_gpu_config(self):
+#         """Log GPU configuration for debugging"""
+#         config = {
+#             "GPU Available": self.gpu_available,
+#             "GPU Name": self.gpu_name,
+#             "GPU Memory": f"{self.gpu_memory_mb} MB",
+#             "Rendering Backend": self.rendering_backend,
+#             "Expected Improvement": "3-5x faster for 100M+ points" if self.gpu_available else "Recommend GPU for best performance"
+#         }
+        
+#         print("\n📊 GPU CONFIGURATION:")
+#         for key, value in config.items():
+#             print(f"  {key}: {value}")
+#         print()
+        
+#         return config
+    
+#     def get_backend_string(self):
+#         """Return backend string for logging"""
+#         return f"[{self.rendering_backend}]"
+
+
+# # Global GPU support instance
+# _gpu_support = None
+
+
+# def init_gpu_support():
+#     """Initialize GPU support globally"""
+#     global _gpu_support
+#     if _gpu_support is None:
+#         _gpu_support = GPUSupport()
+#         _gpu_support.detect_gpu()
+#     return _gpu_support
+
+
+# def get_gpu_support():
+#     """Get global GPU support instance"""
+#     global _gpu_support
+#     if _gpu_support is None:
+#         init_gpu_support()
+#     return _gpu_support
+
+
+# def is_gpu_available():
+#     """Check if GPU is available"""
+#     return get_gpu_support().gpu_available
+
+
+# def get_rendering_backend():
+#     """Get current rendering backend"""
+#     return get_gpu_support().rendering_backend
+
+
+
 
 """
 GPU Support Module - Naksha LiDAR

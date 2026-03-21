@@ -1,4 +1,3 @@
-
 ###
 import importlib as _importlib
 import sys as _sys
@@ -10,9 +9,10 @@ import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QHeaderView, QCheckBox, QColorDialog, QLabel, QLineEdit,
-    QFileDialog, QMenuBar, QComboBox, QWidget
+    QFileDialog, QMenuBar, QComboBox, QWidget, QFrame
 )
 from gui.class_display import update_class_mode
+from gui.theme_manager import get_dialog_stylesheet
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,6 +411,7 @@ class DisplayModeDialog(QDialog):
 
     def __init__(self, parent):
         super().__init__(parent)
+        self.setProperty("themeStyledDialog", True)
 
         from PySide6.QtCore import QSettings
         settings = QSettings("NakshaAI", "LidarApp")
@@ -451,37 +452,7 @@ class DisplayModeDialog(QDialog):
 
         main_layout = QVBoxLayout(self)
 
-        self.setStyleSheet("""
-            QDialog { background-color: #0c0c0c; color: #e0e0e0; font-family: 'Segoe UI'; }
-            #header_label { color: #26a69a; font-weight: bold; text-transform: uppercase; }
-            #apply_btn {
-                background-color: #26a69a; color: #0c0c0c;
-                border-radius: 4px; font-weight: bold; padding: 6px;
-            }
-            #apply_btn:hover { background-color: #4db6ac; }
-            QPushButton {
-                background-color: #2b2b2b; border: 1px solid #444444;
-                border-radius: 4px; color: white; padding: 4px;
-            }
-            QPushButton:hover {
-                background-color: #3d3d3d;
-                border: 1px solid #26a69a;
-            }
-            QTableWidget {
-                background-color: #1a1a1a; border: 1px solid #333333;
-                gridline-color: #2a2a2a; border-radius: 4px;
-            }
-            QCheckBox { color: #e0e0e0; spacing: 8px; }
-            QCheckBox::indicator {
-                width: 18px; height: 18px;
-                background-color: #1a1a1a; border: 1px solid #444444; border-radius: 4px;
-            }
-            QCheckBox::indicator:hover { border: 1px solid #26a69a; background-color: #252525; }
-            QCheckBox::indicator:checked {
-                background-color: #26a69a; border: 1px solid #26a69a; image: url(none);
-            }
-            QCheckBox::indicator:checked:pressed { background-color: #4db6ac; }
-        """)
+        self.setStyleSheet(get_dialog_stylesheet())
 
         self.menu_bar = QMenuBar(self)
         file_menu    = self.menu_bar.addMenu("File")
@@ -496,7 +467,20 @@ class DisplayModeDialog(QDialog):
         exit_action.triggered.connect(self.close)
         main_layout.setMenuBar(self.menu_bar)
 
-        topbar = QHBoxLayout()
+        intro = QLabel(
+            "Manage view-specific class visibility, colors, weights, and point-border settings "
+            "for the active scene."
+        )
+        intro.setObjectName("dialogInlineNote")
+        intro.setWordWrap(True)
+        main_layout.addWidget(intro)
+
+        controls_card = QFrame()
+        controls_card.setObjectName("displayControlsCard")
+        controls_layout = QHBoxLayout(controls_card)
+        controls_layout.setContentsMargins(12, 10, 12, 10)
+        controls_layout.setSpacing(8)
+
         self.slot_box = QComboBox()
         self.slot_box.addItems([
             "Main View",
@@ -505,62 +489,74 @@ class DisplayModeDialog(QDialog):
         ])
         self.slot_box.currentIndexChanged.connect(self.on_slot_changed)
         self.slot_box.currentIndexChanged.connect(self.on_view_selection_changed)
-        topbar.addWidget(self.slot_box)
+        controls_layout.addWidget(self.slot_box)
 
         self.color_mode = QComboBox()
         self.color_mode.addItems([
             "By Classification",
             "Shaded Classification",
         ])
-        topbar.addWidget(self.color_mode)
+        controls_layout.addWidget(self.color_mode)
 
-        border_container = QWidget()
+        border_container = QFrame()
+        border_container.setObjectName("displayBorderStrip")
         border_layout    = QVBoxLayout(border_container)
-        border_layout.setContentsMargins(8, 2, 8, 2)
-        border_layout.setSpacing(2)
+        border_layout.setContentsMargins(10, 6, 10, 6)
+        border_layout.setSpacing(4)
 
-        self.border_label = QLabel("🔳 Border: 0%")
-        self.border_label.setFont(QFont("Segoe UI", 8))
+        self.border_label = QLabel("Border: 0%")
+        self.border_label.setObjectName("displayBorderLabel")
         self.border_label.setAlignment(Qt.AlignCenter)
         border_layout.addWidget(self.border_label)
 
         border_buttons        = QWidget()
         border_buttons_layout = QHBoxLayout(border_buttons)
         border_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        border_buttons_layout.setSpacing(2)
+        border_buttons_layout.setSpacing(6)
 
         self.border_minus_btn = QPushButton("-")
         self.border_minus_btn.setFixedSize(30, 24)
         self.border_minus_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.border_minus_btn.setAutoDefault(False)
+        self.border_minus_btn.setDefault(False)
+        self.border_minus_btn.setFocusPolicy(Qt.NoFocus)
         self.border_minus_btn.clicked.connect(self.decrease_border)
         border_buttons_layout.addWidget(self.border_minus_btn)
 
         self.border_value_display = QLabel("0%")
+        self.border_value_display.setObjectName("valuePill")
         self.border_value_display.setFixedWidth(50)
         self.border_value_display.setAlignment(Qt.AlignCenter)
         self.border_value_display.setFont(QFont("Segoe UI", 9))
-        self.border_value_display.setStyleSheet(
-            "background-color: #2b2b2b; padding: 2px; border-radius: 2px;"
-        )
         border_buttons_layout.addWidget(self.border_value_display)
 
         self.border_plus_btn = QPushButton("+")
         self.border_plus_btn.setFixedSize(30, 24)
         self.border_plus_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.border_plus_btn.setAutoDefault(False)
+        self.border_plus_btn.setDefault(False)
+        self.border_plus_btn.setFocusPolicy(Qt.NoFocus)
         self.border_plus_btn.clicked.connect(self.increase_border)
         border_buttons_layout.addWidget(self.border_plus_btn)
 
         border_layout.addWidget(border_buttons)
-        topbar.addWidget(border_container)
-        main_layout.addLayout(topbar)
+        controls_layout.addWidget(border_container)
+        main_layout.addWidget(controls_card)
 
-        table_layout = QHBoxLayout()
+        table_card = QFrame()
+        table_card.setObjectName("displayTableCard")
+        table_layout = QHBoxLayout(table_card)
+        table_layout.setContentsMargins(12, 12, 12, 12)
+        table_layout.setSpacing(12)
         self.table   = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
             ["Show", "Code", "Description", "Draw", "Lvl", "Color", "Weight"]
         )
+        self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setShowGrid(False)
         table_layout.addWidget(self.table)
 
         side = QVBoxLayout()
@@ -571,16 +567,27 @@ class DisplayModeDialog(QDialog):
         self.clear_btn  = QPushButton("Clear All")
         for b in [self.add_btn, self.edit_btn, self.del_btn,
                   self.select_btn, self.clear_btn]:
+            b.setMinimumHeight(36)
+            b.setMinimumWidth(92)
+            b.setAutoDefault(False)
+            b.setDefault(False)
+            b.setFocusPolicy(Qt.NoFocus)
             side.addWidget(b)
         side.addStretch()
         table_layout.addLayout(side)
-        main_layout.addLayout(table_layout)
+        main_layout.addWidget(table_card)
 
         bottom = QHBoxLayout()
         bottom.addStretch()
         self.apply_btn = QPushButton("Apply")
-        self.apply_btn.setObjectName("apply_btn")
+        self.apply_btn.setObjectName("primaryBtn")
         self.close_btn = QPushButton("Close")
+        self.apply_btn.setAutoDefault(False)
+        self.apply_btn.setDefault(False)
+        self.apply_btn.setFocusPolicy(Qt.NoFocus)
+        self.close_btn.setAutoDefault(False)
+        self.close_btn.setDefault(False)
+        self.close_btn.setFocusPolicy(Qt.NoFocus)
         bottom.addWidget(self.apply_btn)
         bottom.addWidget(self.close_btn)
         main_layout.addLayout(bottom)
@@ -674,21 +681,19 @@ class DisplayModeDialog(QDialog):
             }
 
         for view_idx in range(6):
-            if view_idx not in self.view_palettes:
-                self.view_palettes[view_idx] = {}
-            if view_idx not in self.slot_shows:
-                self.slot_shows[view_idx] = {}
-
+            self.view_palettes[view_idx] = {}
+            self.slot_shows[view_idx]    = {}
+            # default_weight = 1.0 if view_idx == 0 else 0.5
+            default_weight = 1.0   # same weight for all slots
             for code, info in default_palette_template.items():
-                if code not in self.view_palettes[view_idx]:
-                    self.view_palettes[view_idx][code] = {
-                        "show":        info["show"],
-                        "description": str(info["description"]),
-                        "lvl":         str(info.get("lvl", "")),
-                        "color":       tuple(info["color"]),
-                        "weight":      info.get("weight", 1.0)
-                    }
-                self.slot_shows[view_idx][code] = self.view_palettes[view_idx][code].get("show", info["show"])
+                self.view_palettes[view_idx][code] = {
+                    "show":        info["show"],
+                    "description": str(info["description"]),
+                    "lvl":         str(info.get("lvl", "")),
+                    "color":       tuple(info["color"]),
+                    "weight":      default_weight
+                }
+                self.slot_shows[view_idx][code] = info["show"]
 
         self._check_pending_restores()
 
@@ -989,17 +994,16 @@ class DisplayModeDialog(QDialog):
                 self.view_palettes = {}
 
             for view_idx in range(6):
-                if view_idx not in self.view_palettes:
-                    self.view_palettes[view_idx] = {}
-                    
+                self.view_palettes[view_idx] = {}
                 for code, info in master_palette.items():
-                    # Preserve existing view-specific weight if already loaded/synced
-                    if code in self.view_palettes[view_idx]:
-                        weight_to_use = float(self.view_palettes[view_idx][code].get('weight', info.get("weight", 1.0)))
-                    else:
-                        # Inherit from master palette
+                    if view_idx == 0:
                         weight_to_use = float(info.get("weight", 1.0))
-                        
+                    else:
+                        if (view_idx in self.view_palettes and
+                                code in self.view_palettes[view_idx]):
+                            weight_to_use = self.view_palettes[view_idx][code].get('weight', 0.5)
+                        else:
+                            weight_to_use = 0.5
                     self.view_palettes[view_idx][code] = {
                         "show":        bool(info["show"]),
                         "description": str(info["description"]),
@@ -1202,13 +1206,6 @@ class DisplayModeDialog(QDialog):
             else:
                 app._main_view_borders_active = False
                 app.point_border_percent      = 0
-
-        # ── Track that this slot was explicitly Applied by the user ──────────
-        # _get_slot_palette uses this to decide whether to trust the weight
-        # stored in view_palettes[slot] vs reset to 1.0 (base).
-        if not hasattr(app, '_slot_weights_applied'):
-            app._slot_weights_applied = set()
-        app._slot_weights_applied.add(self.current_slot)
 
         # palette_changed emit moved to AFTER GPU push below —
         # emitting here caused sync_palette_to_gpu to fire with border=0
@@ -1499,14 +1496,14 @@ class DisplayModeDialog(QDialog):
 
     def update_border_display(self):
         value = self.view_borders[self.current_slot]
-        self.border_label.setText(f"🔳 Border: {value}%")
+        self.border_label.setText(f"Border: {value}%")
         self.border_value_display.setText(f"{value}%")
 
     def load_view_border(self, view_idx):
         if not hasattr(self, 'view_borders'):
             self.view_borders = {i: 0 for i in range(6)}
         border_value = self.view_borders.get(view_idx, 0)
-        self.border_label.setText(f"🔳 Border: {border_value}%")
+        self.border_label.setText(f"Border: {border_value}%")
         self.border_value_display.setText(f"{border_value}%")
 
     def on_view_switched_to_cut_section(self):
@@ -1547,7 +1544,9 @@ class EditClassDialog(QDialog):
     def __init__(self, code=0, desc="", color=QColor("white"), parent=None,
                  draw="Not set", lvl="", weight=2.0):
         super().__init__(parent)
+        self.setProperty("themeStyledDialog", True)
         self.setWindowTitle("Edit Class")
+        self.setStyleSheet(get_dialog_stylesheet())
         self.color           = color
         self.default_weight  = float(weight)
         self.current_weight  = float(weight)
@@ -1672,11 +1671,6 @@ class EditClassDialog(QDialog):
                     _uam_refresh_section(app, view_idx, palette, border)
 
                 # Final hardware poke to force the shader to re-read the LUT
-                # Mark slot as explicitly weight-applied
-                if not hasattr(app, '_slot_weights_applied'):
-                    app._slot_weights_applied = set()
-                app._slot_weights_applied.add(current_slot)
-
                 self.parent_dialog.palette_changed.emit(current_slot)
                 print(f"⚡ GPU Uniform Poke: Slot {current_slot} weights synchronized")
 

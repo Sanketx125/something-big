@@ -7,7 +7,7 @@
 QMainWindow, QWidget {
     background-color: #121212;
     color: #e0e0e0;
-    font-family: "Segoe UI", Arial;
+    font-family: "SF Pro Text", "Helvetica Neue", "Segoe UI", Arial;
     font-size: 11pt;
 }
 
@@ -261,6 +261,9 @@ QStatusBar {
     border-top: 1px solid #2a2a2a;
     padding: 4px;
 }
+QStatusBar::item {
+    border: none;
+}
 QStatusBar QLabel {
     color: #bbbbbb;
     padding: 2px 8px;
@@ -285,11 +288,12 @@ QSlider::handle:horizontal:hover {
 
 /* Tooltips */
 QToolTip {
-    background-color: #333333;
-    color: #ffffff;
-    border: 1px solid #007acc;
-    padding: 6px;
-    border-radius: 4px;
+    background-color: #20262d;
+    color: #eef3f8;
+    border: 1px solid #4a5665;
+    padding: 8px 10px;
+    border-radius: 5px;
+    font-size: 8.8pt;
 }
 
 /* Tabs */
@@ -354,59 +358,80 @@ QSplitter::handle:vertical {
 
 /* Menu Buttons (Top Bar) */
 QPushButton#menuButton {
-    background-color: #1b1b1b;
+    background-color: transparent;
     color: #e0e0e0;
-    border: 1px solid #2b2b2b;
+    border: none;
     border-radius: 5px;
-    padding: 4px 10px;
+    outline: none;
+    padding: 4px 8px;
     font-size: 10pt;
     font-weight: 500;
 }
 QPushButton#menuButton:hover {
     background-color: #2a2a2a;
-    border-color: #3a3a3a;
+    border: none;
 }
 QPushButton#menuButton:pressed {
     background-color: #007acc;
     color: #ffffff;
 }
+QPushButton#menuButton:checked {
+    background-color: #3a3a3a;
+    color: #ffaa00;
+    font-weight: bold;
+}
 
 /* Ribbon Container */
 #RibbonContainer {
-    background-color: #1a1a1a;
-    border-bottom: 2px solid #2a2a2a;
+    background-color: #1e1e1c;
+    border-top: 1px solid #252522;
+    border-bottom: 1px solid #292925;
 }
 
 /* Ribbon Section */
 #ribbonSection {
-    background-color: #202020;
-    border-right: 1px solid #2a2a2a;
-    padding: 4px;
+    background-color: transparent;
+    border: none;
+    margin: 0px 3px;
+}
+
+#ribbonSectionBox {
+    background-color: #171715;
+    border: 1px solid #2a2a27;
+    border-radius: 12px;
+    padding: 0px;
 }
 
 /* Ribbon Section Title */
 #ribbonSectionTitle {
-    color: #888888;
-    font-size: 8pt;
-    padding: 2px;
+    color: #4a4a47;
+    font-size: 7.5pt;
+    font-weight: 500;
+    padding: 0px 0px 3px 0px;
 }
 
 /* Ribbon Buttons */
 QPushButton#ribbonButton {
-    background-color: #2a2a2a;
-    border: 1px solid #3a3a3a;
-    border-radius: 4px;
-    color: #e0e0e0;
+    background-color: #222220;
+    border: 1px solid #2e2e2b;
+    border-radius: 10px;
+    color: #d3d1c7;
     font-size: 8pt;
-    padding: 4px;
+    outline: none;
+    padding: 0px;
 }
 QPushButton#ribbonButton:hover {
-    background-color: #007acc;
-    border-color: #0098ff;
-    color: #ffffff;
+    background-color: #2a2a28;
+    border: 1px solid #383834;
 }
 QPushButton#ribbonButton:pressed {
-    background-color: #005a9e;
+    background-color: #31312e;
+    border: 1px solid #4a4a45;
+}
+QPushButton#ribbonButton:checked {
+    background-color: #2b3540;
+    border: 1px solid #556675;
+    color: #f5f2ec;
 }
 
 /* ===================================
@@ -524,42 +549,71 @@ QPushButton#ribbonButton:pressed {
     background-color: transparent;
 }
 
-# Add this to your existing ribbon stylesheet (in menu_sidebar_system.py)
-
-
-QPushButton#ribbonButton {
-    background-color: #f0f0f0;
-    border: 1px solid #cccccc;
-    border-radius: 4px;
-    padding: 4px;
-    font-size: 9pt;
+/* ===================================
+   ViewRibbon Controls (Dark)
+=================================== */
+#ampControlSurface {
+    background-color: #222220;
+    border: 1px solid #2e2e2b;
+    border-radius: 10px;
 }
-
-QPushButton#ribbonButton:hover {
-    background-color: #e0e8f0;
-    border: 1px solid #0078d7;
-    /* Drop shadow simulation using border */
-    border-bottom: 2px solid #b8b8b8;
-    border-right: 2px solid #b8b8b8;
+QSlider#ampSlider {
+    background: transparent;
 }
-
-QPushButton#ribbonButton:pressed {
-    background-color: #cce4f7;
-    border-top: 2px solid #888888;
-    border-left: 2px solid #888888;
-    border-bottom: 1px solid #cccccc;
-    border-right: 1px solid #cccccc;
+QSlider#ampSlider::groove:horizontal {
+    height: 4px;
+    background: #171715;
+    border: none;
+    border-radius: 2px;
 }
-
-QWidget#ribbonSection {
-    background-color: white;
-    border-right: 1px solid #e0e0e0;
-    padding: 4px;
+QSlider#ampSlider::sub-page:horizontal {
+    background: #7d8f9e;
+    border-radius: 2px;
 }
-
-QLabel#ribbonSectionTitle {
-    color: #444444;
-    font-weight: bold;
+QSlider#ampSlider::add-page:horizontal {
+    background: #2b2b28;
+    border-radius: 2px;
+}
+QSlider#ampSlider::handle:horizontal {
+    background: #f0f5fb;
+    border: 1px solid #8a8f91;
+    width: 12px;
+    margin: -4px 0;
+    border-radius: 8px;
+}
+QSlider#ampSlider::handle:horizontal:hover {
+    background: #ffffff;
+    border: 1px solid #b0b6ba;
+}
+#ampValueLabel {
+    color: #d3d1c7;
+    font-size: 10px;
+    font-weight: 700;
     background-color: transparent;
+    border: none;
+    border-left: 1px solid #343430;
+    padding: 0px 0px 0px 7px;
 }
+QPushButton#ampResetBtn {
+    background-color: #222220;
+    color: #d3d1c7;
+    border: 1px solid #2e2e2b;
+    border-radius: 10px;
+    font-size: 8.5pt;
+    font-weight: 600;
+    padding: 0px;
+}
+QPushButton#ampResetBtn:hover {
+    background-color: #2a2a28;
+    color: #f5f2ec;
+    border: 1px solid #383834;
+}
+QPushButton#ampResetBtn:pressed {
+    background-color: #31312e;
+    border: 1px solid #4a4a45;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TOP BAR & RIBBON SYSTEM (Dark Mode)
+   ═══════════════════════════════════════════════════════════════ */
 

@@ -1,6 +1,5 @@
 
 
-####
 import numpy as np
 import vtk
 
@@ -12,14 +11,6 @@ class CrossSectionInteractor(vtk.vtkInteractorStyleTrackballCamera):
         super().__init__()
         self.app = app
         self.iren = iren
-
-        # ═══════════════════════════════════════════════════════════════════
-        # PERFORMANCE FIX: Cache VTK coordinate converter (50x faster)
-        # Instead of creating new vtkCoordinate every mouse move
-        # ═══════════════════════════════════════════════════════════════════
-        self._coord_converter = vtk.vtkCoordinate()
-        self._coord_converter.SetCoordinateSystemToDisplay()
-        self._cached_renderer = None
 
         # state machine
         # 0 = waiting for first click
@@ -59,20 +50,16 @@ class CrossSectionInteractor(vtk.vtkInteractorStyleTrackballCamera):
 
     def _display_to_world(self, x, y):
         """
-        OPTIMIZED: Cursor-accurate DISPLAY → WORLD conversion.
-        Uses cached VTK objects - 50x faster than creating new each call.
+        Cursor-accurate DISPLAY → WORLD conversion.
         No snapping. No picking. Zoom safe.
         """
-        # ═══════════════════════════════════════════════════════════════════
-        # PERFORMANCE FIX: Use cached renderer and converter
-        # OLD: Created new vtkCoordinate() every call = 50ms per frame
-        # NEW: Reuse cached objects = 1ms per frame
-        # ═══════════════════════════════════════════════════════════════════
-        if self._cached_renderer is None:
-            self._cached_renderer = self.app.vtk_widget.renderer
+        ren = self.app.vtk_widget.renderer
 
-        self._coord_converter.SetValue(float(x), float(y), 0.0)
-        world = self._coord_converter.GetComputedWorldValue(self._cached_renderer)
+        coord = vtk.vtkCoordinate()
+        coord.SetCoordinateSystemToDisplay()
+        coord.SetValue(float(x), float(y), 0.0)
+
+        world = coord.GetComputedWorldValue(ren)
         return np.array(world, dtype=np.float64)
 
 
@@ -129,3 +116,28 @@ class CrossSectionInteractor(vtk.vtkInteractorStyleTrackballCamera):
             self.P2 = None
             self.slice_state = 0
 
+    # def on_key_press(self, obj, ev):
+    #     key = self.iren.GetKeySym()
+    #     if key.lower() == "escape":
+    #         from vtk import vtkInteractorStyleTrackballCamera
+    #         self.app.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
+    #         self.app.section_controller.clear()
+    #         self.P1 = None
+    #         self.P2 = None
+    #         self.slice_state = 0
+    #         if self.app.cross_action.isChecked():
+    #             self.app.cross_action.setChecked(False)
+    
+    # def on_key_press(self, obj, ev):
+    #     key = self.iren.GetKeySym()
+    #     if key.lower() == "escape":
+    #         # ❌ DELETE THESE LINES (or comment them out):
+    #         # from vtk import vtkInteractorStyleTrackballCamera
+    #         # self.app.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
+    #         # self.app.section_controller.clear()
+    #         # self.P1 = None
+    #         # self.P2 = None
+    #         # self.slice_state = 0
+    #         # if self.app.cross_action.isChecked():
+    #         #     self.app.cross_action.setChecked(False)
+    #         pass  # ✅ ADD THIS - do nothing, let main app handle ESC

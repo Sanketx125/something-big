@@ -18,11 +18,14 @@ class BackupSettingsDialog(QDialog):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setProperty("themeStyledDialog", True)
         self.setWindowTitle("⚙️ Auto-Backup Settings")
         self.setFixedSize(500, 300)
         
         # Load current settings
         self.settings = QSettings("NakshaAI", "LidarApp")
+        from gui.theme_manager import get_dialog_stylesheet
+        self.setStyleSheet(get_dialog_stylesheet())
         
         # Create UI
         self._create_ui()
@@ -59,6 +62,10 @@ class BackupSettingsDialog(QDialog):
         self.path_input = QLineEdit()
         self.path_input.setPlaceholderText("C:/Backups/LidarBackups")
         self.browse_btn = QPushButton("📁 Browse...")
+        self.browse_btn.setObjectName("secondaryBtn")
+        self.browse_btn.setAutoDefault(False)
+        self.browse_btn.setDefault(False)
+        self.browse_btn.setFocusPolicy(Qt.NoFocus)
         self.browse_btn.clicked.connect(self._browse_folder)
         path_layout.addWidget(self.path_input)
         path_layout.addWidget(self.browse_btn)
@@ -119,9 +126,16 @@ class BackupSettingsDialog(QDialog):
         btn_layout = QHBoxLayout()
         
         self.save_btn = QPushButton("💾 Save Settings")
+        self.save_btn.setObjectName("primaryBtn")
+        self.save_btn.setAutoDefault(False)
+        self.save_btn.setDefault(False)
+        self.save_btn.setFocusPolicy(Qt.NoFocus)
         self.save_btn.clicked.connect(self._save_settings)
         
         self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setAutoDefault(False)
+        self.cancel_btn.setDefault(False)
+        self.cancel_btn.setFocusPolicy(Qt.NoFocus)
         self.cancel_btn.clicked.connect(self.reject)
         
         btn_layout.addStretch()

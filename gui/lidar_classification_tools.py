@@ -716,57 +716,61 @@ QListWidget::item:hover { background-color: #3a3a3a; }
 QFrame[frameShape="4"] { color: #444; }
 """
 
-_FENCE_PICKER_STYLE = """
-QDialog { background-color: #1e1e1e; color: #f0f0f0; }
-QLabel { color: #d0d0d0; font-size: 11px; }
-QListWidget {
-    background-color: #1e1e1e; border: 1px solid #3a3a3a;
+def _get_fence_picker_style():
+    from gui.theme_manager import ThemeColors as _TC
+    return f"""
+QDialog {{ background-color: {_TC.get('bg_primary')}; color: {_TC.get('text_primary')}; }}
+QLabel {{ color: {_TC.get('text_primary')}; font-size: 11px; }}
+QListWidget {{
+    background-color: {_TC.get('bg_input')}; border: 1px solid {_TC.get('border_light')};
     border-radius: 4px; padding: 4px;
-}
-QListWidget::item { background: transparent; border: none; padding: 2px; }
-QCheckBox { color: #eeeeee; font-size: 11px; padding: 8px; font-weight: bold; }
-QCheckBox::indicator { width: 18px; height: 18px; }
-QCheckBox::indicator:unchecked {
-    background-color: #2c2c2c; border: 1px solid #555555; border-radius: 3px;
-}
-QCheckBox::indicator:checked {
-    background-color: #9c27b0; border: 1px solid #9c27b0; border-radius: 3px;
-}
-QPushButton {
-    background-color: #2c2c2c; color: #f0f0f0;
-    border: 1px solid #555; border-radius: 4px;
+}}
+QListWidget::item {{ background: transparent; border: none; padding: 2px; }}
+QCheckBox {{ color: {_TC.get('text_primary')}; font-size: 11px; padding: 8px; font-weight: bold; }}
+QCheckBox::indicator {{ width: 18px; height: 18px; }}
+QCheckBox::indicator:unchecked {{
+    background-color: {_TC.get('bg_button')}; border: 1px solid {_TC.get('border_light')}; border-radius: 3px;
+}}
+QCheckBox::indicator:checked {{
+    background-color: {_TC.get('accent')}; border: 1px solid {_TC.get('accent')}; border-radius: 3px;
+}}
+QPushButton {{
+    background-color: {_TC.get('bg_button')}; color: {_TC.get('text_primary')};
+    border: 1px solid {_TC.get('border_light')}; border-radius: 4px;
     padding: 5px 14px; font-size: 10px; font-weight: bold;
-}
-QPushButton:hover { background-color: #3c3c3c; border-color: #ffaa00; }
+}}
+QPushButton:hover {{ background-color: {_TC.get('bg_button_hover')}; border-color: {_TC.get('accent')}; }}
 """
 
 # Style for the minimized chip widget
-_CHIP_STYLE = """
-QWidget#minimizedChip {
-    background-color: #2a2a1a;
-    border: 1px solid #ffaa00;
+def _get_chip_style():
+    from gui.theme_manager import ThemeColors as _TC
+    return f"""
+QWidget#minimizedChip {{
+    background-color: {_TC.get('bg_secondary')};
+    border: 1px solid {_TC.get('accent')};
     border-radius: 6px;
-}
-QLabel#chipLabel {
-    color: #ffcc44;
+}}
+QLabel#chipLabel {{
+    color: {_TC.get('accent')};
     font-size: 10px;
     font-weight: bold;
     padding: 2px 6px;
-}
-QPushButton#chipRestoreBtn {
-    background-color: #3a3a2a;
+}}
+QPushButton#chipRestoreBtn {{
+    background-color: {_TC.get('bg_button')};
     border: none;
     border-radius: 4px;
-    color: #ffcc44;
+    color: {_TC.get('accent')};
     font-size: 10px;
     font-weight: bold;
     padding: 2px 8px;
     min-width: 0;
-}
-QPushButton#chipRestoreBtn:hover {
-    background-color: #5a5a2a;
-    color: #ffff88;
-}
+}}
+QPushButton#chipRestoreBtn:hover {{
+    background-color: {_TC.get('bg_button_hover')};
+    color: {_TC.get('accent_hover')};
+}}
 """
 
 
@@ -788,7 +792,7 @@ class _MinimizedChip(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating)  # don't steal focus
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setObjectName("minimizedChip")
-        self.setStyleSheet(_CHIP_STYLE)
+        self.setStyleSheet(_get_chip_style())
         self.setCursor(Qt.PointingHandCursor)
 
         lay = QHBoxLayout(self)
@@ -1180,12 +1184,13 @@ class FenceSelectorWidget(QWidget):
         dlg = QDialog(self.window(), Qt.Window)
         dlg.setWindowTitle("Select Fence(s)")
         dlg.setWindowModality(Qt.NonModal)
-        dlg.setStyleSheet(_FENCE_PICKER_STYLE)
+        dlg.setStyleSheet(_get_fence_picker_style())
         dlg.resize(420, 500)
         layout = QVBoxLayout(dlg)
 
         info = QLabel("Select one or more fences to use for conversion")
-        info.setStyleSheet("color:#9c27b0; font-weight:bold; padding:8px;")
+        from gui.theme_manager import ThemeColors
+        info.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-weight:bold; padding:8px;")
         layout.addWidget(info)
 
         perm_chk = QCheckBox("🔄 Permanent Fence Mode (keep all fences selected)")
@@ -1279,38 +1284,38 @@ class FenceSelectorWidget(QWidget):
                 size = ""
 
             item_widget = QWidget()
-            item_widget.setStyleSheet("background:#2a2a2a; border-radius:5px;")
+            item_widget.setStyleSheet(f"background:{ThemeColors.get('bg_button')}; border-radius:5px;")
             ilay = QHBoxLayout(item_widget); ilay.setContentsMargins(6, 4, 6, 4)
 
             swatch = QLabel(icon)
             swatch.setFixedSize(28, 28); swatch.setAlignment(Qt.AlignCenter)
             swatch.setStyleSheet(
-                "background:#9c27b0; border-radius:4px; color:white;"
+                f"background:{ThemeColors.get('accent')}; border-radius:4px; color:{ThemeColors.get('text_on_active')};"
                 " font-size:14px; font-weight:bold;")
             ilay.addWidget(swatch)
 
             info_col = QVBoxLayout(); info_col.setSpacing(1)
             title_l = QLabel(f"O #{idx+1}: {stype.capitalize()}")
-            title_l.setStyleSheet("color:#eeeeee; font-weight:bold; font-size:11px;")
+            title_l.setStyleSheet(f"color:{ThemeColors.get('text_primary')}; font-weight:bold; font-size:11px;")
             sub_l   = QLabel(f"{len(coords)} pts | {size}")
-            sub_l.setStyleSheet("color:#888; font-size:10px;")
+            sub_l.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px;")
             info_col.addWidget(title_l); info_col.addWidget(sub_l)
             ilay.addLayout(info_col, 1)
 
             badge = QLabel("Selected")
             badge.setStyleSheet(
-                "background:#9c27b0; color:white; font-weight:bold;"
+                f"background:{ThemeColors.get('accent')}; color:{ThemeColors.get('text_on_active')}; font-weight:bold;"
                 " font-size:10px; border-radius:4px; padding:3px 8px;")
             badge.setVisible(id(shape) in current_ids)
 
             cb = QCheckBox()
             cb.setChecked(id(shape) in current_ids)
-            cb.setStyleSheet("""
-                QCheckBox::indicator { width:20px; height:20px; }
-                QCheckBox::indicator:unchecked {
-                    background:#2c2c2c; border:2px solid #555; border-radius:3px; }
-                QCheckBox::indicator:checked {
-                    background:#9c27b0; border:2px solid #9c27b0; border-radius:3px; }
+            cb.setStyleSheet(f"""
+                QCheckBox::indicator {{ width:20px; height:20px; }}
+                QCheckBox::indicator:unchecked {{
+                    background:{ThemeColors.get('bg_button')}; border:2px solid {ThemeColors.get('border_light')}; border-radius:3px; }}
+                QCheckBox::indicator:checked {{
+                    background:{ThemeColors.get('accent')}; border:2px solid {ThemeColors.get('accent')}; border-radius:3px; }}
             """)
 
             def _connect(shp, bdg, checkbox):
@@ -1319,13 +1324,13 @@ class FenceSelectorWidget(QWidget):
                     bdg.setVisible(chk)
                     on_toggle(shp, chk)
                     checkbox.parentWidget().setStyleSheet(
-                        "background:#3a1a5a; border-radius:5px;" if chk
-                        else "background:#2a2a2a; border-radius:5px;")
+                        f"background:{ThemeColors.get('bg_active')}; border-radius:5px;" if chk
+                        else f"background:{ThemeColors.get('bg_button')}; border-radius:5px;")
                 checkbox.stateChanged.connect(_changed)
             _connect(shape, badge, cb)
 
             if id(shape) in current_ids:
-                item_widget.setStyleSheet("background:#3a1a5a; border-radius:5px;")
+                item_widget.setStyleSheet(f"background:{ThemeColors.get('bg_active')}; border-radius:5px;")
                 on_toggle(shape, True)
 
             ilay.addWidget(badge); ilay.addWidget(cb)
@@ -2358,7 +2363,7 @@ class _BaseClassifyDialog(QDialog):
                         _free_undo_entry(_stack.pop(0))
                 except Exception as e:
                     print(f"⚠️ Undo stack push failed: {e}")
-                    
+
         print(f"🔄 Classification done — refreshing view ({changed:,} pts changed)…")
         self._refresh(to_class=to_class, from_classes=from_classes)
         print(f"✅ View refresh complete")
@@ -2605,15 +2610,16 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
         self._direction_lbl.setStyleSheet("font-size:10px;")
 
         def _update_direction_label(val):
+            from gui.theme_manager import ThemeColors
             if val > 0:
                 self._direction_lbl.setText("m  lower than ground  (below surface)")
-                self._direction_lbl.setStyleSheet("color:#f08080; font-size:10px;")
+                self._direction_lbl.setStyleSheet(f"color:{ThemeColors.get('danger_hover')}; font-size:10px;")
             elif val < 0:
                 self._direction_lbl.setText("m  higher than ground  (above surface)")
-                self._direction_lbl.setStyleSheet("color:#80c0f0; font-size:10px;")
+                self._direction_lbl.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:10px;")
             else:
                 self._direction_lbl.setText("m  at ground level")
-                self._direction_lbl.setStyleSheet("color:#aaa; font-size:10px;")
+                self._direction_lbl.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px;")
 
         self.mt_spin.valueChanged.connect(_update_direction_label)
         _update_direction_label(self.mt_spin.value())

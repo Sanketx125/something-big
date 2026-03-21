@@ -24,13 +24,14 @@ class BackupSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("BackupSettingsDialog")
-        self.setWindowTitle("⚙️ Auto-Backup Settings")
+        self.setProperty("themeStyledDialog", True)
+        self.setWindowTitle("Auto-Backup Settings")
         self.setFixedSize(620, 340)
 
         # Load settings object
         self.settings = QSettings("NakshaAI", "LidarApp")
 
-        # Apply local style so global theme.qss can't break layout
+        # Apply theme-aware style
         self._apply_local_style()
 
         # Build UI
@@ -43,59 +44,9 @@ class BackupSettingsDialog(QDialog):
     #  LOCAL STYLE (override global theme inside this dialog only)
     # ------------------------------------------------------------------ #
     def _apply_local_style(self):
-        self.setStyleSheet("""
-        #BackupSettingsDialog {
-            background-color: #202020;
-        }
-        #BackupSettingsDialog QLabel {
-            color: #f0f0f0;
-        }
-        #BackupSettingsDialog QGroupBox {
-            border: 1px solid #555;
-            border-radius: 4px;
-            margin-top: 8px;
-        }
-        #BackupSettingsDialog QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 10px;
-            padding: 0 3px;
-            color: #f0f0f0;
-        }
-        #BackupSettingsDialog QCheckBox,
-        #BackupSettingsDialog QRadioButton {
-            color: #f0f0f0;
-            spacing: 6px;
-        }
-        #BackupSettingsDialog QLineEdit,
-        #BackupSettingsDialog QSpinBox,
-        #BackupSettingsDialog QComboBox {
-            background-color: #151515;
-            border: 1px solid #555;
-            border-radius: 3px;
-            color: #f0f0f0;
-            min-height: 22px;
-            padding: 2px 6px;
-        }
-        #BackupSettingsDialog QPushButton {
-            background-color: #3c3c3c;
-            color: #f0f0f0;
-            border-radius: 3px;
-            border: 1px solid #555;
-            padding: 4px 10px;
-        }
-        #BackupSettingsDialog QPushButton:hover {
-            background-color: #505050;
-        }
-        #BackupSettingsDialog QPushButton#saveButton {
-            background-color: #2e7d32;
-            border-color: #1b5e20;
-            font-weight: bold;
-            padding: 6px 16px;
-        }
-        #BackupSettingsDialog QPushButton#saveButton:hover {
-            background-color: #1b5e20;
-        }
-        """)
+        from gui.theme_manager import get_dialog_stylesheet
+
+        self.setStyleSheet(get_dialog_stylesheet())
 
     # ------------------------------------------------------------------ #
     #  UI BUILD
@@ -110,7 +61,7 @@ class BackupSettingsDialog(QDialog):
         # ============================================
         self.enable_checkbox = QCheckBox("Enable Auto-Backup")
         self.enable_checkbox.setStyleSheet(
-            "QCheckBox { font-weight: bold; font-size: 11pt; color: #f0f0f0; }"
+            "QCheckBox { font-weight: bold; font-size: 11pt; }"
         )
         layout.addWidget(self.enable_checkbox)
 
@@ -140,6 +91,10 @@ class BackupSettingsDialog(QDialog):
 
         self.browse_btn = QPushButton("Browse…")
         self.browse_btn.setFixedWidth(90)
+        self.browse_btn.setObjectName("secondaryBtn")
+        self.browse_btn.setAutoDefault(False)
+        self.browse_btn.setDefault(False)
+        self.browse_btn.setFocusPolicy(Qt.NoFocus)
         self.browse_btn.clicked.connect(self._browse_folder)
 
         path_layout.addWidget(self.path_input, 1)
@@ -209,10 +164,16 @@ class BackupSettingsDialog(QDialog):
         btn_layout.addStretch()
 
         self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setAutoDefault(False)
+        self.cancel_btn.setDefault(False)
+        self.cancel_btn.setFocusPolicy(Qt.NoFocus)
         self.cancel_btn.clicked.connect(self.reject)
 
         self.save_btn = QPushButton("Save Settings")
-        self.save_btn.setObjectName("saveButton")
+        self.save_btn.setObjectName("primaryBtn")
+        self.save_btn.setAutoDefault(False)
+        self.save_btn.setDefault(False)
+        self.save_btn.setFocusPolicy(Qt.NoFocus)
         self.save_btn.clicked.connect(self._save_settings)
 
         btn_layout.addWidget(self.cancel_btn)

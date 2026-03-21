@@ -15,6 +15,7 @@ class BrushSizeDialog(QDialog):
     
     def __init__(self, parent=None, current_size=1.0, current_shape="circle"):
         super().__init__(parent)
+        self.setProperty("themeStyledDialog", True)
         self.setWindowTitle("Brush Settings")
         self.setModal(True)
         self.setMinimumWidth(400)
@@ -39,125 +40,47 @@ class BrushSizeDialog(QDialog):
         self._settings_changed = True
 
     def _apply_styles(self):
-        """Apply the green-accented dark theme with an outer highlight border."""
-        # Theme Color: Emerald Green #27ae60 or #1db954 (Based on screenshots)
-        # Using #2ecc71 / #1abc9c style green for high visibility
-        green_accent = "#1abc9c" 
-        green_hover = "#16a085"
-        
-        self.setStyleSheet(f"""
-            QDialog {{
-                background-color: #000000;
-                color: #ffffff;
-                border: 2px solid #22252a; /* Outer border */
-            }}
-            QLabel {{
-                color: #ffffff;
-                font-family: 'Segoe UI', sans-serif;
-            }}
+        """Apply theme-aware styles for the brush dialog."""
+        from gui.theme_manager import get_dialog_stylesheet, ThemeColors
+        c = ThemeColors
+        self.setStyleSheet(get_dialog_stylesheet() + f"""
             QGroupBox {{
-                border: 1px solid #22252a;
-                border-radius: 8px;
-                margin-top: 1.2em;
-                font-weight: bold;
-                color: {green_accent};
-                padding-top: 15px;
-                background-color: #0c0d0e;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 5px;
-            }}
-            QRadioButton {{
-                color: #e0e0e0;
-                padding: 10px;
-                font-size: 13px;
-                background: transparent;
-            }}
-            QRadioButton::indicator {{
-                width: 22px;
-                height: 22px;
-                border-radius: 11px;
-                border: 2px solid #373a40;
-                background: #1a1b1e;
-            }}
-            QRadioButton::indicator:checked {{
-                background-color: {green_accent};
-                border: 2px solid {green_accent};
-            }}
-            QRadioButton::indicator:hover {{
-                border-color: {green_accent};
-            }}
-            QSlider::groove:horizontal {{
-                border: 1px solid #373a40;
-                height: 4px;
-                background: #1a1b1e;
-                margin: 2px 0;
-                border-radius: 2px;
-            }}
-            QSlider::handle:horizontal {{
-                background: {green_accent};
-                border: none;
-                width: 14px;
-                height: 14px;
-                margin: -5px 0;
-                border-radius: 7px;
-            }}
-            QDoubleSpinBox {{
-                background-color: #1a1b1e;
-                color: #ffffff;
-                border: 1px solid #373a40;
-                border-radius: 4px;
-                padding: 4px 8px;
-                min-width: 90px;
-                selection-background-color: {green_accent};
-                selection-color: #000000;
-            }}
-            QPushButton {{
-                background-color: #25262b;
-                color: #ffffff;
-                border: 1px solid #373a40;
-                border-radius: 6px;
-                padding: 6px 12px;
-                font-size: 12px;
-            }}
-            QPushButton:hover {{
-                background-color: #2c2e33;
-                border-color: #5c5f66;
+                color: {c.get('text_primary')};
+                background-color: {c.get('bg_secondary')};
             }}
             QPushButton#okButton {{
-                background-color: {green_accent};
-                color: #000000;
-                border: none;
+                background-color: {c.get('dialog_primary_bg')};
+                color: {c.get('dialog_primary_text')};
+                border: 1px solid {c.get('dialog_primary_border')};
                 padding: 8px 20px;
-                font-weight: bold;
+                font-weight: 600;
             }}
             QPushButton#okButton:hover {{
-                background-color: {green_hover};
+                background-color: {c.get('dialog_primary_hover')};
             }}
             #previewPanel {{
-                background-color: #080808;
-                border: 1px solid #22252a;
-                border-radius: 4px;
-                color: #cccccc;
-                font-size: 11px;
+                background-color: {c.get('bg_input')};
+                border: 1px solid {c.get('border_light')};
+                border-radius: 8px;
+                color: {c.get('text_secondary')};
+                font-size: 10.5px;
                 font-weight: 600;
-                letter-spacing: 0.5px;
-                margin-top: 10px;
             }}
             #presetContainer {{
-                background-color: #0c0d0e;
-                border-radius: 6px;
+                background-color: {c.get('bg_input')};
+                border: 1px solid {c.get('border_light')};
+                border-radius: 8px;
                 padding: 5px;
             }}
             #presetLabel {{
-                font-size: 9px; 
-                font-weight: bold; 
-                color: #5c5f66;
-                letter-spacing: 1px;
+                font-size: 9px;
+                font-weight: 700;
+                color: {c.get('text_muted')};
             }}
         """)
+
+    def refresh_theme(self):
+        self._apply_styles()
 
     def _setup_ui(self):
         layout = QVBoxLayout()
@@ -167,12 +90,12 @@ class BrushSizeDialog(QDialog):
         # --- Header ---
         header_layout = QVBoxLayout()
         header_layout.setSpacing(2)
-        title = QLabel("BRUSH CONFIGURATION")
-        # Color updated to green
-        title.setStyleSheet("font-weight: 800; font-size: 14px; color: #1abc9c; letter-spacing: 0.5px;")
-        
+        title = QLabel("Brush Configuration")
+        from gui.theme_manager import ThemeColors
+        title.setStyleSheet(f"font-weight: 700; font-size: 14px; color: {ThemeColors.get('text_primary')};")
+
         desc = QLabel("Adjust tool properties for point cloud classification.")
-        desc.setStyleSheet("color: #666666; font-size: 11px;")
+        desc.setStyleSheet(f"color: {ThemeColors.get('text_muted')}; font-size: 11px;")
         
         header_layout.addWidget(title)
         header_layout.addWidget(desc)
@@ -212,7 +135,7 @@ class BrushSizeDialog(QDialog):
         slider_row = QHBoxLayout()
         slider_label = QLabel("Scale")
         slider_label.setFixedWidth(50)
-        slider_label.setStyleSheet("color: #bbbbbb;")
+        slider_label.setStyleSheet(f"color: {ThemeColors.get('text_secondary')};")
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setMinimum(1)
         self.slider.setMaximum(100)
@@ -225,7 +148,7 @@ class BrushSizeDialog(QDialog):
         spin_row = QHBoxLayout()
         spin_label = QLabel("Radius")
         spin_label.setFixedWidth(50)
-        spin_label.setStyleSheet("color: #bbbbbb;")
+        spin_label.setStyleSheet(f"color: {ThemeColors.get('text_secondary')};")
         self.spinbox = QDoubleSpinBox()
         self.spinbox.setRange(0.1, 10.0)
         self.spinbox.setSingleStep(0.1)
@@ -274,13 +197,18 @@ class BrushSizeDialog(QDialog):
         
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setFixedWidth(90)
+        self.cancel_button.setAutoDefault(False)
+        self.cancel_button.setDefault(False)
+        self.cancel_button.setFocusPolicy(Qt.NoFocus)
         self.cancel_button.clicked.connect(self.reject)
         
         self.ok_button = QPushButton("Apply Settings")
         self.ok_button.setObjectName("okButton")
         self.ok_button.setFixedWidth(130)
         self.ok_button.clicked.connect(self.accept)
-        self.ok_button.setDefault(True)
+        self.ok_button.setAutoDefault(False)
+        self.ok_button.setDefault(False)
+        self.ok_button.setFocusPolicy(Qt.NoFocus)
         
         button_layout.addStretch()
         button_layout.addWidget(self.cancel_button)

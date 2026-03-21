@@ -1,5 +1,3 @@
-
-#####
 """
 Optimized Refresh Pipeline - FIXED VERSION
 
@@ -43,27 +41,12 @@ class OptimizedRefreshPipeline:
         Optimized refresh with automatic fallback.
         ✅ FIX: Skips entirely when _apply_mask_and_record already did GPU sync.
         """
-        # ═══════════════════════════════════════════════════════════════════
-        # PERFORMANCE FIX: Multiple skip conditions to prevent double-refresh
-        # ═══════════════════════════════════════════════════════════════════
-        
-        # Skip if GPU sync already done by fast_classify_update
+        # ✅ CRITICAL: If GPU sync was already done by the fast injection path
+        # in _apply_mask_and_record, skip the entire 170ms refresh cycle.
         if getattr(self.app, "_gpu_sync_done", False):
             self.app._gpu_sync_done = False
             if ENABLE_PERFORMANCE_LOGGING:
                 print(f"⏭️ OptimizedRefresh SKIPPED — GPU sync already done by fast injection")
-            return
-        
-        # Skip if refresh already in progress (prevents recursion)
-        if getattr(self.app, "_optimized_refresh_active", False):
-            if ENABLE_PERFORMANCE_LOGGING:
-                print(f"⏭️ OptimizedRefresh SKIPPED — refresh already in progress")
-            return
-        
-        # Skip if another GPU operation is handling it
-        if getattr(self.app, "_gpu_sync_in_progress", False):
-            if ENABLE_PERFORMANCE_LOGGING:
-                print(f"⏭️ OptimizedRefresh SKIPPED — GPU sync in progress")
             return
 
         if not ENABLE_OPTIMIZED_REFRESH:
@@ -173,13 +156,12 @@ class OptimizedRefreshPipeline:
                 
                 self._pending_renders.clear()
             
-            # ═══════════════════════════════════════════════════════════════════
-            # Step 5: REMOVED — _batched_render() was a duplicate render of Step 4.
-            # fast_classify_update + fast_cross_section_update already pushed to GPU,
-            # and the inline render_window.Render() above flushed the frame.
-            # A second _batched_render() here caused 2-3 extra renders per classification.
-            # MicroStation pattern: ONE GPU push → ONE render per user action.
-            # ═══════════════════════════════════════════════════════════════════
+            # Step 5: Render all pending views
+            if ENABLE_BATCHED_RENDERING:
+                self._batched_render()
+            else:
+                self._individual_renders()
+                self._force_border_reapplication()
             
             # Step 6: Statistics and status
             self._update_statistics()
@@ -208,12 +190,8 @@ class OptimizedRefreshPipeline:
     def _force_border_reapplication(self):
         """Apply borders via GPU uniform system (Phase 4 cleanup)."""
         border_percent = getattr(self.app, "point_border_percent", 0)
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # PERFORMANCE FIX: Early exit when borders disabled
-        # ═══════════════════════════════════════════════════════════════════
         if border_percent <= 0:
-            return  # Nothing to do - skip entirely
+            return
         
         print(f"   🔳 Applying borders via GPU uniform system ({border_percent}%)...")
         try:
@@ -425,16 +403,12 @@ class OptimizedRefreshPipeline:
 
         # ═══════════════════════════════════════════════════════════════
         # ✅ UNIFIED ACTOR: FAST SHARED MEMORY UPDATE
-        # skip_render=True: buffer the GPU write now, flush in the
-        # single batched Render() call at Step 4.  One render covers all
-        # section views — not one render per section.
         # ═══════════════════════════════════════════════════════════════
         try:
             from gui.unified_actor_manager import fast_cross_section_update
             changed_mask = getattr(self.app, '_last_changed_mask', None)
             
-            fast_cross_section_update(self.app, view_idx, changed_mask,
-                                      palette=palette, skip_render=True)
+            fast_cross_section_update(self.app, view_idx, changed_mask, palette=palette)
             
             # The batched render below will pick up any additional refreshes
         except Exception as e:
@@ -469,8 +443,11 @@ class OptimizedRefreshPipeline:
                             border_percent=float(getattr(app, 'point_border_percent', 0) or 0.0),
                         )
                         if _done:
-                            # fast_classify_update already called app.vtk_widget.render() internally.
-                            # No second render needed here — MicroStation one-render-per-action rule.
+                            # Render after buffer update (render was removed from fast_classify_update)
+                            try:
+                                app.vtk_widget.render()
+                            except Exception:
+                                pass
                             if ENABLE_PERFORMANCE_LOGGING:
                                 print(f"   ⚡ Unified actor fast path: <5ms")
                             return  # Done — skip everything below
