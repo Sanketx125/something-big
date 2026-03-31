@@ -366,6 +366,15 @@ def _get_tooltip_shortcuts(app_window, shortcut_tools) -> list[str]:
 class RibbonSection(QWidget):
     """A single section in the ribbon with toggle-capable buttons"""
 
+    _POINT_SYNC_EXCLUSIVE_BUTTONS = {
+        "ToolsRibbon": {"Cross", "Cut", "Width"},
+        "DrawRibbon": {"Smart", "Line", "Polyline", "Rect", "Circle", "Free", "Text", "Move V", "Vertex", "Grid", "Select"},
+        "ClassifyRibbon": {"Above", "Below", "Rect", "Circle", "Free", "Brush", "Point"},
+        "MeasurementRibbon": {"Line", "Path"},
+        "IdentificationRibbon": {"Identify", "Zoom", "Select"},
+        "CurveRibbon": {"Curve"},
+    }
+
     def __init__(self, title, parent=None):
         super().__init__(parent)
         self.setObjectName("ribbonSection")
@@ -383,7 +392,9 @@ class RibbonSection(QWidget):
         layout.setContentsMargins(4, 3, 4, 3)
         layout.setSpacing(3)
         layout.setAlignment(Qt.AlignTop)
-        self.setMinimumHeight(84)
+        
+        # FIXED: Removed setMinimumHeight(108) which was causing excessive empty space below the ribbon tools
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         title_label = QLabel(title)
         title_label.setObjectName("ribbonSectionTitle")
@@ -396,8 +407,8 @@ class RibbonSection(QWidget):
 
         self.button_layout = QHBoxLayout(self.button_box)
         self.button_layout.setSpacing(8)
-        self.button_layout.setContentsMargins(8, 8, 8, 8)
-        self.button_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.button_layout.setContentsMargins(8, 6, 8, 6)
+        self.button_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         layout.addWidget(self.button_box)
 
     def _find_app_window(self):
@@ -500,14 +511,30 @@ class RibbonSection(QWidget):
         if callback:
             btn.clicked.connect(lambda checked, b=btn: self._on_button_click(b, callback))
 
-        self.button_layout.addWidget(btn)
+        # Wrap button + label in a vertical container
+        container = QWidget()
+        container.setObjectName("ribbonButtonContainer")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(3)
+        container_layout.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        container_layout.addWidget(btn, 0, Qt.AlignHCenter)
+
+        label = QLabel(text)
+        label.setObjectName("ribbonButtonLabel")
+        label.setAlignment(Qt.AlignCenter)
+        label.setWordWrap(True)
+        label.setFixedWidth(52)
+        container_layout.addWidget(label, 0, Qt.AlignHCenter)
+
+        self.button_layout.addWidget(container)
 
         self._button_count += 1
         return btn
 
     def _on_button_click(self, btn, callback):
         """Handle button toggle states"""
-        # Deactivate previously active button if it’s not this one
+        # Deactivate previously active button if it's not this one
         if self.active_button and self.active_button != btn:
             self.active_button.setChecked(False)
 
@@ -517,8 +544,25 @@ class RibbonSection(QWidget):
         else:
             self.active_button = None
 
+        self._deactivate_point_sync_for_tool_button(btn)
+
         # Emit or call connected function
         callback()
+
+    def _deactivate_point_sync_for_tool_button(self, btn):
+        ribbon_scope = btn.property("ribbonScope") or self.ribbon_scope
+        ribbon_text = btn.property("ribbonText")
+
+        if ribbon_text not in self._POINT_SYNC_EXCLUSIVE_BUTTONS.get(ribbon_scope, set()):
+            return
+
+        main_window = self.window()
+        point_sync_tool = getattr(main_window, "point_sync_tool", None)
+        if point_sync_tool and getattr(point_sync_tool, "active", False):
+            try:
+                point_sync_tool.deactivate()
+            except Exception:
+                pass
 
 
 class FileRibbon(QWidget):
@@ -558,11 +602,12 @@ class FileRibbon(QWidget):
 
         # Combined attachment tools
         attachments = RibbonSection("Attachments", self)
-        attachments.add_button("Attach DXF", "📎", self._attach_dxf)
-        attachments.add_button("PRJ Loader", "📋", self._identify_blocks)
-        attachments.add_button("Verify Labels", "🔍", self._verify_grid_labels)
-        attachments.add_button("Attach DWG", "📐", self._attach_dwg, toggleable=False)
-        attachments.add_button("Attach SNT", "🗂️", self._attach_snt, toggleable=False)
+        attachments.add_button(" DXF", "📎", self._attach_dxf)
+        attachments.add_button("DWG", "📐", self._attach_dwg, toggleable=False)
+        attachments.add_button("SNT", "🗂️", self._attach_snt, toggleable=False)
+        attachments.add_button("PRJ", "📋", self._identify_blocks)
+        attachments.add_button("Verify", "🔍", self._verify_grid_labels)
+
         layout.addWidget(attachments)
 
         # Project
@@ -871,55 +916,7 @@ class ViewRibbon(QWidget):
         )
         layout.addWidget(navigate)
 
-        amplifier = RibbonSection("Amplifier", self)
-        amplifier.button_layout.setContentsMargins(6, 6, 6, 6)
-        amplifier.button_layout.setSpacing(8)
-        amplifier.button_layout.setAlignment(Qt.AlignCenter | Qt.AlignVCenter)
-
-        amp_surface = QWidget()
-        amp_surface.setObjectName("ampControlSurface")
-        amp_surface.setAttribute(Qt.WA_StyledBackground, True)
-        amp_surface.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        amp_surface.setFixedSize(142, 36)
-
-        amp_layout = QHBoxLayout(amp_surface)
-        amp_layout.setContentsMargins(10, 0, 10, 0)
-        amp_layout.setSpacing(8)
-        amp_layout.setAlignment(Qt.AlignVCenter)
-
-        self.sharp_slider = QSlider(Qt.Horizontal)
-        self.sharp_slider.setObjectName("ampSlider")
-        self.sharp_slider.setFixedSize(78, 18)
-        self.sharp_slider.setRange(0, 200)
-        self.sharp_slider.setSingleStep(10)
-        self.sharp_slider.setPageStep(10)
-        self.sharp_slider.setTracking(True)
-        self.sharp_slider.setValue(self.current_sharpness)
-        self.sharp_slider.setToolTip("Adjust sharpness from 0% to 200%")
-        self.sharp_slider.valueChanged.connect(self._on_sharpness_changed)
-        amp_layout.addWidget(self.sharp_slider)
-
-        self.sharp_value_label = QLabel("100%")
-        self.sharp_value_label.setFixedSize(40, 24)
-        self.sharp_value_label.setAlignment(Qt.AlignCenter)
-        self.sharp_value_label.setObjectName("ampValueLabel")
-        amp_layout.addWidget(self.sharp_value_label)
-
-        reset_btn = QPushButton("Reset")
-        reset_btn.setFixedSize(54, 36)
-        reset_btn.setObjectName("ampResetBtn")
-        reset_btn.setToolTip("Reset sharpness to 100%")
-        reset_btn.setCursor(Qt.PointingHandCursor)
-        reset_btn.setFocusPolicy(Qt.NoFocus)
-        reset_btn.setAutoDefault(False)
-        reset_btn.setDefault(False)
-        reset_btn.clicked.connect(self._reset_amplifiers)
-
-        amplifier.button_layout.addWidget(amp_surface)
-        amplifier.button_layout.addWidget(reset_btn)
-        layout.addWidget(amplifier)
-
-        layout.addStretch()
+        # layout.addStretch()
 
     def _switch_to_non_class_mode(self, mode):
         """
@@ -940,15 +937,6 @@ class ViewRibbon(QWidget):
         # Emit the display change
         self.display_changed.emit(mode)
 
-    def _toggle_theme(self):
-        """Toggle the application theme."""
-        widget = self
-        while widget:
-            if hasattr(widget, "toggle_theme"):
-                widget.toggle_theme()
-                return
-            widget = widget.parent()
-
     def _fit_view(self):
         widget = self
         while widget:
@@ -958,38 +946,17 @@ class ViewRibbon(QWidget):
             widget = widget.parent()
 
     def _on_sharpness_changed(self, value):
-        """Update the amplifier display and emit the active sharpness."""
-        self.current_sharpness = value
-        if hasattr(self, "sharp_value_label"):
-            self.sharp_value_label.setText(f"{value}%")
+        """Amplifier removed — no-op. Signal is never connected."""
+        pass  # Intentionally empty
 
-        self.sharpness_changed.emit(value)
-        print(f"🔪 Sharpness: {value}%")
 
     def _adjust_sharpness(self, delta):
-        """Adjust sharpness by delta (kept for compatibility)."""
-        if hasattr(self, "sharp_slider"):
-            new_value = max(0, min(200, self.sharp_slider.value() + delta))
-            self.sharp_slider.setValue(new_value)
+        """Amplifier removed — no-op."""
+        pass  # Intentionally empty
 
-    # ============================================================
-    # ✅ Reset Both Amplifiers
-    # ============================================================
     def _reset_amplifiers(self):
-        """Reset both saturation and sharpness to 100% (normal)."""
-        self.current_saturation = 100
-        self.current_sharpness = 100
-        
-        self.saturation_changed.emit(100)
-        if hasattr(self, "sharp_slider"):
-            self.sharp_slider.setValue(100)
-        else:
-            if hasattr(self, "sharp_value_label"):
-                self.sharp_value_label.setText("100%")
-            self.sharpness_changed.emit(100)
-        
-        print("🔄 Amplifiers reset to 100%")
-
+        """Amplifier removed — no-op."""
+        pass  # Intentionally empty
     # -----------------------------------------------------
     # 🧱 Depth Toggle
     # -----------------------------------------------------
@@ -1082,7 +1049,7 @@ class ToolsRibbon(QWidget):
         sections = RibbonSection("Sections", self)
         sections.add_button("Cross", "📐",
                             lambda: self.tool_activated.emit("cross_section"))
-        sections.add_button("Cut Section", "🔪",
+        sections.add_button("Cut", "🔪",
                             lambda: self.tool_activated.emit("cut_section"))
         sections.add_button("Width", "📏",
                             lambda: self.tool_activated.emit("set_cut_width"))
@@ -1331,17 +1298,16 @@ class DrawRibbon(QWidget):
         # Draw Tools
         tools = RibbonSection("Tools", self)
         
-        tools.add_button("Smart\nLine", "🔮", lambda: self._handle_smartline_click())
+        tools.add_button("Smart", "🔮", lambda: self._handle_smartline_click())
         tools.add_button("Line", "📏", lambda: self._handle_line_click())
         tools.add_button("Polyline", "⬡", lambda: self._handle_polyline_click())
-        # REPLACE WITH:
         tools.add_button("Rect",  "⬜", lambda: self._handle_rect_click())
         tools.add_button("Circle","⭕", lambda: self._handle_circle_click())
         tools.add_button("Free",  "✏️", lambda: self._handle_freehand_click())
         tools.add_button("Text", "📝", lambda: self.draw_tool_selected.emit("Text"))
         
         # ✅ Move Vertex button
-        tools.add_button("Move\nVertex", "🔄", lambda: self._handle_move_vertex_click())
+        tools.add_button("Move V", "🔄", lambda: self._handle_move_vertex_click())
         
         tools.add_button("Vertex", "🔵", lambda: self._handle_vertex_click())
         tools.add_button("Grid", "⊞", self.grid_requested.emit)
@@ -1353,14 +1319,14 @@ class DrawRibbon(QWidget):
         select_section = RibbonSection("Select", self)
         
         select_section.add_button(
-            "Select\nDrawing", "🎯",
+            "Select", "🎯",
             lambda: self._handle_select_drawing_click()
         )
         
-        select_section.add_button(
-            "Deselect\nAll", "⛔",
-            lambda: self._handle_deselect_all_click()
-        )
+        # select_section.add_button(
+        #     "Deselect\nAll", "⛔",
+        #     lambda: self._handle_deselect_all_click()
+        # )
         
         layout.addWidget(select_section)
 
@@ -1374,7 +1340,7 @@ class DrawRibbon(QWidget):
         # ══════════════════════════════════════════════════════════
         settings_section = RibbonSection("Settings", self)
         settings_section.add_button(
-            "Draw\nSettings", "⚙️",
+            "Settings", "⚙️",
             lambda: self._show_draw_settings(),
             toggleable=False
         )
@@ -1563,7 +1529,7 @@ class DrawRibbon(QWidget):
                         for actor in getattr(dlg, '_classified_fence_actors', []):
                             if actor is fence.get('actor'):
                                 try: digitizer.overlay_renderer.RemoveActor(actor)
-                                except: pass
+                                except Exception: pass
                     dlg._clear_fence_highlights()
             except Exception as e:
                 print(f"⚠️ Fence dialog cleanup: {e}")
@@ -1575,7 +1541,7 @@ class DrawRibbon(QWidget):
                 digitizer.renderer.Modified()
                 digitizer.interactor.GetRenderWindow().Render()
                 digitizer.app.vtk_widget.render()
-            except: pass
+            except Exception: pass
 
             print(f"✅ Deleted {len(fences_to_delete)} classified fence(s)")
             dialog.accept()
@@ -1702,7 +1668,7 @@ class DrawRibbon(QWidget):
             self._show_smartline_settings()
         else:
             print("🖊️ Normal SmartLine activation")
-            self.draw_tool_selected.emit("Smart Line")
+            self.draw_tool_selected.emit("Smartline")
    
     def _show_smartline_settings(self):
         """Show SmartLine arrow settings dialog"""
@@ -1715,7 +1681,7 @@ class DrawRibbon(QWidget):
             print(f"🔧 SmartLine arrow mode: {'ENABLED' if digitizer.smartline_arrow_mode else 'DISABLED'}")
            
             # Activate SmartLine
-            self.draw_tool_selected.emit("Smart Line")
+            self.draw_tool_selected.emit("Smartline")
    
     # ========================================================================
     # LINE SETTINGS
@@ -1854,7 +1820,7 @@ class RibbonManager:
         self.ribbons['by_class'] = ByClassRibbon(self.parent, app=self.parent)
         self.ribbons['draw'] = DrawRibbon(self.parent)
         self.ribbons['curve'] = CurveRibbon(self.parent)
-        self.ribbons['ai'] = AIRibbon(self.parent)
+        self.ribbons['ai'] = AIRibbon(self.parent, app=self.parent)
 
         
         # Hide all by default
@@ -1865,9 +1831,61 @@ class RibbonManager:
         """Show a specific ribbon"""
         if ribbon_name not in self.ribbons:
             return
-            
+
+        if self.current_ribbon != ribbon_name:
+            point_sync_tool = getattr(self.parent, 'point_sync_tool', None)
+            if point_sync_tool and getattr(point_sync_tool, 'active', False):
+                try:
+                    point_sync_tool.deactivate()
+                except Exception:
+                    pass
+
         # Hide current ribbon if different
         if self.current_ribbon and self.current_ribbon != ribbon_name:
+            # ◀◀◀ NEW: Deactivate Curve tools when leaving 'curve' tab
+            if self.current_ribbon == 'curve' and ribbon_name != 'curve':
+                if hasattr(self.parent, 'curve_tool') and self.parent.curve_tool:
+                    try:
+                        self.parent.curve_tool.deactivate()
+                        self.parent.curve_tool.deactivate_select_mode()
+                    except Exception: pass
+            
+            # ◀◀◀ NEW: Deactivate Draw tools when leaving 'draw' tab
+            elif self.current_ribbon == 'draw' and ribbon_name != 'draw':
+                if hasattr(self.parent, 'digitizer') and self.parent.digitizer:
+                    try: self.parent.digitizer.set_tool(None)
+                    except Exception: pass
+            
+            # ◀◀◀ NEW: Deactivate Measure tools when leaving 'measure' tab
+            elif self.current_ribbon == 'measure' and ribbon_name != 'measure':
+                if hasattr(self.parent, 'measurement_tool') and self.parent.measurement_tool:
+                    try: self.parent.measurement_tool.deactivate()
+                    except Exception: pass
+            
+            # ◀◀◀ NEW: Deactivate Identify tools when leaving 'identify' tab
+            elif self.current_ribbon == 'identify' and ribbon_name != 'identify':
+                ribbon = self.ribbons.get('identify')
+                if ribbon and hasattr(ribbon, 'deactivate_all_tools'):
+                    try: ribbon.deactivate_all_tools()
+                    except Exception: pass
+                    
+            # Deactivate Classify tools when leaving 'classify' tab
+            elif self.current_ribbon == 'classify' and ribbon_name != 'classify':
+                if getattr(self.parent, 'active_classify_tool', None):
+                    try: self.parent.deactivate_classification_tool(preserve_cross_section=True)
+                    except: pass
+
+            # Deactivate Tools tools when leaving 'tools' tab
+            elif self.current_ribbon == 'tools' and ribbon_name != 'tools':
+                try: self.parent.deactivate_cross_section_tool()
+                except: pass
+                try:
+                    if hasattr(self.parent, 'cut_section_controller') and self.parent.cut_section_controller:
+                        self.parent.cut_section_controller.deactivate_tool_only()
+                        self.parent.cut_section_mode_on = False
+                        self.parent.set_cross_cursor_active(False)
+                except: pass
+
             self.ribbons[self.current_ribbon].hide()
         
         # Show requested ribbon
@@ -1913,8 +1931,8 @@ class MeasurementRibbon(QWidget):
         
         # 📏 Distance Tools
         distance = RibbonSection("Distance", self)
-        distance.add_button("Measure Line", "📐", lambda: self.measure_tool_selected.emit("measure_line"))
-        distance.add_button("Measure Path", "🛤️", lambda: self.measure_tool_selected.emit("measure_path"))
+        distance.add_button("Line", "📐", lambda: self.measure_tool_selected.emit("measure_line"))
+        distance.add_button("Path", "🛤️", lambda: self.measure_tool_selected.emit("measure_path"))
         layout.addWidget(distance)
     
         
@@ -2017,6 +2035,13 @@ class IdentificationRibbon(QWidget):
             self._deactivate_select_rectangle()
             self._reset_status_label()
 
+    def deactivate_all_tools(self):
+        """Deactivate all identify/select tools in this ribbon."""
+        self._deactivate_identify()
+        self._deactivate_zoom_rectangle()
+        self._deactivate_select_rectangle()
+        self._reset_status_label()
+
     def _reset_button_style(self, button):
         """Reset button to default style"""
         button.setStyleSheet("")
@@ -2094,7 +2119,6 @@ class IdentificationRibbon(QWidget):
             self._reset_status_label()
        
         self.identify_toggled.emit(self.identify_active)
-        
         
         
     def toggle_zoom_rectangle(self):
@@ -2593,7 +2617,7 @@ class ByClassDialog(QDialog):
         if display_dialog:
             try:
                 display_dialog.classes_loaded.connect(self.on_classes_changed)
-            except: pass
+            except Exception: pass
 
     
     def perform_undo(self):
@@ -2981,7 +3005,7 @@ class ByClassDialog(QDialog):
                 for actor in self._selection_highlight_actors:
                     try:
                         self.app.vtk_widget.renderer.RemoveActor(actor)
-                    except:
+                    except Exception:
                         pass
             
             self._selection_highlight_actors = []
@@ -3129,7 +3153,9 @@ class ByClassDialog(QDialog):
                 self.app.redostack.clear()
             elif hasattr(self.app, 'redo_stack'):
                 self.app.redo_stack.clear()
-            
+            from gui.memory_manager import trim_undo_stack
+            trim_undo_stack(self.app)
+
             # Apply conversion
             classification[mask] = to_class
             
@@ -3400,13 +3426,13 @@ class ByClassDialog(QDialog):
         if hasattr(self.app, 'point_count_widget'):
             try:
                 self.app.point_count_widget.schedule_update()
-            except:
+            except Exception:
                 pass
         
         # ✅ Force final render
         try:
             self.app.vtk_widget.render()
-        except:
+        except Exception:
             pass
         
         mode_str = "by-class" if has_by_class_actors else "unified"
@@ -3507,7 +3533,7 @@ class ByClassDialog(QDialog):
                     'parallel_scale': camera.GetParallelScale(),
                     'parallel_projection': camera.GetParallelProjection(),
                 }
-        except:
+        except Exception:
             pass
         return None
     
@@ -3529,7 +3555,7 @@ class ByClassDialog(QDialog):
                 camera.ParallelProjectionOff()
             
             self.app.vtk_widget.renderer.ResetCameraClippingRange()
-        except:
+        except Exception:
             pass
     
     def _detect_by_class_mode(self):
@@ -3709,7 +3735,7 @@ class ClosedByClassDialog(QDialog):
         if display_dialog:
             try:
                 display_dialog.classes_loaded.connect(self.on_classes_changed)
-            except: pass
+            except Exception: pass
     
     
     def perform_undo(self):
@@ -4407,7 +4433,9 @@ class ClosedByClassDialog(QDialog):
             }
             self.app.undo_stack.append(undo_step)
             self.app.redo_stack.clear()
-            
+            from gui.memory_manager import trim_undo_stack
+            trim_undo_stack(self.app)
+
             print(f"   ✅ Converted ALL {from_class_count:,} From class points to To class")
             self.app._conversion_just_happened = True
             # ✅ CRITICAL: Direct refresh - simple and always works
@@ -4524,7 +4552,9 @@ class ClosedByClassDialog(QDialog):
         }
         self.app.undo_stack.append(undo_step)
         self.app.redo_stack.clear()
-        
+        from gui.memory_manager import trim_undo_stack
+        trim_undo_stack(self.app)
+
         print(f"   ✅ Converted {near_count:,} points")
         print(f"{'='*60}\n")
         self.app._conversion_just_happened = True
@@ -4669,7 +4699,7 @@ class ClosedByClassDialog(QDialog):
                     if self._force_vtk_color_update():
                         print(f"   ✅ Main view updated (direct VTK with visibility)")
                         update_success = True
-                except:
+                except Exception:
                     pass
         
         # ========================================
@@ -4742,13 +4772,13 @@ class ClosedByClassDialog(QDialog):
         if hasattr(self.app, 'point_count_widget'):
             try:
                 self.app.point_count_widget.schedule_update()
-            except:
+            except Exception:
                 pass
         
         # ✅ Force final render
         try:
             self.app.vtk_widget.render()
-        except:
+        except Exception:
             pass
         
         mode_str = "by-class" if has_by_class_actors else "unified"
@@ -5155,7 +5185,12 @@ class ByClassHeightDialog(QDialog):
         # Shortcuts...
         
         self._last_conversion_info = None
-        
+        self.selected_fences = []
+        self.permanent_fence_mode = False
+        self._selection_highlight_actors = []
+        self._hover_highlight_actor = None
+        self._classified_fence_actors = []
+        self._fence_selection_dialog = None
         self.init_ui()
         self.populate_classes()
         
@@ -5164,13 +5199,15 @@ class ByClassHeightDialog(QDialog):
         if display_dialog:
             try:
                 display_dialog.classes_loaded.connect(self.on_classes_changed)
-            except: pass
+            except Exception: pass
     
     def showEvent(self, event):
         """Ensure dialog gets focus when shown"""
         super().showEvent(event)
         self.setFocus()
         self.activateWindow()
+        if hasattr(self, 'selected_fences') and self.selected_fences:
+            self._restore_highlights_from_data()
         print("🔵 ByClassHeightDialog activated and focused")
     
     def focusInEvent(self, event):
@@ -5413,6 +5450,69 @@ class ByClassHeightDialog(QDialog):
         self.info_banner.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.info_banner)
         
+        # ===================== FENCE FILTER SECTION (NEW!) =====================
+        fence_header = QHBoxLayout()
+        fence_label = QLabel("🔷 FENCE FILTER (OPTIONAL)")
+        fence_label.setObjectName("header_label")
+        self.fence_count_badge = QLabel("0")
+        self.fence_count_badge.setStyleSheet("""
+            QLabel {
+                background-color: #9c27b0; color: white; border-radius: 10px;
+                padding: 2px 8px; font-size: 9px; font-weight: bold;
+            }
+        """)
+        self.fence_count_badge.setAlignment(Qt.AlignCenter)
+        fence_header.addWidget(fence_label)
+        fence_header.addStretch()
+        fence_header.addWidget(self.fence_count_badge)
+        layout.addLayout(fence_header)
+        
+        self.fence_filter_enabled = QCheckBox("Enable Fence Filter (classify only inside fence)")
+        self.fence_filter_enabled.toggled.connect(self.on_fence_filter_toggled)
+        layout.addWidget(self.fence_filter_enabled)
+        
+        self.fence_container = QWidget()
+        fence_layout = QVBoxLayout(self.fence_container)
+        fence_layout.setContentsMargins(5, 0, 5, 0)
+        fence_layout.setSpacing(4)
+        
+        fence_btn_row = QHBoxLayout()
+        self.select_fence_btn = QPushButton("📐 Select Fence(s)")
+        self.select_fence_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1976d2; color: white; font-size: 10px;
+                font-weight: bold; padding: 8px; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #1565c0; }
+        """)
+        self.select_fence_btn.clicked.connect(self.select_fence)
+        fence_btn_row.addWidget(self.select_fence_btn, 2)
+        
+        self.clear_fence_btn = QPushButton("🗑️ Clear")
+        self.clear_fence_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #555555; color: white; font-size: 10px;
+                padding: 8px; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #d32f2f; }
+        """)
+        self.clear_fence_btn.clicked.connect(self.clear_fence_selection)
+        fence_btn_row.addWidget(self.clear_fence_btn, 1)
+        fence_layout.addLayout(fence_btn_row)
+        
+        self.fence_status = QLabel("❌ No fence selected")
+        self.fence_status.setStyleSheet("""
+            QLabel {
+                padding: 4px; background-color: #2c2c2c; border-radius: 3px;
+                color: #f44336; font-size: 9px;
+            }
+        """)
+        self.fence_status.setWordWrap(True)
+        fence_layout.addWidget(self.fence_status)
+        
+        layout.addWidget(self.fence_container)
+        self.fence_container.setVisible(False)
+        
         # Step 1: Class selection
         class_label = QLabel("📋 SELECT CLASSES")
         class_label.setObjectName("header_label") # Applies Teal color
@@ -5494,8 +5594,422 @@ class ByClassHeightDialog(QDialog):
         self.preview_label.setWordWrap(True)
         layout.addWidget(self.preview_label)
 
-    # Populate the lists now that UI is ready
- 
+    # ==================== FENCE METHODS ====================
+    
+    def on_fence_filter_toggled(self, checked):
+        """Toggle fence filter UI visibility"""
+        is_checked = bool(checked)
+        self.fence_container.setVisible(is_checked)
+        if is_checked:
+            self.info_banner.setText("📏🔷 Height classification INSIDE FENCE only")
+        else:
+            self.info_banner.setText("📏 Convert points based on height above ground (Class 1)")
+
+    def select_fence(self):
+        """Select fences from digitize manager"""
+        if hasattr(self, '_fence_selection_dialog') and self._fence_selection_dialog is not None:
+            try:
+                self._fence_selection_dialog.close()
+            except RuntimeError:
+                pass
+            self._fence_selection_dialog = None
+        
+        digitize = getattr(self.app, 'digitizer', None)
+        if not digitize:
+            QMessageBox.warning(self, "No Digitize Manager",
+                "Digitize manager not found.\nDraw at least one shape first.")
+            return
+        
+        drawings = getattr(digitize, 'drawings', [])
+        if not drawings:
+            QMessageBox.warning(self, "No Drawings",
+                "No shapes found. Draw a shape using Digitize tools first.")
+            return
+        
+        valid_shapes = [d for d in drawings if d.get('type') in 
+                    ['rectangle', 'circle', 'polygon', 'freehand', 'line',
+                     'smart_line', 'polyline', 'smartline']]
+        if not valid_shapes:
+            QMessageBox.warning(self, "No Shapes Found",
+                "No valid shapes found.\nSupported: rectangle, circle, polygon, freehand, line, polyline")
+            return
+        
+        from PySide6.QtWidgets import (QListWidget, QAbstractItemView, QVBoxLayout,
+                                        QHBoxLayout, QPushButton, QCheckBox, QWidget,
+                                        QLabel as QLabel2, QListWidgetItem)
+        from PySide6.QtCore import QEvent
+        
+        try:
+            dialog = QDialog(self, Qt.Window)
+            self._fence_selection_dialog = dialog
+            dialog.setWindowTitle("Select Fence(s) for Height Classification")
+            dialog.setWindowModality(Qt.NonModal)
+            dialog.resize(400, 500)
+            
+            dlayout = QVBoxLayout(dialog)
+            
+            info_label = QLabel("Select fence(s) to restrict height classification area")
+            info_label.setStyleSheet("color: #9c27b0; font-weight: bold; padding: 8px;")
+            dlayout.addWidget(info_label)
+            
+            permanent_check = QCheckBox("🔄 Permanent Fence Mode")
+            permanent_check.setChecked(True)
+            self.permanent_fence_mode = True
+            permanent_check.setStyleSheet("""
+                QCheckBox { color: #eeeeee; font-size: 11px; padding: 8px; font-weight: bold; }
+                QCheckBox::indicator { width: 18px; height: 18px; }
+                QCheckBox::indicator:unchecked { background-color: #2c2c2c; border: 1px solid #555555; border-radius: 3px; }
+                QCheckBox::indicator:checked { background-color: #9c27b0; border: 1px solid #9c27b0; border-radius: 3px; }
+            """)
+            dlayout.addWidget(permanent_check)
+            
+            fence_list = QListWidget()
+            fence_list.setStyleSheet("""
+                QListWidget { background-color: #1e1e1e; border: 1px solid #3a3a3a; border-radius: 4px; padding: 4px; }
+                QListWidget::item { background: transparent; border: none; padding: 2px; }
+            """)
+            fence_list.setSelectionMode(QAbstractItemView.NoSelection)
+            
+            SHAPE_ICONS = {'rectangle': '▭', 'circle': '○', 'polygon': '⬟', 'polyline': '⬡',
+                           'line': '─', 'smartline': '⚡', 'freehand': '✏️'}
+            
+            custom_widgets = []
+            current_hover_actor = [None]
+            selection_highlight_actors = {}
+            
+            def highlight_fence_in_3d(shape):
+                if current_hover_actor[0]:
+                    try:
+                        if hasattr(self.app, 'digitizer') and hasattr(self.app.digitizer, 'overlay_renderer'):
+                            self.app.digitizer.overlay_renderer.RemoveActor(current_hover_actor[0])
+                        else:
+                            self.app.vtk_widget.renderer.RemoveActor(current_hover_actor[0])
+                        current_hover_actor[0] = None
+                    except Exception: pass
+                if not shape:
+                    try: self.app.vtk_widget.render()
+                    except Exception: pass
+                    return
+                coords = shape.get('coords', [])
+                if not coords: return
+                try:
+                    if hasattr(self.app, 'digitizer'):
+                        ha = self.app.digitizer._make_polyline_actor(coords, color=(1, 1, 0), width=6)
+                    else:
+                        import vtk
+                        pts = vtk.vtkPoints()
+                        for c in coords: pts.InsertNextPoint(c)
+                        ln = vtk.vtkPolyLine()
+                        ln.GetPointIds().SetNumberOfIds(len(coords))
+                        for i in range(len(coords)): ln.GetPointIds().SetId(i, i)
+                        cls = vtk.vtkCellArray(); cls.InsertNextCell(ln)
+                        pd = vtk.vtkPolyData(); pd.SetPoints(pts); pd.SetLines(cls)
+                        mp = vtk.vtkPolyDataMapper(); mp.SetInputData(pd)
+                        ha = vtk.vtkActor(); ha.SetMapper(mp)
+                        ha.GetProperty().SetColor(1, 1, 0); ha.GetProperty().SetLineWidth(6)
+                    if hasattr(self.app, 'digitizer') and hasattr(self.app.digitizer, 'overlay_renderer'):
+                        self.app.digitizer.overlay_renderer.AddActor(ha)
+                    else:
+                        self.app.vtk_widget.renderer.AddActor(ha)
+                    current_hover_actor[0] = ha
+                    self.app.vtk_widget.render()
+                except Exception as e:
+                    print(f"⚠️ Hover highlight failed: {e}")
+            
+            def add_selection_highlight(shp):
+                coords = shp.get('coords', [])
+                if not coords: return
+                try:
+                    if hasattr(self.app, 'digitizer'):
+                        act = self.app.digitizer._make_polyline_actor(coords, color=(0, 0.5, 1), width=5)
+                    else:
+                        import vtk
+                        pts = vtk.vtkPoints()
+                        for c in coords: pts.InsertNextPoint(c)
+                        ln = vtk.vtkPolyLine()
+                        ln.GetPointIds().SetNumberOfIds(len(coords))
+                        for i in range(len(coords)): ln.GetPointIds().SetId(i, i)
+                        cls = vtk.vtkCellArray(); cls.InsertNextCell(ln)
+                        pd = vtk.vtkPolyData(); pd.SetPoints(pts); pd.SetLines(cls)
+                        mp = vtk.vtkPolyDataMapper(); mp.SetInputData(pd)
+                        act = vtk.vtkActor(); act.SetMapper(mp)
+                        act.GetProperty().SetColor(0, 0.5, 1); act.GetProperty().SetLineWidth(5)
+                    self.app.vtk_widget.renderer.AddActor(act)
+                    selection_highlight_actors[id(shp)] = act
+                    self.app.vtk_widget.render()
+                except Exception as e:
+                    print(f"⚠️ Selection highlight failed: {e}")
+
+            def remove_selection_highlight(shp):
+                act = selection_highlight_actors.pop(id(shp), None)
+                if act:
+                    try:
+                        self.app.vtk_widget.renderer.RemoveViewProp(act)
+                        self.app.vtk_widget.render()
+                    except Exception: pass
+            
+            for idx, shape in enumerate(valid_shapes):
+                shape_type = shape.get('type', 'unknown')
+                coords = np.array(shape.get('coords', []))
+                coord_count = len(coords)
+                min_pt = coords.min(axis=0); max_pt = coords.max(axis=0)
+                w = max_pt[0] - min_pt[0]; h = max_pt[1] - min_pt[1]
+                icon = SHAPE_ICONS.get(shape_type, '◆')
+                
+                item_widget = QWidget()
+                item_widget.setStyleSheet("QWidget { background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 6px; padding: 8px; margin: 2px; } QWidget:hover { background-color: #3c3c3c; border: 1px solid #555555; }")
+                item_widget.setMouseTracking(True)
+                il = QHBoxLayout(item_widget); il.setContentsMargins(8, 8, 8, 8)
+                
+                cb = QCheckBox()
+                cb.setStyleSheet("QCheckBox::indicator { width: 18px; height: 18px; border-radius: 3px; border: 1px solid #555555; background-color: #1e1e1e; } QCheckBox::indicator:checked { background-color: #9c27b0; border: 1px solid #9c27b0; }")
+                il.addWidget(cb)
+                
+                tl = QLabel2(f"{icon} #{idx+1}: {shape_type.capitalize()}\n{coord_count} pts | {w:.1f}×{h:.1f}m")
+                tl.setStyleSheet("color: #eeeeee; font-size: 10px; background: transparent;")
+                il.addWidget(tl, 1)
+                
+                sb = QLabel2("Selected")
+                sb.setStyleSheet("QLabel { background-color: #6a1b9a; color: white; font-size: 9px; font-weight: bold; padding: 4px 8px; border-radius: 3px; }")
+                sb.setVisible(False)
+                il.addWidget(sb)
+                
+                li = QListWidgetItem(fence_list)
+                
+                db = QPushButton("🗑️")
+                db.setStyleSheet("QPushButton { background-color: transparent; color: #f44336; font-size: 14px; border: none; padding: 4px; } QPushButton:hover { background-color: #4a1414; border-radius: 4px; }")
+                il.addWidget(db)
+                
+                def make_toggle(badge, widget, shp):
+                    def toggle(checked):
+                        badge.setVisible(checked)
+                        if checked:
+                            widget.setStyleSheet("background-color: #3a2a4a; border: 1px solid #6a1b9a; border-radius: 6px; padding: 8px; margin: 2px;")
+                            add_selection_highlight(shp)
+                        else:
+                            widget.setStyleSheet("QWidget { background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 6px; padding: 8px; margin: 2px; } QWidget:hover { background-color: #3c3c3c; border: 1px solid #555555; }")
+                            remove_selection_highlight(shp)
+                    return toggle
+                cb.toggled.connect(make_toggle(sb, item_widget, shape))
+                
+                def make_click(checkbox, delbtn):
+                    def on_press(event):
+                        if not delbtn.underMouse():
+                            checkbox.setChecked(not checkbox.isChecked())
+                    return on_press
+                item_widget.mousePressEvent = make_click(cb, db)
+                item_widget.setCursor(Qt.PointingHandCursor)
+                
+                def make_del(shp, lst_item, tidx):
+                    def do_del():
+                        remove_selection_highlight(shp)
+                        highlight_fence_in_3d(None)
+                        if hasattr(self.app, 'digitizer'):
+                            self.app.digitizer.clear_coordinate_labels()
+                            self.app.digitizer._remove_drawing(shp)
+                        if shp in self.selected_fences:
+                            self.selected_fences.remove(shp)
+                        for i, cw in enumerate(custom_widgets):
+                            if cw[3] is shp: custom_widgets.pop(i); break
+                        fence_list.takeItem(fence_list.row(lst_item))
+                        update_stats(); self.update_fence_display()
+                        try: self.app.vtk_widget.render()
+                        except Exception: pass
+                    return do_del
+                db.clicked.connect(make_del(shape, li, idx))
+                
+                class HoverFilter(QWidget):
+                    def __init__(self, parent, sd):
+                        super().__init__(parent); self.sd = sd
+                    def eventFilter(self, obj, event):
+                        if event.type() == QEvent.Enter: highlight_fence_in_3d(self.sd)
+                        elif event.type() == QEvent.Leave: highlight_fence_in_3d(None)
+                        return super().eventFilter(obj, event)
+                item_widget.installEventFilter(HoverFilter(item_widget, shape))
+                
+                li.setSizeHint(item_widget.sizeHint())
+                fence_list.setItemWidget(li, item_widget)
+                custom_widgets.append((cb, item_widget, sb, shape))
+            
+            if self.selected_fences:
+                sids = {id(f) for f in self.selected_fences}
+                for cb, _, _, shp in custom_widgets:
+                    if id(shp) in sids: cb.setChecked(True)
+            
+            dlayout.addWidget(fence_list)
+            
+            stats_label = QLabel("Select one or more fences")
+            stats_label.setStyleSheet("color: #aaaaaa; font-size: 9px; padding: 4px;")
+            dlayout.addWidget(stats_label)
+            
+            def update_stats():
+                c = sum(1 for cb, _, _, _ in custom_widgets if cb.isChecked())
+                stats_label.setText(f"✅ {c} fence(s) selected" if c else "⚠️ No fences selected")
+            for cb, _, _, _ in custom_widgets:
+                cb.toggled.connect(update_stats)
+            
+            bl = QHBoxLayout()
+            sa = QPushButton("Select All")
+            sa.setStyleSheet("QPushButton { background-color: #1976d2; color: white; font-size: 10px; padding: 6px 12px; border-radius: 3px; }")
+            sa.clicked.connect(lambda: [cb.setChecked(True) for cb, _, _, _ in custom_widgets])
+            bl.addWidget(sa)
+            
+            ca = QPushButton("Clear All")
+            ca.setStyleSheet("QPushButton { background-color: #555555; color: white; font-size: 10px; padding: 6px 12px; border-radius: 3px; }")
+            def clear_all():
+                for cb, _, _, _ in custom_widgets: cb.setChecked(False)
+                for act in selection_highlight_actors.values():
+                    try: self.app.vtk_widget.renderer.RemoveActor(act)
+                    except Exception: pass
+                selection_highlight_actors.clear()
+                self.selected_fences = []; self._clear_fence_highlights()
+                self.fence_status.setText("❌ No fence selected")
+                self.fence_status.setStyleSheet("QLabel { padding: 4px; background-color: #2c2c2c; border-radius: 3px; color: #f44336; }")
+                self.fence_count_badge.setText("0"); update_stats()
+            ca.clicked.connect(clear_all)
+            bl.addWidget(ca); bl.addStretch()
+            
+            ap = QPushButton("Apply Selection")
+            ap.setStyleSheet("QPushButton { background-color: #2e7d32; color: white; font-size: 10px; font-weight: bold; padding: 6px 16px; border-radius: 3px; }")
+            def apply_sel():
+                highlight_fence_in_3d(None)
+                sel = [shp for cb, _, _, shp in custom_widgets if cb.isChecked()]
+                if not sel:
+                    QMessageBox.warning(dialog, "No Selection", "Select at least one fence")
+                    return
+                self.permanent_fence_mode = permanent_check.isChecked()
+                if not self.permanent_fence_mode: self.selected_fences = []
+                eids = {id(f) for f in self.selected_fences}
+                for s in sel:
+                    if id(s) not in eids:
+                        self.selected_fences.append(s); eids.add(id(s))
+                for s in self.selected_fences:
+                    coords = s.get('coords', [])
+                    if isinstance(coords, list): coords = np.array(coords)
+                    if s['type'] in ['line', 'smart_line', 'polyline', 'smartline']:
+                        if len(coords) > 0 and not np.array_equal(coords[0], coords[-1]):
+                            s['coords'] = np.vstack([coords, coords[0]]) if isinstance(coords, np.ndarray) else coords + [coords[0]]
+                self.update_fence_display()
+                fc = len(self.selected_fences)
+                tp = sum(len(f.get('coords', [])) for f in self.selected_fences)
+                mt = "🔄 PERMANENT" if self.permanent_fence_mode else "TEMP"
+                self.fence_status.setText(f"✅ {fc} fence(s) ({tp} pts) - {mt}")
+                self.fence_status.setStyleSheet("QLabel { padding: 4px; background-color: #1b5e20; border-radius: 3px; color: #4caf50; font-weight: bold; }")
+                try: self.app.vtk_widget.render()
+                except Exception: pass
+                self._fence_selection_dialog = None
+                dialog.close(); dialog.deleteLater()
+            ap.clicked.connect(apply_sel)
+            bl.addWidget(ap)
+            
+            cl = QPushButton("Close")
+            cl.setStyleSheet("QPushButton { background-color: #555555; color: white; font-size: 10px; padding: 6px 16px; border-radius: 3px; }")
+            def on_cl():
+                highlight_fence_in_3d(None)
+                for act in selection_highlight_actors.values():
+                    try: self.app.vtk_widget.renderer.RemoveActor(act)
+                    except Exception: pass
+                selection_highlight_actors.clear()
+                self._fence_selection_dialog = None; dialog.close()
+            cl.clicked.connect(on_cl)
+            bl.addWidget(cl)
+            dlayout.addLayout(bl)
+            dialog.show()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Fence dialog failed:\n{str(e)}")
+
+    def clear_fence_selection(self):
+        self.selected_fences = []
+        self.permanent_fence_mode = False
+        self.fence_status.setText("❌ No fence selected")
+        self.fence_status.setStyleSheet("QLabel { padding: 4px; background-color: #2c2c2c; border-radius: 3px; color: #f44336; }")
+        self._clear_fence_highlights()
+        self.update_fence_display()
+
+    def _clear_fence_highlights(self):
+        if hasattr(self, '_hover_highlight_actor') and self._hover_highlight_actor:
+            try:
+                self.app.vtk_widget.renderer.RemoveViewProp(self._hover_highlight_actor)
+                self._hover_highlight_actor = None
+            except Exception: pass
+        if hasattr(self, '_selection_highlight_actors'):
+            for actor in self._selection_highlight_actors:
+                try: self.app.vtk_widget.renderer.RemoveViewProp(actor)
+                except Exception: pass
+            self._selection_highlight_actors = []
+        if hasattr(self, '_classified_fence_actors'):
+            for actor in self._classified_fence_actors:
+                try: self.app.vtk_widget.renderer.RemoveViewProp(actor)
+                except Exception: pass
+            self._classified_fence_actors = []
+        try: self.app.vtk_widget.render()
+        except Exception: pass
+
+    def update_fence_display(self):
+        self.fence_count_badge.setText(str(len(self.selected_fences)) if self.selected_fences else "0")
+
+    def _restore_highlights_from_data(self):
+        try:
+            if hasattr(self, '_selection_highlight_actors'):
+                for actor in self._selection_highlight_actors:
+                    try: self.app.vtk_widget.renderer.RemoveViewProp(actor)
+                    except Exception: pass
+            self._selection_highlight_actors = []
+            if not self.selected_fences: return
+            for shape in self.selected_fences:
+                coords = shape.get('coords', [])
+                if not coords: continue
+                if hasattr(self.app, 'digitizer'):
+                    ha = self.app.digitizer._make_polyline_actor(coords, color=(0, 0.5, 1), width=5)
+                else:
+                    import vtk
+                    pts = vtk.vtkPoints()
+                    for c in coords: pts.InsertNextPoint(c)
+                    ln = vtk.vtkPolyLine(); ln.GetPointIds().SetNumberOfIds(len(coords))
+                    for i in range(len(coords)): ln.GetPointIds().SetId(i, i)
+                    cls = vtk.vtkCellArray(); cls.InsertNextCell(ln)
+                    pd = vtk.vtkPolyData(); pd.SetPoints(pts); pd.SetLines(cls)
+                    mp = vtk.vtkPolyDataMapper(); mp.SetInputData(pd)
+                    ha = vtk.vtkActor(); ha.SetMapper(mp)
+                    ha.GetProperty().SetColor(0, 0.5, 1); ha.GetProperty().SetLineWidth(5)
+                self.app.vtk_widget.renderer.AddActor(ha)
+                self._selection_highlight_actors.append(ha)
+            self.app.vtk_widget.render()
+        except Exception as e:
+            print(f"⚠️ Restore highlights failed: {e}")
+
+    def _points_inside_polygon(self, points, polygon_coords):
+        from matplotlib.path import Path
+        if isinstance(polygon_coords, list):
+            poly_xy = np.array([(c[0], c[1]) for c in polygon_coords])
+        else:
+            poly_xy = polygon_coords[:, :2]
+        points_xy = points[:, :2]
+        min_x, min_y = np.min(poly_xy, axis=0)
+        max_x, max_y = np.max(poly_xy, axis=0)
+        bbox_mask = (points_xy[:, 0] >= min_x) & (points_xy[:, 0] <= max_x) & \
+                    (points_xy[:, 1] >= min_y) & (points_xy[:, 1] <= max_y)
+        inside = np.zeros(len(points), dtype=bool)
+        if np.any(bbox_mask):
+            poly_path = Path(poly_xy)
+            inside[bbox_mask] = poly_path.contains_points(points_xy[bbox_mask])
+        return inside
+
+    def _highlight_classified_fences(self):
+        if not self.selected_fences: return
+        self._classified_fence_actors = []
+        for fence in self.selected_fences:
+            actor = fence.get('actor')
+            if actor:
+                try:
+                    actor.GetProperty().SetColor(0, 1, 1)
+                    actor.GetProperty().SetLineWidth(4)
+                    fence['classified_fence'] = True
+                    self._classified_fence_actors.append(actor)
+                except Exception: pass
+        try: self.app.vtk_widget.render()
+        except Exception: pass 
     
     def populate_classes(self):
         """Populate class lists from Display Mode"""
@@ -5665,14 +6179,13 @@ class ByClassHeightDialog(QDialog):
             self.max_height_spin.setValue(data['max'])
     
     def analyze_heights(self):
-        """Analyze actual height distribution"""
+        """Analyze actual height distribution — optionally restricted to fence"""
         selected_items = self.from_list.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "No Selection", "Please select at least one From class")
             return
         
         any_selected = any(item.data(Qt.UserRole) is None for item in selected_items)
-        
         if any_selected:
             QMessageBox.warning(self, "Invalid Selection", "Cannot analyze 'Any class' - select specific classes")
             return
@@ -5682,18 +6195,24 @@ class ByClassHeightDialog(QDialog):
         
         classification = self.app.data.get("classification")
         xyz = self.app.data.get("xyz")
-        
         if classification is None or xyz is None:
             return
         
+        # ✅ CHECK FENCE FILTER
+        use_fence = self.fence_filter_enabled.isChecked() and len(self.selected_fences) > 0
+        if self.fence_filter_enabled.isChecked() and not self.selected_fences:
+            QMessageBox.warning(self, "No Fence", 
+                "Fence filter is enabled but no fence selected.\n"
+                "Please select a fence or disable the fence filter.")
+            return
+        
         print(f"\n{'='*60}")
-        print(f"📊 ANALYZING HEIGHT DISTRIBUTION")
+        print(f"📊 ANALYZING HEIGHT DISTRIBUTION {'(FENCE-RESTRICTED)' if use_fence else ''}")
         print(f"{'='*60}")
         
         # Get ground points
         ground_mask = (classification == ground_class)
         ground_count = np.sum(ground_mask)
-        
         if ground_count == 0:
             QMessageBox.warning(self, "No Ground Points", "No Ground (Class 1) points found")
             return
@@ -5701,20 +6220,53 @@ class ByClassHeightDialog(QDialog):
         # Get From class points
         from_class_mask = (classification == from_class)
         from_class_count = np.sum(from_class_mask)
-        
         if from_class_count == 0:
             QMessageBox.warning(self, "No Source Points", f"No points of class {from_class} found")
             return
         
+        # ✅ FENCE FILTER: restrict to points inside fence(s)
+        if use_fence:
+            from_class_xyz_all = xyz[from_class_mask]
+            
+            combined_inside = np.zeros(len(from_class_xyz_all), dtype=bool)
+            for fence in self.selected_fences:
+                fence_coords = fence['coords']
+                if isinstance(fence_coords, list):
+                    fence_coords = np.array(fence_coords)
+                inside = self._points_inside_polygon(from_class_xyz_all, fence_coords)
+                combined_inside |= inside
+            
+            from_class_xyz = from_class_xyz_all[combined_inside]
+            fence_label_text = f" (inside {len(self.selected_fences)} fence(s))"
+            
+            if len(from_class_xyz) == 0:
+                QMessageBox.warning(self, "No Points", 
+                    f"No class {from_class} points found inside fence")
+                return
+            
+            # Also filter ground to fence area for better local reference
+            ground_xyz_all = xyz[ground_mask]
+            ground_inside = np.zeros(len(ground_xyz_all), dtype=bool)
+            for fence in self.selected_fences:
+                fence_coords = fence['coords']
+                if isinstance(fence_coords, list):
+                    fence_coords = np.array(fence_coords)
+                inside = self._points_inside_polygon(ground_xyz_all, fence_coords)
+                ground_inside |= inside
+            
+            ground_xyz = ground_xyz_all[ground_inside] if np.sum(ground_inside) > 0 else ground_xyz_all
+            print(f"   Ground points in fence: {np.sum(ground_inside):,}")
+        else:
+            from_class_xyz = xyz[from_class_mask]
+            ground_xyz = xyz[ground_mask]
+            fence_label_text = ""
+        
         # Build KDTree
-        ground_xyz = xyz[ground_mask]
         ground_xy = ground_xyz[:, :2]
         tree = cKDTree(ground_xy)
         
         # Query From class points
-        from_class_xyz = xyz[from_class_mask]
         from_class_xy = from_class_xyz[:, :2]
-        
         distances, indices = tree.query(from_class_xy, k=1)
         
         # Calculate heights
@@ -5730,32 +6282,27 @@ class ByClassHeightDialog(QDialog):
         # Create height options
         percentiles = [25, 50, 75, 90, 95, 99]
         height_options = []
-        
         for p in percentiles:
             threshold = np.percentile(heights, p)
             count = np.sum((heights >= 0) & (heights <= threshold))
             percentage = (count / len(heights)) * 100
             height_options.append({
-                'percentile': p,
-                'min': 0.0,
-                'max': threshold,
-                'count': count,
-                'percentage': percentage
+                'percentile': p, 'min': 0.0, 'max': threshold,
+                'count': count, 'percentage': percentage
             })
         
+        print(f"   Points analyzed: {len(from_class_xyz):,}{fence_label_text}")
         print(f"   Min: {min_h:.3f}m, Max: {max_h:.3f}m, Mean: {mean_h:.3f}m")
         print(f"{'='*60}\n")
         
         # Populate dropdown
         self.height_combo.clear()
-        
         for opt in height_options:
             label = f"0m - {opt['max']:.2f}m — {opt['percentile']}% coverage ({opt['count']:,} pts)"
             self.height_combo.addItem(label, opt)
         
         self.height_combo.insertSeparator(self.height_combo.count())
         
-        # Add common ranges
         common_ranges = [(0, 0.5), (0, 1.0), (0, 2.0), (0, 5.0), (0, 10.0), (0.2, 2.0), (2.0, 10.0)]
         for min_r, max_r in common_ranges:
             if max_r <= max_h:
@@ -5768,14 +6315,15 @@ class ByClassHeightDialog(QDialog):
             self.height_combo.setCurrentIndex(2)
         
         self.height_info_label.setText(
-            f"✅ Analyzed {from_class_count:,} points | Min: {min_h:.3f}m | Max: {max_h:.3f}m"
+            f"✅ Analyzed {len(from_class_xyz):,} points{fence_label_text} | "
+            f"Min: {min_h:.3f}m | Max: {max_h:.3f}m"
         )
         self.height_info_label.setStyleSheet("color: #4caf50; font-size: 9px; font-weight: bold;")
         
         QMessageBox.information(self, "Height Analysis Complete", 
-                               f"Analyzed {from_class_count:,} points\n"
-                               f"Min: {min_h:.3f}m, Max: {max_h:.3f}m\n"
-                               f"Select a height range from dropdown")
+            f"Analyzed {len(from_class_xyz):,} points{fence_label_text}\n"
+            f"Min: {min_h:.3f}m, Max: {max_h:.3f}m\n"
+            f"Select a height range from dropdown")
         
     def preview_conversion(self):
         """Preview conversion"""
@@ -5870,9 +6418,20 @@ class ByClassHeightDialog(QDialog):
             QMessageBox.warning(self, "Invalid Range", "Min height must be less than Max height")
             return
         
+        # ✅ CHECK FENCE
+        use_fence = self.fence_filter_enabled.isChecked() and len(self.selected_fences) > 0
+        if self.fence_filter_enabled.isChecked() and not self.selected_fences:
+            QMessageBox.warning(self, "No Fence", 
+                "Fence filter is enabled but no fence selected.")
+            return
+        
+        fence_text = ""
+        if use_fence:
+            fence_text = f"\nInside {len(self.selected_fences)} fence(s)"
+        
         msg = (
             f"Convert {from_display} → class {to_class}\n"
-            f"Height: {min_height}m - {max_height}m above Ground?"
+            f"Height: {min_height}m - {max_height}m above Ground?{fence_text}"
         )
         
         reply = QMessageBox.question(self, "Confirm Conversion", msg,
@@ -5912,6 +6471,28 @@ class ByClassHeightDialog(QDialog):
             
             if self.ribbon_parent:
                 self.ribbon_parent.update_status(f"✅ Converted {converted_count:,} points", "success")
+            
+            # ✅ FENCE CLEANUP after successful conversion
+            if use_fence:
+                self._clear_fence_highlights()
+                self._highlight_classified_fences()
+                if not self.permanent_fence_mode:
+                    if hasattr(self.app, 'digitizer'):
+                        for fence in list(self.selected_fences):
+                            for drawing in list(self.app.digitizer.drawings):
+                                fc = fence.get('coords', [])
+                                dc = drawing.get('coords', [])
+                                if len(fc) == len(dc) and all(
+                                    tuple(a) == tuple(b) for a, b in zip(fc, dc)):
+                                    self.app.digitizer._remove_drawing(drawing)
+                                    break
+                    self.selected_fences = []
+                    self.update_fence_display()
+                    self.fence_status.setText("❌ No fence (temp mode - select again)")
+                    self.fence_status.setStyleSheet("""
+                        QLabel { padding: 4px; background-color: #2c2c2c;
+                            border-radius: 3px; color: #f44336; }
+                    """)
             
             QMessageBox.information(self, "Conversion Complete",
                                    f"✅ Successfully converted {converted_count:,} points")
@@ -5955,12 +6536,50 @@ class ByClassHeightDialog(QDialog):
             return 0
         
         # Build KDTree
-        ground_xyz = xyz[ground_mask]
+        # ✅ Get indices for tracking
+        from_class_indices = np.where(from_class_mask)[0]
+        from_class_xyz = xyz[from_class_mask]
+        
+        # ✅ FENCE FILTER: restrict to points inside fence(s)
+        use_fence = self.fence_filter_enabled.isChecked() and len(self.selected_fences) > 0
+        if use_fence:
+            combined_inside = np.zeros(len(from_class_xyz), dtype=bool)
+            for fence in self.selected_fences:
+                fence_coords = fence['coords']
+                if isinstance(fence_coords, list):
+                    fence_coords = np.array(fence_coords)
+                inside = self._points_inside_polygon(from_class_xyz, fence_coords)
+                combined_inside |= inside
+            
+            from_class_xyz = from_class_xyz[combined_inside]
+            from_class_indices = from_class_indices[combined_inside]
+            
+            print(f"   Fence filter: {np.sum(combined_inside):,} of {from_class_count:,} pts inside fence")
+            
+            if len(from_class_xyz) == 0:
+                print("   ⚠️ No points inside fence")
+                if preview:
+                    return 0
+                return 0
+            
+            # Use fence-local ground for better height reference
+            ground_xyz_all = xyz[ground_mask]
+            ground_inside_mask = np.zeros(len(ground_xyz_all), dtype=bool)
+            for fence in self.selected_fences:
+                fence_coords = fence['coords']
+                if isinstance(fence_coords, list):
+                    fence_coords = np.array(fence_coords)
+                inside = self._points_inside_polygon(ground_xyz_all, fence_coords)
+                ground_inside_mask |= inside
+            ground_xyz = ground_xyz_all[ground_inside_mask] if np.sum(ground_inside_mask) > 0 else ground_xyz_all
+        else:
+            ground_xyz = xyz[ground_mask]
+        
+        # Build KDTree
         ground_xy = ground_xyz[:, :2]
         tree = cKDTree(ground_xy)
         
         # Query From class points
-        from_class_xyz = xyz[from_class_mask]
         from_class_xy = from_class_xyz[:, :2]
         
         distances, indices = tree.query(from_class_xy, k=1)
@@ -5970,6 +6589,7 @@ class ByClassHeightDialog(QDialog):
         nearest_ground_z = ground_xyz[indices, 2]
         heights = from_class_z - nearest_ground_z
         
+        # Points within height range
         # Points within height range
         height_mask = (heights >= min_height) & (heights <= max_height)
         in_range_count = np.sum(height_mask)
@@ -5985,9 +6605,9 @@ class ByClassHeightDialog(QDialog):
             return 0
         
         # Build final mask for main dataset
+        # ✅ FIXED: Use from_class_indices (already fence-filtered if applicable)
         final_mask = np.zeros(len(classification), dtype=bool)
-        from_indices = np.where(from_class_mask)[0]
-        convert_indices = from_indices[height_mask]
+        convert_indices = from_class_indices[height_mask]
         final_mask[convert_indices] = True
         
         # Save undo
@@ -6018,7 +6638,9 @@ class ByClassHeightDialog(QDialog):
             self.app.redostack.clear()
         elif hasattr(self.app, 'redo_stack'):
             self.app.redo_stack.clear()
-        
+        from gui.memory_manager import trim_undo_stack
+        trim_undo_stack(self.app)
+
         print(f"   ✅ Converted {in_range_count:,} points")
         print(f"{'='*60}\n")
         
@@ -6043,7 +6665,7 @@ class ByClassHeightDialog(QDialog):
                         for actor in old_actors.values():
                             try:
                                 self.app.vtk_widget.renderer.RemoveActor(actor)
-                            except:
+                            except Exception:
                                 pass
                         old_actors.clear()
                         print("      ✅ Cleared actor cache")
@@ -6286,7 +6908,7 @@ class ByClassHeightDialog(QDialog):
                     if self._force_vtk_color_update():
                         print(f"   ✅ Main view updated (direct VTK with visibility)")
                         update_success = True
-                except:
+                except Exception:
                     pass
         
         # ========================================
@@ -6359,13 +6981,13 @@ class ByClassHeightDialog(QDialog):
         if hasattr(self.app, 'point_count_widget'):
             try:
                 self.app.point_count_widget.schedule_update()
-            except:
+            except Exception:
                 pass
         
         # ✅ Force final render
         try:
             self.app.vtk_widget.render()
-        except:
+        except Exception:
             pass
         
         mode_str = "by-class" if has_by_class_actors else "unified"
@@ -6463,7 +7085,7 @@ class ByClassHeightDialog(QDialog):
                     'parallel_scale': camera.GetParallelScale(),
                     'parallel_projection': camera.GetParallelProjection(),
                 }
-        except:
+        except Exception:
             pass
         return None
 
@@ -6486,7 +7108,7 @@ class ByClassHeightDialog(QDialog):
                 camera.ParallelProjectionOff()
             
             self.app.vtk_widget.renderer.ResetCameraClippingRange()
-        except:
+        except Exception:
             pass
 
 
@@ -6523,9 +7145,9 @@ class ByClassHeightDialog(QDialog):
                                         if input_data:
                                             pts = input_data.GetNumberOfPoints()
                                             print(f"        '{key}': {pts:,} points")
-                                except:
+                                except Exception:
                                     pass
-                except:
+                except Exception:
                     pass
         
         # Check renderer
@@ -6548,7 +7170,7 @@ class ByClassHeightDialog(QDialog):
                             if input_data:
                                 pts = input_data.GetNumberOfPoints()
                                 print(f"      Actor #{i}: {pts:,} points")
-                    except:
+                    except Exception:
                         pass
         
         print("="*60 + "\n")
@@ -6695,7 +7317,7 @@ class ByClassHeightDialog(QDialog):
                                         if pts > point_count:
                                             actor = a
                                             point_count = pts
-                            except:
+                            except Exception:
                                 continue
                 elif actors:
                     return actors
@@ -6719,7 +7341,7 @@ class ByClassHeightDialog(QDialog):
                                         if pts > point_count:
                                             actor = a
                                             point_count = pts
-                        except:
+                        except Exception:
                             continue
         
         return actor
@@ -6788,7 +7410,7 @@ class ByClassHeightDialog(QDialog):
                                                     actor = a
                                                     point_count = pts
                                                     print(f"   ✅ Found actor '{key}' with {pts:,} points")
-                                    except:
+                                    except Exception:
                                         continue
                         
                         # Second try: If no actor found, use ANY actor with points
@@ -6806,7 +7428,7 @@ class ByClassHeightDialog(QDialog):
                                                     actor = a
                                                     point_count = pts
                                                     print(f"   ✅ Found actor '{key}' with {pts:,} points")
-                                    except:
+                                    except Exception:
                                         continue
                     
                     elif actors:  # Single actor, not dict
@@ -6835,7 +7457,7 @@ class ByClassHeightDialog(QDialog):
                                                 actor = a
                                                 point_count = pts
                                                 print(f"   ✅ Found actor #{i} with {pts:,} points")
-                            except:
+                            except Exception:
                                 continue
             
             if not actor:
@@ -7029,7 +7651,7 @@ class ByClassHeightDialog(QDialog):
                     'parallel_scale': camera.GetParallelScale(),
                     'parallel_projection': camera.GetParallelProjection(),
                 }
-        except:
+        except Exception:
             pass
         return None
 
@@ -7052,7 +7674,7 @@ class ByClassHeightDialog(QDialog):
                 camera.ParallelProjectionOff()
             
             self.app.vtk_widget.renderer.ResetCameraClippingRange()
-        except:
+        except Exception:
             pass
 
 
@@ -7215,7 +7837,7 @@ class InsideFenceDialog(QDialog):
             if hasattr(self, '_selection_highlight_actors'):
                 for actor in self._selection_highlight_actors:
                     try: self.app.vtk_widget.renderer.RemoveViewProp(actor)
-                    except: pass
+                    except Exception: pass
             self._selection_highlight_actors = []
 
             if not hasattr(self, 'selected_fences') or not self.selected_fences:
@@ -7778,7 +8400,7 @@ class InsideFenceDialog(QDialog):
                     try:
                         if hasattr(self.app, '_refresh_single_section_view'):
                             self.app._refresh_single_section_view(view_idx)
-                    except:
+                    except Exception:
                         pass
 
             if hasattr(self.app, 'point_count_widget'):
@@ -7809,26 +8431,26 @@ class InsideFenceDialog(QDialog):
             try:
                 self.app.vtk_widget.renderer.RemoveViewProp(self._hover_highlight_actor) # FIXED
                 self._hover_highlight_actor = None
-            except: pass
+            except Exception: pass
         
         # Remove selection highlights (blue)
         if hasattr(self, '_selection_highlight_actors'):
             for actor in self._selection_highlight_actors:
                 try:
                     self.app.vtk_widget.renderer.RemoveViewProp(actor) # FIXED
-                except: pass
+                except Exception: pass
             self._selection_highlight_actors = []
             if hasattr(self, '_classified_fence_actors'):
                 for actor in self._classified_fence_actors:
                     try:
                         self.app.digitizer.overlay_renderer.RemoveActor(actor)
-                    except:
+                    except Exception:
                         pass
                 self._classified_fence_actors = []
         # Render to update view
         try:
             self.app.vtk_widget.render()
-        except:
+        except Exception:
             pass
         
         print("   ✅ Fence highlights cleared")
@@ -7998,13 +8620,13 @@ class InsideFenceDialog(QDialog):
                         else:
                             self.app.vtk_widget.renderer.RemoveActor(current_hover_actor[0])
                         current_hover_actor[0] = None
-                    except:
+                    except Exception:
                         pass
                 
                 if not shape:
                     try:
                         self.app.vtk_widget.render()
-                    except:
+                    except Exception:
                         pass
                     return
                 
@@ -8212,7 +8834,7 @@ class InsideFenceDialog(QDialog):
                         # G. Force VTK hardware flush
                         try:
                             self.app.vtk_widget.render()
-                        except: pass
+                        except Exception: pass
                         
                     return delete_action
                 
@@ -8315,7 +8937,7 @@ class InsideFenceDialog(QDialog):
                 for actor in selection_highlight_actors.values():
                     try:
                         self.app.vtk_widget.renderer.RemoveActor(actor)
-                    except:
+                    except Exception:
                         pass
                 selection_highlight_actors.clear()
                 self.selected_fences = []
@@ -8339,7 +8961,7 @@ class InsideFenceDialog(QDialog):
                     custom_widgets.clear()
                     fence_list.clear()
                     try: self.app.vtk_widget.render()
-                    except: pass
+                    except Exception: pass
                 print("🗑️ Clear All: Removed all fence selections, highlights and drawings")
 
             clear_btn.clicked.connect(clear_all_fences) 
@@ -8440,7 +9062,7 @@ class InsideFenceDialog(QDialog):
                 
                 try:
                     self.app.vtk_widget.render()
-                except:
+                except Exception:
                     pass
                 
                 self._fence_selection_dialog = None  # ← ADD THIS
@@ -8472,7 +9094,7 @@ class InsideFenceDialog(QDialog):
             #     for actor in selection_highlight_actors.values():
             #         try:
             #             self.app.vtk_widget.renderer.RemoveActor(actor)
-            #         except:
+            #         except Exception:
             #             pass
             #     selection_highlight_actors.clear()
             #     dialog.close()
@@ -8483,7 +9105,7 @@ class InsideFenceDialog(QDialog):
                 for actor in selection_highlight_actors.values():
                     try:
                         self.app.vtk_widget.renderer.RemoveActor(actor)
-                    except:
+                    except Exception:
                         pass
                 selection_highlight_actors.clear()
                 self._fence_selection_dialog = None  # ✅ Clear reference
@@ -8625,6 +9247,8 @@ class InsideFenceDialog(QDialog):
         }
         self.app.undo_stack.append(undo_step)
         self.app.redo_stack.clear()
+        from gui.memory_manager import trim_undo_stack
+        trim_undo_stack(self.app)
         self.app._conversion_just_happened = True
         
         print(f"   ✅ Converted {inside_count:,} points to class {to_class}")
@@ -8818,7 +9442,7 @@ class InsideFenceDialog(QDialog):
         # ✅ Force final render
         try:
             self.app.vtk_widget.render()
-        except:
+        except Exception:
             pass
         
         mode_str = "by-class" if has_by_class_actors else "unified"
@@ -8934,7 +9558,7 @@ class InsideFenceDialog(QDialog):
                                                 target_actor = actor
                                                 target_point_count = pts
                                                 print(f"   ✅ Found actor '{key}': {pts:,} points")
-                            except:
+                            except Exception:
                                 pass
             
             if not target_actor:
@@ -9093,7 +9717,7 @@ class InsideFenceDialog(QDialog):
             if hasattr(self, '_hover_highlight_actor') and self._hover_highlight_actor:
                 try:
                     self.app.vtk_widget.renderer.RemoveActor(self._hover_highlight_actor)
-                except:
+                except Exception:
                     pass
             
             # Create temporary yellow highlight
@@ -9160,7 +9784,7 @@ class InsideFenceDialog(QDialog):
                 for actor in self._selection_highlight_actors:
                     try:
                         self.app.vtk_widget.renderer.RemoveActor(actor)
-                    except:
+                    except Exception:
                         pass
             
             self._selection_highlight_actors = []
@@ -9308,7 +9932,7 @@ class InsideFenceDialog(QDialog):
                     try:
                         if hasattr(self.app, '_refresh_single_section_view'):
                             self.app._refresh_single_section_view(view_idx)
-                    except:
+                    except Exception:
                         pass
 
             if hasattr(self.app, 'point_count_widget'):
@@ -9677,7 +10301,7 @@ class InsideFenceDialog(QDialog):
                     shading_vis = getattr(cache, 'visible_classes_set', None)
                     if shading_vis is not None and len(shading_vis) > 0:
                         shading_vis = shading_vis.copy()
-                except:
+                except Exception:
                     pass
                 
                 if shading_vis is None or len(shading_vis) == 0:
@@ -9824,7 +10448,7 @@ class InsideFenceDialog(QDialog):
 
         try:
             self.app.vtk_widget.render()
-        except:
+        except Exception:
             pass
         print(f"✅ Highlighted {len(self._classified_fence_actors)} classified fence(s) in cyan")
 
@@ -10076,8 +10700,9 @@ class AIRibbon(QWidget):
     
     ai_classify_requested = Signal()
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, app=None):
         super().__init__(parent)
+        self.app = app
         self.build_ribbon()
         
     def build_ribbon(self):
@@ -10100,7 +10725,12 @@ class AIRibbon(QWidget):
     def _start_classification(self):
         """Trigger AI classification workflow"""
         try:
-            app = self.parent().parent().parent()
+            app = getattr(self, 'app', None)
+            if app is None:
+                # Fallback if self.app is somehow missing
+                app = getattr(self.parent(), 'app', None)
+            if app is None:
+                app = self.parent().parent().parent()
             
             # Check if LAZ file is loaded
             if not hasattr(app, 'data') or app.data is None:

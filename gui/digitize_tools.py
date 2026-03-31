@@ -2,20 +2,28 @@ from ast import Pass
 import vtk
 import numpy as np
 try:
-    from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+    from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                     QLineEdit, QSpinBox, QFontComboBox, QComboBox,
                                     QCheckBox, QPushButton, QGroupBox, QColorDialog,QRadioButton, QMenu)
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QColor, QCursor
 except ImportError:
     try:
-        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                       QLineEdit, QSpinBox, QFontComboBox, QComboBox,
                                       QCheckBox, QPushButton, QGroupBox, QColorDialog, QMenu)
         from PyQt5.QtCore import Qt
         from PyQt5.QtGui import QColor, QCursor
     except ImportError:
         print("⚠️ Qt library not found - text editing will be limited")
+
+try:
+    from gui.theme_manager import get_dialog_stylesheet, ThemeColors as _TC
+except Exception:
+    def get_dialog_stylesheet(): return ""
+    class _TC:
+        @staticmethod
+        def get(k): return ""
 
 class DigitizeManager:
     """
@@ -186,49 +194,279 @@ class DigitizeManager:
         if self.active_tool in ("smartline", "line"):
             style = self._get_draw_style(self.active_tool)
             color = style['color']
+            width = style['width']
+            line_style = style['style']
             if len(self.temp_points) >= 2:
-                screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                self._update_preview_actor_screen('_continuous_line_actor', screen_pts, color=color, width=3)
+                self._update_continuous_preview(color=color, width=width, line_style=line_style)
             if len(self.temp_points) >= 1:
-                last_screen = self._world_to_display_pt(self.temp_points[-1])
-                self._update_preview_actor_screen('_preview_line_actor',
-                    [last_screen, (mouse_x, mouse_y)], color=color, width=2)
+                self._update_cursor_preview(color=color, width=width, line_style=line_style)
 
         elif self.active_tool == "polyline":
-            color = self._get_draw_style('polyline')['color']
+            style = self._get_draw_style('polyline')
+            color = style['color']
+            width = style['width']
+            line_style = style['style']
             if len(self.temp_points) >= 2:
-                screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                self._update_preview_actor_screen('_continuous_line_actor',
-                    screen_pts, color=color, width=3)
+                self._update_continuous_preview(color=color, width=width, line_style=line_style)
             if len(self.temp_points) >= 1:
-                last_screen = self._world_to_display_pt(self.temp_points[-1])
-                first_screen = self._world_to_display_pt(self.temp_points[0])
-                self._update_preview_actor_screen('_preview_line_actor',
-                    [last_screen, (mouse_x, mouse_y), first_screen], color=color, width=2, line_style='dotted')
+                self._update_cursor_preview(color=color, width=width, line_style='dotted', close_loop=True)
 
         elif self.active_tool == "rectangle" and len(self.temp_points) == 1:
-            color = self._get_draw_style('rectangle')['color']
-            s1 = self._world_to_display_pt(self.temp_points[0])
-            screen_rect = [(s1[0], s1[1]), (mouse_x, s1[1]),
-                        (mouse_x, mouse_y), (s1[0], mouse_y), (s1[0], s1[1])]
-            self._update_preview_actor_screen('_rectangle_preview_actor', screen_rect, color=color, width=2)
+            style = self._get_draw_style('rectangle')
+            self._update_rectangle_preview(color=style['color'], width=style['width'], line_style=style['style'])
 
         elif self.active_tool == "circle" and len(self.temp_points) == 1:
-            pos = self._get_mouse_world_no_snap()
-            center = self.temp_points[0]
-            radius = np.linalg.norm(np.array(pos[:2]) - np.array(center[:2]))
-            self._update_circle_preview_2d(center, radius)
+            style = self._get_draw_style('circle')
+            self._update_circle_preview_world(color=style['color'], width=style['width'], line_style=style['style'])
 
         elif self.active_tool == "freehand" and len(self.temp_points) >= 2:
             fh_style = self._get_draw_style('freehand')
-            screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-            self._update_preview_actor_screen('_preview_actor', screen_pts, color=fh_style['color'], width=2)
+            self._update_freehand_preview_world(
+                color=fh_style['color'],
+                width=fh_style['width'],
+                line_style=fh_style['style'],
+            )
 
         self.app.vtk_widget.render()
 
-    def _update_continuous_line_world(self, attr_name, world_points, color=(0,1,0), width=3):
+    def _update_continuous_preview(self, color, width=3, line_style='solid'):
+        """Keep placed preview vertices in world space so pan/zoom cannot detach them."""
+        if len(self.temp_points) < 2:
+            self._remove_preview_actor_2d('_continuous_line_actor')
+            return
+
+        self._update_continuous_line_world(
+            '_continuous_line_actor',
+            list(self.temp_points),
+            color=color,
+            width=width,
+            line_style=line_style,
+        )
+
+    def _update_cursor_preview(self, color, width=2, line_style='solid', close_loop=False, current_world=None):
+        """Keep the live rubber-band preview in world space during pan/zoom."""
+        if len(self.temp_points) < 1:
+            self._remove_preview_actor_2d('_preview_line_actor')
+            return
+
+        if current_world is None:
+            current_world = self._get_mouse_world()
+        preview_points = [tuple(self.temp_points[-1]), tuple(current_world)]
+        if close_loop and self.temp_points:
+            preview_points.append(tuple(self.temp_points[0]))
+
+        self._update_continuous_line_world(
+            '_preview_line_actor',
+            preview_points,
+            color=color,
+            width=width,
+            line_style=line_style,
+        )
+
+    def _build_rectangle_preview_points(self, p1, p2):
+        """Build rectangle preview coordinates in world space."""
+        x1, y1, z1 = p1
+        x2, y2, z2 = p2
+        return [
+            (x1, y1, z1),
+            (x2, y1, z1),
+            (x2, y2, z2),
+            (x1, y2, z2),
+            (x1, y1, z1),
+        ]
+
+    def _build_circle_preview_points(self, center, edge, n=None):
+        """Build circle preview coordinates in world space."""
+        radius = np.sqrt((edge[0] - center[0]) ** 2 + (edge[1] - center[1]) ** 2)
+        if radius <= 0:
+            return []
+
+        if n is None:
+            n = self._get_circle_segment_count(center, edge)
+
+        thetas = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        coords = [
+            (center[0] + radius * np.cos(t), center[1] + radius * np.sin(t), center[2])
+            for t in thetas
+        ]
+        coords.append(coords[0])
+        return coords
+
+    def _get_circle_segment_count(self, center, edge, min_segments=128, max_segments=1440):
+        """Choose circle resolution from current on-screen size so zoomed previews stay smooth."""
+        try:
+            screen_radius = float(self._world_to_screen_distance(center, edge))
+        except Exception:
+            screen_radius = 0.0
+
+        if screen_radius > 0.0:
+            circumference_px = 2.0 * np.pi * screen_radius
+            segments = int(np.ceil(circumference_px / 2.0))  # about one segment per ~2 px
+        else:
+            world_radius = float(np.sqrt((edge[0] - center[0]) ** 2 + (edge[1] - center[1]) ** 2))
+            segments = 128 if world_radius < 50 else 180
+
+        segments = max(min_segments, min(max_segments, segments))
+        return int(np.ceil(segments / 8.0) * 8)
+
+    def _update_rectangle_preview(self, color, width=2, line_style='solid'):
+        """Keep rectangle preview in world space so it stays aligned while panning."""
+        if len(self.temp_points) != 1:
+            self._remove_preview_actor_2d('_rectangle_preview_actor')
+            return
+
+        world_pos = self._get_mouse_world_no_snap()
+        coords = self._build_rectangle_preview_points(self.temp_points[0], world_pos)
+        self._update_continuous_line_world(
+            '_rectangle_preview_actor',
+            coords,
+            color=color,
+            width=width,
+            line_style=line_style,
+        )
+
+    def _update_circle_preview_world(self, color, width=2, line_style='solid'):
+        """Keep circle preview in world space so it stays aligned while panning."""
+        if len(self.temp_points) != 1:
+            self._remove_preview_actor_2d('_circle_preview_actor')
+            self._remove_preview_actor_2d('_circle_preview_actor_2d')
+            return
+
+        self._remove_preview_actor_2d('_circle_preview_actor_2d')
+        world_pos = self._get_mouse_world_no_snap()
+        coords = self._build_circle_preview_points(self.temp_points[0], world_pos)
+        if coords:
+            self._update_continuous_line_world(
+                '_circle_preview_actor',
+                coords,
+                color=color,
+                width=width,
+                line_style=line_style,
+            )
+            actor = getattr(self, '_circle_preview_actor', None)
+            if actor is not None:
+                try:
+                    actor.GetProperty().RenderLinesAsTubesOn()
+                except Exception:
+                    pass
+        else:
+            self._remove_preview_actor_2d('_circle_preview_actor')
+
+    def _update_freehand_preview_world(self, color, width=2, line_style='solid'):
+        """Keep freehand preview in world space so it stays aligned while panning."""
+        if len(self.temp_points) < 2:
+            self._remove_preview_actor_2d('_preview_actor')
+            self._remove_preview_actor_2d('_freehand_preview_actor_2d')
+            return
+
+        self._update_continuous_line_world(
+            '_preview_actor',
+            list(self.temp_points),
+            color=color,
+            width=width,
+            line_style=line_style,
+        )
+
+    def _get_line_dash_pattern(self, line_style):
+        """Return the visible dash pattern in screen-pixel units."""
+        if line_style == 'dashed':
+            return [(10.0, 6.0)]
+        if line_style == 'dotted':
+            return [(2.0, 6.0)]
+        if line_style == 'dash-dot':
+            return [(10.0, 6.0), (2.0, 6.0)]
+        if line_style == 'dash-dot-dot':
+            return [(10.0, 6.0), (2.0, 4.0), (2.0, 6.0)]
+        return None
+
+    def _build_styled_polydata_world(self, world_points, line_style='solid'):
+        """Build world-space polydata with visible line styles using explicit segments."""
+        poly = vtk.vtkPolyData()
+        pts = vtk.vtkPoints()
+        pts.SetDataTypeToDouble()
+        lines = vtk.vtkCellArray()
+
+        if not world_points or len(world_points) < 2:
+            poly.SetPoints(pts)
+            poly.SetLines(lines)
+            poly.Modified()
+            return poly
+
+        dash_pattern = self._get_line_dash_pattern(line_style)
+        if not dash_pattern:
+            for p in world_points:
+                pts.InsertNextPoint(float(p[0]), float(p[1]), float(p[2]))
+
+            n = pts.GetNumberOfPoints()
+            lines.InsertNextCell(n)
+            for i in range(n):
+                lines.InsertCellPoint(i)
+
+            poly.SetPoints(pts)
+            poly.SetLines(lines)
+            poly.Modified()
+            return poly
+
+        point_idx = 0
+        for seg_idx in range(len(world_points) - 1):
+            p1 = np.array(world_points[seg_idx], dtype=np.float64)
+            p2 = np.array(world_points[seg_idx + 1], dtype=np.float64)
+
+            world_vec = p2 - p1
+            world_len = np.linalg.norm(world_vec)
+            if world_len < 1e-9:
+                continue
+
+            screen_len = float(self._world_to_screen_distance(p1, p2))
+            if screen_len < 1e-6:
+                screen_len = world_len
+
+            direction = world_vec / world_len
+            t_px = 0.0
+            pattern_idx = 0
+
+            while t_px < screen_len:
+                dash_length, gap_length = dash_pattern[pattern_idx]
+                dash_end_px = min(t_px + dash_length, screen_len)
+                if dash_end_px - t_px <= 1e-6:
+                    break
+
+                start_ratio = t_px / screen_len
+                end_ratio = dash_end_px / screen_len
+                dash_start = p1 + direction * (world_len * start_ratio)
+                dash_end = p1 + direction * (world_len * end_ratio)
+
+                pts.InsertNextPoint(float(dash_start[0]), float(dash_start[1]), float(dash_start[2]))
+                start_idx = point_idx
+                point_idx += 1
+
+                pts.InsertNextPoint(float(dash_end[0]), float(dash_end[1]), float(dash_end[2]))
+                end_idx = point_idx
+                point_idx += 1
+
+                lines.InsertNextCell(2)
+                lines.InsertCellPoint(start_idx)
+                lines.InsertCellPoint(end_idx)
+
+                t_px = dash_end_px + gap_length
+                pattern_idx = (pattern_idx + 1) % len(dash_pattern)
+
+        poly.SetPoints(pts)
+        poly.SetLines(lines)
+        poly.Modified()
+        return poly
+
+    def _apply_world_line_style(self, prop, line_style='solid'):
+        """World actors use explicit segmented geometry, so keep the property itself solid."""
+        try:
+            prop.SetLineStippleRepeatFactor(1)
+            prop.SetLineStipplePattern(0xFFFF)
+        except Exception:
+            pass
+
+    def _update_continuous_line_world(self, attr_name, world_points, color=(0,1,0), width=3, line_style='solid'):
         """
-        World-space preview for committed vertices — zooms/pans perfectly with no lag.
+        World-space preview geometry — zooms/pans perfectly with no lag.
         Uses vtkPolyDataMapper (3D) instead of 2D screen-space mapper.
         """
         if not world_points or len(world_points) < 2:
@@ -238,37 +476,35 @@ class DigitizeManager:
                 setattr(self, attr_name, None)
             return
 
-        pts = vtk.vtkPoints()
-        for p in world_points:
-            pts.InsertNextPoint(float(p[0]), float(p[1]), float(p[2]))
-
-        n = pts.GetNumberOfPoints()
-        cell = vtk.vtkCellArray()
-        cell.InsertNextCell(n)
-        for i in range(n):
-            cell.InsertCellPoint(i)
-
-        poly = vtk.vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(cell)
-        poly.Modified()
+        poly = self._build_styled_polydata_world(world_points, line_style=line_style)
 
         actor = getattr(self, attr_name, None)
+        if actor is not None and actor.IsA("vtkActor2D"):
+            self._remove_preview_actor_2d(attr_name)
+            actor = None
+
         if actor is None:
             mapper = vtk.vtkPolyDataMapper()
             mapper.SetInputData(poly)
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetResolveCoincidentTopologyPolygonOffsetParameters(-3, -3)
             actor = vtk.vtkActor()
             actor.SetMapper(mapper)
             actor.GetProperty().SetColor(float(color[0]), float(color[1]), float(color[2]))
             actor.GetProperty().SetLineWidth(float(width))
             actor.GetProperty().SetOpacity(1.0)
-            self.overlay_renderer.AddActor(actor)
+            self._apply_world_line_style(actor.GetProperty(), line_style=line_style)
+            actor.PickableOff()
+            actor.SetVisibility(1)
+            self._add_actor_to_overlay(actor)
             setattr(self, attr_name, actor)
         else:
             actor.GetMapper().SetInputData(poly)
             actor.GetMapper().Modified()
             actor.GetProperty().SetColor(float(color[0]), float(color[1]), float(color[2]))
-            actor.GetProperty().SetLineWidth(float(width))     
+            actor.GetProperty().SetLineWidth(float(width))
+            self._apply_world_line_style(actor.GetProperty(), line_style=line_style)
+            actor.SetVisibility(1)
 
     def _restore_shared_interactor_observers(self):
         """Re-install non-digitizer observers that may be removed during tool switches."""
@@ -361,29 +597,11 @@ class DigitizeManager:
             '_continuous_line_actor',
             '_rectangle_preview_actor',
             '_preview_actor',
+            '_circle_preview_actor_2d',
+            '_circle_preview_actor',
+            '_freehand_preview_actor_2d',
         ):
             self._remove_preview_actor_2d(attr)
-
-        if hasattr(self, '_circle_preview_actor_2d') and self._circle_preview_actor_2d:
-            try:
-                self.renderer.RemoveViewProp(self._circle_preview_actor_2d)
-            except Exception:
-                pass
-            self._circle_preview_actor_2d = None
-
-        if hasattr(self, '_circle_preview_actor') and self._circle_preview_actor:
-            try:
-                self.renderer.RemoveViewProp(self._circle_preview_actor)
-            except Exception:
-                pass
-            self._circle_preview_actor = None
-
-        if hasattr(self, '_freehand_preview_actor_2d') and self._freehand_preview_actor_2d:
-            try:
-                self.renderer.RemoveViewProp(self._freehand_preview_actor_2d)
-            except Exception:
-                pass
-            self._freehand_preview_actor_2d = None
 
     def _show_suspended_preview(self, tool_name, temp_points):
         """Show a world-space placeholder while a draw tool is suspended."""
@@ -434,7 +652,7 @@ class DigitizeManager:
 
         return display_points
     
-    def _update_circle_preview_2d(self, center, radius):
+    def _update_circle_preview_2d(self, center, radius, segments=None):
         """
         Generates a smooth 2D overlay for the circle preview. 
         NO Z-FIGHTING allowed.
@@ -445,7 +663,7 @@ class DigitizeManager:
             self._circle_preview_actor = None
 
         # 2. Generate World Points (Resolution matters)
-        n = 128 # Smooth circle
+        n = segments or 128
         thetas = np.linspace(0, 2 * np.pi, n, endpoint=True)
         # Assume Z is constant at center for the preview ring
         world_coords = [
@@ -781,7 +999,7 @@ class DigitizeManager:
                                are preserved so the user can resume later).
         """
 
-        # ✅ Deactivate cross cursor if no tool selected
+        # Clear the shared canvas tool cursor if no draw tool is selected
         if tool is None and hasattr(self.app, 'set_cross_cursor_active'):
             self.app.set_cross_cursor_active(False, "draw")
 
@@ -964,10 +1182,10 @@ class DigitizeManager:
         if self.active_tool == "text":
             self._start_text_label()
         
-        # ✅ Activate cross cursor AFTER all interactor changes
+        # Activate the shared canvas tool cursor after interactor changes
         if self.active_tool and hasattr(self.app, 'set_cross_cursor_active'):
             self.app.set_cross_cursor_active(True, "draw")
-            print("🎯 Cross cursor activated for drawing")
+            print("Canvas tool cursor activated for drawing")
 
 
         if _resumed and self.active_tool and self.temp_points:
@@ -1102,10 +1320,12 @@ class DigitizeManager:
             else:
                 self.temp_points.append(world_pos)
                 if len(self.temp_points) >= 2:
-                    screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                    # ✅ Use update (no blink) instead of remove+add
                     fh_style = self._get_draw_style('freehand')
-                    self._update_preview_actor_screen('_preview_actor', screen_pts, color=fh_style['color'], width=2)
+                    self._update_freehand_preview_world(
+                        color=fh_style['color'],
+                        width=fh_style['width'],
+                        line_style=fh_style['style'],
+                    )
                 self.app.vtk_widget.render()
                 print("🖊️ Freehand RESUMED")
             self.is_drawing_freehand = True
@@ -1146,8 +1366,17 @@ class DigitizeManager:
 
             # ✅ Use update in-place — no remove+add = no blink on click
             if len(self.temp_points) >= 2:
-                screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                self._update_preview_actor_screen('_continuous_line_actor', screen_pts, color=sl_style['color'], width=3)
+                self._update_continuous_preview(
+                    color=sl_style['color'],
+                    width=sl_style['width'],
+                    line_style=sl_style['style'],
+                )
+                self._update_cursor_preview(
+                    color=sl_style['color'],
+                    width=sl_style['width'],
+                    line_style=sl_style['style'],
+                    current_world=pos,
+                )
                 self.app.vtk_widget.render()
             return
 
@@ -1173,8 +1402,17 @@ class DigitizeManager:
 
             # ✅ Use update in-place
             if len(self.temp_points) >= 2:
-                screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                self._update_preview_actor_screen('_continuous_line_actor', screen_pts, color=ln_style['color'], width=3)
+                self._update_continuous_preview(
+                    color=ln_style['color'],
+                    width=ln_style['width'],
+                    line_style=ln_style['style'],
+                )
+                self._update_cursor_preview(
+                    color=ln_style['color'],
+                    width=ln_style['width'],
+                    line_style=ln_style['style'],
+                    current_world=pos,
+                )
                 self.app.vtk_widget.render()
             return
 
@@ -1221,8 +1459,18 @@ class DigitizeManager:
 
             # ✅ Use update in-place
             if len(self.temp_points) >= 2:
-                screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                self._update_preview_actor_screen('_continuous_line_actor', screen_pts, color=pl_style['color'], width=3)
+                self._update_continuous_preview(
+                    color=pl_style['color'],
+                    width=pl_style['width'],
+                    line_style=pl_style['style'],
+                )
+                self._update_cursor_preview(
+                    color=pl_style['color'],
+                    width=pl_style['width'],
+                    line_style='dotted',
+                    close_loop=True,
+                    current_world=pos,
+                )
                 self.app.vtk_widget.render()
             return
 
@@ -1693,58 +1941,9 @@ class DigitizeManager:
                 self.middle_down = False
                 self._is_panning = False
                 return
-            current_pos = self.interactor.GetEventPosition()
-            dx = current_pos[0] - self._pan_start_pos[0]
-            dy = current_pos[1] - self._pan_start_pos[1]
-            if abs(dx) < 1 and abs(dy) < 1:
-                return
-            camera = self.renderer.GetActiveCamera()
-            focal = camera.GetFocalPoint()
-            cam_pos = camera.GetPosition()
-            renderer = self.renderer
-            renderer.SetWorldPoint(focal[0], focal[1], focal[2], 1.0)
-            renderer.WorldToDisplay()
-            display_focal = renderer.GetDisplayPoint()
-            renderer.SetDisplayPoint(display_focal[0] - dx, display_focal[1] - dy, display_focal[2])
-            renderer.DisplayToWorld()
-            world_focal = renderer.GetWorldPoint()
-            delta_x = world_focal[0] / world_focal[3] - focal[0]
-            delta_y = world_focal[1] / world_focal[3] - focal[1]
-            delta_z = world_focal[2] / world_focal[3] - focal[2]
-            camera.SetFocalPoint(focal[0] + delta_x, focal[1] + delta_y, focal[2] + delta_z)
-            camera.SetPosition(cam_pos[0] + delta_x, cam_pos[1] + delta_y, cam_pos[2] + delta_z)
-            self._pan_start_pos = current_pos
-
-            # ✅ FIX: Reproject preview actors to new screen positions after camera moved
-            if self.temp_points and self.active_tool in ("smartline", "line", "polyline"):
-                mouse_x, mouse_y = current_pos
-
-                if self.active_tool == "smartline":
-                    sl_state = self._get_draw_style('smartline')
-                    color_cont = sl_state['color']
-                    color_rubber = sl_state['color']
-                elif self.active_tool == "line":
-                    ln_state = self._get_draw_style('line')
-                    color_cont = ln_state['color']
-                    color_rubber = ln_state['color']
-                else:  # polyline
-                    pl_state = self._get_draw_style('polyline')
-                    color_cont = pl_state['color']
-                    color_rubber = pl_state['color']
-
-                if len(self.temp_points) >= 2:
-                    screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                    self._update_preview_actor_screen('_continuous_line_actor', screen_pts, color=color_cont, width=3)
-
-                last_screen = self._world_to_display_pt(self.temp_points[-1])
-                if self.active_tool == "polyline":
-                    first_screen = self._world_to_display_pt(self.temp_points[0])
-                    self._update_preview_actor_screen('_preview_line_actor',
-                        [last_screen, (mouse_x, mouse_y), first_screen], color=color_rubber, width=2, line_style='dotted')
-                else:
-                    self._update_preview_actor_screen('_preview_line_actor',
-                        [last_screen, (mouse_x, mouse_y)], color=color_rubber, width=2)
-
+            style = self.interactor.GetInteractorStyle()
+            if style and hasattr(style, "OnMouseMove"):
+                style.OnMouseMove()
             self.app.vtk_widget.render()
             return   ####
 
@@ -1757,11 +1956,11 @@ class DigitizeManager:
             if len(self.temp_points) == 0 or dist_px > 2.0:
                 self.temp_points.append(world_pos)
                 if len(self.temp_points) >= 2:
-                    # ✅ Screen-space freehand, anti-blink
                     fh_style = self._get_draw_style('freehand')
-                    screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                    self._update_preview_actor_screen(
-                        '_preview_actor', screen_pts, color=fh_style['color'], width=2
+                    self._update_freehand_preview_world(
+                        color=fh_style['color'],
+                        width=fh_style['width'],
+                        line_style=fh_style['style'],
                     )
                 self.app.vtk_widget.render()
             return
@@ -1773,17 +1972,16 @@ class DigitizeManager:
 
             # Continuous line through all placed points
             if len(self.temp_points) >= 2:
-                screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                self._update_preview_actor_screen(
-                    '_continuous_line_actor', screen_pts, color=sl_style['color'], width=3
+                self._update_continuous_preview(
+                    color=sl_style['color'],
+                    width=sl_style['width'],
+                    line_style=sl_style['style'],
                 )
 
-            # Rubber-band from last point to cursor
-            last_screen = self._world_to_display_pt(self.temp_points[-1])
-            self._update_preview_actor_screen(
-                '_preview_line_actor',
-                [last_screen, (mouse_x, mouse_y)],
-                color=sl_style['color'], width=2
+            self._update_cursor_preview(
+                color=sl_style['color'],
+                width=sl_style['width'],
+                line_style=sl_style['style'],
             )
             self.app.vtk_widget.render()
             return
@@ -1794,40 +1992,39 @@ class DigitizeManager:
             ln_style = self._get_draw_style('line')
 
             if len(self.temp_points) >= 2:
-                screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                self._update_preview_actor_screen(
-                    '_continuous_line_actor', screen_pts, color=ln_style['color'], width=3
+                self._update_continuous_preview(
+                    color=ln_style['color'],
+                    width=ln_style['width'],
+                    line_style=ln_style['style'],
                 )
 
-            last_screen = self._world_to_display_pt(self.temp_points[-1])
-            self._update_preview_actor_screen(
-                '_preview_line_actor',
-                [last_screen, (mouse_x, mouse_y)],
-                color=ln_style['color'], width=2
+            self._update_cursor_preview(
+                color=ln_style['color'],
+                width=ln_style['width'],
+                line_style=ln_style['style'],
             )
             self.app.vtk_widget.render()
             return
 
         # --- RECTANGLE PREVIEW ---
         if self.active_tool == "rectangle" and len(self.temp_points) == 1:
-            mouse_x, mouse_y = self.interactor.GetEventPosition()
             rc_style = self._get_draw_style('rectangle')
-            s1 = self._world_to_display_pt(self.temp_points[0])
-            x1, y1 = s1
-            x2, y2 = mouse_x, mouse_y
-            screen_rect = [(x1,y1),(x2,y1),(x2,y2),(x1,y2),(x1,y1)]
-            self._update_preview_actor_screen(
-                '_rectangle_preview_actor', screen_rect, color=rc_style['color'], width=2
+            self._update_rectangle_preview(
+                color=rc_style['color'],
+                width=rc_style['width'],
+                line_style=rc_style['style'],
             )
             self.app.vtk_widget.render()
             return
 
         # --- CIRCLE PREVIEW ---
         if self.active_tool == "circle" and len(self.temp_points) == 1:
-            pos = self._get_mouse_world_no_snap()
-            center = self.temp_points[0]
-            radius = np.linalg.norm(np.array(pos[:2]) - np.array(center[:2]))
-            self._update_circle_preview_2d(center, radius)
+            ci_style = self._get_draw_style('circle')
+            self._update_circle_preview_world(
+                color=ci_style['color'],
+                width=ci_style['width'],
+                line_style=ci_style['style'],
+            )
             self.app.vtk_widget.render()
             return
 
@@ -1837,17 +2034,17 @@ class DigitizeManager:
             pl_style = self._get_draw_style('polyline')
 
             if len(self.temp_points) >= 2:
-                screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-                self._update_preview_actor_screen(
-                    '_continuous_line_actor', screen_pts, color=pl_style['color'], width=3
+                self._update_continuous_preview(
+                    color=pl_style['color'],
+                    width=pl_style['width'],
+                    line_style=pl_style['style'],
                 )
 
-            last_screen = self._world_to_display_pt(self.temp_points[-1])
-            first_screen = self._world_to_display_pt(self.temp_points[0])
-            self._update_preview_actor_screen(
-                '_preview_line_actor',
-                [last_screen, (mouse_x, mouse_y), first_screen],
-                color=pl_style['color'], width=2, line_style='dotted'
+            self._update_cursor_preview(
+                color=pl_style['color'],
+                width=pl_style['width'],
+                line_style='dotted',
+                close_loop=True,
             )
             self.app.vtk_widget.render()
             return
@@ -2574,6 +2771,10 @@ class DigitizeManager:
 
         # --- ✅ FIX: Recreate ALL drawings from saved state ---
         for d in state:
+            # ✅ SKIP any 'curve' entries to ensure isolation from curve tool
+            if d.get('type') == 'curve':
+                continue
+                
             coords = d["coords"]
             color = d.get("original_color", (1, 0, 0))
             width = d.get("original_width", 2)
@@ -3133,20 +3334,7 @@ class DigitizeManager:
         if len(points) < 2: return None
 
         # 1. Geometry
-        vtk_points = vtk.vtkPoints()
-        vtk_points.SetDataTypeToDouble() 
-        for p in points: vtk_points.InsertNextPoint(p)
-
-        polyline = vtk.vtkPolyLine()
-        polyline.GetPointIds().SetNumberOfIds(len(points))
-        for i in range(len(points)): polyline.GetPointIds().SetId(i, i)
-
-        cells = vtk.vtkCellArray()
-        cells.InsertNextCell(polyline)
-
-        polydata = vtk.vtkPolyData()
-        polydata.SetPoints(vtk_points)
-        polydata.SetLines(cells)
+        polydata = self._build_styled_polydata_world(points, line_style=line_style)
 
         # 2. 3D Mapper
         mapper = vtk.vtkPolyDataMapper()
@@ -3162,13 +3350,7 @@ class DigitizeManager:
         actor.GetProperty().SetColor(color)
         actor.GetProperty().SetLineWidth(width)
 
-        # Apply line style (dashed / dotted)
-        if line_style == 'dashed':
-            actor.GetProperty().SetLineStipplePattern(0xFF00)
-            actor.GetProperty().SetLineStippleRepeatFactor(1)
-        elif line_style == 'dotted':
-            actor.GetProperty().SetLineStipplePattern(0xAAAA)
-            actor.GetProperty().SetLineStippleRepeatFactor(1)
+        self._apply_world_line_style(actor.GetProperty(), line_style=line_style)
 
         actor._digitize_overlay = True 
         
@@ -3197,11 +3379,28 @@ class DigitizeManager:
             pass
 
     def _remove_preview_actor_2d(self, attr_name):
-        """Safely remove a named 2D preview actor from renderer."""
+        """Safely remove a transient preview actor from any renderer layer."""
         actor = getattr(self, attr_name, None)
         if actor is not None:
             try:
+                actor.VisibilityOff()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, 'overlay_renderer') and self.overlay_renderer:
+                    self.overlay_renderer.RemoveActor(actor)
+            except Exception:
+                pass
+            try:
                 self.renderer.RemoveActor2D(actor)
+            except Exception:
+                pass
+            try:
+                self.renderer.RemoveActor(actor)
+            except Exception:
+                pass
+            try:
+                self.renderer.RemoveViewProp(actor)
             except Exception:
                 pass
             setattr(self, attr_name, None) 
@@ -3510,12 +3709,7 @@ class DigitizeManager:
             print("⚠️ Rectangle needs exactly 2 points")
             return
         
-        if hasattr(self, "_rectangle_preview_actor"):
-            try:
-                self.renderer.RemoveActor(self._rectangle_preview_actor)
-            except:
-                pass
-            self._rectangle_preview_actor = None
+        self._remove_preview_actor_2d('_rectangle_preview_actor')
         
         p1, p2 = self.temp_points
         x1, y1, z1 = p1
@@ -3563,21 +3757,14 @@ class DigitizeManager:
         self._save_state()
         if len(self.temp_points) != 2: return
         
-        # 🛑 REMOVE PREVIEWS
-        if hasattr(self, '_circle_preview_actor_2d') and self._circle_preview_actor_2d:
-            try: self.renderer.RemoveViewProp(self._circle_preview_actor_2d)
-            except: pass
-            self._circle_preview_actor_2d = None
-
-        if hasattr(self, '_circle_preview_actor') and self._circle_preview_actor:
-            try: self.renderer.RemoveViewProp(self._circle_preview_actor)
-            except: pass
-            self._circle_preview_actor = None
+        self._remove_preview_actor_2d('_circle_preview_actor_2d')
+        self._remove_preview_actor_2d('_circle_preview_actor')
         
         center, edge = self.temp_points
         radius = np.sqrt((edge[0]-center[0])**2 + (edge[1]-center[1])**2)
         
-        if n is None: n = 128 if radius < 50 else 180
+        if n is None:
+            n = self._get_circle_segment_count(center, edge)
         
         thetas = np.linspace(0, 2 * np.pi, n, endpoint=False)
         coords = [(center[0] + radius * np.cos(t), center[1] + radius * np.sin(t), center[2]) for t in thetas]
@@ -3633,10 +3820,8 @@ class DigitizeManager:
         """
         self._save_state()
         
-        # 1. Cleanup preview — remove from overlay (not renderer directly)
-        if hasattr(self, "_preview_actor") and self._preview_actor:
-            self._remove_actor_from_overlay(self._preview_actor)
-            self._preview_actor = None
+        self._remove_preview_actor_2d('_preview_actor')
+        self._remove_preview_actor_2d('_freehand_preview_actor_2d')
 
         if len(self.temp_points) < 2:
             self.temp_points = []
@@ -3811,13 +3996,7 @@ class DigitizeManager:
         # ── 2. Remove preview line actors (in self.renderer — they are temp) ────
         for attr in ['_preview_line_actor', '_continuous_line_actor', '_line_start_marker',
                     '_rectangle_preview_actor']:
-            actor = getattr(self, attr, None)
-            if actor:
-                try: self.renderer.RemoveActor(actor)
-                except: pass
-                try: actor.VisibilityOff()
-                except: pass
-                setattr(self, attr, None)
+            self._remove_preview_actor_2d(attr)
 
         # ── 3. Remove circle / freehand preview actors ───────────────────────────
         for attr in ['_circle_preview_actor_2d', '_circle_preview_actor',
@@ -4616,20 +4795,21 @@ class DigitizeManager:
             
         def _deferred_menu():
             menu = QMenu(self.app)
-            menu.setStyleSheet("""
-                QMenu {
-                    background-color: #2c2c2c;
-                    color: #f0f0f0;
-                    border: 1px solid #555;
+            menu.setStyleSheet(f"""
+                QMenu {{
+                    background-color: {_TC.get('bg_secondary')};
+                    color: {_TC.get('text_primary')};
+                    border: 1px solid {_TC.get('border')};
                     padding: 5px;
-                }
-                QMenu::item {
+                }}
+                QMenu::item {{
                     padding: 8px 30px;
                     border-radius: 3px;
-                }
-                QMenu::item:selected {
-                    background-color: #3c3c3c;
-                }
+                }}
+                QMenu::item:selected {{
+                    background-color: {_TC.get('bg_button_hover')};
+                    color: {_TC.get('text_primary')};
+                }}
             """)
             
             edit_action = menu.addAction("✏️ Edit Text")
@@ -5293,35 +5473,15 @@ class DigitizeManager:
             self.interactor.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release, 1.0)
 
         elif tool == "freehand":
-            if hasattr(self, '_freehand_preview_actor_2d') and self._freehand_preview_actor_2d:
-                try:
-                    self.renderer.RemoveActor2D(self._freehand_preview_actor_2d)
-                except Exception:
-                    pass
-                self._freehand_preview_actor_2d = None
-            if hasattr(self, "_preview_actor") and self._preview_actor:
-                try:
-                    self._remove_actor_from_overlay(self._preview_actor)
-                except Exception:
-                    pass
-                self._preview_actor = None
+            self._remove_preview_actor_2d('_freehand_preview_actor_2d')
+            self._remove_preview_actor_2d('_preview_actor')
             self.is_drawing_freehand = False
             self.left_down = False
             self.temp_points = []
 
         elif tool == "circle":
-            if hasattr(self, '_circle_preview_actor_2d') and self._circle_preview_actor_2d:
-                try:
-                    self.renderer.RemoveActor2D(self._circle_preview_actor_2d)
-                except Exception:
-                    pass
-                self._circle_preview_actor_2d = None
-            if hasattr(self, "_circle_preview_actor") and self._circle_preview_actor:
-                try:
-                    self.renderer.RemoveActor(self._circle_preview_actor)
-                except Exception:
-                    pass
-                self._circle_preview_actor = None
+            self._remove_preview_actor_2d('_circle_preview_actor_2d')
+            self._remove_preview_actor_2d('_circle_preview_actor')
             self.temp_points = []
 
         elif tool == "rectangle":
@@ -5407,48 +5567,21 @@ class DigitizeManager:
             self._cancel_smart_line()
 
         elif tool == "freehand":
-            if hasattr(self, '_freehand_preview_actor_2d') and self._freehand_preview_actor_2d:
-                try:
-                    self.renderer.RemoveActor2D(self._freehand_preview_actor_2d)
-                except Exception:
-                    pass
-                self._freehand_preview_actor_2d = None
-
-            if hasattr(self, "_preview_actor") and self._preview_actor:
-                try:
-                    self._remove_actor_from_overlay(self._preview_actor)
-                except Exception:
-                    pass
-                self._preview_actor = None
+            self._remove_preview_actor_2d('_freehand_preview_actor_2d')
+            self._remove_preview_actor_2d('_preview_actor')
                 
             self.is_drawing_freehand = False
             self.left_down = False
             self.temp_points = []
 
         elif tool == "circle":
-            if hasattr(self, '_circle_preview_actor_2d') and self._circle_preview_actor_2d:
-                try:
-                    self.renderer.RemoveActor2D(self._circle_preview_actor_2d)
-                except Exception:
-                    pass
-                self._circle_preview_actor_2d = None
-
-            if hasattr(self, "_circle_preview_actor") and self._circle_preview_actor:
-                try:
-                    self.renderer.RemoveActor(self._circle_preview_actor)
-                except Exception:
-                    pass
-                self._circle_preview_actor = None
+            self._remove_preview_actor_2d('_circle_preview_actor_2d')
+            self._remove_preview_actor_2d('_circle_preview_actor')
             
             self.temp_points = []
 
         else:
-            if hasattr(self, "_preview_line_actor") and self._preview_line_actor:
-                try:
-                    self.renderer.RemoveActor(self._preview_line_actor)
-                except Exception:
-                    pass
-                self._preview_line_actor = None
+            self._remove_preview_actor_2d('_preview_line_actor')
             self.temp_points = []
 
         self._clear_temp_vertex_history()
@@ -5486,31 +5619,12 @@ class DigitizeManager:
         else:
             return
 
-        # ✅ FIX: Convert world points to screen points for 2D preview
-        screen_pts = [self._world_to_display_pt(p) for p in self.temp_points]
-
-        screen_pts_draw = screen_pts
-
-        # ✅ Update the committed-vertices line (screen space, immediate)
-        self._update_preview_actor_screen('_continuous_line_actor', screen_pts_draw, color=color, width=3)
-
-        # ✅ FIX: Also show rubber-band from last vertex to current mouse position
-        mouse_x, mouse_y = self.interactor.GetEventPosition()
-        last_screen = screen_pts[-1]
+        self._update_continuous_preview(color=color, width=s['width'], line_style=s['style'])
 
         if self.active_tool == "polyline":
-            first_screen = screen_pts[0]
-            self._update_preview_actor_screen(
-                '_preview_line_actor',
-                [last_screen, (mouse_x, mouse_y), first_screen],
-                color=color, width=2, line_style='dotted'
-            )
+            self._update_cursor_preview(color=color, width=s['width'], line_style='dotted', close_loop=True)
         else:
-            self._update_preview_actor_screen(
-                '_preview_line_actor',
-                [last_screen, (mouse_x, mouse_y)],
-                color=color, width=2
-            )
+            self._update_cursor_preview(color=color, width=s['width'], line_style=s['style'])
 
         self.app.vtk_widget.render()
             
@@ -5918,59 +6032,8 @@ class LineEditDialog(QDialog):
         self.setWindowTitle("Edit Line Properties")
         self.setModal(True)
         self.resize(350, 200)
-        
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QGroupBox {
-                border: 1px solid #555555;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 10px;
-                color: #ffffff;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-            }
-            QSpinBox {
-                background-color: #3c3c3c;
-                color: #ffffff;
-                border: 1px solid #555555;
-                border-radius: 3px;
-                padding: 5px;
-            }
-            QSpinBox:focus {
-                border: 1px solid #0078d7;
-            }
-            QPushButton {
-                background-color: #0078d7;
-                color: #ffffff;
-                border: none;
-                border-radius: 3px;
-                padding: 8px 20px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #1084d8;
-            }
-            QPushButton:pressed {
-                background-color: #006cc1;
-            }
-            QPushButton#cancel_btn {
-                background-color: #555555;
-            }
-            QPushButton#cancel_btn:hover {
-                background-color: #666666;
-            }
-            QLabel {
-                color: #cccccc;
-            }
-        """)
+        self.setProperty("themeStyledDialog", True)
+        self.setStyleSheet(get_dialog_stylesheet())
         
         layout = QVBoxLayout()
         
@@ -6025,7 +6088,7 @@ class LineEditDialog(QDialog):
         self.color_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: rgb({r}, {g}, {b});
-                border: 2px solid #ffffff;
+                border: 2px solid {_TC.get('border_light')};
                 border-radius: 3px;
             }}
         """)
@@ -6072,68 +6135,14 @@ class LineEditDialog(QDialog):
 class TextEditDialog(QDialog):
     """Custom dialog for editing text labels with font controls and color picker."""
     
-    def __init__(self, current_text="", current_size=40, current_font="Arial", 
+    def __init__(self, current_text="", current_size=40, current_font="Arial",
                  current_bold=False, current_italic=False, current_color=(1, 1, 0), parent=None):
         super().__init__(parent)
         self.setWindowTitle("Edit Text Label")
         self.setModal(True)
         self.resize(400, 320)
-        
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QGroupBox {
-                border: 1px solid #555555;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 10px;
-                color: #ffffff;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-            }
-            QLineEdit, QSpinBox, QComboBox {
-                background-color: #3c3c3c;
-                color: #ffffff;
-                border: 1px solid #555555;
-                border-radius: 3px;
-                padding: 5px;
-            }
-            QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
-                border: 1px solid #0078d7;
-            }
-            QCheckBox {
-                color: #ffffff;
-            }
-            QPushButton {
-                background-color: #0078d7;
-                color: #ffffff;
-                border: none;
-                border-radius: 3px;
-                padding: 8px 20px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #1084d8;
-            }
-            QPushButton:pressed {
-                background-color: #006cc1;
-            }
-            QPushButton#cancel_btn {
-                background-color: #555555;
-            }
-            QPushButton#cancel_btn:hover {
-                background-color: #666666;
-            }
-            QLabel {
-                color: #cccccc;
-            }
-        """)
+        self.setProperty("themeStyledDialog", True)
+        self.setStyleSheet(get_dialog_stylesheet())
         
         layout = QVBoxLayout()
         
@@ -6224,7 +6233,7 @@ class TextEditDialog(QDialog):
         self.color_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: rgb({r}, {g}, {b});
-                border: 2px solid #ffffff;
+                border: 2px solid {_TC.get('border_light')};
                 border-radius: 3px;
             }}
         """)
@@ -6312,50 +6321,8 @@ class LineArrowSettingsDialog(QDialog):
         self.setWindowTitle(f"{tool_name} Arrow Settings")
         self.setModal(True)
         self.resize(350, 180)
-        
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QGroupBox {
-                border: 1px solid #555555;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 10px;
-                color: #ffffff;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-            }
-            QRadioButton {
-                color: #ffffff;
-                padding: 8px;
-            }
-            QPushButton {
-                background-color: #0078d7;
-                color: #ffffff;
-                border: none;
-                border-radius: 3px;
-                padding: 8px 20px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #1084d8;
-            }
-            QPushButton:pressed {
-                background-color: #006cc1;
-            }
-            QPushButton#cancel_btn {
-                background-color: #555555;
-            }
-            QPushButton#cancel_btn:hover {
-                background-color: #666666;
-            }
-        """)
+        self.setProperty("themeStyledDialog", True)
+        self.setStyleSheet(get_dialog_stylesheet())
         
         layout = QVBoxLayout()
         

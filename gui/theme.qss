@@ -1,3 +1,5 @@
+
+
 /* ================================
    NakshaAI Dark Theme - Clean
    No errors, fully Qt-compatible
@@ -98,6 +100,43 @@ QPushButton:checked {
     background-color: #007acc;
     border-color: #0098ff;
     color: #ffffff;
+}
+
+/* Tool Buttons */
+QToolButton {
+    background-color: #333333;
+    border: 1px solid #555555;
+    border-radius: 5px;
+    padding: 5px 10px;
+    color: #dddddd;
+    font-weight: 600;
+}
+QToolButton:hover {
+    background-color: #444444;
+    border-color: #007acc;
+}
+QToolButton:pressed {
+    background-color: #007acc;
+    border-color: #0098ff;
+}
+QToolButton:checked {
+    background-color: #007acc;
+    border-color: #0098ff;
+    color: #ffffff;
+}
+QToolButton::menu-indicator {
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    right: 6px;
+}
+
+/* Frames */
+QFrame {
+    border: none;
+}
+QFrame[frameShape="4"],
+QFrame[frameShape="5"] {
+    border: 1px solid #2a2a2a;
 }
 
 /* Text Inputs */
@@ -359,26 +398,31 @@ QSplitter::handle:vertical {
 /* Menu Buttons (Top Bar) */
 QPushButton#menuButton {
     background-color: transparent;
-    color: #e0e0e0;
+    color: #ffffff;
     border: none;
-    border-radius: 5px;
+    border-radius: 4px;
     outline: none;
-    padding: 4px 8px;
+    padding: 3px 8px;
+    min-width: 0px;
     font-size: 10pt;
     font-weight: 500;
+    text-align: center;
 }
+
 QPushButton#menuButton:hover {
     background-color: #2a2a2a;
-    border: none;
+    color: #ffffff;
 }
+
 QPushButton#menuButton:pressed {
     background-color: #007acc;
     color: #ffffff;
 }
+
 QPushButton#menuButton:checked {
-    background-color: #3a3a3a;
-    color: #ffaa00;
-    font-weight: bold;
+    background-color: #2b3540;
+    color: #ffffff;
+    font-weight: 600;
 }
 
 /* Ribbon Container */
@@ -405,9 +449,24 @@ QPushButton#menuButton:checked {
 /* Ribbon Section Title */
 #ribbonSectionTitle {
     color: #4a4a47;
-    font-size: 7.5pt;
+    font-size: 8.5pt;
     font-weight: 500;
     padding: 0px 0px 3px 0px;
+}
+
+/* Ribbon Button Label (below icon) */
+#ribbonButtonLabel {
+    color: #8a8a87;
+    font-size: 8.6pt;
+    font-weight: 500;
+    padding: 1px 0px 0px 0px;
+    background: transparent;
+    border: none;
+}
+
+/* Ribbon Button Container */
+#ribbonButtonContainer {
+    background: transparent;
 }
 
 /* Ribbon Buttons */
@@ -416,7 +475,7 @@ QPushButton#ribbonButton {
     border: 1px solid #2e2e2b;
     border-radius: 10px;
     color: #d3d1c7;
-    font-size: 8pt;
+    font-size: 9pt;
     outline: none;
     padding: 0px;
 }
@@ -612,8 +671,3 @@ QPushButton#ampResetBtn:pressed {
     background-color: #31312e;
     border: 1px solid #4a4a45;
 }
-
-/* ═══════════════════════════════════════════════════════════════
-   TOP BAR & RIBBON SYSTEM (Dark Mode)
-   ═══════════════════════════════════════════════════════════════ */
-

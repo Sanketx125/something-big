@@ -1,3 +1,4 @@
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QFileDialog, QComboBox, QHeaderView, QMessageBox, QDialog,
@@ -5,12 +6,14 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QTimer
 from PySide6.QtWidgets import QGraphicsOpacityEffect
+from PySide6.QtWidgets import QFrame, QAbstractItemView
 from PySide6.QtCore import Signal, Qt, QSettings,QEvent
 from PySide6.QtGui import QColor
 from torch import layout  #✅ Add QColor
 
  
 from .class_picker import ClassPicker
+from .theme_manager import get_dialog_stylesheet
 
 TOOLS = [
     "AboveLine", "BelowLine", "Rectangle", "Circle",
@@ -617,193 +620,355 @@ class DrawSettingsPicker(QDialog):
             # Update style
             self._style_combos[key].setCurrentText(style.get("style", "solid"))
 
+# ═══════════════════════════════════════════════════════════════════
+# SETTINGS KEY — shared across all methods
+# ═══════════════════════════════════════════════════════════════════
+_COL_WIDTHS_KEY  = "display_preset_picker/column_widths"
+_GEOMETRY_KEY    = "display_preset_picker/geometry"
+_DEFAULT_WIDTHS = [57, 79, 122, 147, 112, 213]
+
+
 class ClassVisibilityPicker(QDialog):
-    """Lightweight dialog to pick visible classes + view target for Display Mode"""
-    
+    """Lightweight dialog — Display/Shading Mode preset configurator"""
+
     settings_changed = Signal(dict)
-    
+
+    # ── QSETTINGS HELPERS (class-level so any method can call them) ─────────
+    @staticmethod
+    def _load_col_widths():
+        s = QSettings("NakshaAI", "LidarApp")
+        raw = s.value(_COL_WIDTHS_KEY, None)
+        if raw and isinstance(raw, list) and len(raw) == 6:
+            try:
+                widths = [int(w) for w in raw]
+                if all(w >= 20 for w in widths):
+                    return widths
+            except (ValueError, TypeError):
+                pass
+        return list(_DEFAULT_WIDTHS)
+
+    @staticmethod
+    def _save_col_widths(widths):
+        QSettings("NakshaAI", "LidarApp").setValue(_COL_WIDTHS_KEY, widths)
+
+    # ───────────────────────────────────────────────────────────────────────
     def __init__(self, app_window, mode="display", parent=None):
         super().__init__(parent)
-        self.app_window = app_window
-        self.mode = mode
-        
-        # ✅ Import all widgets at the start
-        from PySide6.QtWidgets import QGroupBox, QSpinBox, QDoubleSpinBox, QGridLayout, QScrollArea
-        
+        self.app_window  = app_window
+        self.mode        = mode
+        self._col_resize_blocked = False   # guard against recursive saves
+
+        from PySide6.QtWidgets import (
+            QGroupBox, QSpinBox, QDoubleSpinBox, QGridLayout, QScrollArea
+        )
+        self.setProperty("themeStyledDialog", True)
         self.setWindowTitle(f"Configure {mode.title()} Mode Preset")
-        
-        # ✅ Make it non-modal and keep on top of parent
         self.setModal(False)
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        
-        self.resize(600, 650)  # ✅ Increased height for view selector
-        
+
+        # ✅ WindowStaysOnTopHint removed — we manage visibility ourselves
+        self.setWindowFlags(Qt.Window)
+
+        # Restore geometry (size + position) from last session
+        s = QSettings("NakshaAI", "LidarApp")
+        saved_geo = s.value(_GEOMETRY_KEY)
+        if saved_geo:
+            self.restoreGeometry(saved_geo)
+        else:
+            self.resize(820, 620)
+            self.setMinimumSize(720, 500)
+
+        # ── Install app-level event filter to detect tab/window switches ──
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().installEventFilter(self)
+
         layout = QVBoxLayout(self)
-        
-        # ============================================================================
-        # ✅ NEW: VIEW/SLOT SELECTION (ONLY for Display Mode)
-        # ============================================================================
-        # ============================================================================
-        # ✅ SINGLE VIEW SELECTION (ONLY for Display Mode)
-        # ============================================================================
-        if mode == "display":
-            view_group = QGroupBox("🎯 Target View")
-            view_layout = QVBoxLayout()
-            
-            info_label = QLabel("Select ONE view for this shortcut:")
-            info_label.setStyleSheet("color: #cccccc; font-style: italic;")
-            view_layout.addWidget(info_label)
-            
-            self.view_selector = QComboBox()
-            self.view_selector.addItems([
-                "Main View",
-                "View 1",
-                "View 2", 
-                "View 3",
-                "View 4",
-                "Cut Section View"
-            ])
-            self.view_selector.setCurrentIndex(0)
-            self.view_selector.setStyleSheet("""
-                QComboBox {
-                    padding: 6px;
-                    font-size: 13px;
-                    font-weight: 500;
-                }
-            """)
-            self.view_selector.currentIndexChanged.connect(self._on_view_selector_changed)
-            view_layout.addWidget(self.view_selector)
-            view_group.setLayout(view_layout)
-            layout.addWidget(view_group)
-            
-            # ✅ Store SINGLE view configuration
-            self.selected_view_idx = 0  # Default to Main View
-        
-            # ✅ Border control (no sync button)
-            settings_group = QGroupBox("⚙️ Display Settings")
-            settings_layout = QGridLayout()
 
-            settings_layout.addWidget(QLabel("Border %:"), 0, 0)
-            self.border_spin = QDoubleSpinBox()
-            self.border_spin.setRange(0, 100)
-            self.border_spin.setValue(0)
-            self.border_spin.setSingleStep(5.0)
-            self.border_spin.setToolTip("Border percentage for selected view")
-            settings_layout.addWidget(self.border_spin, 0, 1)
-
-            settings_group.setLayout(settings_layout)
-            layout.addWidget(settings_group)
-        # ============================================================================
-        
-        # ✅ Add shading parameters if mode is "shading"
+        # ── shading parameters (shading mode only) ──────────────────────
         if mode == "shading":
             shading_group = QGroupBox("Shading Parameters")
             shading_layout = QGridLayout()
-            
-            # Azimuth
+
             shading_layout.addWidget(QLabel("Azimuth (°):"), 0, 0)
             self.az_spin = QDoubleSpinBox()
-            self.az_spin.setRange(0, 360)
-            self.az_spin.setValue(45.0)
-            self.az_spin.setSingleStep(1.0)
+            self.az_spin.setRange(0, 360); self.az_spin.setValue(45.0)
             shading_layout.addWidget(self.az_spin, 0, 1)
-            
-            # Angle
+
             shading_layout.addWidget(QLabel("Angle (°):"), 1, 0)
             self.angle_spin = QDoubleSpinBox()
-            self.angle_spin.setRange(0, 90)
-            self.angle_spin.setValue(45.0)
-            self.angle_spin.setSingleStep(1.0)
+            self.angle_spin.setRange(0, 90); self.angle_spin.setValue(45.0)
             shading_layout.addWidget(self.angle_spin, 1, 1)
-            
-            # Ambient
+
             shading_layout.addWidget(QLabel("Ambient:"), 2, 0)
             self.ambient_spin = QDoubleSpinBox()
-            self.ambient_spin.setRange(0, 1)
-            self.ambient_spin.setValue(0.1)
-            self.ambient_spin.setSingleStep(0.1)
+            self.ambient_spin.setRange(0, 1); self.ambient_spin.setValue(0.1)
             shading_layout.addWidget(self.ambient_spin, 2, 1)
-            
-            # Quality
+
             shading_layout.addWidget(QLabel("Quality (%):"), 3, 0)
             self.quality_spin = QDoubleSpinBox()
-            self.quality_spin.setRange(0, 100)
-            self.quality_spin.setValue(100.0)
-            self.quality_spin.setSingleStep(10.0)
+            self.quality_spin.setRange(0, 100); self.quality_spin.setValue(100.0)
             shading_layout.addWidget(self.quality_spin, 3, 1)
-            
-            # Speed
+
             shading_layout.addWidget(QLabel("Speed:"), 4, 0)
             self.speed_spin = QSpinBox()
-            self.speed_spin.setRange(1, 10)
-            self.speed_spin.setValue(1)
+            self.speed_spin.setRange(1, 10); self.speed_spin.setValue(1)
             shading_layout.addWidget(self.speed_spin, 4, 1)
-            
+
             shading_group.setLayout(shading_layout)
             layout.addWidget(shading_group)
-        
-        # ✅ Class visibility section
-        class_group = QGroupBox("Class Visibility")
-        class_layout = QVBoxLayout()
-        
-        # Refresh button to reload classes
-        refresh_layout = QHBoxLayout()
-        refresh_layout.addWidget(QLabel("Select which classes to display:"))
-        refresh_layout.addStretch()
-        self.refresh_btn = QPushButton("🔄 Refresh Classes")
-        self.refresh_btn.clicked.connect(self._refresh_classes)
-        refresh_layout.addWidget(self.refresh_btn)
-        class_layout.addLayout(refresh_layout)
-        
-        # Scroll area for class dropdowns
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumHeight(200)
-        
-        scroll_widget = QWidget()
-        self.class_grid = QGridLayout(scroll_widget)
-        self.class_grid.setColumnStretch(1, 1)
-        scroll.setWidget(scroll_widget)
-        
-        class_layout.addWidget(scroll)
-        class_group.setLayout(class_layout)
-        layout.addWidget(class_group, stretch=1)
-        
-        # Quick selection buttons
-        quick_layout = QHBoxLayout()
+
+        # ── class grid (fallback for non-display modes) ──────────────────
+        self.class_checkboxes  = {}
+        self.weight_spinboxes  = {}
+
+        if mode != "display":
+            scroll_widget = QWidget()
+            self.class_grid = QGridLayout(scroll_widget)
+            self.class_grid.setColumnStretch(1, 1)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(scroll_widget)
+            layout.addWidget(scroll, stretch=1)
+
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            self.ok_btn     = QPushButton("OK")
+            self.cancel_btn = QPushButton("Cancel")
+            btn_layout.addWidget(self.ok_btn)
+            btn_layout.addWidget(self.cancel_btn)
+            layout.addLayout(btn_layout)
+
+            self.ok_btn.clicked.connect(self._on_ok_clicked)
+            self.cancel_btn.clicked.connect(self.reject)
+            self._populate_classes()
+        else:
+            # Display mode — full table UI
+            self._rebuild_display_mode_ui(layout)
+
+    # ───────────────────────────────────────────────────────────────
+    # EVENT FILTER — hide when another top-level window is activated
+    # ───────────────────────────────────────────────────────────────
+    def eventFilter(self, obj, event):
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.WindowActivate and self.isVisible():
+            # If the activated window is NOT this dialog and NOT the parent
+            activated = obj
+            is_self   = (activated is self)
+            is_parent = (self.parent() and activated is self.parent())
+            if not is_self and not is_parent:
+                # Only hide if it's a top-level window (tab switch / other app window)
+                if hasattr(activated, 'isWindow') and activated.isWindow():
+                    self.hide()
+        return super().eventFilter(obj, event)
+    
+    def changeEvent(self, event):
+        """Intercept minimize — hide instead of collapsing to ugly mini title-bar."""
+        if event.type() == QEvent.WindowStateChange:
+            if self.windowState() & Qt.WindowMinimized:
+                event.ignore()
+                self.setWindowState(Qt.WindowNoState)
+                self.hide()
+                return
+        super().changeEvent(event)
+
+    def closeEvent(self, event):
+        # Save geometry
+        QSettings("NakshaAI", "LidarApp").setValue(
+            _GEOMETRY_KEY, self.saveGeometry()
+        )
+        # Save column widths one final time
+        self._persist_col_widths()
+        # Remove event filter
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().removeEventFilter(self)
+        super().closeEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.setStyleSheet(get_dialog_stylesheet())
+        # Restore geometry every show so position is correct
+        s = QSettings("NakshaAI", "LidarApp")
+        saved_geo = s.value(_GEOMETRY_KEY)
+        if saved_geo:
+            self.restoreGeometry(saved_geo)
+
+    # ── column-width helpers ─────────────────────────────────────
+    def _on_column_resized(self, logical_index, old_size, new_size):
+        """Debounced save — fires 800ms after the user STOPS dragging."""
+        if self._col_resize_blocked:
+            return
+        # Cancel any pending save and restart the timer
+        if not hasattr(self, '_col_save_timer'):
+            from PySide6.QtCore import QTimer
+            self._col_save_timer = QTimer(self)
+            self._col_save_timer.setSingleShot(True)
+            self._col_save_timer.timeout.connect(self._persist_col_widths)
+        self._col_save_timer.start(800)   # 800 ms debounce — saves once after drag ends
+
+    def _persist_col_widths(self):
+        """Save current column widths to QSettings."""
+        if not hasattr(self, 'class_table') or self.class_table is None:
+            return
+        widths = [self.class_table.columnWidth(c)
+                for c in range(self.class_table.columnCount())]
+        QSettings("NakshaAI", "LidarApp").setValue(_COL_WIDTHS_KEY, widths)
+        print(f"💾 Column widths saved: {widths}")
+
+    # ───────────────────────────────────────────────────────────────────────
+    # MAIN TABLE UI
+    # ───────────────────────────────────────────────────────────────────────
+    def _rebuild_display_mode_ui(self, layout):
+        """Build the Display Mode preset UI.
+        Column widths are loaded from QSettings on every open —
+        user changes are saved instantly and survive restarts.
+        """
+        # ── clear anything the __init__ already added ──────────────────
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            cl = item.layout()
+            if w:
+                w.deleteLater()
+            elif cl:
+                while cl.count():
+                    ci = cl.takeAt(0)
+                    cw = ci.widget()
+                    if cw:
+                        cw.deleteLater()
+
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+
+        # ── intro ──────────────────────────────────────────────────────
+        intro = QLabel(
+            "Save a Display Mode preset: target view, class visibility, weights, and border."
+        )
+        intro.setObjectName("dialogInlineNote")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # ── controls row ───────────────────────────────────────────────
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(10)
+
+        controls_row.addWidget(QLabel("Target View:"))
+        self.view_selector = QComboBox()
+        self.view_selector.setMinimumWidth(130)
+        self.view_selector.addItems([
+            "Main View", "View 1", "View 2",
+            "View 3", "View 4", "Cut Section View"
+        ])
+        self.view_selector.setCurrentIndex(0)
+        self.view_selector.currentIndexChanged.connect(self._on_view_selector_changed)
+        controls_row.addWidget(self.view_selector)
+
+        controls_row.addSpacing(12)
+        controls_row.addWidget(QLabel("Border %:"))
+
+        self.border_spin = QDoubleSpinBox()
+        self.border_spin.setRange(0, 100)
+        self.border_spin.setDecimals(2)
+        self.border_spin.setValue(0)
+        self.border_spin.setSingleStep(5.0)
+        self.border_spin.setFixedWidth(85)
+        controls_row.addWidget(self.border_spin)
+        controls_row.addStretch()
+        layout.addLayout(controls_row)
+
+        table_note = QLabel("Choose which classes this preset should display:")
+        table_note.setObjectName("dialogInlineNote")
+        layout.addWidget(table_note)
+
+        # ── table + buttons ────────────────────────────────────────────
+        table_and_btns = QHBoxLayout()
+        table_and_btns.setSpacing(8)
+
+        self.class_table = QTableWidget(0, 6)
+        self.class_table.setObjectName("displayClassTable")
+        self.class_table.setHorizontalHeaderLabels(
+            ["Show", "Code", "Description", "Lvl", "Color", "Weight"]
+        )
+        self.class_table.setAlternatingRowColors(True)
+        self.class_table.verticalHeader().setVisible(False)
+        self.class_table.verticalHeader().setDefaultSectionSize(34)
+        self.class_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.class_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.class_table.setFocusPolicy(Qt.NoFocus)
+        self.class_table.setWordWrap(False)
+        self.class_table.setShowGrid(False)
+
+        hdr = self.class_table.horizontalHeader()
+        hdr.setDefaultAlignment(Qt.AlignCenter)
+        hdr.setHighlightSections(False)
+        hdr.setStretchLastSection(True)          # last column fills leftover
+
+        # All columns user-resizable
+        for col in range(6):
+            hdr.setSectionResizeMode(col, QHeaderView.Interactive)
+
+        # ✅ RESTORE saved widths — or fall back to defaults
+        widths = self._load_col_widths()
+        self._col_resize_blocked = True          # block save during init
+        for col, w in enumerate(widths):
+            self.class_table.setColumnWidth(col, w)
+        self._col_resize_blocked = False
+        print(f"✅ Column widths restored: {widths}")
+
+        # ✅ SAVE immediately whenever user drags a column edge
+        hdr.sectionResized.connect(self._on_column_resized)
+
+        table_and_btns.addWidget(self.class_table, stretch=1)
+
+        # ── action buttons ─────────────────────────────────────────────
+        action_col = QVBoxLayout()
+        action_col.setContentsMargins(0, 0, 0, 0)
+        action_col.setSpacing(6)
+
+        self.refresh_btn    = QPushButton("Refresh")
         self.select_all_btn = QPushButton("Select All")
-        self.clear_all_btn = QPushButton("Clear All")
-        quick_layout.addWidget(self.select_all_btn)
-        quick_layout.addWidget(self.clear_all_btn)
-        quick_layout.addStretch()
-        layout.addLayout(quick_layout)
-        
-        # OK/Cancel buttons
-        # OK/Apply/Cancel buttons
-        # OK/Cancel buttons (NO APPLY BUTTON)
+        self.clear_all_btn  = QPushButton("Clear All")
+        for btn in (self.refresh_btn, self.select_all_btn, self.clear_all_btn):
+            btn.setObjectName("displayActionButton")
+            btn.setMinimumHeight(30)
+            btn.setFixedWidth(80)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+            btn.setFocusPolicy(Qt.NoFocus)
+            action_col.addWidget(btn)
+        action_col.addStretch()
+        table_and_btns.addLayout(action_col)
+
+        layout.addLayout(table_and_btns, stretch=1)
+
+        # ── OK / Cancel ────────────────────────────────────────────────
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        self.ok_btn = QPushButton("OK")
+        self.ok_btn     = QPushButton("OK")
+        self.ok_btn.setObjectName("primaryBtn")
         self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("secondaryBtn")
+        for btn in (self.ok_btn, self.cancel_btn):
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+            btn.setFocusPolicy(Qt.NoFocus)
         btn_layout.addWidget(self.ok_btn)
         btn_layout.addWidget(self.cancel_btn)
         layout.addLayout(btn_layout)
 
-        # Connections
+        # ── connections ────────────────────────────────────────────────
+        self.refresh_btn.clicked.connect(self._refresh_classes)
         self.select_all_btn.clicked.connect(self._select_all)
         self.clear_all_btn.clicked.connect(self._clear_all)
         self.ok_btn.clicked.connect(self._on_ok_clicked)
         self.cancel_btn.clicked.connect(self.reject)
-                
-        # Store checkbox references
+
+        # ── populate ───────────────────────────────────────────────────
         self.class_checkboxes = {}
-        
-        # Populate classes
+        self.weight_spinboxes = {}
         self._populate_classes()
-    
+
     def showEvent(self, event):
         super().showEvent(event)
-        self.setStyleSheet(DARK_STYLESHEET)
+        self.setStyleSheet(get_dialog_stylesheet())
         
         # ✅ Position next to parent window
         if self.parent():
@@ -859,172 +1024,221 @@ class ClassVisibilityPicker(QDialog):
                 print(f"   ✅ Restored weight for class {code}: {weight}")
         
         print(f"✅ Refreshed {len(self.class_checkboxes)} classes from Display Mode with preserved states")
-    
+        
     def _populate_classes(self):
-        """Load classes from app_window.class_palette and create checkboxes"""
-        # Clear existing
-        for i in reversed(range(self.class_grid.count())):
-            widget = self.class_grid.itemAt(i).widget()
-            if widget:
-                widget.deleteLater()
-        
-        self.class_checkboxes.clear()
-        
-        if not hasattr(self.app_window, 'class_palette'):
-            no_data = QLabel("⚠️ No class data available. Please load a point cloud first.")
-            self.class_grid.addWidget(no_data, 0, 0, 1, 5)
-            return
-        
-        # ✅ Set column stretch for better layout
-        self.class_grid.setColumnStretch(0, 0)   # Checkbox
-        self.class_grid.setColumnStretch(1, 0)   # Color
-        self.class_grid.setColumnStretch(2, 0)   # Code
-        self.class_grid.setColumnStretch(3, 2)   # Description
-        self.class_grid.setColumnStretch(4, 1)   # Weight
-        
-        # Add header row
-        header_row = 0
+        """Load classes — transparent holders for checkbox and weight cells."""
+        if hasattr(self, 'class_table') and self.class_table is not None:
+            self.class_table.setRowCount(0)
+            self.class_checkboxes.clear()
+            self.weight_spinboxes = {}
 
-        checkbox_header = QLabel("")
-        self.class_grid.addWidget(checkbox_header, header_row, 0)
+            if not hasattr(self.app_window, 'class_palette') or not self.app_window.class_palette:
+                return
 
-        color_header = QLabel("█")
-        color_header.setStyleSheet("font-weight: bold; color: #cccccc;")
-        self.class_grid.addWidget(color_header, header_row, 1)
+            current_view_idx = 0
+            has_preset_data  = False
+            preset_data      = {}
 
-        code_header = QLabel("Code")
-        code_header.setStyleSheet("font-weight: bold; color: #cccccc;")
-        self.class_grid.addWidget(code_header, header_row, 2)
-
-        desc_header = QLabel("Description")
-        desc_header.setStyleSheet("font-weight: bold; color: #cccccc;")
-        self.class_grid.addWidget(desc_header, header_row, 3)
-
-        weight_header = QLabel("Weight")
-        weight_header.setStyleSheet("font-weight: bold; color: #cccccc;")
-        self.class_grid.addWidget(weight_header, header_row, 4)
-
-        lvl_header = QLabel("Level")
-        lvl_header.setStyleSheet("font-weight: bold; color: #cccccc;")
-        self.class_grid.addWidget(lvl_header, header_row, 5)
-        
-        row = 1
-        self.weight_spinboxes = {}
-        
-        for code, entry in sorted(self.app_window.class_palette.items()):
-            desc = entry.get("description", f"Class {code}")
-            color = entry.get("color", (128, 128, 128))
-            lvl = entry.get("lvl", "")
-            draw = entry.get("draw", "")
-            
-            # Checkbox
-            # Checkbox
-            checkbox = QCheckBox()
-
-            # ✅ CRITICAL: Check if we have preset data for this view
-            default_checked = True  # Default to checked
-            if self.mode == "display" and hasattr(self, 'view_configs') and hasattr(self, 'view_selector'):
-                current_view_idx = self.view_selector.currentIndex()
-                if current_view_idx in self.view_configs:
-                    if code in self.view_configs[current_view_idx]:
-                        default_checked = self.view_configs[current_view_idx][code].get("show", True)
-                        print(f"   📋 Class {code}: preset visibility = {default_checked}")
-
-            checkbox.setChecked(default_checked)
-            checkbox.setStyleSheet("""
-                QCheckBox::indicator {
-                    width: 20px;
-                    height: 20px;
-                    border-radius: 4px;
-                    border: 2px solid #569cd6;
-                }
-                QCheckBox::indicator:unchecked {
-                    background-color: #2d2d30;
-                    border-color: #666666;
-                }
-                QCheckBox::indicator:checked {
-                    background-color: #0e639c;
-                    border-color: #007acc;
-                }
-            """)
-            self.class_checkboxes[code] = checkbox
-            self.class_grid.addWidget(checkbox, row, 0)
-            
-            # Color
-            color_label = QLabel("█")
-            r, g, b = color
-            color_label.setStyleSheet(f"color: rgb({r}, {g}, {b}); font-size: 20px;")
-            self.class_grid.addWidget(color_label, row, 1)
-            
-            # Code
-            code_label = QLabel(str(code))
-            code_label.setStyleSheet("font-weight: bold; color: #e0e0e0;")
-            self.class_grid.addWidget(code_label, row, 2)
-            
-            # Description
-            desc_label = QLabel(desc)
-            desc_label.setWordWrap(True)
-            desc_label.setStyleSheet("color: #cccccc;")
-            self.class_grid.addWidget(desc_label, row, 3)
-            
-            # ✅ CRITICAL: Weight spinbox with value from view_configs
-            # ✅ Weight spinbox - load from view_configs if available
-            weight_spin = QDoubleSpinBox()
-            weight_spin.setRange(0.1, 10.0)
-            weight_spin.setSingleStep(0.1)
-            weight_spin.setMinimumWidth(70)
-
-            # ✅ CRITICAL: Load weight from view_configs if exists, otherwise use defaults
-            default_weight = 1.0
             if self.mode == "display" and hasattr(self, 'view_selector'):
                 current_view_idx = self.view_selector.currentIndex()
-                
-                # Check if we have saved weight in view_configs
-                if (hasattr(self, 'view_configs') and 
-                    current_view_idx in self.view_configs and 
-                    code in self.view_configs[current_view_idx]):
-                    # Use saved weight from preset
-                    default_weight = self.view_configs[current_view_idx][code].get("weight", 1.0)
-                    print(f"      📋 Loaded weight for class {code}: {default_weight} (from preset)")
-                else:
-                    # Use default weight based on view type
-                    if current_view_idx == 0:
-                        default_weight = 1.0  # Main View
-                    else:
-                        default_weight = 0.5  # Cross-section views
-                    print(f"      🆕 Using default weight for class {code}: {default_weight}")
-            else:
-                default_weight = 1.0  # Fallback
 
+            if (self.mode == "display"
+                    and hasattr(self, 'view_configs')
+                    and current_view_idx in self.view_configs):
+                has_preset_data = True
+                preset_data     = self.view_configs[current_view_idx]
+
+            for code, entry in sorted(self.app_window.class_palette.items()):
+                row = self.class_table.rowCount()
+                self.class_table.insertRow(row)
+
+                # ── Show checkbox ──────────────────────────────────────────
+                default_checked = True
+                if has_preset_data and code in preset_data:
+                    default_checked = preset_data[code].get("show", True)
+
+                checkbox = QCheckBox()
+                checkbox.setChecked(default_checked)
+                checkbox.setFocusPolicy(Qt.NoFocus)
+                checkbox.setCursor(Qt.PointingHandCursor)
+                # ✅ No background on checkbox itself
+                checkbox.setStyleSheet("QCheckBox { background: transparent; }")
+
+                # ✅ Transparent holder widget — kills the black cell background
+                cb_holder = QWidget()
+                cb_holder.setAttribute(Qt.WA_TranslucentBackground, True)
+                cb_holder.setStyleSheet("background: transparent;")
+                cb_layout = QHBoxLayout(cb_holder)
+                cb_layout.setContentsMargins(0, 0, 0, 0)
+                cb_layout.setAlignment(Qt.AlignCenter)
+                cb_layout.addWidget(checkbox)
+                self.class_table.setCellWidget(row, 0, cb_holder)
+                self.class_checkboxes[code] = checkbox
+
+                # ── Code ───────────────────────────────────────────────────
+                code_item = QTableWidgetItem(str(code))
+                code_item.setTextAlignment(Qt.AlignCenter)
+                self.class_table.setItem(row, 1, code_item)
+
+                # ── Description ────────────────────────────────────────────
+                desc_item = QTableWidgetItem(entry.get("description", f"Class {code}"))
+                desc_item.setToolTip(desc_item.text())
+                self.class_table.setItem(row, 2, desc_item)
+
+                # ── Lvl ────────────────────────────────────────────────────
+                lvl_item = QTableWidgetItem(str(entry.get("lvl", "") or "-"))
+                lvl_item.setTextAlignment(Qt.AlignCenter)
+                lvl_item.setToolTip(lvl_item.text())
+                self.class_table.setItem(row, 3, lvl_item)
+
+                # ── Color swatch ───────────────────────────────────────────
+                color = entry.get("color", (128, 128, 128))
+                self._set_class_color_cell(row, color)
+
+                # ── Weight spinbox ─────────────────────────────────────────
+                default_weight = 1.0
+                if has_preset_data and code in preset_data:
+                    default_weight = preset_data[code].get("weight", 1.0)
+
+                weight_spin = QDoubleSpinBox()
+                weight_spin.setRange(0.1, 10.0)
+                weight_spin.setDecimals(2)
+                weight_spin.setSingleStep(0.1)
+                weight_spin.setAlignment(Qt.AlignCenter)
+                weight_spin.setFixedWidth(72)
+                weight_spin.setValue(default_weight)
+                # ✅ No black background on spinbox
+                weight_spin.setStyleSheet(
+                    "QDoubleSpinBox { background: transparent; border: none; }"
+                    "QDoubleSpinBox:focus { border: 1px solid #007acc; border-radius:3px; }"
+                )
+                weight_spin.valueChanged.connect(
+                    lambda val, c=code: self._on_weight_changed(c, val)
+                )
+
+                # ✅ Transparent holder for weight too
+                w_holder = QWidget()
+                w_holder.setAttribute(Qt.WA_TranslucentBackground, True)
+                w_holder.setStyleSheet("background: transparent;")
+                w_layout = QHBoxLayout(w_holder)
+                w_layout.setContentsMargins(0, 0, 0, 0)
+                w_layout.setAlignment(Qt.AlignCenter)
+                w_layout.addWidget(weight_spin)
+                self.class_table.setCellWidget(row, 5, w_holder)
+                self.weight_spinboxes[code] = weight_spin
+
+            if self.mode == "display":
+                if not hasattr(self, 'view_configs'):
+                    self.view_configs = {}
+                self._last_view_idx = (
+                    self.view_selector.currentIndex()
+                    if hasattr(self, 'view_selector') else 0
+                )
+
+            print(f"✅ Populated {len(self.class_checkboxes)} classes"
+                f"{' from preset' if has_preset_data else ' (defaults)'}")
+            return
+
+        # ── fallback grid path (non-display modes) — unchanged ────────────
+        for i in reversed(range(self.class_grid.count())):
+            w = self.class_grid.itemAt(i).widget()
+            if w:
+                w.deleteLater()
+        self.class_checkboxes.clear()
+
+        if not hasattr(self.app_window, 'class_palette'):
+            self.class_grid.addWidget(
+                QLabel("⚠️ No class data. Load a point cloud first."), 0, 0, 1, 5
+            )
+            return
+
+        row = 0
+        self.weight_spinboxes = {}
+        current_view_idx = 0
+        has_preset_data  = False
+        preset_data      = {}
+
+        if self.mode == "display" and hasattr(self, 'view_selector'):
+            current_view_idx = self.view_selector.currentIndex()
+        if (self.mode == "display"
+                and hasattr(self, 'view_configs')
+                and current_view_idx in self.view_configs):
+            has_preset_data = True
+            preset_data     = self.view_configs[current_view_idx]
+
+        for code, entry in sorted(self.app_window.class_palette.items()):
+            desc  = entry.get("description", f"Class {code}")
+            color = entry.get("color", (128, 128, 128))
+            lvl   = entry.get("lvl", "")
+
+            checkbox = QCheckBox()
+            default_checked = True
+            if has_preset_data and code in preset_data:
+                default_checked = preset_data[code].get("show", True)
+            checkbox.setChecked(default_checked)
+            checkbox.setStyleSheet("background: transparent;")
+            self.class_checkboxes[code] = checkbox
+            self.class_grid.addWidget(checkbox, row, 0)
+
+            r, g, b = color
+            color_label = QLabel("█")
+            color_label.setStyleSheet(f"color: rgb({r},{g},{b}); font-size:20px;")
+            self.class_grid.addWidget(color_label, row, 1)
+
+            self.class_grid.addWidget(QLabel(str(code)), row, 2)
+            self.class_grid.addWidget(QLabel(desc), row, 3)
+
+            weight_spin = QDoubleSpinBox()
+            weight_spin.setRange(0.1, 10.0); weight_spin.setSingleStep(0.1)
+            weight_spin.setMinimumWidth(70)
+            default_weight = 1.0
+            if has_preset_data and code in preset_data:
+                default_weight = preset_data[code].get("weight", 1.0)
             weight_spin.setValue(default_weight)
-            weight_spin.valueChanged.connect(lambda val, c=code: self._on_weight_changed(c, val))
+            weight_spin.valueChanged.connect(
+                lambda val, c=code: self._on_weight_changed(c, val))
             self.class_grid.addWidget(weight_spin, row, 4)
-
             self.weight_spinboxes[code] = weight_spin
 
-            # Level
-            lvl_text = str(lvl) if lvl else "-"
-            lvl_label = QLabel(lvl_text)
-            lvl_label.setStyleSheet("color: #999999; font-style: italic; padding: 4px;")
-            lvl_label.setAlignment(Qt.AlignCenter)
-            lvl_label.setMinimumWidth(60)
-            self.class_grid.addWidget(lvl_label, row, 5)
-            
-            self.class_grid.setColumnMinimumWidth(0, 30)
-            self.class_grid.setColumnMinimumWidth(1, 30)
-            self.class_grid.setColumnMinimumWidth(2, 50)
-            self.class_grid.setColumnMinimumWidth(3, 150)
-            self.class_grid.setColumnMinimumWidth(4, 80)
-            self.class_grid.setColumnMinimumWidth(5, 80)
             row += 1
-        
-        print(f"✅ Loaded {len(self.class_checkboxes)} classes with weights from view_configs")
-        
+
+        print(f"✅ Populated {len(self.class_checkboxes)} classes (grid mode)")
+
         if self.mode == "display":
             if not hasattr(self, 'view_configs'):
                 self.view_configs = {}
-            self._last_view_idx = 0
+            self._last_view_idx = (
+                self.view_selector.currentIndex()
+                if hasattr(self, 'view_selector') else 0
+            )
         
+    def _set_class_color_cell(self, row, color):
+        """Color swatch cell — transparent holder, no black background."""
+        if not hasattr(self, 'class_table') or self.class_table is None:
+            return
+
+        qcolor = QColor(*color) if isinstance(color, tuple) else QColor(color)
+        border_color = qcolor.darker(145)
+
+        swatch = QFrame()
+        swatch.setFixedSize(52, 18)
+        swatch.setStyleSheet(
+            f"background-color: rgb({qcolor.red()},{qcolor.green()},{qcolor.blue()});"
+            f"border: 1px solid {border_color.name()};"
+            "border-radius: 5px;"
+        )
+        swatch.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        # ✅ transparent holder — no black fill
+        holder = QWidget()
+        holder.setAttribute(Qt.WA_TranslucentBackground, True)
+        holder.setStyleSheet("background: transparent;")
+        holder_layout = QHBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setAlignment(Qt.AlignCenter)
+        holder_layout.addWidget(swatch)
+        self.class_table.setCellWidget(row, 4, holder)
+
     
     def _select_all(self):
         """Check all class checkboxes"""
@@ -1155,9 +1369,45 @@ class ClassVisibilityPicker(QDialog):
                 
     def _on_weight_changed(self, code, value):
         """Called when user changes weight - persist to app_window"""
-        if code in self.app_window.class_palette:
-            self.app_window.class_palette[code]["weight"] = value
-            print(f"✅ Updated weight for class {code}: {value}")
+        if code not in self.app_window.class_palette:
+            return
+
+        self.app_window.class_palette[code]["weight"] = value
+
+        if not hasattr(self.app_window, 'view_palettes') or self.app_window.view_palettes is None:
+            self.app_window.view_palettes = {}
+        if 0 not in self.app_window.view_palettes:
+            self.app_window.view_palettes[0] = {}
+
+        main_entry = dict(self.app_window.view_palettes[0].get(code, {}))
+        main_entry.update(self.app_window.class_palette[code])
+        main_entry["weight"] = value
+        self.app_window.view_palettes[0][code] = main_entry
+        self.app_window.class_palette[code] = dict(main_entry)
+
+        dlg = getattr(self.app_window, 'display_mode_dialog', None)
+        if dlg and hasattr(dlg, 'view_palettes'):
+            if 0 not in dlg.view_palettes:
+                dlg.view_palettes[0] = {}
+            dlg.view_palettes[0][code] = dict(main_entry)
+
+        if not hasattr(self.app_window, '_slot_weights_applied'):
+            self.app_window._slot_weights_applied = set()
+        self.app_window._slot_weights_applied.add(0)
+
+        print(f"✅ Updated weight for class {code}: {value}")
+        
+        try:
+            from gui.unified_actor_manager import fast_palette_refresh
+            from gui.class_display import update_class_mode
+
+            border = float(getattr(self.app_window, 'point_border_percent', 0.0) or 0.0)
+            refreshed = fast_palette_refresh(self.app_window, self.app_window.class_palette, border)
+            if not refreshed and getattr(self.app_window, 'display_mode', 'class') == 'class':
+                print("⚠️ Main View fast weight refresh unavailable - forcing rebuild")
+                update_class_mode(self.app_window, force_refresh=True)
+        except Exception as e:
+            print(f"⚠️ GPU Weight Poke failed: {e}")
 
     def _sync_from_display_mode(self):
         """Sync border and weights from current Display Mode state"""
@@ -1180,10 +1430,6 @@ class ClassVisibilityPicker(QDialog):
             print(f"✅ Synced border: {self.app_window.display_border_percent}%")
         else:
             print("⚠️ No display_border_percent found in app_window")
-          
-                
-                
-
         
     def get_all_view_configs(self):
         """Return configuration for SINGLE selected view"""
@@ -1260,25 +1506,77 @@ class ClassVisibilityPicker(QDialog):
         self.accept()
         
     def _on_view_selector_changed(self, new_index):
-        """When user changes view selection, update all weights"""
-        print(f"\n📍 View selector changed to index {new_index}")
-        
-        # Repopulate classes with correct weights for new view
-        self._populate_classes()
-        
-        # Determine correct weight for this view
-        if new_index == 0:
-            weight = 1.0
-            view_name = "Main View"
-        else:
-            weight = 0.5
-            view_name = ["View 1", "View 2", "View 3", "View 4", "Cut Section View"][new_index - 1]
-        
-        print(f"   ✅ Repopulated classes for {view_name} with weight={weight}")
-            
-        
+        """When user changes view selection, load state for that view.
 
-               
+        ✅ FIX: Each shortcut has INDEPENDENT state per view.
+        If we already have cached config (from the table cell / user edits),
+        use it AS-IS.  Do NOT overlay live Display Mode dialog state.
+        Only seed from live state when there is NO cached config at all.
+        """
+        print(f"\n📍 View selector changed to index {new_index}")
+
+        # ── Save current view's state before switching ──
+        if hasattr(self, '_last_view_idx') and hasattr(self, 'view_configs'):
+            old_idx = self._last_view_idx
+            config = {}
+            for code, checkbox in self.class_checkboxes.items():
+                if code in self.app_window.class_palette:
+                    entry = self.app_window.class_palette[code]
+                    weight = 1.0
+                    if hasattr(self, 'weight_spinboxes') and code in self.weight_spinboxes:
+                        weight = self.weight_spinboxes[code].value()
+                    config[code] = {
+                        "show": checkbox.isChecked(),
+                        "weight": weight,
+                        "description": entry.get("description", ""),
+                        "color": entry.get("color", (128, 128, 128)),
+                        "draw": entry.get("draw", ""),
+                        "lvl": entry.get("lvl", ""),
+                    }
+            self.view_configs[old_idx] = config
+            print(f"   💾 Saved state for view {old_idx}")
+
+        self._last_view_idx = new_index
+
+        if not hasattr(self, 'view_configs'):
+            self.view_configs = {}
+
+        if new_index in self.view_configs:
+            # ✅ FIX: Use cached config AS-IS — fully independent per shortcut.
+            #    Do NOT overlay live Display Mode weights or visibility.
+            print(f"   ✅ Using cached config for view {new_index} (independent state, no live overlay)")
+        else:
+            # No cached config — seed from live state (first time visiting this view)
+            parent_sm = self.parent()
+            live_classes = None
+            live_border = 0
+            if parent_sm and hasattr(parent_sm, '_get_live_display_state_for_view'):
+                live_classes, live_border = parent_sm._get_live_display_state_for_view(new_index)
+
+            if live_classes:
+                self.view_configs[new_index] = live_classes
+                if hasattr(self, 'border_spin'):
+                    self.border_spin.setValue(live_border)
+                print(f"   ✅ Seeded from live Display Mode state for view {new_index}")
+            else:
+                print(f"   ℹ️ No live state for view {new_index}, using defaults")
+
+        # Repopulate classes with correct data
+        self._populate_classes()
+
+        # Apply checkbox and weight states from view_configs
+        if new_index in self.view_configs:
+            for code, checkbox in self.class_checkboxes.items():
+                if code in self.view_configs[new_index]:
+                    checkbox.setChecked(self.view_configs[new_index][code].get("show", True))
+            if hasattr(self, 'weight_spinboxes'):
+                for code, spin in self.weight_spinboxes.items():
+                    if code in self.view_configs[new_index]:
+                        spin.setValue(self.view_configs[new_index][code].get("weight", 1.0))
+
+        view_name = ["Main View", "View 1", "View 2", "View 3", "View 4",
+                    "Cut Section View"][new_index] if new_index < 6 else f"View {new_index}"
+        print(f"   ✅ Repopulated classes for {view_name}")   
 
 class ShortcutManager(QWidget):
     applied = Signal(dict)
@@ -1300,6 +1598,7 @@ class ShortcutManager(QWidget):
  
         # Initialize with correct parent
         super().__init__(target_parent)
+        self.setProperty("themeStyledDialog", True)
        
         self.setWindowTitle("Configure Shortcuts")
        
@@ -1309,23 +1608,40 @@ class ShortcutManager(QWidget):
         # Because target_parent is set, it will automatically minimize when the main app minimizes.
         self.setWindowFlags(Qt.Window)
        
-        self.resize(900, 500)
+        self.resize(980, 560)
  
         self.app_window = app_window
+        self.app_window.shortcut_manager = self  # ✅ ADD THIS LINE
+
         self.current_mnu_path = None
         self.settings = QSettings("NakshaAI", "LidarApp")
        
-        self.setStyleSheet(DARK_STYLESHEET)
+        self.setStyleSheet(get_dialog_stylesheet())
  
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        intro = QLabel(
+            "Configure shortcut keys and attach saved Display Mode, Shading Mode, Draw Settings, or class presets."
+        )
+        intro.setObjectName("dialogInlineNote")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
  
         # Table - now expands to fill space
         self.table = QTableWidget(0, 4)
+        self.table.setObjectName("displayClassTable")
         self.table.setHorizontalHeaderLabels(["Modifier", "Key", "Tool", "Classes"])
         self.table.setAlternatingRowColors(True)
-        self.table.setShowGrid(True)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        self.table.horizontalHeader().setHighlightSections(False)
         # Add bottom padding inside the scrollable table area
         self.table.setStyleSheet("""
             QTableWidget {
@@ -1356,19 +1672,25 @@ class ShortcutManager(QWidget):
  
         # Buttons
         btns = QHBoxLayout()
-        self.add_btn = QPushButton("+")
-        self.add_btn.setObjectName("add_btn")
-        self.del_btn = QPushButton("-")
-        self.del_btn.setObjectName("del_btn")
+        self.add_btn = QPushButton("Add")
+        self.add_btn.setObjectName("displayActionButton")
+        self.del_btn = QPushButton("Delete")
+        self.del_btn.setObjectName("displayActionButton")
         self.load_btn = QPushButton("Load")
+        self.load_btn.setObjectName("displayActionButton")
         self.save_btn = QPushButton("Save As...")
-        self.save_btn.setObjectName("save_btn")
+        self.save_btn.setObjectName("displayActionButton")
         self.apply_btn = QPushButton("Apply")
-        self.apply_btn.setObjectName("apply_btn")
+        self.apply_btn.setObjectName("primaryBtn")
         self.cancel_btn = QPushButton("Close")
+        self.cancel_btn.setObjectName("secondaryBtn")
         self.cancel_btn.clicked.connect(self.close)
-       
+        
         for b in [self.add_btn, self.del_btn, self.load_btn, self.save_btn, self.apply_btn, self.cancel_btn]:
+            b.setMinimumHeight(36)
+            b.setAutoDefault(False)
+            b.setDefault(False)
+            b.setFocusPolicy(Qt.NoFocus)
             btns.addWidget(b)
         layout.addLayout(btns)
  
@@ -1481,70 +1803,62 @@ class ShortcutManager(QWidget):
         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
         self.table.setItem(row, 3, item)
 
-    #Added by bala
+    
     @staticmethod
     def apply_shortcuts_from_settings(app_window):
         """
-        ✅ NEW: Apply shortcuts from QSettings without opening dialog
-        Called by Ctrl+Shift+S shortcut
-        
-        This is like Ctrl+Shift+D for Display Mode - applies saved settings instantly!
+        ✅ FIXED: Ctrl+Shift+S — reload shortcut DEFINITIONS only.
+        NEVER touch view_palettes or class_palette.
+        Those are only mutated when the user actually presses the shortcut key.
         """
         print(f"\n{'='*60}")
-        print(f"⚡ APPLYING SHORTCUTS FROM SETTINGS (Ctrl+Shift+S)")
+        print(f"⚡ RELOADING SHORTCUTS FROM SETTINGS (Ctrl+Shift+S)")
         print(f"{'='*60}")
-        
+
         try:
-            # Read from QSettings (same as auto_load_shortcuts)
             settings = QSettings("NakshaAI", "LidarApp")
             shortcuts_data = settings.value("shortcuts", None)
-            
+
             if shortcuts_data is None:
                 print("   ⚠️ No saved shortcuts found in QSettings")
                 if hasattr(app_window, 'statusBar'):
                     app_window.statusBar().showMessage(
-                        "⚠️ No shortcuts configured - Open Shortcut Manager first",
+                        "⚠️ No shortcuts configured — open Shortcut Manager first",
                         3000
                     )
-                print(f"{'='*60}\n")
                 return
-            
-            # Parse saved shortcuts
+
             if isinstance(shortcuts_data, str):
                 shortcuts_list = json.loads(shortcuts_data)
             else:
                 shortcuts_list = shortcuts_data
-            
+
             print(f"   📋 Found {len(shortcuts_list)} shortcuts in storage")
-            
-            # Build shortcuts dictionary (same logic as on_apply)
+
             shortcuts = {}
             simple_tools = (
                 "CrossSectionRect", "CutSectionRect", "CutFromCross", "CutFromCut",
                 "TopView", "Depth", "RGB", "Intensity", "Elevation", "Class"
             )
-            
+
             for entry in shortcuts_list:
-                modifier = entry.get("modifier", "alt")
-                key = entry.get("key", "F1")
-                tool = entry.get("tool", "AboveLine")
-                
-                # Build shortcut key tuple
-                mod = modifier.lower()
+                modifier  = entry.get("modifier", "alt")
+                key       = entry.get("key", "F1")
+                tool      = entry.get("tool", "AboveLine")
+                mod       = modifier.lower()
                 key_upper = key.upper()
-                
-                # Handle DisplayMode presets
+
                 if tool == "DisplayMode":
                     preset_payload = entry.get("display_preset")
                     if preset_payload:
+                        # ✅ Store definition ONLY — no view_palettes mutation
                         shortcuts[(mod, key_upper)] = {
                             "tool": "DisplayMode",
                             "preset": preset_payload
                         }
-                        print(f"      ✅ {mod}+{key_upper} → DisplayMode preset")
+                        print(f"      ✅ {mod}+{key_upper} → DisplayMode [stored only]")
                     continue
-                
-                # Handle ShadingMode presets
+
                 if tool == "ShadingMode":
                     preset_payload = entry.get("shading_preset")
                     if preset_payload:
@@ -1552,10 +1866,9 @@ class ShortcutManager(QWidget):
                             "tool": "ShadingMode",
                             "preset": preset_payload
                         }
-                        print(f"      ✅ {mod}+{key_upper} → ShadingMode preset")
+                        print(f"      ✅ {mod}+{key_upper} → ShadingMode [stored only]")
                     continue
-                
-                # Handle DrawSettings presets
+
                 if tool == "DrawSettings":
                     preset_payload = entry.get("draw_preset")
                     if preset_payload:
@@ -1563,140 +1876,40 @@ class ShortcutManager(QWidget):
                             "tool": "DrawSettings",
                             "preset": preset_payload
                         }
-                        print(f"      ✅ {mod}+{key_upper} → DrawSettings preset")
+                        print(f"      ✅ {mod}+{key_upper} → DrawSettings [stored only]")
                     continue
 
-                # Handle simple tools
                 if tool in simple_tools:
                     shortcuts[(mod, key_upper)] = {
-                        "tool": tool,
-                        "from": None,
-                        "to": None
+                        "tool": tool, "from": None, "to": None
                     }
                     print(f"      ✅ {mod}+{key_upper} → {tool}")
                 else:
-                    # Tools with class mapping
                     from_cls = entry.get("from_classes")
-                    to_cls = entry.get("to_class")
-                    
+                    to_cls   = entry.get("to_class")
                     shortcuts[(mod, key_upper)] = {
-                        "tool": tool,
-                        "from": from_cls,
-                        "to": to_cls
+                        "tool": tool, "from": from_cls, "to": to_cls
                     }
                     print(f"      ✅ {mod}+{key_upper} → {tool} [{from_cls} → {to_cls}]")
-            
-            # Apply to app_window
+
+            # ✅ ONLY update the shortcuts lookup table — nothing else
             app_window.shortcuts = shortcuts
-            
-            # ✅ CRITICAL: Sync to view_palettes (same as on_apply)
-            if not hasattr(app_window, 'view_palettes'):
-                app_window.view_palettes = {}
-            
-            # Sync DisplayMode presets to view_palettes
-            saved_weights = {}
-            if hasattr(app_window, 'display_mode_dialog') and app_window.display_mode_dialog:
-                dlg = app_window.display_mode_dialog
-                
-                # Save current weights
-                if hasattr(dlg, 'view_palettes'):
-                    for view_idx, palette in dlg.view_palettes.items():
-                        saved_weights[view_idx] = {}
-                        for code, info in palette.items():
-                            saved_weights[view_idx][code] = info.get('weight', 1.0)
-            
-            for (mod, key), shortcut_info in shortcuts.items():
-                if shortcut_info.get("tool") != "DisplayMode":
-                    continue
-                
-                preset = shortcut_info.get("preset")
-                if not preset or not preset.get("views"):
-                    continue
-                
-                for view_idx_raw, class_configs in preset.get("views", {}).items():
-                    view_idx = int(view_idx_raw)
-                    slot_palette = {}
-                    
-                    for code_raw, info in class_configs.items():
-                        code = int(code_raw)
-                        
-                        # Preserve user-edited weights
-                        weight = info.get("weight", 1.0)
-                        if view_idx in saved_weights and code in saved_weights[view_idx]:
-                            weight = saved_weights[view_idx][code]
-                        
-                        slot_palette[code] = {
-                            "show": bool(info.get("show", True)),
-                            "color": tuple(info.get("color", (128, 128, 128))),
-                            "weight": float(weight),
-                        }
-                    
-                    app_window.view_palettes[view_idx] = slot_palette
-            
-            # Sync to Display Mode dialog if open
-            if hasattr(app_window, 'display_mode_dialog') and app_window.display_mode_dialog:
-                dlg = app_window.display_mode_dialog
-                
-                for (mod, key), shortcut_info in shortcuts.items():
-                    if shortcut_info.get("tool") != "DisplayMode":
-                        continue
-                    
-                    preset = shortcut_info.get("preset")
-                    if not preset or not preset.get("views"):
-                        continue
-                    
-                    for view_idx_raw, class_configs in preset.get("views", {}).items():
-                        view_idx = int(view_idx_raw)
-                        
-                        if view_idx not in dlg.view_palettes:
-                            dlg.view_palettes[view_idx] = {}
-                        
-                        for code_raw, info in class_configs.items():
-                            code = int(code_raw)
-                            
-                            preserved_weight = info.get("weight", 1.0)
-                            if view_idx in saved_weights and code in saved_weights[view_idx]:
-                                preserved_weight = saved_weights[view_idx][code]
-                            
-                            dlg.view_palettes[view_idx][code] = {
-                                "show": bool(info.get("show", True)),
-                                "color": tuple(info.get("color", (128, 128, 128))),
-                                "weight": float(preserved_weight),
-                                "description": str(info.get("description", "")),
-                                "lvl": str(info.get("lvl", "")),
-                                "draw": info.get("draw", "")
-                            }
-                        
-                        if view_idx not in dlg.slot_shows:
-                            dlg.slot_shows[view_idx] = {}
-                        
-                        for code_raw, info in class_configs.items():
-                            code = int(code_raw)
-                            dlg.slot_shows[view_idx][code] = bool(info.get("show", True))
-                
-                print("   ✅ Synced shortcuts to Display Mode dialog")
-            
-            # Status message
+
             if hasattr(app_window, 'statusBar'):
                 app_window.statusBar().showMessage(
-                    f"✅ {len(shortcuts)} shortcuts applied from settings (Ctrl+Shift+S)",
+                    f"✅ {len(shortcuts)} shortcuts reloaded (press key to apply)",
                     2500
                 )
-            
-            print(f"   ✅ Applied {len(shortcuts)} shortcuts to app_window")
+
+            print(f"   ✅ {len(shortcuts)} shortcuts loaded — view_palettes/class_palette UNTOUCHED")
             print(f"{'='*60}\n")
-            
+
         except Exception as e:
-            print(f"❌ Failed to apply shortcuts from settings: {e}")
+            print(f"❌ apply_shortcuts_from_settings failed: {e}")
             import traceback
             traceback.print_exc()
-            
             if hasattr(app_window, 'statusBar'):
-                app_window.statusBar().showMessage(
-                    f"❌ Failed to apply shortcuts: {e}",
-                    3000
-                )
-            print(f"{'='*60}\n")
+                app_window.statusBar().showMessage(f"❌ Failed: {e}", 3000)
 
             ####
 
@@ -1711,7 +1924,16 @@ class ShortcutManager(QWidget):
             if event.type() == QEvent.Wheel:
                 event.ignore()
                 return True  # Block the wheel event
-        return super().eventFilter(obj, event)        
+        return super().eventFilter(obj, event) 
+    def changeEvent(self, event):
+        """Intercept minimize — hide instead of collapsing to ugly mini title-bar."""
+        if event.type() == QEvent.WindowStateChange:
+            if self.windowState() & Qt.WindowMinimized:
+                event.ignore()
+                self.setWindowState(Qt.WindowNoState)
+                self.hide()
+                return
+        super().changeEvent(event)       
  
     def _toggle_class_cell(self, row, tool_text):
         """Disable class selection for some tools. DisplayMode and ShadingMode open their respective dialogs to store presets."""
@@ -1884,6 +2106,11 @@ class ShortcutManager(QWidget):
                     print(f"   📋 Loaded TO: Any")
 
     def _get_or_create_display_mode_dialog(self):
+        if hasattr(self.app_window, "ensure_display_mode_dialog"):
+            if self.app_window.ensure_display_mode_dialog():
+                return getattr(self.app_window, "display_mode_dialog", None)
+            return None
+
         dlg = getattr(self.app_window, "display_mode_dialog", None)
         if dlg is None:
             from gui.display_mode import DisplayModeDialog
@@ -1893,38 +2120,36 @@ class ShortcutManager(QWidget):
 
 
     def _open_display_mode_for_row(self, row: int):
-        """Open lightweight class picker for Display Mode - Single view selection"""
+        """Open lightweight class picker for Display Mode - Single view selection.
+
+        ✅ FIX: Each shortcut has INDEPENDENT visibility/weight state.
+        The table cell is the sole source of truth for THIS shortcut's preset.
+        We do NOT overlay live Display Mode dialog state onto saved presets.
+        """
         self._pending_display_mode_row = row
-        
-        # ── Source of truth: TABLE CELL (only ever written by on_accepted, so
-        #    it holds exactly what the user configured in the picker).
-        #    app.shortcuts may have been mutated by _sync_to_displaymode_shortcuts
-        #    (Display Mode Apply → shortcut) and must NOT override the user's
-        #    explicitly saved picker state.
+
         existing_preset = None
         mod_combo = self.table.cellWidget(row, 0)
         key_combo = self.table.cellWidget(row, 1)
-        if mod_combo and key_combo:
-            mod = mod_combo.currentText().lower()
-            key = key_combo.currentText().upper()
 
-        # 1️⃣  Table cell first — this is the canonical user-configured preset
+        # 1️⃣  Table cell first — canonical user-configured preset for THIS shortcut
         cell = self.table.item(row, 3)
         if cell:
             existing_preset = decode_display_preset(cell.data(Qt.UserRole))
             if existing_preset:
-                print(f"   ✅ Loaded preset from table cell (user-configured state)")
+                print(f"   ✅ Loaded preset from table cell (independent shortcut state)")
 
         # 2️⃣  Fall back to app.shortcuts only when the table cell has no data
-        #     (e.g. a newly-added row before the first OK)
         if existing_preset is None and mod_combo and key_combo:
+            mod = mod_combo.currentText().lower()
+            key = key_combo.currentText().upper()
             shortcut_info = getattr(self.app_window, 'shortcuts', {}).get((mod, key))
             if shortcut_info and shortcut_info.get("tool") == "DisplayMode":
                 existing_preset = shortcut_info.get("preset")
                 if existing_preset:
                     print(f"   ⚠️  Loaded preset from app.shortcuts (table cell empty)")
 
-        # ✅ CRITICAL: Always create a FRESH picker (don't reuse)
+        # ✅ Always create a FRESH picker (don't reuse)
         if hasattr(self, '_display_picker') and self._display_picker is not None:
             try:
                 self._display_picker.close()
@@ -1939,15 +2164,24 @@ class ShortcutManager(QWidget):
             views = existing_preset.get("views", {})
             border_percent = existing_preset.get("border_percent", 0)
 
-            # ── Preset border is authoritative — do NOT let the live Display
-            #    Mode dialog override it here. The preset was saved by the user
-            #    and must be shown exactly as configured. ──
-            picker.border_spin.setValue(border_percent)
-
             if views:
                 views = {int(k): v for k, v in views.items()}
                 first_view_idx = min(views.keys())
-                view_classes = views[first_view_idx]
+                # ✅ Deep-copy so we never mutate the stored preset
+                view_classes = {int(k): dict(v) for k, v in views[first_view_idx].items()}
+
+                # ════════════════════════════════════════════════════════
+                # ✅ FIX: DO NOT overlay live Display Mode state.
+                #    Each shortcut has INDEPENDENT visibility AND weights.
+                #    The table cell is the single source of truth.
+                #
+                #    REMOVED:
+                #    view_classes, border_percent = self._overlay_live_display_state(
+                #        first_view_idx, view_classes, border_percent
+                #    )
+                # ════════════════════════════════════════════════════════
+
+                picker.border_spin.setValue(border_percent)
 
                 picker.view_selector.blockSignals(True)
                 picker.view_selector.setCurrentIndex(first_view_idx)
@@ -1955,84 +2189,102 @@ class ShortcutManager(QWidget):
 
                 if not hasattr(picker, 'view_configs'):
                     picker.view_configs = {}
-                picker.view_configs[first_view_idx] = {int(k): v for k, v in view_classes.items()}
+                picker.view_configs[first_view_idx] = view_classes
 
-                # ── No live-overlay here: view_configs is loaded from the table
-                #    cell (user-configured), not from app.view_palettes / the
-                #    Display Mode dialog. This prevents Display Mode Apply from
-                #    silently clobbering the user's custom weights in the picker. ──
+                # ✅ FIX: Sync live weights so picker reflects latest Display Mode Apply
+                self._sync_live_weights_into(view_classes, first_view_idx)
 
                 picker._populate_classes()
 
+                # ✅ Explicitly set checkbox states from THIS shortcut's saved data
                 for code, checkbox in picker.class_checkboxes.items():
                     if code in view_classes:
                         checkbox.setChecked(view_classes[code].get("show", True))
                     else:
                         checkbox.setChecked(True)
 
+                # ✅ Explicitly set weights from THIS shortcut's saved data
+                if hasattr(picker, 'weight_spinboxes'):
+                    for code, spin in picker.weight_spinboxes.items():
+                        if code in view_classes:
+                            spin.setValue(view_classes[code].get("weight", 1.0))
+
+                visible_count = sum(1 for c in view_classes.values() if c.get('show'))
                 print(f"📂 Loaded existing preset for view {first_view_idx}: "
-                      f"{sum(1 for c in view_classes.values() if c.get('show'))} visible")
+                    f"{visible_count} visible (independent per-shortcut state)")
+
+            else:
+                picker.border_spin.setValue(border_percent)
+                print(f"📋 Preset has no views configured")
+                picker._populate_classes()
 
         else:
-            # FRESH PRESET: no saved data yet — start with defaults
+            # ── FRESH PRESET: no saved data yet ──
             print(f"📋 Creating fresh preset - defaulting to Main View")
 
             picker.view_selector.blockSignals(True)
             picker.view_selector.setCurrentIndex(0)
             picker.view_selector.blockSignals(False)
 
-            # No seeding from live view_palettes: a fresh preset should start
-            # clean so the user explicitly chooses what they want.
+            # Seed from live Display Mode state (only for brand-new presets)
+            fresh_classes, fresh_border = self._get_live_display_state_for_view(0)
+            if fresh_classes:
+                if not hasattr(picker, 'view_configs'):
+                    picker.view_configs = {}
+                picker.view_configs[0] = fresh_classes
+                picker.border_spin.setValue(fresh_border)
+
             picker._populate_classes()
+
+            if fresh_classes:
+                for code, checkbox in picker.class_checkboxes.items():
+                    if code in fresh_classes:
+                        checkbox.setChecked(fresh_classes[code].get("show", True))
+                if hasattr(picker, 'weight_spinboxes'):
+                    for code, spin in picker.weight_spinboxes.items():
+                        if code in fresh_classes:
+                            spin.setValue(fresh_classes[code].get("weight", 1.0))
+
             print(f"✅ Fresh preset initialized for Main View")
-        
-        # ✅ Connect to handle OK button (no need to disconnect, fresh instance)
+
+        # ── Connect OK handler ────────────────────────────────────────
         def on_accepted():
-            # Get condef on_accepted():
-            # Get configuration for SINGLE view
             all_configs = picker.get_all_view_configs()
             border_percent = all_configs.get("border_percent", 0)
             view_configs = all_configs.get("views", {})
-            
+
             if not view_configs:
                 print("⚠️ No view configured")
                 return
-            
-            # Get the SINGLE view (should only be one)
+
             view_idx = list(view_configs.keys())[0]
             view_classes = view_configs[view_idx]
-            
-            # Build preset for SINGLE view
+
             preset = {
                 "border_percent": border_percent,
                 "views": {view_idx: view_classes},
                 "force_refresh": True
             }
-            
-            # ✅ Create summary WITH WEIGHT INFO
+
             visible = sum(1 for c in view_classes.values() if c.get("show"))
-            view_name = ["Main", "View 1", "View 2", "View 3", "View 4", "Cut"][view_idx]
-            
-            # ✅ Get weight information
+            view_name = ["Main", "View 1", "View 2", "View 3", "View 4", "Cut"][view_idx] \
+                if view_idx < 6 else f"View {view_idx}"
+
             weights = [c.get("weight", 1.0) for c in view_classes.values()]
             unique_weights = sorted(set(weights))
-            
-            # Build compact summary
             if len(unique_weights) == 1:
                 weight_info = f"W={unique_weights[0]:.1f}"
             else:
                 weight_info = f"W={min(weights):.1f}-{max(weights):.1f}"
-            
-            # summary = f"{view_name}: {visible}vis, B={border_percent}%, {weight_info}"
-            summary = f"{view_name}: {visible}vis, B={border_percent:.1f}%, W={weight_info}"
-            
+
+            summary = f"{view_name}: {visible}vis, B={border_percent:.1f}%, {weight_info}"
+
             item = QTableWidgetItem(summary)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             item.setData(Qt.UserRole, encode_display_preset(preset))
             self.table.setItem(row, 3, item)
 
-            # ── PATCH: keep app.shortcuts in sync so the NEXT open of this
-            #          picker reads fresh weights, not stale ones ──
+            # Update app.shortcuts if it exists
             _mod_w = self.table.cellWidget(row, 0)
             _key_w = self.table.cellWidget(row, 1)
             if _mod_w and _key_w:
@@ -2041,39 +2293,186 @@ class ShortcutManager(QWidget):
                 _sh = getattr(self.app_window, 'shortcuts', {})
                 if (_m, _k) in _sh and _sh[(_m, _k)].get('tool') == 'DisplayMode':
                     _sh[(_m, _k)]['preset'] = preset
-                    print(f"   🔗 app.shortcuts[{_m}+{_k}] preset updated with fresh weights")
+                    print(f"   🔗 app.shortcuts[{_m}+{_k}] preset updated")
 
             print(f"✅ Saved: {summary}")
 
-            # ── Persist immediately to QSettings so weights survive restart ──
-            # (auto_save_shortcuts is normally only called on ShortcutManager Apply;
-            #  call it here too so picker OK alone is enough to make changes durable)
             try:
                 self.auto_save_shortcuts()
                 print(f"   💾 QSettings updated — preset will survive restart")
             except Exception as _e:
                 print(f"   ⚠️ auto_save_shortcuts failed: {_e}")
 
-            # ✅ CRITICAL: Close and cleanup the picker
             picker.close()
             picker.deleteLater()
             self._display_picker = None
 
         picker.accepted.connect(on_accepted)
-        
-        # ✅ Also handle rejection (Cancel button)
+
         def on_rejected():
             print("❌ Display mode configuration cancelled")
             picker.close()
             picker.deleteLater()
             self._display_picker = None
-        
+
         picker.rejected.connect(on_rejected)
-        
-        # ✅ Show as non-modal child window
+
         picker.show()
         picker.raise_()
         picker.activateWindow()
+
+
+    def _overlay_live_display_state(self, view_idx, preset_classes, preset_border):
+        """
+        Overlay live Display Mode dialog state onto preset classes.
+        
+        This ensures that any changes made via Display Mode Apply (class checks,
+        weight edits, border changes) are reflected when the shortcut picker opens.
+        
+        Returns:
+            (updated_classes_dict, updated_border)
+        """
+        try:
+            dlg = getattr(self.app_window, 'display_mode_dialog', None)
+            if dlg is None:
+                return preset_classes, preset_border
+
+            # Check if this view has been Applied in Display Mode
+            if not hasattr(dlg, 'view_palettes') or view_idx not in dlg.view_palettes:
+                return preset_classes, preset_border
+
+            live_palette = dlg.view_palettes[view_idx]
+            if not live_palette:
+                return preset_classes, preset_border
+
+            # Check if weights were explicitly applied for this slot
+            explicitly_applied = (
+                hasattr(self.app_window, '_slot_weights_applied') and
+                view_idx in self.app_window._slot_weights_applied
+            )
+
+            if not explicitly_applied:
+                # Dialog palette exists but user never clicked Apply for this view
+                # Don't overlay — trust the table cell (user's picker config)
+                print(f"   ℹ️ View {view_idx} not explicitly Applied in Display Mode — using table cell data")
+                return preset_classes, preset_border
+
+            print(f"   🔄 Overlaying live Display Mode state for view {view_idx}")
+
+            updated_classes = dict(preset_classes)  # start from preset
+
+            for code, live_info in live_palette.items():
+                code_int = int(code)
+                if code_int in updated_classes:
+                    # Update show and weight from live state
+                    updated_classes[code_int]['show'] = live_info.get('show', True)
+                    updated_classes[code_int]['weight'] = float(live_info.get('weight', 1.0))
+                    print(f"      Class {code_int}: show={live_info.get('show')}, "
+                        f"weight={live_info.get('weight', 1.0):.1f} (from Display Mode)")
+                else:
+                    # Class exists in Display Mode but not in preset — add it
+                    updated_classes[code_int] = {
+                        'show': live_info.get('show', True),
+                        'weight': float(live_info.get('weight', 1.0)),
+                        'description': live_info.get('description', ''),
+                        'color': tuple(live_info.get('color', (128, 128, 128))),
+                        'draw': live_info.get('draw', ''),
+                        'lvl': live_info.get('lvl', ''),
+                    }
+                    print(f"      Class {code_int}: ADDED from Display Mode "
+                        f"(show={live_info.get('show')}, weight={live_info.get('weight', 1.0):.1f})")
+
+            # Update border from live dialog state
+            updated_border = preset_border
+            if hasattr(dlg, 'view_borders') and view_idx in dlg.view_borders:
+                updated_border = float(dlg.view_borders[view_idx])
+                if updated_border != preset_border:
+                    print(f"      Border: {preset_border}% → {updated_border}% (from Display Mode)")
+
+            applied_count = sum(1 for c in updated_classes.values() if c.get('show'))
+            print(f"   ✅ Overlay complete: {applied_count} visible, border={updated_border}%")
+
+            return updated_classes, updated_border
+
+        except Exception as e:
+            print(f"   ⚠️ _overlay_live_display_state failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return preset_classes, preset_border
+
+
+    def _get_live_display_state_for_view(self, view_idx):
+        """
+        Get fresh class config from live Display Mode dialog for a specific view.
+        Used when creating a FRESH preset (no table cell data exists).
+        
+        Returns:
+            (classes_dict, border_value) or (None, 0)
+        """
+        try:
+            dlg = getattr(self.app_window, 'display_mode_dialog', None)
+            
+            # Try Display Mode dialog first
+            if dlg is not None and hasattr(dlg, 'view_palettes') and view_idx in dlg.view_palettes:
+                live_palette = dlg.view_palettes[view_idx]
+                if live_palette:
+                    classes = {}
+                    for code, info in live_palette.items():
+                        code_int = int(code)
+                        classes[code_int] = {
+                            'show': info.get('show', True),
+                            'weight': float(info.get('weight', 1.0)),
+                            'description': info.get('description', ''),
+                            'color': tuple(info.get('color', (128, 128, 128))),
+                            'draw': info.get('draw', ''),
+                            'lvl': info.get('lvl', ''),
+                        }
+                    
+                    border = 0
+                    if hasattr(dlg, 'view_borders') and view_idx in dlg.view_borders:
+                        border = float(dlg.view_borders[view_idx])
+                    
+                    print(f"   📋 Seeded from Display Mode dialog view {view_idx}: "
+                        f"{len(classes)} classes, border={border}%")
+                    return classes, border
+            
+            # Fall back to app.view_palettes
+            app_palettes = getattr(self.app_window, 'view_palettes', {})
+            if view_idx in app_palettes and app_palettes[view_idx]:
+                classes = {}
+                for code, info in app_palettes[view_idx].items():
+                    code_int = int(code)
+                    classes[code_int] = {
+                        'show': info.get('show', True),
+                        'weight': float(info.get('weight', 1.0)),
+                        'description': info.get('description', ''),
+                        'color': tuple(info.get('color', (128, 128, 128))),
+                        'draw': info.get('draw', ''),
+                        'lvl': info.get('lvl', ''),
+                    }
+                print(f"   📋 Seeded from app.view_palettes[{view_idx}]: {len(classes)} classes")
+                return classes, 0
+            
+            # Fall back to class_palette for main view
+            if view_idx == 0 and hasattr(self.app_window, 'class_palette'):
+                classes = {}
+                for code, info in self.app_window.class_palette.items():
+                    classes[int(code)] = {
+                        'show': info.get('show', True),
+                        'weight': float(info.get('weight', 1.0)),
+                        'description': info.get('description', ''),
+                        'color': tuple(info.get('color', (128, 128, 128))),
+                        'draw': info.get('draw', ''),
+                        'lvl': info.get('lvl', ''),
+                    }
+                print(f"   📋 Seeded from app.class_palette: {len(classes)} classes")
+                return classes, 0
+            
+            return None, 0
+            
+        except Exception as e:
+            print(f"   ⚠️ _get_live_display_state_for_view failed: {e}")
+            return None, 0
     
     
     def _open_shading_mode_for_row(self, row: int):
@@ -2725,12 +3124,20 @@ class ShortcutManager(QWidget):
                 dlg = self.app_window.display_mode_dialog
                 
                 # Save current weights from dialog
+                # Save current weights from dialog
                 saved_weights = {}
                 if hasattr(dlg, 'view_palettes'):
                     for view_idx, palette in dlg.view_palettes.items():
                         saved_weights[view_idx] = {}
                         for code, info in palette.items():
                             saved_weights[view_idx][code] = info.get('weight', 1.0)
+
+                # ✅ FIX: Main View weights live in class_palette (Display Mode Apply writes there,
+                # not to view_palettes[0]), so read from there too.
+                saved_weights.setdefault(0, {})
+                if hasattr(self.app_window, 'class_palette'):
+                    for code, info in self.app_window.class_palette.items():
+                        saved_weights[0][int(code)] = info.get('weight', 1.0)
                 
                 # Inject preserved weights INTO the shortcut presets (not the other way)
                 for (mod, key), shortcut_info in shortcuts.items():
@@ -2766,7 +3173,38 @@ class ShortcutManager(QWidget):
         finally:
             # ✅ Always clear the flag
             self._applying_shortcuts = False
- 
+
+
+    def _sync_live_weights_into(self, view_classes: dict, view_idx: int):
+        """
+        Pull fresh weights from live Display Mode state into view_classes.
+
+        Main View (0): Display Mode Apply writes to class_palette → read from there.
+        Cross views (1-4): Display Mode Apply writes to dlg.view_palettes[idx] → read from there.
+        Only weights are synced — visibility (show) stays as saved in the preset.
+        """
+        dlg = getattr(self.app_window, 'display_mode_dialog', None)
+
+        live_source = {}
+        if dlg and hasattr(dlg, 'view_palettes') and view_idx in dlg.view_palettes:
+            live_source = dlg.view_palettes[view_idx]
+        
+        # Main View fallback: class_palette is the authoritative weight store for slot 0
+        if view_idx == 0 and hasattr(self.app_window, 'class_palette'):
+            for code, info in self.app_window.class_palette.items():
+                code_int = int(code)
+                if code_int in view_classes:
+                    live_w = info.get('weight', 1.0)
+                    # live_source may also have it — class_palette wins for slot 0
+                    view_classes[code_int]['weight'] = float(live_w)
+            return
+
+        # Cross views: use view_palettes[idx]
+        for code, live_info in live_source.items():
+            code_int = int(code)
+            if code_int in view_classes:
+                view_classes[code_int]['weight'] = float(live_info.get('weight', 1.0))
+
     def on_cancel(self):
         self.is_editing_shortcuts = False
         self.close()
@@ -2810,263 +3248,254 @@ class ShortcutManager(QWidget):
  
     def auto_load_shortcuts(self):
         """
-        ✅ Load shortcuts automatically when ShortcutManager opens
-        Uses QSettings for cross-platform persistence
+        ✅ FIXED: Load shortcuts from QSettings into app_window.shortcuts ONLY.
+        NEVER touch view_palettes or class_palette here — that only happens on keypress.
         """
-        self._is_loading_shortcuts = True
         try:
             shortcuts_data = self.settings.value("shortcuts", None)
-
             if shortcuts_data is None:
                 print("ℹ️ No saved shortcuts found")
                 return
 
+            if isinstance(shortcuts_data, str):
+                shortcuts_list = json.loads(shortcuts_data)
+            else:
+                shortcuts_list = shortcuts_data
+
+            print(f"📋 Loading {len(shortcuts_list)} shortcuts from QSettings...")
+
+            shortcuts = {}
+            simple_tools = (
+                "CrossSectionRect", "CutSectionRect", "CutFromCross", "CutFromCut",
+                "TopView", "Depth", "RGB", "Intensity", "Elevation", "Class"
+            )
+
+            self._is_loading_shortcuts = True
             try:
-                # Parse saved shortcuts
-                if isinstance(shortcuts_data, str):
-                    shortcuts_list = json.loads(shortcuts_data)
-                else:
-                    shortcuts_list = shortcuts_data
+                for row_idx, entry in enumerate(shortcuts_list):
+                    modifier = entry.get("modifier", "alt")
+                    key      = entry.get("key", "F1")
+                    tool     = entry.get("tool", "AboveLine")
+                    mod      = modifier.lower()
+                    key_upper = key.upper()
 
+                    if tool == "DisplayMode":
+                        preset_payload = entry.get("display_preset")
+                        if preset_payload:
+                            # ✅ ONLY store in shortcuts dict — never touch view_palettes here
+                            shortcuts[(mod, key_upper)] = {
+                                "tool": "DisplayMode",
+                                "preset": preset_payload
+                            }
+                            views = preset_payload.get("views", {})
+                            print(f"   ✅ {mod}+{key_upper} → DisplayMode "
+                                f"(views: {list(views.keys())}) [stored, NOT applied]")
+                        continue
+
+                    if tool == "ShadingMode":
+                        preset_payload = entry.get("shading_preset")
+                        if preset_payload:
+                            shortcuts[(mod, key_upper)] = {
+                                "tool": "ShadingMode",
+                                "preset": preset_payload
+                            }
+                            print(f"   ✅ {mod}+{key_upper} → ShadingMode [stored, NOT applied]")
+                        continue
+
+                    if tool == "DrawSettings":
+                        preset_payload = entry.get("draw_preset")
+                        if preset_payload:
+                            shortcuts[(mod, key_upper)] = {
+                                "tool": "DrawSettings",
+                                "preset": preset_payload
+                            }
+                            print(f"   ✅ {mod}+{key_upper} → DrawSettings [stored, NOT applied]")
+                        continue
+
+                    if tool in simple_tools:
+                        shortcuts[(mod, key_upper)] = {
+                            "tool": tool, "from": None, "to": None
+                        }
+                        print(f"   ✅ {mod}+{key_upper} → {tool}")
+                    else:
+                        from_cls = entry.get("from_classes")
+                        to_cls   = entry.get("to_class")
+                        shortcuts[(mod, key_upper)] = {
+                            "tool": tool, "from": from_cls, "to": to_cls
+                        }
+                        print(f"   ✅ {mod}+{key_upper} → {tool} [{from_cls} → {to_cls}]")
+
+            finally:
+                self._is_loading_shortcuts = False
+
+            # ✅ Store shortcuts — this is ALL we do at load time
+            self.app_window.shortcuts = shortcuts
+
+            print(f"✅ {len(shortcuts)} shortcuts loaded into app_window.shortcuts")
+            print("   ⚠️  view_palettes / class_palette NOT touched — will apply on keypress only")
+
+            # ── Rebuild table UI ──────────────────────────────────────────
+            self._is_loading_shortcuts = True
+            try:
                 self.table.setRowCount(0)
-
                 for entry in shortcuts_list:
                     row = self.table.rowCount()
                     self.table.insertRow(row)
 
-                    # Modifier
+                    modifier  = entry.get("modifier", "alt")
+                    key       = entry.get("key", "F1")
+                    tool      = entry.get("tool", "AboveLine")
+                    tool_text = tool
+
                     mod_combo = QComboBox()
                     mod_combo.addItems([
-                        "alt", "ctrl", "shift", "alt+shift",
-                        "ctrl+alt", "ctrl+shift", "ctrl+alt+shift", "none"
+                        "alt", "ctrl", "shift",
+                        "alt+shift", "ctrl+alt",
+                        "ctrl+shift", "ctrl+alt+shift", "none"
                     ])
-                    mod_combo.setCurrentText(entry.get("modifier", "alt"))
-                    mod_combo.currentTextChanged.connect(lambda _, r=row: self._on_key_changed(r))
-                    mod_combo.setFocusPolicy(Qt.StrongFocus)
-                    mod_combo.installEventFilter(self)
+                    mod_combo.setCurrentText(modifier)
+                    mod_combo.currentTextChanged.connect(
+                        lambda _, r=row: self._on_key_changed(r)
+                    )
                     self.table.setCellWidget(row, 0, mod_combo)
 
-                    # Key (F1-F12 + 0-9 + A-Z + Space)
                     key_combo = QComboBox()
-                    keys = [f"F{i}" for i in range(1, 13)]   # F1-F12
-                    keys += [chr(i) for i in range(65, 91)]  # A-Z
-                    keys.append("Space")                     # Space
+                    keys = [f"F{i}" for i in range(1, 13)]
+                    keys += [chr(i) for i in range(65, 91)]
+                    keys.append("Space")
                     key_combo.addItems(keys)
-                    key_combo.setCurrentText(entry.get("key", "F1"))
-                    key_combo.currentTextChanged.connect(lambda _, r=row: self._on_key_changed(r))
-                    key_combo.setFocusPolicy(Qt.StrongFocus)
-                    key_combo.installEventFilter(self)
+                    key_combo.setCurrentText(key)
+                    key_combo.currentTextChanged.connect(
+                        lambda _, r=row: self._on_key_changed(r)
+                    )
                     self.table.setCellWidget(row, 1, key_combo)
 
-                    # Tool
                     tool_combo = QComboBox()
                     tool_combo.addItems(TOOLS)
-                    tool_combo.setCurrentText(entry.get("tool", "AboveLine"))
-                    tool_combo.currentTextChanged.connect(lambda t, r=row: self._toggle_class_cell(r, t))
-                    tool_combo.setFocusPolicy(Qt.StrongFocus)
-                    tool_combo.installEventFilter(self)
+                    if tool_text in TOOLS:
+                        tool_combo.setCurrentText(tool_text)
+                    tool_combo.currentTextChanged.connect(
+                        lambda t, r=row: self._toggle_class_cell(r, t)
+                    )
                     self.table.setCellWidget(row, 2, tool_combo)
 
-                    # Classes / Preset (DisplayMode support)
-                    tool = entry.get("tool")
+                    # ── Column 3: Classes cell ────────────────────────────
                     if tool == "DisplayMode":
                         preset_payload = entry.get("display_preset")
-
-                        if preset_payload and preset_payload.get("views"):
-                            views = preset_payload.get("views", {})
-                            border_percent = preset_payload.get("border_percent", 0)
-
-                            view_summaries = []
-                            for view_idx in sorted(views.keys()):
-                                view_classes = views[view_idx]
-                                visible = sum(1 for c in view_classes.values() if c.get("show"))
-                                weights = [c.get("weight", 1.0) for c in view_classes.values()]
-                                if not weights:
-                                    continue
-                                unique_weights = sorted(set(round(w, 2) for w in weights))
-                                if len(unique_weights) == 1:
-                                    weight_info = f"W={unique_weights[0]:.1f}"
-                                else:
-                                    weight_info = f"W={min(weights):.1f}-{max(weights):.1f}"
-                                if view_idx == 0:
-                                    view_name = "Main"
-                                elif view_idx == 5:
-                                    view_name = "Cut"
-                                else:
-                                    view_name = f"View {view_idx}"
-                                view_summaries.append(
-                                    f"{view_name}: {visible}vis, B={border_percent:.1f}%, {weight_info}"
-                                )
-                            summary = "; ".join(view_summaries) if view_summaries else "DisplayMode preset"
-                            item = QTableWidgetItem(summary)
-                            item.setData(Qt.UserRole, encode_display_preset(preset_payload))
-
-                        elif preset_payload:
-                            # Legacy single-view format (no views key)
-                            item = QTableWidgetItem("Click/Double-click to configure display preset")
-                            item.setData(Qt.UserRole, encode_display_preset(preset_payload))
-                        else:
-                            item = QTableWidgetItem("Click/Double-click to configure display preset")
-                            item.setData(
-                                Qt.UserRole,
-                                encode_display_preset({
-                                    "views": {},
-                                    "border_percent": 0,
-                                    "force_refresh": True,
-                                })
+                        if preset_payload:
+                            views       = preset_payload.get("views", {})
+                            border_pct  = preset_payload.get("border_percent", 0)
+                            first_view  = int(list(views.keys())[0]) if views else 0
+                            view_name   = (["Main", "V1", "V2", "V3", "V4", "Cut"]
+                                        [first_view] if first_view < 6 else f"V{first_view}")
+                            vis_cnt     = sum(
+                                sum(1 for c in cls.values() if c.get("show"))
+                                for cls in views.values()
                             )
-
-                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                        self.table.setItem(row, 3, item)
-                        continue
- 
-                    if tool == "DrawSettings":
-                        preset_payload = entry.get("draw_preset")
-                        saved_text = entry.get("draw_text", "")
-
-                        if preset_payload and saved_text:
-                            item = QTableWidgetItem(saved_text)
-                            item.setData(Qt.UserRole, encode_draw_preset(preset_payload))
-                        elif preset_payload:
-                            item = QTableWidgetItem("Draw preset")
-                            item.setData(Qt.UserRole, encode_draw_preset(preset_payload))
+                            summary = (f"{view_name}: {vis_cnt}vis, "
+                                    f"B={border_pct:.1f}%")
+                            item = QTableWidgetItem(summary)
+                            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                            item.setData(Qt.UserRole,
+                                        encode_display_preset(preset_payload))
+                            self.table.setItem(row, 3, item)
                         else:
-                            item = QTableWidgetItem("Click/Double-click to configure draw preset")
-                            item.setData(Qt.UserRole, encode_draw_preset({"tools": {}}))
+                            item = QTableWidgetItem("Click to configure")
+                            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                            self.table.setItem(row, 3, item)
 
-                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                        self.table.setItem(row, 3, item)
-                        continue
-
-
-                    # ✅ Handle ShadingMode presets
-                    if tool == "ShadingMode":
+                    elif tool == "ShadingMode":
                         preset_payload = entry.get("shading_preset")
-                        saved_text = entry.get("shading_text", "")  # ✅ GET SAVED TEXT
-                        
-                        if preset_payload and saved_text:
-                            item = QTableWidgetItem(saved_text)  # ✅ USE EXACT SAVED TEXT
-                            item.setData(Qt.UserRole, encode_shading_preset(preset_payload))
-                        elif preset_payload and preset_payload.get("classes"):
-                            # Fallback - regenerate
-                            visible = [
-                                c for c, info in preset_payload["classes"].items()
-                                if info.get("show")
-                            ]
-                            azimuth = preset_payload.get("azimuth", 45.0)
-                            angle = preset_payload.get("angle", 45.0)
-                            speed = preset_payload.get("speed", 1)
-                            item = QTableWidgetItem(f"Shading: {azimuth}°/{angle}°, {len(visible)} visible, Speed={speed}")
-                            item.setData(Qt.UserRole, encode_shading_preset(preset_payload))
+                        if preset_payload:
+                            az  = preset_payload.get("azimuth", 45)
+                            ang = preset_payload.get("angle",   45)
+                            item = QTableWidgetItem(
+                                f"Shading: az={az}° ang={ang}°")
                         else:
-                            item = QTableWidgetItem("Click/Double-click to configure shading preset")
-                            item.setData(Qt.UserRole, encode_shading_preset({
-                                "azimuth": 45.0,
-                                "angle": 45.0,
-                                "ambient": 0.1,
-                                "quality": 100.0,
-                                "speed": 1,
-                                "classes": {}
-                            }))
-                        
+                            item = QTableWidgetItem("Preset: Not configured yet")
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        item.setData(Qt.UserRole,
+                                    encode_shading_preset(preset_payload or {}))
                         self.table.setItem(row, 3, item)
-                        continue  
-                        
-                    if tool in ("CrossSectionRect", "CutSectionRect", "CutFromCross", "CutFromCut", 
-                                                                "TopView", "Depth", "RGB", "Intensity", "Elevation", "Class"):
-                        item = QTableWidgetItem("N/A")
-                        item.setData(Qt.UserRole, encode_classes(None, None))
+
+                    elif tool == "DrawSettings":
+                        preset_payload = entry.get("draw_preset")
+                        item = QTableWidgetItem(
+                            f"Draw: {len((preset_payload or {}).get('tools', {}))} tools"
+                        )
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        item.setData(Qt.UserRole,
+                                    encode_draw_preset(preset_payload or {}))
+                        self.table.setItem(row, 3, item)
+
                     else:
                         from_cls = entry.get("from_classes")
-                        to_cls = entry.get("to_class")
-
-                        from_txt = ", ".join(str(c) for c in from_cls) if from_cls else "Any"
-                        to_txt = str(to_cls) if to_cls is not None else "Any"
-
-                        item = QTableWidgetItem(f"{from_txt} → {to_txt}")
+                        to_cls   = entry.get("to_class")
+                        label    = f"{from_cls} → {to_cls}" if from_cls or to_cls else "Any → Any"
+                        item = QTableWidgetItem(label)
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                         item.setData(Qt.UserRole, encode_classes(from_cls, to_cls))
+                        self.table.setItem(row, 3, item)
 
-                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                    self.table.setItem(row, 3, item)
-                    ###
+            finally:
+                self._is_loading_shortcuts = False
 
-                print(f"✅ Loaded {len(shortcuts_list)} shortcuts from persistent storage")
-                QTimer.singleShot(0, self._sort_table_by_modifier) # ✅ Sort by modifier after loading
+            print(f"✅ Table rebuilt with {self.table.rowCount()} rows")
 
-            except Exception as e:
-                print(f"❌ Error loading shortcuts: {e}")
+        except Exception as e:
+            print(f"❌ auto_load_shortcuts failed: {e}")
+            import traceback
+            traceback.print_exc()
 
-        finally:
-            self._is_loading_shortcuts = False ##
+    def auto_save_shortcuts(self):
+        """Save shortcut definitions to QSettings — preset data only, no live state."""
+        try:
+            shortcuts_list = []
+            for row in range(self.table.rowCount()):
+                mod_combo  = self.table.cellWidget(row, 0)
+                key_combo  = self.table.cellWidget(row, 1)
+                tool_combo = self.table.cellWidget(row, 2)
+                cell       = self.table.item(row, 3)
 
-    def auto_save_shortcuts(self):    ######
-        """
-        ✅ Save current shortcuts to persistent storage
-        Called automatically when shortcuts are applied
-        """
-        shortcuts_list = []
+                if not (mod_combo and key_combo and tool_combo):
+                    continue
 
-        for row in range(self.table.rowCount()):
-            mod_combo = self.table.cellWidget(row, 0)
-            key_combo = self.table.cellWidget(row, 1)
-            tool_combo = self.table.cellWidget(row, 2)
+                modifier = mod_combo.currentText()
+                key      = key_combo.currentText()
+                tool     = tool_combo.currentText()
 
-            modifier = mod_combo.currentText() if mod_combo else "alt"
-            key = key_combo.currentText() if key_combo else "F1"
-            tool = tool_combo.currentText() if tool_combo else "AboveLine"
+                entry = {"modifier": modifier, "key": key, "tool": tool}
 
-            entry = {
-                "modifier": modifier,
-                "key": key,
-                "tool": tool
-            }
+                if tool == "DisplayMode" and cell:
+                    preset = decode_display_preset(cell.data(Qt.UserRole))
+                    if preset:
+                        entry["display_preset"] = preset
 
-            if tool == "DisplayMode":
-                cell = self.table.item(row, 3)
-                preset_payload = decode_display_preset(cell.data(Qt.UserRole)) if cell else None
-                entry["display_preset"] = preset_payload
-                entry["display_text"] = cell.text() if cell else ""  # ✅ SAVE THE EXACT TEXT
-                entry["from_classes"] = None
-                entry["to_class"] = None
+                elif tool == "ShadingMode" and cell:
+                    preset = decode_shading_preset(cell.data(Qt.UserRole))
+                    if preset:
+                        entry["shading_preset"] = preset
+
+                elif tool == "DrawSettings" and cell:
+                    preset = decode_draw_preset(cell.data(Qt.UserRole))
+                    if preset:
+                        entry["draw_preset"] = preset
+
+                else:
+                    if cell:
+                        from_cls, to_cls = decode_classes(cell.data(Qt.UserRole))
+                        entry["from_classes"] = from_cls
+                        entry["to_class"]     = to_cls
+
                 shortcuts_list.append(entry)
-                continue
-                
-            if tool == "ShadingMode":
-                cell = self.table.item(row, 3)
-                preset_payload = decode_shading_preset(cell.data(Qt.UserRole)) if cell else None
-                entry["shading_preset"] = preset_payload
-                entry["shading_text"] = cell.text() if cell else ""  # ✅ SAVE SHADING TEXT TOO
-                entry["from_classes"] = None
-                entry["to_class"] = None
-                shortcuts_list.append(entry)
-                continue
 
-            if tool == "DrawSettings":
-                cell = self.table.item(row, 3)
-                preset_payload = decode_draw_preset(cell.data(Qt.UserRole)) if cell else None
-                entry["draw_preset"] = preset_payload
-                entry["draw_text"] = cell.text() if cell else ""
-                entry["from_classes"] = None
-                entry["to_class"] = None
-                shortcuts_list.append(entry)
-                continue            
-            # ----------------------------------------
+            self.settings.setValue("shortcuts", json.dumps(shortcuts_list))
+            print(f"💾 Saved {len(shortcuts_list)} shortcuts to QSettings")
 
-            if tool not in ("CrossSectionRect", "CutSectionRect", "CutFromCross", "CutFromCut", "TopView"):
-                cell = self.table.item(row, 3)
-                from_cls, to_cls = decode_classes(cell.data(Qt.UserRole)) if cell else (None, None)
-                entry["from_classes"] = from_cls
-                entry["to_class"] = to_cls
-            else:
-                entry["from_classes"] = None
-                entry["to_class"] = None
-
-            shortcuts_list.append(entry)
-
-        # Save to QSettings
-        self.settings.setValue("shortcuts", json.dumps(shortcuts_list))
-        print(f"✅ Saved {len(shortcuts_list)} shortcuts to persistent storage")
+        except Exception as e:
+            print(f"❌ auto_save_shortcuts failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _sort_table_by_modifier(self):   #Added by bala
         """

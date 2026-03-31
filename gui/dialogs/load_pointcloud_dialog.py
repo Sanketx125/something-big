@@ -405,6 +405,8 @@ class LoadPointCloudDialog(QDialog):
         load_btn = QPushButton("Load Points")
         load_btn.setObjectName("primaryBtn")
         load_btn.setMinimumWidth(128)
+        load_btn.setDefault(True)
+        load_btn.setAutoDefault(True)
 
         actions.addWidget(cancel_btn)
         actions.addWidget(load_btn)

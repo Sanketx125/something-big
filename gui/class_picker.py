@@ -1,16 +1,29 @@
 
 
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton, 
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
                                QHBoxLayout, QListWidget, QListWidgetItem)
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QBrush, QPen, QLinearGradient
-from PySide6.QtGui import QPixmap, QIcon, QColor
 import os
 
 from gui.theme_manager import ThemeColors, get_dialog_stylesheet
 
+_COLOR_ICON_CACHE = {}
+
+
+def _normalize_rgb(rgb):
+    if isinstance(rgb, QColor):
+        return (rgb.red(), rgb.green(), rgb.blue())
+    return tuple(int(c) for c in rgb[:3])
+
+
 def make_color_icon(rgb):
     """Creates a high-fidelity color pill icon with a subtle glow."""
+    rgb = _normalize_rgb(rgb)
+    cached = _COLOR_ICON_CACHE.get(rgb)
+    if cached is not None:
+        return cached
+
     pix = QPixmap(32, 32)
     pix.fill(Qt.transparent)
     
@@ -35,7 +48,9 @@ def make_color_icon(rgb):
     painter.drawEllipse(2, 2, 24, 24)
     
     painter.end()
-    return QIcon(pix)
+    icon = QIcon(pix)
+    _COLOR_ICON_CACHE[rgb] = icon
+    return icon
 
 class ClassPicker(QWidget):
     """
@@ -49,6 +64,7 @@ class ClassPicker(QWidget):
         # ✅ CRITICAL: Save initial app state BEFORE any UI is built
         self._saved_to_class = getattr(app, 'to_class', None)
         self._saved_from_classes = getattr(app, 'from_classes', None)
+        self._last_class_signature = None
         print(f"📌 ClassPicker init - saved to_class: {self._saved_to_class}, from_classes: {self._saved_from_classes}")
  
         self.setWindowFlags(
@@ -81,6 +97,7 @@ class ClassPicker(QWidget):
         self.from_list = QListWidget()
         self.from_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.from_list.setMaximumHeight(150)
+        self.from_list.setUniformItemSizes(True)
         
         # Add "Any class" option
         any_item = QListWidgetItem("Any class")
@@ -382,11 +399,34 @@ class ClassPicker(QWidget):
         self.from_list.blockSignals(False)
         self.to_combo.blockSignals(False)
 
+    def _current_class_signature(self):
+        """Build a lightweight signature so unchanged palettes skip full UI rebuilds."""
+        palette = getattr(self.app, "class_palette", {}) or {}
+        signature = []
+        for code, info in sorted(palette.items()):
+            try:
+                class_code = int(code)
+            except Exception:
+                continue
+            signature.append((
+                class_code,
+                str(info.get("lvl", "")),
+                str(info.get("description", "")),
+                _normalize_rgb(info.get("color", (128, 128, 128))),
+            ))
+        return tuple(signature)
+
     def on_classes_changed(self):
         """
         Called when Display Mode loads new classes.
         ✅ FIXED: Properly preserves user's "To class" selection
         """
+        signature = self._current_class_signature()
+        if signature and signature == self._last_class_signature:
+            self.sync_with_app()
+            print("   Class Picker skipped rebuild (palette unchanged)")
+            return
+
         print("\n" + "="*60)
         print("🔄 CLASS PICKER: Detected class changes from Display Mode")
         print("="*60)
@@ -490,6 +530,7 @@ class ClassPicker(QWidget):
         }
 
         # Block signals during rebuild
+        self.setUpdatesEnabled(False)
         self.from_list.blockSignals(True)
         self.to_combo.blockSignals(True)
 
@@ -543,6 +584,15 @@ class ClassPicker(QWidget):
         self.from_list.addItem(any_item)
         
         class_list.sort(key=lambda x: x['code'])
+        self._last_class_signature = tuple(
+            (
+                int(cls['code']),
+                str(cls['lvl']),
+                str(cls['desc']),
+                _normalize_rgb(cls['color']),
+            )
+            for cls in class_list
+        )
         
         for cls in class_list:
             code = cls['code']
@@ -551,9 +601,7 @@ class ClassPicker(QWidget):
             if not lvl or lvl.strip() == "":
                 lvl = STANDARD_LEVELS.get(code, str(code))
             
-            pixmap = QPixmap(16, 16)
-            pixmap.fill(cls['color'])
-            icon = QIcon(pixmap)
+            icon = make_color_icon(cls['color'])
             
             desc = cls['desc']
             label = f"{code} - {lvl} ({desc})" if desc else f"{code} - {lvl}"
@@ -606,6 +654,7 @@ class ClassPicker(QWidget):
         # Unblock signals
         self.from_list.blockSignals(False)
         self.to_combo.blockSignals(False)
+        self.setUpdatesEnabled(True)
         
         # ✅ Update app state to match restored selections
         self.app.to_class = self.to_combo.currentData()

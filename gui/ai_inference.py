@@ -825,9 +825,14 @@ class InferenceWorker(QThread):
 
     def _run_inference(self, xyz, features, n_total):
         vote_counts = np.zeros((n_total, 5), dtype=np.int32)
-        stride       = InferenceConfig.TILE_SIZE - InferenceConfig.TILE_OVERLAP
+        tile_size    = InferenceConfig.TILE_SIZE
+        stride       = tile_size - InferenceConfig.TILE_OVERLAP
         x_min, y_min = xyz[:,0].min(), xyz[:,1].min()
         x_max, y_max = xyz[:,0].max(), xyz[:,1].max()
+
+        # Pre-sort by x for O(log N) tile lookups instead of O(N) masks
+        x_order  = np.argsort(xyz[:, 0])
+        x_sorted = xyz[x_order, 0]
 
         tile_specs = []
         xs = x_min
@@ -837,34 +842,43 @@ class InferenceWorker(QThread):
                 tile_specs.append((xs, ys)); ys += stride
             xs += stride
 
-        print(f"    Tiles: {len(tile_specs)}")
+        # Pre-compute tile members: binary search on x, then filter y
+        tile_members = []
+        for tx, ty in tile_specs:
+            lo = np.searchsorted(x_sorted, tx, side='left')
+            hi = np.searchsorted(x_sorted, tx + tile_size, side='left')
+            if hi <= lo:
+                tile_members.append(None); continue
+            cands  = x_order[lo:hi]
+            y_vals = xyz[cands, 1]
+            t_idx  = cands[(y_vals >= ty) & (y_vals < ty + tile_size)]
+            t_idx.sort()  # match np.where order for RNG reproducibility
+            tile_members.append(t_idx if len(t_idx) >= 100 else None)
+
+        n_active = sum(1 for m in tile_members if m is not None)
+        print(f"    Tiles: {len(tile_specs)} ({n_active} active)")
         total_batches = 0
-        total_work    = max(1, len(tile_specs) * InferenceConfig.VOTE_PASSES)
+        total_work    = max(1, n_active * InferenceConfig.VOTE_PASSES)
 
         for vote in range(InferenceConfig.VOTE_PASSES):
             self._check_cancel()
             gpu_batch = []; batch_meta = []
 
-            for tile_idx, (tx, ty) in enumerate(tile_specs):
-                if tile_idx % 50 == 0: self._check_cancel()
-                mask = (
-                    (xyz[:,0] >= tx) & (xyz[:,0] < tx + InferenceConfig.TILE_SIZE) &
-                    (xyz[:,1] >= ty) & (xyz[:,1] < ty + InferenceConfig.TILE_SIZE)
-                )
-                n_tile = mask.sum()
-                if n_tile < 100: continue
-                tile_indices = np.where(mask)[0]
+            for ti, members in enumerate(tile_members):
+                if ti % 50 == 0: self._check_cancel()
+                if members is None: continue
+                n_tile = len(members)
                 if n_tile >= InferenceConfig.NUM_POINTS:
                     sel = self._rng.choice(n_tile, InferenceConfig.NUM_POINTS,
                                            replace=False)
                 else:
                     sel = self._rng.choice(n_tile, InferenceConfig.NUM_POINTS,
                                            replace=True)
-                batch_coords  = xyz[tile_indices[sel]].copy().astype(np.float32)
-                batch_feat    = features[tile_indices[sel]].copy()
+                batch_coords  = xyz[members[sel]].copy().astype(np.float32)
+                batch_feat    = features[members[sel]].copy()
                 batch_coords -= batch_coords.mean(axis=0)
                 gpu_batch.append((batch_coords, batch_feat))
-                batch_meta.append((tile_indices, sel))
+                batch_meta.append((members, sel))
 
                 if len(gpu_batch) >= InferenceConfig.INFERENCE_BATCH_SIZE:
                     self._check_cancel()
@@ -980,18 +994,34 @@ class InferenceWorker(QThread):
         )
         all_ground_xyz = xyz[ground_mask]
         if len(all_ground_xyz) == 0: return predictions, 0
+
+        # First pass: filter by building ratio (variable-length neighbors)
+        ratio_pass = []
+        for i, neighbors in enumerate(neighbor_lists):
+            if len(neighbors) >= 5:
+                if (predictions[neighbors] == self.BUILDING).sum() / len(neighbors) >= 0.50:
+                    ratio_pass.append(i)
+        if not ratio_pass:
+            return predictions, 0
+
+        pass_candidates = candidates[np.array(ratio_pass)]
+
+        # Batch ground elevation query (replaces per-point KDTree calls)
         tree_ground_2d = cKDTree(all_ground_xyz[:, :2])
-        fixes = 0
-        for pt_idx, neighbors in zip(candidates, neighbor_lists):
-            if len(neighbors) < 5: continue
-            if (predictions[neighbors] == self.BUILDING).sum() / len(neighbors) < 0.50:
-                continue
-            d_g, i_g = tree_ground_2d.query(xyz[pt_idx, :2], k=10)
-            near_gz  = all_ground_xyz[i_g[d_g < 20.0], 2]
-            if (len(near_gz) > 0
-                    and xyz[pt_idx, 2] - np.median(near_gz) > 2.5):
-                predictions[pt_idx] = self.BUILDING; fixes += 1
-        return predictions, fixes
+        d_g, i_g = tree_ground_2d.query(
+            xyz[pass_candidates, :2], k=10, workers=-1
+        )
+
+        # Vectorized elevation check
+        near_mask    = d_g < 20.0
+        ground_z     = all_ground_xyz[i_g, 2]
+        ground_z_m   = np.where(near_mask, ground_z, np.nan)
+        median_gz    = np.nanmedian(ground_z_m, axis=1)
+        has_near     = near_mask.any(axis=1)
+        to_fix       = has_near & ((xyz[pass_candidates, 2] - median_gz) > 2.5)
+
+        predictions[pass_candidates[to_fix]] = self.BUILDING
+        return predictions, int(to_fix.sum())
 
     def _fix_building_walls(self, xyz, predictions, hag, post_features):
         building_mask = predictions == self.BUILDING
@@ -1050,27 +1080,34 @@ class InferenceWorker(QThread):
                 if len(nbrs) < 5: isolated.append(pi)
                 elif (predictions[nbrs] == self.BUILDING).sum() / len(nbrs) < 0.15:
                     isolated.append(pi)
-            for idx in isolated:
-                _, nn = tree_all.query(xyz[idx], k=20)
-                nb    = predictions[nn[1:]][predictions[nn[1:]] != self.BUILDING]
-                if len(nb) > 0:
-                    v, c = np.unique(nb, return_counts=True)
-                    predictions[idx] = v[c.argmax()]; fixes += 1
+            # Batch KDTree query for all isolated points at once
+            if isolated:
+                isolated_arr = np.array(isolated)
+                _, nn_batch  = tree_all.query(xyz[isolated_arr], k=20, workers=-1)
+                nn_preds     = predictions[nn_batch[:, 1:]]
+                for i, idx in enumerate(isolated_arr):
+                    nb = nn_preds[i][nn_preds[i] != self.BUILDING]
+                    if len(nb) > 0:
+                        v, c = np.unique(nb, return_counts=True)
+                        predictions[idx] = v[c.argmax()]; fixes += 1
 
         lc = np.where(
             (confidence < 0.6) &
             np.isin(predictions, [self.MIDVEG, self.HIGHVEG, self.BUILDING])
         )[0]
         if 0 < len(lc) < 500_000:
-            for idx in lc:
-                _, nn = tree_all.query(xyz[idx], k=15)
-                nc = confidence[nn[1:]]; np_ = predictions[nn[1:]]
-                hc = nc > 0.8
-                if hc.sum() >= 5:
-                    hp = np_[hc]; v, c = np.unique(hp, return_counts=True)
-                    new = v[c.argmax()]
-                    if new != predictions[idx]:
-                        predictions[idx] = new; fixes += 1
+            # Batch KDTree query for all low-confidence points at once
+            _, nn_batch = tree_all.query(xyz[lc], k=15, workers=-1)
+            nn_conf = confidence[nn_batch[:, 1:]]
+            nn_pred = predictions[nn_batch[:, 1:]]
+            high_conf = nn_conf > 0.8
+            n_high    = high_conf.sum(axis=1)
+            for i in np.where(n_high >= 5)[0]:
+                hp = nn_pred[i][high_conf[i]]
+                v, c = np.unique(hp, return_counts=True)
+                new = v[c.argmax()]
+                if new != predictions[lc[i]]:
+                    predictions[lc[i]] = new; fixes += 1
         return predictions, fixes
 
     # ── POWER LINE DETECTION ─────────────────────────────────

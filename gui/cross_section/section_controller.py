@@ -397,6 +397,34 @@ class SectionController:
         self._section_actor = None
         self.app.vtk_widget.render()
 
+    def clear_preview(self):
+        """Clear only the active drawing preview elements (centerline and rubberband), leaving finalized sections intact."""
+        renderer = self.app.vtk_widget.renderer
+        needs_render = False
+        
+        # Clear 3D rubber band
+        if hasattr(self, "rubber_actor") and self.rubber_actor:
+            renderer.RemoveActor(self.rubber_actor)
+            self.rubber_actor = None
+            self.rubber_points = None
+            self.rubber_poly = None
+            needs_render = True
+            
+        # Clear 2D rubber band
+        if hasattr(self, "_rubber_actor_2d") and self._rubber_actor_2d:
+            renderer.RemoveActor(self._rubber_actor_2d)
+            self._rubber_actor_2d = None
+            needs_render = True
+            
+        # Clear 2D centerline
+        if hasattr(self, "_centerline_actor_2d") and self._centerline_actor_2d:
+            renderer.RemoveActor(self._centerline_actor_2d)
+            self._centerline_actor_2d = None
+            needs_render = True
+            
+        if needs_render:
+            self.app.vtk_widget.render()
+
     # ---------------- RECTANGLE INIT ----------------
     def _init_rectangle(self, npoints=5):
         """OPTIMIZED: Initialize rectangle once with reusable structures"""

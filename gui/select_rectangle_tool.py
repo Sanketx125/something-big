@@ -890,12 +890,8 @@ class SelectRectangleTool:
             
             # Refresh point cloud display
             if deleted_points > 0:
-                if self.app.display_mode == "class":
-                    from gui.class_display import update_class_mode
-                    update_class_mode(self.app)
-                else:
-                    from gui.pointcloud_display import update_pointcloud
-                    update_pointcloud(self.app, self.app.display_mode)
+                from gui.pointcloud_display import update_pointcloud
+                update_pointcloud(self.app, self.app.display_mode)
             
             # If only DXF deleted, just render
             if deleted_dxf > 0 and deleted_points == 0:

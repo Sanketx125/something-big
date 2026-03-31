@@ -1,3 +1,5 @@
+
+####
 from json import tool
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage, vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper, vtkCoordinate
@@ -7,6 +9,8 @@ import vtk
 import numpy as np
 import time
 from gui.vtk_utils import force_vtk_pipeline_update
+# ✅ Shared helper — avoids triggering shading rebuild when no mesh exists yet
+from gui.classification_tools import _shading_mesh_exists
           
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
@@ -105,9 +109,14 @@ class ClassificationInteractor:
         # ✅ CRITICAL FIX: Use custom mouse move handler that ALWAYS shows previews
         self.style.AddObserver("MouseMoveEvent", self._on_mouse_move_with_preview)
 
-        # also forward middle mouse press/release to style
-        self.style.AddObserver("MiddleButtonPressEvent", lambda o, e: self.style.OnMiddleButtonDown())
-        self.style.AddObserver("MiddleButtonReleaseEvent", lambda o, e: self.style.OnMiddleButtonUp())
+        # ✅ CUSTOM PAN: Do NOT forward to style.OnMiddleButtonDown/Up — those call
+        # VTK's internal C++ Render() which segfaults on stale render windows.
+        # Instead, implement pan manually with safe deferred rendering.
+        self._is_panning = False
+        self._last_pan_pos = (0, 0)
+        self._pan_render_pending = False
+        self.style.AddObserver("MiddleButtonPressEvent", self._on_safe_pan_start)
+        self.style.AddObserver("MiddleButtonReleaseEvent", self._on_safe_pan_stop)
 
         # state
         self.P1 = None
@@ -142,6 +151,300 @@ class ClassificationInteractor:
         print("✅ ClassificationInteractor initialized with live previews")
         self.style.AddObserver("RightButtonPressEvent", self.on_right_press)
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # ✅ SAFE RENDER GUARDS - Prevents crash on stale VTK render windows
+    # Root cause: switching between cut section ↔ synchronized views leaves
+    # render windows in an invalid state. Unguarded Render() dereferences
+    # near-null pointer (0x24) → win32 memory access violation → hard crash.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _is_vtk_widget_alive(vtk_widget):
+        """Check if a VTK widget is still alive and renderable."""
+        if vtk_widget is None:
+            return False
+        try:
+            # Qt widget destroyed?
+            if hasattr(vtk_widget, 'isVisible') and callable(vtk_widget.isVisible):
+                if not vtk_widget.isVisible():
+                    return False
+            # Render window accessible?
+            rw = vtk_widget.GetRenderWindow()
+            if rw is None:
+                return False
+            # Interactor alive? (None if window finalized)
+            if rw.GetInteractor() is None:
+                return False
+            # Has at least one renderer?
+            renderers = rw.GetRenderers()
+            if renderers is None or renderers.GetNumberOfItems() == 0:
+                return False
+            return True
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _safe_render(vtk_widget):
+        """
+        Safely render a VTK widget. Returns True on success, False otherwise.
+        NEVER raises — all exceptions are caught to prevent crash.
+        """
+        if vtk_widget is None:
+            return False
+        try:
+            # Inline validity checks (avoid second method call for speed)
+            rw = vtk_widget.GetRenderWindow()
+            if rw is None:
+                return False
+            if rw.GetInteractor() is None:
+                return False
+            renderers = rw.GetRenderers()
+            if renderers is None or renderers.GetNumberOfItems() == 0:
+                return False
+            rw.Render()
+            return True
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _safe_render_pyvista(vtk_widget):
+        """Safely call .render() on a PyVista widget."""
+        if vtk_widget is None:
+            return False
+        try:
+            if hasattr(vtk_widget, 'isVisible') and callable(vtk_widget.isVisible):
+                if not vtk_widget.isVisible():
+                    return False
+            rw = vtk_widget.GetRenderWindow()
+            if rw is None or rw.GetInteractor() is None:
+                return False
+            vtk_widget.render()
+            return True
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            return False
+        except Exception:
+            return False
+
+    def _safe_render_interactor(self):
+        """Safely render via self.interactor's render window."""
+        try:
+            if self.interactor is None:
+                return False
+            rw = self.interactor.GetRenderWindow()
+            if rw is None or rw.GetInteractor() is None:
+                return False
+            renderers = rw.GetRenderers()
+            if renderers is None or renderers.GetNumberOfItems() == 0:
+                return False
+            rw.Render()
+            return True
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _safe_render_from_renderer(renderer):
+        """Safely render from a VTK renderer reference."""
+        if renderer is None:
+            return False
+        try:
+            rw = renderer.GetRenderWindow()
+            if rw is None or rw.GetInteractor() is None:
+                return False
+            rw.Render()
+            return True
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _safe_get_render_window(vtk_widget):
+        """Safely get render window from a VTK widget. Returns None if dead."""
+        if vtk_widget is None:
+            return None
+        try:
+            rw = vtk_widget.GetRenderWindow()
+            if rw is None or rw.GetInteractor() is None:
+                return None
+            return rw
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            return None
+        except Exception:
+            return None
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ✅ CUSTOM SAFE PAN - Replaces VTK's built-in pan which crashes
+    # VTK's OnMiddleButtonDown/Up → OnMouseMove internally calls C++ Render()
+    # which segfaults on stale OpenGL contexts. This custom pan does camera
+    # math in Python and uses Qt deferred repaint — zero C++ Render() calls.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _on_safe_pan_start(self, obj, event):
+        """Start custom pan (replaces style.OnMiddleButtonDown)."""
+        try:
+            if self.interactor is None:
+                return
+            
+            # ═══════════════════════════════════════════════════════════════
+            # ✅ CRITICAL: Verify middle button is actually pressed via Qt
+            # VTK sends phantom MiddleButtonPressEvent after classification
+            # ═══════════════════════════════════════════════════════════════
+            try:
+                from PySide6.QtWidgets import QApplication
+                from PySide6.QtCore import Qt
+                buttons = QApplication.mouseButtons()
+                if not (buttons & Qt.MiddleButton):
+                    # Phantom event - ignore completely
+                    return
+            except Exception:
+                pass
+            
+            self._is_panning = True
+            self._last_pan_pos = self.interactor.GetEventPosition()
+            print("🖱️ Middle button PRESSED - starting pan")
+            
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _on_safe_pan_stop(self, obj, event):
+        """Stop custom pan (replaces style.OnMiddleButtonUp)."""
+        self._is_panning = False
+
+    def _do_safe_pan(self):
+        """
+        Execute pan: move camera by mouse delta.
+        ✅ CRITICAL FIX: Verify middle button is ACTUALLY pressed before panning.
+        This prevents phantom pan from corrupted VTK interactor state.
+        """
+        # ═══════════════════════════════════════════════════════════════════
+        # ✅ CRITICAL: Check Qt button state, not just our flag
+        # VTK can send phantom MiddleButtonPressEvent after classification
+        # tools complete, setting _is_panning=True incorrectly.
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtCore import Qt
+            buttons = QApplication.mouseButtons()
+            middle_actually_pressed = bool(buttons & Qt.MiddleButton)
+            
+            if not middle_actually_pressed:
+                # Middle button not pressed - reset our flag if it was set
+                if self._is_panning:
+                    self._is_panning = False
+                return
+        except Exception:
+            # Fallback: use our flag only
+            if not getattr(self, '_is_panning', False):
+                return
+        
+        if not getattr(self, '_is_panning', False):
+            return
+        
+        try:
+            if self.interactor is None:
+                return
+            
+            current_pos = self.interactor.GetEventPosition()
+            last = getattr(self, '_last_pan_pos', current_pos)
+            
+            dx = current_pos[0] - last[0]
+            dy = current_pos[1] - last[1]
+            
+            if dx == 0 and dy == 0:
+                return
+            
+            vtk_widget = self._get_active_vtk_widget()
+            if vtk_widget is None:
+                return
+            
+            renderer = getattr(vtk_widget, 'renderer', None)
+            if renderer is None:
+                return
+            
+            camera = renderer.GetActiveCamera()
+            if camera is None:
+                return
+            
+            # Get window size for pixel-to-world conversion
+            try:
+                rw = vtk_widget.GetRenderWindow()
+                size = rw.GetSize() if rw is not None else (800, 600)
+            except (RuntimeError, AttributeError):
+                size = (800, 600)
+            
+            w = max(size[0], 1)
+            h = max(size[1], 1)
+            
+            # Use ParallelScale for orthographic views
+            if camera.GetParallelProjection():
+                parallel_scale = camera.GetParallelScale()
+                scale_x = (2.0 * parallel_scale) / h
+                scale_y = scale_x
+            else:
+                distance = camera.GetDistance()
+                scale_x = distance / (w * 0.5)
+                scale_y = scale_x
+            
+            # Camera axes
+            camera.OrthogonalizeViewUp()
+            up = list(camera.GetViewUp())
+            pos = list(camera.GetPosition())
+            fp = list(camera.GetFocalPoint())
+            
+            vd = [fp[i] - pos[i] for i in range(3)]
+            
+            # Right vector = vd × up
+            right = [
+                vd[1] * up[2] - vd[2] * up[1],
+                vd[2] * up[0] - vd[0] * up[2],
+                vd[0] * up[1] - vd[1] * up[0]
+            ]
+            mag = (right[0]**2 + right[1]**2 + right[2]**2) ** 0.5
+            if mag < 1e-12:
+                self._last_pan_pos = current_pos
+                return
+            right = [r / mag for r in right]
+            
+            # Pan vector
+            pan = [-dx * scale_x * right[i] - dy * scale_y * up[i] for i in range(3)]
+            
+            camera.SetPosition(*[pos[i] + pan[i] for i in range(3)])
+            camera.SetFocalPoint(*[fp[i] + pan[i] for i in range(3)])
+            
+            self._last_pan_pos = current_pos
+            
+            # Deferred render
+            if not getattr(self, '_pan_render_pending', False):
+                self._pan_render_pending = True
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(0, self._execute_deferred_pan_render)
+            
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            self._is_panning = False
+        except Exception:
+            pass
+
+    def _execute_deferred_pan_render(self):
+        """Render on the Qt event loop (valid OpenGL context). Called by QTimer."""
+        self._pan_render_pending = False
+        try:
+            vtk_widget = self._get_active_vtk_widget()
+            if vtk_widget is not None:
+                # ✅ Check widget is visible (Qt-level, safe)
+                if hasattr(vtk_widget, 'isVisible') and not vtk_widget.isVisible():
+                    return
+                vtk_widget.render()
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            pass
+        except Exception:
+            pass
+
     # Added by bala for mouse smooth
     def _get_display_point(self):
         """Exact mouse position in DISPLAY coords (no snapping, very fast)."""
@@ -149,18 +452,31 @@ class ClassificationInteractor:
         return float(x), float(y)
 
     def _display_to_world_fast(self, x, y):
-        """DISPLAY → WORLD without picker (no snapping)."""
+        """DISPLAY → WORLD without picker (no snapping). ✅ SAFE: guarded render window access."""
         if not hasattr(self, "_cached_renderer") or self._cached_renderer is None:
-            self._cached_renderer = (
-                self.interactor.GetRenderWindow()
-                .GetRenderers()
-                .GetFirstRenderer()
-            )
+            try:
+                rw = self.interactor.GetRenderWindow()
+                if rw is None:
+                    return (0.0, 0.0, 0.0)
+                renderers = rw.GetRenderers()
+                if renderers is None:
+                    return (0.0, 0.0, 0.0)
+                self._cached_renderer = renderers.GetFirstRenderer()
+            except (RuntimeError, AttributeError, OSError, ReferenceError):
+                return (0.0, 0.0, 0.0)
+            except Exception:
+                return (0.0, 0.0, 0.0)
+
+        if self._cached_renderer is None:
+            return (0.0, 0.0, 0.0)
 
         coord = vtk.vtkCoordinate()
         coord.SetCoordinateSystemToDisplay()
         coord.SetValue(x, y, 0)
-        return coord.GetComputedWorldValue(self._cached_renderer)
+        try:
+            return coord.GetComputedWorldValue(self._cached_renderer)
+        except Exception:
+            return (0.0, 0.0, 0.0)
 
     def _is_main_view(self):
         """True if this interactor is attached to the main plan view widget."""
@@ -247,20 +563,27 @@ class ClassificationInteractor:
             return (pt[0], pt[2])  # X-Z
  
     def _get_active_vtk_widget(self):
-        """Get the correct VTK widget by matching the current interactor."""
+        """
+        Get the correct VTK widget by matching the current interactor.
+        ✅ SAFE: All GetRenderWindow() calls guarded to prevent crash on stale windows.
+        """
+        if self.interactor is None:
+            return None
        
         # 1. Check Cut Section
         if hasattr(self.app, 'cut_section_controller'):
             cut_vtk = getattr(self.app.cut_section_controller, 'cut_vtk', None)
             if cut_vtk:
-                # Check if this widget owns our interactor (PyVista check)
                 if getattr(cut_vtk, 'interactor', None) == self.interactor:
                     return cut_vtk
-                # Check via VTK RenderWindow (Standard VTK check)
-                if cut_vtk.GetRenderWindow().GetInteractor() == self.interactor:
-                    return cut_vtk
+                rw = self._safe_get_render_window(cut_vtk)
+                if rw is not None:
+                    try:
+                        if rw.GetInteractor() == self.interactor:
+                            return cut_vtk
+                    except Exception:
+                        pass
  
-        # 2. Check Section Docks
         # 2. Check Section Docks (SAFE)
         section_vtks = getattr(self.app, 'section_vtks', None)
         if isinstance(section_vtks, dict):
@@ -268,8 +591,13 @@ class ClassificationInteractor:
                 if widget:
                     if getattr(widget, 'interactor', None) == self.interactor:
                         return widget
-                    if widget.GetRenderWindow().GetInteractor() == self.interactor:
-                        return widget
+                    rw = self._safe_get_render_window(widget)
+                    if rw is not None:
+                        try:
+                            if rw.GetInteractor() == self.interactor:
+                                return widget
+                        except Exception:
+                            pass
 
  
         # 3. Check Main View
@@ -277,25 +605,34 @@ class ClassificationInteractor:
         if main_widget:
             if getattr(main_widget, 'interactor', None) == self.interactor:
                 return main_widget
-            if main_widget.GetRenderWindow().GetInteractor() == self.interactor:
-                return main_widget
+            rw = self._safe_get_render_window(main_widget)
+            if rw is not None:
+                try:
+                    if rw.GetInteractor() == self.interactor:
+                        return main_widget
+                except Exception:
+                    pass
  
-        # 4. FALLBACK: Match by RenderWindow (Most robust for PyVista/Qt)
+        # 4. FALLBACK: Match by RenderWindow
         try:
             current_rw = self.interactor.GetRenderWindow()
+            if current_rw is None:
+                return None
            
-            # Check cut section by Window
             if hasattr(self.app, 'cut_section_controller'):
                 cut_vtk = getattr(self.app.cut_section_controller, 'cut_vtk', None)
-                if cut_vtk and cut_vtk.GetRenderWindow() == current_rw:
-                    return cut_vtk
+                if cut_vtk:
+                    rw = self._safe_get_render_window(cut_vtk)
+                    if rw is not None and rw == current_rw:
+                        return cut_vtk
                    
-            # Check section docks by Window
             if hasattr(self.app, 'section_vtks'):
                 for widget in self.app.section_vtks.values():
-                    if widget and widget.GetRenderWindow() == current_rw:
-                        return widget
-        except:
+                    if widget:
+                        rw = self._safe_get_render_window(widget)
+                        if rw is not None and rw == current_rw:
+                            return widget
+        except Exception:
             pass                  
         return None
    
@@ -762,7 +1099,7 @@ class ClassificationInteractor:
             prop.SetLighting(False)
             
             renderer.AddActor(test_actor)
-            self.interactor.GetRenderWindow().Render()
+            self._safe_render_interactor()
             
             print("✅ Test line drawn (RED diagonal) - if you see this, rendering works!")
         except Exception as e:
@@ -825,8 +1162,7 @@ class ClassificationInteractor:
         tool = getattr(self.app, "active_classify_tool", None)
         if tool in ("above_line", "below_line"):
             self._draw_vertical_guides(P1, P2, tool, renderer)
-        
-        vtk_widget.GetRenderWindow().Render()
+        # Render is batched by _on_mouse_move_with_preview — do NOT call here
 
     def _draw_vertical_guides(self, P1, P2, tool, renderer):
         """
@@ -927,26 +1263,20 @@ class ClassificationInteractor:
             self.rect_pts.SetPoint(i, d[0], d[1], 0)
 
         self.rect_pts.Modified()
-        vtk_widget.GetRenderWindow().Render()
+        self._safe_render(vtk_widget)
 
     def _draw_freehand_preview(self, live_point=None):
-        """✅ FREEHAND PREVIEW: Smooth flowing line following circle approach"""
+        """
+        ✅ PERFORMANCE FIX: Reuse VTK actor — NO RemoveActor/AddActor per frame.
+        Only updates point coordinates and calls Modified(). Zero allocation after init.
+        """
         if len(self.drawing_points) < 1:
             return
 
-        # ✅ Use the same VTK widget as other classification tools
         vtk_widget = self._get_active_vtk_widget()
         if vtk_widget is None:
             return
         renderer = vtk_widget.renderer
-
-        # Remove previous actor
-        if hasattr(self, "freehand_actor") and self.freehand_actor:
-            try:
-                renderer.RemoveActor2D(self.freehand_actor)
-            except Exception:
-                pass
-            self.freehand_actor = None
 
         # Collect all points
         all_pts = list(self.drawing_points)
@@ -956,63 +1286,67 @@ class ClassificationInteractor:
         if len(all_pts) < 2:
             return
 
-        # Convert world coordinates to display coordinates
-        from vtkmodules.vtkRenderingCore import vtkCoordinate
-        # Create freehand points in world space
-        freehand_world = []
-        for u, z in all_pts:
-            freehand_world.append((u, 0, z))
+        n = len(all_pts)
 
-        # Create 2D polyline in display coordinates
-        pts = vtkPoints()
-        coord = vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
-        for point in freehand_world:
-            coord.SetValue(point[0], point[1], point[2])
-            display_pos = coord.GetComputedDisplayValue(renderer)
-            pts.InsertNextPoint(display_pos[0], display_pos[1], 0)
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_freehand_pts") or self.freehand_actor is None:
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
 
-        lines = vtkCellArray()
-        n = len(freehand_world)
-        for i in range(n - 1):
-            lines.InsertNextCell(2)
-            lines.InsertCellPoint(i)
-            lines.InsertCellPoint(i + 1)
+            self._freehand_pts   = vtkPoints()
+            self._freehand_lines = vtkCellArray()
+            self._freehand_poly  = vtkPolyData()
+            self._freehand_poly.SetPoints(self._freehand_pts)
+            self._freehand_poly.SetLines(self._freehand_lines)
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._freehand_poly)
+            dc = _C(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
 
-        # Create mapper for 2D
-        from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
+            self.freehand_actor = vtkActor2D()
+            self.freehand_actor.SetMapper(mapper)
+            prop = self.freehand_actor.GetProperty()
+            prop.SetColor(1, 0.8, 0)
+            prop.SetLineWidth(2)
+            prop.SetOpacity(0.8)
 
-        # Convert to 2D coordinates
-        coordinate = vtkCoordinate()
-        coordinate.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(coordinate)
+            renderer.AddActor2D(self.freehand_actor)
 
-        # Create 2D actor (will be drawn on top)
-        from vtkmodules.vtkRenderingCore import vtkActor2D
-        self.freehand_actor = vtkActor2D()
-        self.freehand_actor.SetMapper(mapper)
+        # Re-attach if renderer was cleared
+        if not renderer.HasViewProp(self.freehand_actor):
+            renderer.AddActor2D(self.freehand_actor)
+        self.freehand_actor.VisibilityOn()
 
-        # Set properties - Distinct freehand style
-        prop = self.freehand_actor.GetProperty()
-        prop.SetColor(1, 0.8, 0)   # Orange-yellow (different from polygon/circle)
-        prop.SetLineWidth(2)       # Lighter for smoother feel
-        prop.SetOpacity(0.8)       # Semi-transparent
+        # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
+        if not hasattr(self, "_freehand_coord"):
+            from vtkmodules.vtkRenderingCore import vtkCoordinate as _C
+            self._freehand_coord = _C()
+            self._freehand_coord.SetCoordinateSystemToWorld()
 
-        # Add as 2D actor (always on top!)
-        renderer.AddActor2D(self.freehand_actor)
-        print(f"✏️ Freehand preview drawn ({len(all_pts)} points)")
-        # DON'T call Render() here
+        coord = self._freehand_coord
+        self._freehand_pts.Reset()
+        self._freehand_lines.Reset()
+
+        for i, (u, z) in enumerate(all_pts):
+            xw, yw, zw = self._view2d_to_world(u, z)
+            coord.SetValue(xw, yw, zw)
+            d = coord.GetComputedDisplayValue(renderer)
+            self._freehand_pts.InsertNextPoint(d[0], d[1], 0)
+            if i > 0:
+                self._freehand_lines.InsertNextCell(2)
+                self._freehand_lines.InsertCellPoint(i - 1)
+                self._freehand_lines.InsertCellPoint(i)
+
+        self._freehand_pts.Modified()
+        self._freehand_poly.Modified()
+        # Render is batched by caller (_on_mouse_move_with_preview)
 
 
 
     def _draw_polygon_preview(self, live_point=None):
-        """Draw polygon preview with current points."""
+        """
+        ✅ PERFORMANCE FIX: Reuse Actor2D — no RemoveActor/new objects per frame.
+        """
         if len(self.drawing_points) < 1:
             return
 
@@ -1021,75 +1355,125 @@ class ClassificationInteractor:
             return
         renderer = vtk_widget.renderer
 
-        if hasattr(self, "poly_actor") and self.poly_actor:
-            renderer.RemoveActor(self.poly_actor)
-            self.poly_actor = None
-
-        pts = vtkPoints()
-        lines = vtkCellArray()
-
         all_pts = list(self.drawing_points)
         if live_point:
             all_pts.append(live_point)
 
-        z_offset = 0.02  # Increased
+        n = len(all_pts)
+
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_poly_pts_2d") or self.poly_actor is None:
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
+
+            self._poly_pts_2d   = vtkPoints()
+            self._poly_lines_2d = vtkCellArray()
+            self._poly_poly_2d  = vtkPolyData()
+            self._poly_poly_2d.SetPoints(self._poly_pts_2d)
+            self._poly_poly_2d.SetLines(self._poly_lines_2d)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._poly_poly_2d)
+            dc = _C(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.poly_actor = vtkActor2D()
+            self.poly_actor.SetMapper(mapper)
+            prop = self.poly_actor.GetProperty()
+            prop.SetColor(1, 1, 0)
+            prop.SetLineWidth(4)
+            prop.SetOpacity(1.0)
+
+            renderer.AddActor2D(self.poly_actor)
+
+        if not renderer.HasViewProp(self.poly_actor):
+            renderer.AddActor2D(self.poly_actor)
+        self.poly_actor.VisibilityOn()
+
+        # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
+        if not hasattr(self, "_poly_coord_conv"):
+            from vtkmodules.vtkRenderingCore import vtkCoordinate as _C
+            self._poly_coord_conv = _C()
+            self._poly_coord_conv.SetCoordinateSystemToWorld()
+
+        coord = self._poly_coord_conv
+        self._poly_pts_2d.Reset()
+        self._poly_lines_2d.Reset()
 
         for i, (u, z) in enumerate(all_pts):
-            pts.InsertNextPoint(u, 0.0, z + z_offset)
-
+            xw, yw, zw = self._view2d_to_world(u, z)
+            coord.SetValue(xw, yw, zw)
+            d = coord.GetComputedDisplayValue(renderer)
+            self._poly_pts_2d.InsertNextPoint(d[0], d[1], 0)
             if i > 0:
-                lines.InsertNextCell(2)
-                lines.InsertCellPoint(i - 1)
-                lines.InsertCellPoint(i)
+                self._poly_lines_2d.InsertNextCell(2)
+                self._poly_lines_2d.InsertCellPoint(i - 1)
+                self._poly_lines_2d.InsertCellPoint(i)
 
-        if len(all_pts) > 2:
-            lines.InsertNextCell(2)
-            lines.InsertCellPoint(len(all_pts) - 1)
-            lines.InsertCellPoint(0)
+        # Close polygon if > 2 points
+        if n > 2:
+            self._poly_lines_2d.InsertNextCell(2)
+            self._poly_lines_2d.InsertCellPoint(n - 1)
+            self._poly_lines_2d.InsertCellPoint(0)
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        mapper = vtkPolyDataMapper()
-        mapper.SetInputData(poly)
-
-        self.poly_actor = vtkActor()
-        self.poly_actor.SetMapper(mapper)
-
-        prop = self.poly_actor.GetProperty()
-        prop.SetColor(1, 1, 0)
-        prop.SetLineWidth(4)
-        prop.SetDepthTest(False)
-        prop.SetLighting(False)
-
-        renderer.AddActor(self.poly_actor)
-        self.interactor.GetRenderWindow().Render()
+        self._poly_pts_2d.Modified()
+        self._poly_poly_2d.Modified()
+        # Render batched by caller
 
     def _draw_brush_cursor(self, center, radius=20.0):
-        """✅ Brush cursor in DISPLAY pixels (zoom invariant)"""
+        """
+        ✅ PERFORMANCE FIX: Brush cursor in DISPLAY pixels (zoom invariant).
+        Reuses VTK actor — only updates point data. Zero allocation per frame.
+        """
         vtk_widget = self._get_active_vtk_widget()
         if vtk_widget is None:
             return
         renderer = vtk_widget.renderer
 
-        # remove previous
-        if getattr(self, "brush_actor", None):
-            try:
-                renderer.RemoveActor2D(self.brush_actor)
-            except Exception:
-                pass
-            self.brush_actor = None
-
-        # display center (VTK display coords: origin bottom-left)
         x, y = self.interactor.GetEventPosition()
-        r = max(float(radius), 3.0)  # radius is pixels now
+        r = max(float(radius), 3.0)
 
         num_segments = 32
         dot_segments = 8
 
-        pts = vtkPoints()
-        lines = vtkCellArray()
+        # Total points: dashed circle (num_segments pts) + crosshair (4 pts) + dot (dot_segments*2 pts)
+        # Each dash: 2 pts  ×  num_segments/2 dashes = num_segments pts
+        # Crosshair: 4 pts (2 lines × 2 pts)
+        # Dot ring: dot_segments × 2 pts
+        total_pts = num_segments + 4 + dot_segments * 2
+
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_brush_pts") or self.brush_actor is None:
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
+
+            self._brush_pts   = vtkPoints()
+            self._brush_lines = vtkCellArray()
+            self._brush_poly  = vtkPolyData()
+            self._brush_poly.SetPoints(self._brush_pts)
+            self._brush_poly.SetLines(self._brush_lines)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._brush_poly)
+            dc = _C(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.brush_actor = vtkActor2D()
+            self.brush_actor.SetMapper(mapper)
+            prop = self.brush_actor.GetProperty()
+            prop.SetColor(1, 1, 0)
+            prop.SetLineWidth(3)
+            prop.SetOpacity(0.9)
+
+            renderer.AddActor2D(self.brush_actor)
+
+        if not renderer.HasViewProp(self.brush_actor):
+            renderer.AddActor2D(self.brush_actor)
+        self.brush_actor.VisibilityOn()
+
+        # ── FAST GEOMETRY UPDATE (display coords, no world conversion) ────────
+        pts   = self._brush_pts
+        lines = self._brush_lines
+        pts.Reset()
+        lines.Reset()
 
         def add_seg(p0, p1):
             i0 = pts.InsertNextPoint(float(p0[0]), float(p0[1]), 0.0)
@@ -1120,32 +1504,67 @@ class ClassificationInteractor:
             p2 = (x + dot_r * np.cos(a2), y + dot_r * np.sin(a2))
             add_seg(p1, p2)
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
+        pts.Modified()
+        self._brush_poly.Modified()
+        # Render batched by caller
 
-        from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
+    # def _clear_all_previews(self):
+    #     """
+    #     ✅ Optimized Clear: Uses Visibility toggles instead of Actor removal.
+    #     Eliminates the 'Delete-Recreate' lag and prevents preview flickering.
+    #     """
+    #     # 1. Identify all potential actor names
+    #     actor_names = [
+    #         "line_actor", "dotted_actor", "rect_actor", "circle_actor",
+    #         "brush_actor", "polygon_actor", "freehand_actor", "poly_actor",
+    #         "line_actor_cut", "dotted_actor_cut", "rect_actor_cut", "circle_actor_cut",
+    #         "brush_actor_cut", "freehand_actor_cut", "poly_actor_cut",
+    #     ]
 
-        display_coord = vtkCoordinate()
-        display_coord.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(display_coord)
+    #     # 2. Batch Visibility Change (Instantaneous)
+    #     for name in actor_names:
+    #         actor = getattr(self, name, None)
+    #         if actor:
+    #             # Instead of removing/None, we just hide. 
+    #             # This keeps the VTK pipeline ready for the next interaction.
+    #             actor.VisibilityOff()
 
-        self.brush_actor = vtkActor2D()
-        self.brush_actor.SetMapper(mapper)
+    #     # 3. Reset state variables
+    #     self.P1 = None
+    #     self.is_dragging = False
+    #     self.drawing_points = []
+    #     self.is_drawing_freehand = False
+        
+    #     if hasattr(self, 'drawing_points_display_cut'):
+    #         self.drawing_points_display_cut = []
+    #     if hasattr(self, 'P1_display_cut'):
+    #         self.P1_display_cut = None
 
-        prop = self.brush_actor.GetProperty()
-        prop.SetColor(1, 1, 0)
-        prop.SetLineWidth(3)
-        prop.SetOpacity(0.9)
-
-        renderer.AddActor2D(self.brush_actor)
+    #     # 4. Single Final Render Call
+    #     # We only render ONCE to update the screen, not once per renderer/actor.
+    #     vtk_widget = self._get_active_vtk_widget()
+    #     if vtk_widget:
+    #         try:
+    #             self._safe_render(vtk_widget)
+    #         except Exception:
+    #             pass
+        
+    #     # Also render cut-section if it exists
+    #     if hasattr(self.app, 'cut_section_controller'):
+    #         cut_vtk = getattr(self.app.cut_section_controller, 'cut_vtk', None)
+    #         if cut_vtk and hasattr(cut_vtk, 'renderer'):
+    #             try:
+    #                 self._safe_render(cut_vtk)
+    #             except Exception:
+    #                 pass
 
     def _clear_all_previews(self):
         """
         ✅ Optimized Clear: Uses Visibility toggles instead of Actor removal.
         Eliminates the 'Delete-Recreate' lag and prevents preview flickering.
+    
+        ✅ FIX (fast-classification): Reset throttle timestamps so the very
+        first mouse-move of the NEXT classification is never skipped.
         """
         # 1. Identify all potential actor names
         actor_names = [
@@ -1154,43 +1573,46 @@ class ClassificationInteractor:
             "line_actor_cut", "dotted_actor_cut", "rect_actor_cut", "circle_actor_cut",
             "brush_actor_cut", "freehand_actor_cut", "poly_actor_cut",
         ]
-
+    
         # 2. Batch Visibility Change (Instantaneous)
         for name in actor_names:
             actor = getattr(self, name, None)
             if actor:
-                # Instead of removing/None, we just hide. 
-                # This keeps the VTK pipeline ready for the next interaction.
                 actor.VisibilityOff()
-
+    
         # 3. Reset state variables
         self.P1 = None
         self.is_dragging = False
         self.drawing_points = []
         self.is_drawing_freehand = False
-        
+    
         if hasattr(self, 'drawing_points_display_cut'):
             self.drawing_points_display_cut = []
         if hasattr(self, 'P1_display_cut'):
             self.P1_display_cut = None
-
+    
+        # ✅ FIX A — Reset render/move throttles so the NEXT classification's
+        # first mouse-move is never accidentally skipped by the 16 ms guard.
+        self._last_render_time     = 0.0
+        self._last_mouse_move_time = 0.0
+    
         # 4. Single Final Render Call
-        # We only render ONCE to update the screen, not once per renderer/actor.
         vtk_widget = self._get_active_vtk_widget()
         if vtk_widget:
             try:
-                vtk_widget.GetRenderWindow().Render()
+                self._safe_render(vtk_widget)
             except Exception:
                 pass
-        
+    
         # Also render cut-section if it exists
         if hasattr(self.app, 'cut_section_controller'):
             cut_vtk = getattr(self.app.cut_section_controller, 'cut_vtk', None)
             if cut_vtk and hasattr(cut_vtk, 'renderer'):
                 try:
-                    cut_vtk.GetRenderWindow().Render()
+                    self._safe_render(cut_vtk)
                 except Exception:
-                    pass
+                    pass  
+ 
 
     def _on_mouse_move_with_preview(self, obj, evt):
             """
@@ -1212,10 +1634,7 @@ class ClassificationInteractor:
 
             # Skip if less than 16ms since last update (60 FPS)
             if (current_time - self._last_mouse_move_time) < 0.016:
-                try:
-                    self.style.OnMouseMove()  # Keep panning smooth
-                except Exception:
-                    pass
+                self._do_safe_pan()  # ✅ Custom pan — no VTK Render()
                 return
 
             self._last_mouse_move_time = current_time
@@ -1235,10 +1654,8 @@ class ClassificationInteractor:
                 dx, dy = self._get_display_point()
                 P2 = self._display_to_world_fast(dx, dy)
             except Exception:
-                try:
-                    return self.style.OnMouseMove()
-                except Exception:
-                    return
+                self._do_safe_pan()  # ✅ Custom pan — no VTK Render()
+                return
 
             # ✅ Cache active vtk widget (refresh every 100ms)
             if not hasattr(self, '_cached_vtk_widget'):
@@ -1278,7 +1695,7 @@ class ClassificationInteractor:
                     self._draw_circle_preview(self.P1, P2)
 
                 if vtk_widget and (current_time - self._last_render_time) > 0.016:
-                    vtk_widget.GetRenderWindow().Render()
+                    self._safe_render(vtk_widget)
                     self._last_render_time = current_time
 
             # ✅ Rectangle preview
@@ -1298,7 +1715,7 @@ class ClassificationInteractor:
                     self._draw_rectangle_preview(self.P1, P2)
 
                 if vtk_widget and (current_time - self._last_render_time) > 0.016:
-                    vtk_widget.GetRenderWindow().Render()
+                    self._safe_render(vtk_widget)
                     self._last_render_time = current_time
 
             # ✅ Line tools preview
@@ -1311,7 +1728,7 @@ class ClassificationInteractor:
                     self._draw_temp_line(self.P1, P2)
 
                 if vtk_widget and (current_time - self._last_render_time) > 0.016:
-                    vtk_widget.GetRenderWindow().Render()
+                    self._safe_render(vtk_widget)
                     self._last_render_time = current_time
 
             # ✅ Brush tool
@@ -1365,7 +1782,7 @@ class ClassificationInteractor:
                 if self._is_main_view() and self.is_dragging and tool == "brush":
                     pass  # Skip — render happens in classification block below
                 elif vtk_widget and (current_time - self._last_render_time) > 0.016:
-                    vtk_widget.GetRenderWindow().Render()
+                    self._safe_render(vtk_widget)
                     self._last_render_time = current_time
 
                 if self.is_dragging:
@@ -1382,7 +1799,7 @@ class ClassificationInteractor:
                         if not hasattr(self, "_brush_accumulated_mask") or self._brush_accumulated_mask is None:
                             self._brush_accumulated_mask = np.zeros(len(xyz), dtype=bool)
                             self._brush_old_classes = {}
-                            self._brush_frame_fresh = np.array([], dtype=np.int64)
+                            self._brush_frame_chunks = []
 
                         if not hasattr(self, "_brush_stroke_positions") or self._brush_stroke_positions is None:
                             self._brush_stroke_positions = []
@@ -1443,15 +1860,20 @@ class ClassificationInteractor:
                                 classes[fresh] = to_class
                                 self._brush_accumulated_mask[fresh] = True
 
-                                # Accumulate for batched GPU injection
-                                self._brush_frame_fresh = np.union1d(
-                                    self._brush_frame_fresh, fresh
-                                )
+                                # Accumulate raw chunks and dedupe once per render tick.
+                                self._brush_frame_chunks.append(fresh)
 
                             self._brush_needs_render = True
 
                         # PHASE 2: 30fps tick — single GPU injection + render
-                        frame_fresh = getattr(self, '_brush_frame_fresh', None)
+                        frame_chunks = getattr(self, '_brush_frame_chunks', None)
+                        frame_fresh = None
+                        if frame_chunks:
+                            if len(frame_chunks) == 1:
+                                frame_fresh = np.unique(frame_chunks[0])
+                            else:
+                                frame_fresh = np.unique(np.concatenate(frame_chunks))
+
                         if (frame_fresh is not None and len(frame_fresh) > 0
                                 and getattr(self, '_brush_needs_render', False)):
                             now = time.time()
@@ -1485,26 +1907,23 @@ class ClassificationInteractor:
                                             if vtk_ca:
                                                 vtk_ca.Modified()
                                             _mark_actor_dirty(actor)
-
-                                    # ✅ MAIN VIEW ONLY during drag — sections update on release
-                                    # This eliminates the 27M mask alloc + section scan per frame
-                                    if getattr(self.app, "display_mode", "class") == "shaded_class":
-                                        try:
-                                            from gui.shading_display import refresh_shaded_after_classification_fast
-                                            acc_mask = self._brush_accumulated_mask
-                                            refresh_shaded_after_classification_fast(
-                                                self.app,
-                                                changed_mask=acc_mask,
-                                            )
-                                        except Exception as _se:
-                                            print(f"Warning: Brush shading refresh: {_se}")
-                                    else:
-                                        self.app.vtk_widget.render()
+                                  
+                                        # ✅ MAIN VIEW ONLY during drag — sections update on release
+                                        if (getattr(self.app, "display_mode", "class") == "shaded_class"
+                                                and _shading_mesh_exists(self.app)):
+                                            try:
+                                                from gui.shading_display import refresh_shaded_after_classification_fast
+                                                acc_mask = self._brush_accumulated_mask
+                                                refresh_shaded_after_classification_fast(self.app, changed_mask=acc_mask)
+                                            except Exception as _se:
+                                                print(f"⚠️ Brush shading refresh: {_se}")
+                                        else:
+                                            self._safe_render_pyvista(self.app.vtk_widget)
 
                                 except Exception as e:
                                     print(f"⚠️ Brush GPU inject: {e}")
 
-                                self._brush_frame_fresh = np.array([], dtype=np.int64)
+                                self._brush_frame_chunks = []
                                 self._brush_last_render_time = now
                                 self._brush_needs_render = False
 
@@ -1565,7 +1984,7 @@ class ClassificationInteractor:
             elif tool == "polygon":
                 self._draw_polygon_preview((P2[0], P2[2]))
                 if vtk_widget and (current_time - self._last_render_time) > 0.016:
-                    vtk_widget.GetRenderWindow().Render()
+                    self._safe_render(vtk_widget)
                     self._last_render_time = current_time
 
             # ✅ Freehand preview
@@ -1597,14 +2016,11 @@ class ClassificationInteractor:
                     self._draw_freehand_preview()
 
                 if vtk_widget and (current_time - self._last_render_time) > 0.016:
-                    vtk_widget.GetRenderWindow().Render()
+                    self._safe_render(vtk_widget)
                     self._last_render_time = current_time
 
-            # Keep panning working
-            try:
-                self.style.OnMouseMove()
-            except Exception:
-                pass
+            # ✅ SAFE PAN: Custom implementation — no VTK C++ Render()
+            self._do_safe_pan()
 
     def on_left_press(self, obj, evt):
         """✅ Start drawing - sets P1 for preview rendering (FIXED for above/below line snapping)"""
@@ -1729,7 +2145,7 @@ class ClassificationInteractor:
         if tool == "polygon":
             self.drawing_points.append(P)
             self._draw_polygon_preview()
-            self.interactor.GetRenderWindow().Render()
+            self._safe_render_interactor()
             print(f"{'='*60}\n")
             return
 
@@ -1747,11 +2163,19 @@ class ClassificationInteractor:
             print(f"{'='*60}\n")
             return
 
+        # self.P1 = pt
+        # self.app._suppress_section_refresh = True
+        # self.is_dragging = True
+        # # ❌ REMOVED: self.app._suppress_section_refresh = True
+        # # ✅ This flag should ONLY be set for brush tool, not for rectangle/other tools
         self.P1 = pt
         self.app._suppress_section_refresh = True
         self.is_dragging = True
-        # ❌ REMOVED: self.app._suppress_section_refresh = True
-        # ✅ This flag should ONLY be set for brush tool, not for rectangle/other tools
+        # ✅ FIX B — reset throttles so first preview frame of this
+        # new classification is never skipped by the 16 ms guard.
+        self._last_render_time     = 0.0
+        self._last_mouse_move_time = 0.0
+        # ❌ REMOVED: self.app._suppress_section_refresh = Tru
 
         # ✅ MAIN VIEW brush init
         if tool == "brush" and self._is_main_view():
@@ -1761,7 +2185,7 @@ class ClassificationInteractor:
             import numpy as np
             self._brush_accumulated_mask = np.zeros(len(self.app.data["xyz"]), dtype=bool)
             self._brush_old_classes = {}
-            self._brush_frame_fresh = np.array([], dtype=np.int64)
+            self._brush_frame_chunks = []
             self._brush_stroke_positions = []
             self._last_brush_center = None
             self._brush_render_counter = 0
@@ -1946,31 +2370,32 @@ class ClassificationInteractor:
                     elapsed = (time.time() - start) * 1000
                     print(f"✅ Main Brush stroke complete: {int(mask.sum()):,} points in {elapsed:.0f}ms")
 
-                brush_changed_mask = undo_mask
-                if brush_changed_mask is None:
-                    brush_changed_mask = getattr(self, "_brush_accumulated_mask", None)
-
                 # Clean up brush state
                 self._brush_accumulated_mask = None
                 self._brush_old_classes = {}
-                self._brush_frame_fresh = np.array([], dtype=np.int64)
+                self._brush_frame_chunks = []
                 self._brush_stroke_positions = []
                 self._last_brush_center = None
                 self._brush_needs_render = False
                 self.app._suppress_section_refresh = False
+                # In shaded_class mode keep OptimizedRefresh alive — shading mesh needs its own rebuild
                 if getattr(self.app, "display_mode", "class") != "shaded_class":
                     self.app._gpu_sync_done = True
-                else:
+                elif _shading_mesh_exists(self.app):
                     try:
                         from gui.shading_display import refresh_shaded_after_classification_fast
                         refresh_shaded_after_classification_fast(
                             self.app,
-                            changed_mask=brush_changed_mask,
+                            changed_mask=getattr(self, '_brush_accumulated_mask', None)
                         )
                     except Exception as _se:
-                        print(f"Warning: Brush release shading refresh: {_se}")
+                        print(f"⚠️ Brush release shading refresh: {_se}")
+                else:
+                    # No mesh yet — treat like class mode so GPU sync completes
+                    self.app._gpu_sync_done = True
+                    print("⏭️ Brush release: skipping shading refresh — no mesh built yet")
 
-                # ✅ Final: sync sections (deferred from drag) + render all
+                 # ✅ Final: sync sections (deferred from drag) + render all
                 try:
                     # Update cross-sections with the full undo_mask
                     if hasattr(self.app, 'section_vtks') and undo_mask is not None:
@@ -1981,14 +2406,32 @@ class ClassificationInteractor:
                             except Exception:
                                 pass
 
-                    self.app.vtk_widget.render()
+                    self._safe_render_pyvista(self.app.vtk_widget)
                     if hasattr(self.app, 'section_vtks'):
                         for sw in self.app.section_vtks.values():
                             if sw:
-                                try: sw.render()
-                                except: pass
+                                self._safe_render_pyvista(sw)
                 except Exception:
                     pass
+
+                # ═══════════════════════════════════════════════════════════
+                # ✅ FIX: Refresh cut section view after main view brush
+                # 
+                # Branch A returns early (before _refresh_all_views_after_classification),
+                # so cross-sections get updated via fast_cross_section_update() above,
+                # but the cut section was NEVER refreshed. This fixes that gap.
+                # ═══════════════════════════════════════════════════════════
+                try:
+                    if hasattr(self.app, 'cut_section_controller'):
+                        ctrl = self.app.cut_section_controller
+                        if (ctrl.is_cut_view_active 
+                                and ctrl.cut_points is not None 
+                                and ctrl._cut_index_map is not None
+                                and ctrl.cut_vtk is not None):
+                            ctrl._refresh_cut_colors_fast()
+                            print(f"   ⚡ Cut section refreshed after main view brush")
+                except Exception as e:
+                    print(f"   ⚠️ Cut section refresh failed: {e}")
 
                 self.is_dragging = False
                 try: self.style.OnLeftButtonUp()
@@ -2096,8 +2539,7 @@ class ClassificationInteractor:
                                         print(f"      Core: {core_pts:,}, Buffer: {buffer_pts:,}")
  
                             _apply_classification(self.app, update_mask, from_classes, to_class)
-                            from gui.vtk_utils import force_vtk_pipeline_update
-                            force_vtk_pipeline_update(self.app)
+                            
  
                         self._refresh_all_views_after_classification(to_class)
                         return
@@ -2236,7 +2678,8 @@ class ClassificationInteractor:
             self.drawing_points = []
             self.is_drawing_freehand = False
             self._last_brush_center = None
-            
+            self._is_panning = False
+            self._last_pan_pos = (0, 0) 
             # Clear previews
             self._last_rectangle_preview_P2 = None
             self._last_circle_preview_P2 = None
@@ -2256,7 +2699,7 @@ class ClassificationInteractor:
             try:
                 vtk_widget = self._get_active_vtk_widget()
                 if vtk_widget:
-                    vtk_widget.GetRenderWindow().Render()
+                    self._safe_render(vtk_widget)
             except:
                 pass
             
@@ -2445,7 +2888,7 @@ class ClassificationInteractor:
                                          to_class=to_class, palette=palette,
                                          border_percent=border_pct)
                     try:
-                        vtk_widget.render()
+                        self._safe_render_pyvista(vtk_widget)
                     except Exception:
                         pass
                     print(f"   ✅ Unified actor GPU poke complete")
@@ -2471,19 +2914,29 @@ class ClassificationInteractor:
             if saved_camera is not None and vtk_widget is not None:
                 try:
                     vtk_widget.camera_position = saved_camera
-                    vtk_widget.render()
+                    self._safe_render_pyvista(vtk_widget)
                 except Exception as e:
                     print(f"   ⚠️ Camera restore failed: {e}")
 
+            # # STEP 4: CUT SECTION
+            # if hasattr(app, "cut_section_controller") and app.cut_section_controller is not None:
+            #     try:
+            #         cut_ctrl = app.cut_section_controller
+            #         if hasattr(cut_ctrl, 'onclassificationchanged'):
+            #             cut_ctrl.onclassificationchanged()
+            #         print("   ✅ Cut Section refreshed")
+            #     except Exception:
+            #         pass
             # STEP 4: CUT SECTION
-            if hasattr(app, "cut_section_controller") and app.cut_section_controller is not None:
+            if (hasattr(app, "cut_section_controller") and app.cut_section_controller is not None
+                    and not getattr(app, "_optimized_refresh_active", False)):
                 try:
                     cut_ctrl = app.cut_section_controller
                     if hasattr(cut_ctrl, 'onclassificationchanged'):
                         cut_ctrl.onclassificationchanged()
                     print("   ✅ Cut Section refreshed")
                 except Exception:
-                    pass
+                    pass  ###
 
             # STEP 5: POINT STATISTICS
             try:
@@ -2651,7 +3104,7 @@ class ClassificationInteractor:
                                      palette=palette,
                                      border_percent=border_pct)
                 try:
-                    self.app.vtk_widget.render()
+                    self._safe_render_pyvista(self.app.vtk_widget)
                 except Exception:
                     pass
                 print(f"   ✅ Unified partial refresh complete")
@@ -2767,7 +3220,7 @@ class ClassificationInteractor:
             )
             
             vtk_widget.renderer.SetBackground(*flash_color)
-            vtk_widget.render()
+            self._safe_render_pyvista(vtk_widget)
             
             # Restore original background after brief delay
             from PySide6.QtCore import QTimer
@@ -2775,7 +3228,7 @@ class ClassificationInteractor:
             def restore_background():
                 try:
                     vtk_widget.renderer.SetBackground(*original_bg)
-                    vtk_widget.render()
+                    self._safe_render_pyvista(vtk_widget)
                 except:
                     pass
             
@@ -2903,59 +3356,82 @@ class ClassificationInteractor:
 
 
     def _draw_freehand_preview(self, live_point=None):
-        """Freehand preview that works in MAIN (XY) and SECTION (u,z)."""
+        """
+        ✅ PERFORMANCE FIX: Delegates to the optimised version above (no duplicate pipeline).
+        Works for MAIN (XY) and SECTION (u,z) — uses self._freehand_* reusable pipeline.
+        """
+        # The optimised _draw_freehand_preview defined earlier in the class handles this.
+        # Python uses the LAST definition of a method, so this body must contain the logic.
         if len(self.drawing_points) < 1:
             return
 
-        renderWindow = self.interactor.GetRenderWindow()
-        renderer = renderWindow.GetRenderers().GetFirstRenderer()
-
-        if hasattr(self, "poly_actor") and self.poly_actor:
-            renderer.RemoveActor2D(self.poly_actor)
-            self.poly_actor = None
+        vtk_widget = self._get_active_vtk_widget()
+        if vtk_widget is None:
+            # Fallback: use first renderer
+            try:
+                rw = self.interactor.GetRenderWindow()
+                renderer = rw.GetRenderers().GetFirstRenderer()
+            except Exception:
+                return
+        else:
+            renderer = vtk_widget.renderer
 
         all_pts = list(self.drawing_points)
         if live_point:
             all_pts.append(live_point)
-        if len(all_pts) < 1:
+        if len(all_pts) < 2:
             return
 
-        from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
-        pts = vtkPoints()
-        lines = vtkCellArray()
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_freehand_pts") or self.freehand_actor is None:
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
 
-        coord = vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
+            self._freehand_pts   = vtkPoints()
+            self._freehand_lines = vtkCellArray()
+            self._freehand_poly  = vtkPolyData()
+            self._freehand_poly.SetPoints(self._freehand_pts)
+            self._freehand_poly.SetLines(self._freehand_lines)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._freehand_poly)
+            dc = _C(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.freehand_actor = vtkActor2D()
+            self.freehand_actor.SetMapper(mapper)
+            prop = self.freehand_actor.GetProperty()
+            prop.SetColor(1, 0.8, 0)
+            prop.SetLineWidth(2)
+            prop.SetOpacity(0.8)
+
+            renderer.AddActor2D(self.freehand_actor)
+
+        if not renderer.HasViewProp(self.freehand_actor):
+            renderer.AddActor2D(self.freehand_actor)
+        self.freehand_actor.VisibilityOn()
+
+        if not hasattr(self, "_freehand_coord"):
+            from vtkmodules.vtkRenderingCore import vtkCoordinate as _C
+            self._freehand_coord = _C()
+            self._freehand_coord.SetCoordinateSystemToWorld()
+
+        coord = self._freehand_coord
+        self._freehand_pts.Reset()
+        self._freehand_lines.Reset()
 
         for i, (u, v) in enumerate(all_pts):
             xw, yw, zw = self._view2d_to_world(u, v)
             coord.SetValue(xw, yw, zw)
             d = coord.GetComputedDisplayValue(renderer)
-            pts.InsertNextPoint(d[0], d[1], 0)
+            self._freehand_pts.InsertNextPoint(d[0], d[1], 0)
             if i > 0:
-                lines.InsertNextCell(2)
-                lines.InsertCellPoint(i - 1)
-                lines.InsertCellPoint(i)
+                self._freehand_lines.InsertNextCell(2)
+                self._freehand_lines.InsertCellPoint(i - 1)
+                self._freehand_lines.InsertCellPoint(i)
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-
-        display_coord = vtkCoordinate()
-        display_coord.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(display_coord)
-
-        self.poly_actor = vtkActor2D()
-        self.poly_actor.SetMapper(mapper)
-        prop = self.poly_actor.GetProperty()
-        prop.SetColor(1, 0.8, 0)
-        prop.SetLineWidth(2)
-        prop.SetOpacity(0.8)
-
-        renderer.AddActor2D(self.poly_actor)
+        self._freehand_pts.Modified()
+        self._freehand_poly.Modified()
+        # Render batched by caller
 
     def _draw_point_cursor(self, center, radius=0.5):
         """✅ POINT CURSOR: Filled circle with outline (different from brush/circle tools)"""
@@ -3173,13 +3649,13 @@ class ClassificationInteractor:
                                         polydata.Modified()
                                     
                                     if hasattr(ctrl, 'cut_vtk') and ctrl.cut_vtk:
-                                        ctrl.cut_vtk.render()
+                                        self._safe_render_pyvista(ctrl.cut_vtk)
                     except Exception as _ce:
                         print(f"⚠️ Cut section poke failed: {_ce}")
             
             # 4. SINGLE BATCHED RENDER (replaces per-function render calls)
             try:
-                self.app.vtk_widget.render()
+                self._safe_render_pyvista(self.app.vtk_widget)
             except Exception:
                 pass
             
@@ -3198,23 +3674,24 @@ class ClassificationInteractor:
             # ✅ FIX: Signal that GPU sync is complete — prevents the
             # classify_with_stats_update decorator from triggering a
             # redundant 170ms OptimizedRefreshPipeline cycle.
-            # Refresh shaded mesh if in shaded mode: fast_classify_update
-            # only updates the point cloud actor, not the triangulated mesh.
-            if getattr(self.app, "display_mode", None) == "shaded_class":
+            self.app._gpu_sync_done = True
+            
+            if (getattr(self.app, "display_mode", None) == "shaded_class"
+                    and _shading_mesh_exists(self.app)):
                 try:
                     from gui.shading_display import refresh_shaded_after_classification_fast
                     refresh_shaded_after_classification_fast(self.app, mask)
                 except Exception as _se:
-                    print(f"Warning: Shading refresh failed: {_se}")
+                    print(f"⚠️ Shading refresh failed: {_se}")
                     try:
                         from gui.shading_display import update_shaded_class
                         update_shaded_class(self.app, force_rebuild=True)
                     except Exception:
                         pass
+            elif getattr(self.app, "display_mode", None) == "shaded_class":
+                print("⏭️ Skipping shading refresh — no shading mesh built yet "
+                      "(mode restored from settings, Apply not pressed)")
 
-            if getattr(self.app, "display_mode", "class") != "shaded_class":
-                self.app._gpu_sync_done = True
-                
         except Exception as e:
             print(f"⚠️ Fast injection failed, falling back to full refresh: {e}")
             import traceback
@@ -3408,99 +3885,79 @@ class ClassificationInteractor:
         print("✅ Circle preview rendered (main view)")    
 
     def _draw_circle_preview(self, P1, P2):
-        """✅ FIXED: Draw circle preview as 2D overlay (always visible)"""
-        
+        """
+        ✅ PERFORMANCE FIX: Reuse Actor2D — no RemoveActor/new objects per frame.
+        """
         vtk_widget = self._get_active_vtk_widget()
         if vtk_widget is None:
-            print("❌ No VTK widget for circle preview")
             return
-        
         renderer = vtk_widget.renderer
-        
-        # Remove previous actor
-        if hasattr(self, "circle_actor") and self.circle_actor:
-            try:
-                renderer.RemoveActor2D(self.circle_actor)
-            except:
-                pass
-            self.circle_actor = None
-        
-        # Get 2D view coordinates (u, z)
+
         u1, z1 = self._get_view_coordinates(P1)
         u2, z2 = self._get_view_coordinates(P2)
-        
-        print(f"  Circle preview: P1=({u1:.2f}, {z1:.2f}), P2=({u2:.2f}, {z2:.2f})")
-        
-        # Calculate circle parameters in 2D view space
         center_u = (u1 + u2) / 2.0
         center_z = (z1 + z2) / 2.0
         radius = float(np.hypot(u2 - u1, z2 - z1)) / 2.0
-        
-        print(f"  Circle: center=({center_u:.2f}, {center_z:.2f}), radius={radius:.2f}")
-        
         if radius < 0.01:
             return
-        
-        # Generate circle points in 2D view space
+
         num_segments = 64
+
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_circle_pts") or self.circle_actor is None:
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
+
+            self._circle_pts   = vtkPoints()
+            self._circle_lines = vtkCellArray()
+            self._circle_poly  = vtkPolyData()
+            self._circle_poly.SetPoints(self._circle_pts)
+            self._circle_poly.SetLines(self._circle_lines)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._circle_poly)
+            dc = _C(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.circle_actor = vtkActor2D()
+            self.circle_actor.SetMapper(mapper)
+            prop = self.circle_actor.GetProperty()
+            prop.SetColor(1.0, 1.0, 0.0)
+            prop.SetLineWidth(2)
+            prop.SetOpacity(1.0)
+
+            renderer.AddActor2D(self.circle_actor)
+
+        if not renderer.HasViewProp(self.circle_actor):
+            renderer.AddActor2D(self.circle_actor)
+        self.circle_actor.VisibilityOn()
+
+        # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
+        if not hasattr(self, "_circle_coord"):
+            from vtkmodules.vtkRenderingCore import vtkCoordinate as _C
+            self._circle_coord = _C()
+            self._circle_coord.SetCoordinateSystemToWorld()
+
+        coord = self._circle_coord
+        self._circle_pts.Reset()
+        self._circle_lines.Reset()
+
         theta = np.linspace(0, 2 * np.pi, num_segments + 1)
         circle_u = center_u + radius * np.cos(theta)
         circle_z = center_z + radius * np.sin(theta)
-        
-        # Convert 2D view coordinates to 3D world coordinates
-        circle_world = []
-        for i in range(len(theta)):
-            u, z = circle_u[i], circle_z[i]
-            world_pt = self._view2d_to_world(u, z)
-            circle_world.append(world_pt)
-        
-        # Convert world coordinates to display coordinates (screen pixels)
-        from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
-        
-        pts = vtk.vtkPoints()
-        coord = vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
-        
-        for world_pt in circle_world:
-            coord.SetValue(world_pt[0], world_pt[1], world_pt[2])
-            display_pos = coord.GetComputedDisplayValue(renderer)
-            pts.InsertNextPoint(display_pos[0], display_pos[1], 0)
-        
-        # Create polyline
-        lines = vtk.vtkCellArray()
-        for i in range(num_segments):
-            lines.InsertNextCell(2)
-            lines.InsertCellPoint(i)
-            lines.InsertCellPoint(i + 1)
-        
-        poly = vtk.vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-        
-        # Create 2D mapper (renders in screen space)
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-        
-        coordinate = vtkCoordinate()
-        coordinate.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(coordinate)
-        
-        # Create 2D actor (always on top!)
-        self.circle_actor = vtkActor2D()
-        self.circle_actor.SetMapper(mapper)
-        
-        # Set properties - Yellow like other tools
-        prop = self.circle_actor.GetProperty()
-        prop.SetColor(1.0, 1.0, 0.0)  # Yellow
-        prop.SetLineWidth(2)
-        prop.SetOpacity(1.0)
-        
-        renderer.AddActor2D(self.circle_actor)        
-        try:
-            vtk_widget.GetRenderWindow().Render()
-            print("  ✅ Circle preview rendered")
-        except Exception as e:
-            print(f"  ⚠️ Render failed: {e}")
+
+        for i in range(num_segments + 1):
+            wx, wy, wz = self._view2d_to_world(circle_u[i], circle_z[i])
+            coord.SetValue(wx, wy, wz)
+            d = coord.GetComputedDisplayValue(renderer)
+            self._circle_pts.InsertNextPoint(d[0], d[1], 0)
+            if i > 0:
+                self._circle_lines.InsertNextCell(2)
+                self._circle_lines.InsertCellPoint(i - 1)
+                self._circle_lines.InsertCellPoint(i)
+
+        self._circle_pts.Modified()
+        self._circle_poly.Modified()
+        # Render batched by caller
 
     def _calculate_perpendicular_coord(self):
         """Calculate perpendicular coordinate ONCE per drawing session"""
@@ -3692,7 +4149,7 @@ class ClassificationInteractor:
 
             # render its vtk widget
             if active in self.app.section_vtks:
-                self.app.section_vtks[active].render()
+                self._safe_render_pyvista(self.app.section_vtks[active])
 
             print(f"🔄 Refreshed ONLY Cross-Section View {active+1}")
 
@@ -3859,7 +4316,7 @@ class ClassificationInteractor:
             mesh.Modified()
             
             # Single render
-            self.app.vtk_widget.render()
+            self._safe_render_pyvista(self.app.vtk_widget)
             
             print(f"   ✅ Mesh updated in-place (no rebuild!)")
             print(f"{'='*60}\n")
@@ -3980,7 +4437,7 @@ class ClassificationInteractor:
 
         # Force render
         try:
-            vtk_widget.GetRenderWindow().Render()
+            self._safe_render(vtk_widget)
             print("   ✅ Circle preview rendered")
         except Exception as e:
             print(f"   ⚠️ Render failed: {e}")
@@ -4053,7 +4510,7 @@ class ClassificationInteractor:
 
         renderer.AddActor2D(self.rect_actor_cut)
         try:
-            vtk_widget.GetRenderWindow().Render()
+            self._safe_render(vtk_widget)
         except Exception:
             pass
 
@@ -4113,187 +4570,163 @@ class ClassificationInteractor:
         prop.SetOpacity(0.8)       # Semi-transparent
 
         renderer.AddActor2D(self.freehand_actor_cut)
-        vtk_widget.GetRenderWindow().Render()
+        self._safe_render(vtk_widget)
 
 
     def _draw_line_preview_cut(self, P1, P2):
-        """Line preview for CUT SECTION - uses 2D display coordinates directly."""
-        from vtkmodules.vtkRenderingCore import vtkCoordinate
+        """
+        ✅ PERFORMANCE FIX: Line preview for CUT SECTION.
+        Reuses Actor2D — no RemoveActor/new objects per frame. Zero print spam.
+        """
+        from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
 
-        print(f"\n🔧 _draw_line_preview_cut called")
-        print(f"   P1: {P1}")
-        print(f"   P2: {P2}")
-        
         vtk_widget = self._get_active_vtk_widget()
         if vtk_widget is None:
-            print("❌ No VTK widget for line preview (cut section)")
             return
-
-        print(f"   ✅ Got VTK widget: {vtk_widget}")
         renderer = vtk_widget.renderer
-        print(f"   ✅ Got renderer: {renderer}")
 
-        # ✅ FIX: Remove previous actor - CORRECT VARIABLE NAME
-        if hasattr(self, "line_actor_cut") and self.line_actor_cut:
-            try:
-                renderer.RemoveActor2D(self.line_actor_cut)
-                print(f"   🧹 Removed old line_actor_cut")
-            except Exception as e:
-                print(f"   ⚠️ Could not remove old line_actor_cut: {e}")
-            self.line_actor_cut = None  # ✅ FIXED: was self.line_actor = None
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_line_cut_pts") or self.line_actor_cut is None:
+            self._line_cut_pts = vtkPoints()
+            self._line_cut_pts.SetNumberOfPoints(2)
+            _lines = vtkCellArray()
+            _lines.InsertNextCell(2)
+            _lines.InsertCellPoint(0)
+            _lines.InsertCellPoint(1)
+            self._line_cut_poly = vtkPolyData()
+            self._line_cut_poly.SetPoints(self._line_cut_pts)
+            self._line_cut_poly.SetLines(_lines)
 
-        # World → display
-        coord = vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._line_cut_poly)
+            dc = vtkCoordinate(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
 
-        coord.SetValue(P1[0], P1[1], P1[2])
-        display_p1 = coord.GetComputedDisplayValue(renderer)
+            self.line_actor_cut = vtkActor2D()
+            self.line_actor_cut.SetMapper(mapper)
+            prop = self.line_actor_cut.GetProperty()
+            prop.SetColor(1, 1, 0)
+            prop.SetLineWidth(2)
+            prop.SetOpacity(1.0)
 
-        coord.SetValue(P2[0], P2[1], P2[2])
-        display_p2 = coord.GetComputedDisplayValue(renderer)
+            renderer.AddActor2D(self.line_actor_cut)
 
-        print(f"   📐 Display coords: P1={display_p1[:2]}, P2={display_p2[:2]}")
-        win_size = renderer.GetRenderWindow().GetSize()
-        print(f"   📐 Viewport size: {win_size}")
+        if not renderer.HasViewProp(self.line_actor_cut):
+            renderer.AddActor2D(self.line_actor_cut)
+        self.line_actor_cut.VisibilityOn()
 
-        # Build 2D line
-        pts = vtkPoints()
-        pts.InsertNextPoint(display_p1[0], display_p1[1], 0)
-        pts.InsertNextPoint(display_p2[0], display_p2[1], 0)
+        # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
+        if not hasattr(self, "_line_cut_coord"):
+            self._line_cut_coord = vtkCoordinate()
+            self._line_cut_coord.SetCoordinateSystemToWorld()
 
-        lines = vtkCellArray()
-        lines.InsertNextCell(2)
-        lines.InsertCellPoint(0)
-        lines.InsertCellPoint(1)
+        coord = self._line_cut_coord
+        coord.SetValue(float(P1[0]), float(P1[1]), float(P1[2]))
+        d1 = coord.GetComputedDisplayValue(renderer)
+        coord.SetValue(float(P2[0]), float(P2[1]), float(P2[2]))
+        d2 = coord.GetComputedDisplayValue(renderer)
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
+        self._line_cut_pts.SetPoint(0, d1[0], d1[1], 0)
+        self._line_cut_pts.SetPoint(1, d2[0], d2[1], 0)
+        self._line_cut_pts.Modified()
+        self._line_cut_poly.Modified()
 
-        from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-
-        coordinate = vtkCoordinate()
-        coordinate.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(coordinate)
-
-        self.line_actor_cut = vtkActor2D()
-        self.line_actor_cut.SetMapper(mapper)
-
-        prop = self.line_actor_cut.GetProperty()
-        prop.SetColor(1, 1, 0)   # Yellow
-        prop.SetLineWidth(2)
-        prop.SetOpacity(1.0)
-
-        renderer.AddActor2D(self.line_actor_cut)
-        print(f"   ✅ Added line_actor_cut to renderer")
-        print(f"   📊 Renderer now has {renderer.GetActors2D().GetNumberOfItems()} 2D actors")
-
-        renderer.GetRenderWindow().Render()
-        print("📏 Line preview (cut section) - COMPLETE")
-
+        # Vertical dashed guides for above/below line
         tool = getattr(self.app, "active_classify_tool", None)
-        print(f"   🔍 active_classify_tool={tool}")
-        # ✅ FIX: Add debug output for cut section actors
-        print(f"   line_actor_cut={self.line_actor_cut}, dotted_actor_cut={getattr(self, 'dotted_actor_cut', None)}")
-        
         if tool in ("above_line", "below_line"):
-            print("   🔍 calling _draw_vertical_guides_cut")
             self._draw_vertical_guides_cut(P1, P2, tool, renderer)
-        else:
-            print("   ⚠️ NOT calling _draw_vertical_guides_cut")
+        # Render batched by caller
 
 
     def _draw_vertical_guides_cut(self, P1, P2, tool, renderer):
-        """Vertical guides for line tools in CUT SECTION (dotted 2D overlay)."""
+        """
+        ✅ PERFORMANCE FIX: Vertical dashed guides for CUT SECTION above/below line.
+        Reuses Actor2D — no RemoveActor/new objects per frame. Zero render call here.
+        """
         from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
 
-        # Remove previous dotted actor (CUT)
-        if hasattr(self, "dotted_actor_cut") and self.dotted_actor_cut:
-            try:
-                renderer.RemoveActor2D(self.dotted_actor_cut)
-            except Exception:
-                pass
-            self.dotted_actor_cut = None
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_dotted_cut_pts") or self.dotted_actor_cut is None:
+            self._dotted_cut_pts   = vtkPoints()
+            self._dotted_cut_lines = vtkCellArray()
+            self._dotted_cut_poly  = vtkPolyData()
+            self._dotted_cut_poly.SetPoints(self._dotted_cut_pts)
+            self._dotted_cut_poly.SetLines(self._dotted_cut_lines)
 
-        # === build dotted segments in DISPLAY space ===
-        coord = vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._dotted_cut_poly)
+            dc = vtkCoordinate(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
 
-        coord.SetValue(P1[0], P1[1], P1[2])
+            self.dotted_actor_cut = vtkActor2D()
+            self.dotted_actor_cut.SetMapper(mapper)
+            prop = self.dotted_actor_cut.GetProperty()
+            prop.SetColor(1, 1, 0)
+            prop.SetLineWidth(2)
+            prop.SetOpacity(0.8)
+
+            renderer.AddActor2D(self.dotted_actor_cut)
+
+        if not renderer.HasViewProp(self.dotted_actor_cut):
+            renderer.AddActor2D(self.dotted_actor_cut)
+
+        # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
+        if not hasattr(self, "_dotted_cut_coord"):
+            self._dotted_cut_coord = vtkCoordinate()
+            self._dotted_cut_coord.SetCoordinateSystemToWorld()
+
+        coord = self._dotted_cut_coord
+        coord.SetValue(float(P1[0]), float(P1[1]), float(P1[2]))
         p1_disp = coord.GetComputedDisplayValue(renderer)
-
-        coord.SetValue(P2[0], P2[1], P2[2])
+        coord.SetValue(float(P2[0]), float(P2[1]), float(P2[2]))
         p2_disp = coord.GetComputedDisplayValue(renderer)
 
-        win_size = renderer.GetRenderWindow().GetSize()
-        height = win_size[1]
-
-        seg_len = 10   # pixels of visible line
-        gap    = 6     # pixels gap
-
-        def build_segments(x_disp, y_start):
-            segs = []
-            if tool == "above_line":
-                y = y_start
-                y_end = height
-                while y < y_end:
-                    y0 = y
-                    y1 = min(y + seg_len, y_end)
-                    segs.append(((x_disp, y0), (x_disp, y1)))
-                    y += seg_len + gap
-            else:  # below_line
-                y = y_start
-                y_end = 0
-                while y > y_end:
-                    y0 = y
-                    y1 = max(y - seg_len, y_end)
-                    segs.append(((x_disp, y0), (x_disp, y1)))
-                    y -= seg_len + gap
-            return segs
-
-        segments = []
-        segments.extend(build_segments(p1_disp[0], p1_disp[1]))
-        segments.extend(build_segments(p2_disp[0], p2_disp[1]))
-
-        # Build polyline from segments
-        pts = vtkPoints()
-        lines = vtkCellArray()
-        idx = 0
-        for (x0, y0), (x1, y1) in segments:
-            pts.InsertNextPoint(x0, y0, 0)
-            pts.InsertNextPoint(x1, y1, 0)
-            lines.InsertNextCell(2)
-            lines.InsertCellPoint(idx)
-            lines.InsertCellPoint(idx + 1)
-            idx += 2
-
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-
-        coordinate = vtkCoordinate()
-        coordinate.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(coordinate)
-
-        self.dotted_actor_cut = vtkActor2D()
-        self.dotted_actor_cut.SetMapper(mapper)
-
-        prop = self.dotted_actor_cut.GetProperty()
-        prop.SetColor(1, 1, 0)
-        prop.SetLineWidth(2)
-        prop.SetOpacity(0.8)
-
-        renderer.AddActor2D(self.dotted_actor_cut)
-
         try:
-            renderer.GetRenderWindow().Render()
+            win_size = renderer.GetRenderWindow().GetSize()
+            height = win_size[1]
         except Exception:
-            pass
+            height = 600
+
+        seg_len = 10
+        gap = 6
+
+        pts   = self._dotted_cut_pts
+        lines = self._dotted_cut_lines
+        pts.Reset()
+        lines.Reset()
+        idx = 0
+
+        def fill(x_disp, y_start):
+            nonlocal idx
+            if tool == "above_line":
+                y, y_end, step = y_start, height, seg_len + gap
+                while y < y_end:
+                    y2 = min(y + seg_len, y_end)
+                    pts.InsertNextPoint(x_disp, y, 0)
+                    pts.InsertNextPoint(x_disp, y2, 0)
+                    lines.InsertNextCell(2)
+                    lines.InsertCellPoint(idx); lines.InsertCellPoint(idx + 1)
+                    idx += 2; y += step
+            else:
+                y, y_end, step = y_start, 0, seg_len + gap
+                while y > y_end:
+                    y2 = max(y - seg_len, y_end)
+                    pts.InsertNextPoint(x_disp, y, 0)
+                    pts.InsertNextPoint(x_disp, y2, 0)
+                    lines.InsertNextCell(2)
+                    lines.InsertCellPoint(idx); lines.InsertCellPoint(idx + 1)
+                    idx += 2; y -= step
+
+        fill(p1_disp[0], p1_disp[1])
+        fill(p2_disp[0], p2_disp[1])
+
+        if idx > 0:
+            pts.Modified()
+            self._dotted_cut_poly.Modified()
+            self.dotted_actor_cut.VisibilityOn()
+        else:
+            self.dotted_actor_cut.VisibilityOff()
+        # Render batched by caller
 
     def _draw_rectangle_preview_cut(self, P1, P2):
         """Rectangle preview for CUT SECTION."""
@@ -4359,7 +4792,7 @@ class ClassificationInteractor:
         self.rect_actor_cut.GetProperty().SetLineWidth(2)
         
         renderer.AddActor2D(self.rect_actor_cut)
-        renderer.GetRenderWindow().Render()
+        self._safe_render_from_renderer(renderer)
         print(f"📦 Rectangle preview (cut section) drawn")
 
 
@@ -4424,7 +4857,7 @@ class ClassificationInteractor:
         prop.SetOpacity(0.8)       # Semi-transparent
 
         renderer.AddActor2D(self.freehand_actor_cut)
-        vtk_widget.GetRenderWindow().Render()
+        self._safe_render(vtk_widget)
 
 
     def _draw_brush_cursor_cut(self, center, radius=1.0):
@@ -4578,30 +5011,24 @@ class ClassificationInteractor:
         # ✅ CRITICAL: Force immediate render
         try:
             if hasattr(vtk_widget, 'GetRenderWindow'):
-                vtk_widget.GetRenderWindow().Render()
+                self._safe_render(vtk_widget)
             elif hasattr(vtk_widget, 'render'):
-                vtk_widget.render()
+                self._safe_render_pyvista(vtk_widget)
             print(f"   ✅ Render called successfully")
         except Exception as e:
             print(f"   ⚠️ Render failed: {e}")
             
     def _draw_brush_cursor_cut_display(self, center_world, radius_px=20.0):
-        """✅ Brush cursor for CUT SECTION drawn in DISPLAY coords (always visible)."""
+        """
+        ✅ PERFORMANCE FIX: Brush cursor for CUT SECTION in DISPLAY coords.
+        Reuses actor — zero allocation per frame after init.
+        """
         from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
 
         vtk_widget = self._get_active_vtk_widget()
         if vtk_widget is None:
             return
-
         renderer = vtk_widget.renderer
-
-        # Remove old
-        if hasattr(self, "brush_actor_cut") and self.brush_actor_cut:
-            try:
-                renderer.RemoveActor2D(self.brush_actor_cut)
-            except Exception:
-                pass
-            self.brush_actor_cut = None
 
         # Convert center to display coords
         coord = vtkCoordinate()
@@ -4609,17 +5036,42 @@ class ClassificationInteractor:
         coord.SetValue(float(center_world[0]), float(center_world[1]), float(center_world[2]))
         c_disp = coord.GetComputedDisplayValue(renderer)
         cx, cy = float(c_disp[0]), float(c_disp[1])
-
-        # Compute pixel radius by offsetting along local +X in cut view
-        # (works whether cut coords are local or world-like in that renderer)
         pixel_radius = max(6.0, float(radius_px))
 
-        # Build dashed circle + crosshair + center dot in DISPLAY coords
         num_segments = 32
         dot_segments = 8
 
-        pts = vtkPoints()
-        lines = vtkCellArray()
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_brush_cut_pts") or self.brush_actor_cut is None:
+            self._brush_cut_pts   = vtkPoints()
+            self._brush_cut_lines = vtkCellArray()
+            self._brush_cut_poly  = vtkPolyData()
+            self._brush_cut_poly.SetPoints(self._brush_cut_pts)
+            self._brush_cut_poly.SetLines(self._brush_cut_lines)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._brush_cut_poly)
+            dc = vtkCoordinate(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.brush_actor_cut = vtkActor2D()
+            self.brush_actor_cut.SetMapper(mapper)
+            prop = self.brush_actor_cut.GetProperty()
+            prop.SetColor(1, 1, 0)
+            prop.SetLineWidth(3)
+            prop.SetOpacity(0.9)
+
+            renderer.AddActor2D(self.brush_actor_cut)
+
+        if not renderer.HasViewProp(self.brush_actor_cut):
+            renderer.AddActor2D(self.brush_actor_cut)
+        self.brush_actor_cut.VisibilityOn()
+
+        # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
+        pts   = self._brush_cut_pts
+        lines = self._brush_cut_lines
+        pts.Reset()
+        lines.Reset()
 
         def add_seg(p0, p1):
             i0 = pts.InsertNextPoint(p0[0], p0[1], 0.0)
@@ -4628,51 +5080,32 @@ class ClassificationInteractor:
             lines.InsertCellPoint(i0)
             lines.InsertCellPoint(i1)
 
-        # dashed circle (every other segment)
         for i in range(0, num_segments, 2):
             a1 = 2.0 * np.pi * i / num_segments
             a2 = 2.0 * np.pi * (i + 1) / num_segments
-            p1 = (cx + pixel_radius * np.cos(a1), cy + pixel_radius * np.sin(a1))
-            p2 = (cx + pixel_radius * np.cos(a2), cy + pixel_radius * np.sin(a2))
-            add_seg(p1, p2)
+            add_seg((cx + pixel_radius * np.cos(a1), cy + pixel_radius * np.sin(a1)),
+                    (cx + pixel_radius * np.cos(a2), cy + pixel_radius * np.sin(a2)))
 
-        # crosshair
         ch = pixel_radius * 0.3
         add_seg((cx - ch, cy), (cx + ch, cy))
         add_seg((cx, cy - ch), (cx, cy + ch))
 
-        # center dot ring
         dot_r = max(2.0, pixel_radius * 0.05)
         for i in range(dot_segments):
             a1 = 2.0 * np.pi * i / dot_segments
             a2 = 2.0 * np.pi * (i + 1) / dot_segments
-            p1 = (cx + dot_r * np.cos(a1), cy + dot_r * np.sin(a1))
-            p2 = (cx + dot_r * np.cos(a2), cy + dot_r * np.sin(a2))
-            add_seg(p1, p2)
+            add_seg((cx + dot_r * np.cos(a1), cy + dot_r * np.sin(a1)),
+                    (cx + dot_r * np.cos(a2), cy + dot_r * np.sin(a2)))
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-        display_coord = vtkCoordinate()
-        display_coord.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(display_coord)
-
-        self.brush_actor_cut = vtkActor2D()
-        self.brush_actor_cut.SetMapper(mapper)
-
-        prop = self.brush_actor_cut.GetProperty()
-        prop.SetColor(1, 1, 0)
-        prop.SetLineWidth(3)
-        prop.SetOpacity(0.9)
-
-        renderer.AddActor2D(self.brush_actor_cut)
-        vtk_widget.GetRenderWindow().Render()
+        pts.Modified()
+        self._brush_cut_poly.Modified()
+        # Render batched by caller
         
     def _draw_rectangle_cursor_cut_display(self, center_world, radius_px=20.0):
-        """✅ Rectangle brush cursor for CUT SECTION in DISPLAY coords."""
+        """
+        ✅ PERFORMANCE FIX: Rectangle brush cursor for CUT SECTION in DISPLAY coords.
+        Reuses actor — zero allocation per frame after init.
+        """
         from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
 
         vtk_widget = self._get_active_vtk_widget()
@@ -4680,25 +5113,47 @@ class ClassificationInteractor:
             return
         renderer = vtk_widget.renderer
 
-        # Remove old
-        if hasattr(self, "brush_actor_cut") and self.brush_actor_cut:
-            try:
-                renderer.RemoveActor2D(self.brush_actor_cut)
-            except Exception:
-                pass
-            self.brush_actor_cut = None
-
         coord = vtkCoordinate()
         coord.SetCoordinateSystemToWorld()
         coord.SetValue(float(center_world[0]), float(center_world[1]), float(center_world[2]))
         c_disp = coord.GetComputedDisplayValue(renderer)
         cx, cy = float(c_disp[0]), float(c_disp[1])
         dx = dy = max(6.0, float(radius_px))
-
         x_min, x_max = cx - dx, cx + dx
         y_min, y_max = cy - dy, cy + dy
 
-        pts = vtkPoints()
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_rect_cut_pts") or self.brush_actor_cut is None:
+            self._rect_cut_pts   = vtkPoints()
+            self._rect_cut_lines = vtkCellArray()
+            self._rect_cut_poly  = vtkPolyData()
+            self._rect_cut_poly.SetPoints(self._rect_cut_pts)
+            self._rect_cut_poly.SetLines(self._rect_cut_lines)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._rect_cut_poly)
+            dc = vtkCoordinate(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.brush_actor_cut = vtkActor2D()
+            self.brush_actor_cut.SetMapper(mapper)
+            prop = self.brush_actor_cut.GetProperty()
+            prop.SetColor(1, 1, 0)
+            prop.SetLineWidth(3)
+            prop.SetOpacity(0.9)
+
+            renderer.AddActor2D(self.brush_actor_cut)
+
+        if not renderer.HasViewProp(self.brush_actor_cut):
+            renderer.AddActor2D(self.brush_actor_cut)
+        self.brush_actor_cut.VisibilityOn()
+
+        # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
+        pts   = self._rect_cut_pts
+        lines = self._rect_cut_lines
+        pts.Reset()
+        lines.Reset()
+
         corners = [
             (x_min, y_min, 0.0),
             (x_max, y_min, 0.0),
@@ -4708,33 +5163,14 @@ class ClassificationInteractor:
         ]
         for c in corners:
             pts.InsertNextPoint(*c)
-
-        lines = vtkCellArray()
         for i in range(1, len(corners)):
             lines.InsertNextCell(2)
             lines.InsertCellPoint(i - 1)
             lines.InsertCellPoint(i)
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-        display_coord = vtkCoordinate()
-        display_coord.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(display_coord)
-
-        self.brush_actor_cut = vtkActor2D()
-        self.brush_actor_cut.SetMapper(mapper)
-
-        prop = self.brush_actor_cut.GetProperty()
-        prop.SetColor(1, 1, 0)
-        prop.SetLineWidth(3)
-        prop.SetOpacity(0.9)
-
-        renderer.AddActor2D(self.brush_actor_cut)
-        vtk_widget.GetRenderWindow().Render()
+        pts.Modified()
+        self._rect_cut_poly.Modified()
+        # Render batched by caller
 
     # Add this helper method to ClassificationInteractor class
 
@@ -4904,27 +5340,54 @@ class ClassificationInteractor:
             )
                 
     def _draw_rectangle_cursor(self, center, radius):
-        """✅ Rectangle brush cursor in DISPLAY pixels (zoom invariant)."""
+        """
+        ✅ PERFORMANCE FIX: Rectangle brush cursor in DISPLAY pixels (zoom invariant).
+        Reuses actor — zero allocation per frame after init.
+        """
         vtk_widget = self._get_active_vtk_widget()
         if vtk_widget is None:
             return
         renderer = vtk_widget.renderer
 
-        if hasattr(self, "brush_actor") and self.brush_actor:
-            try:
-                renderer.RemoveActor2D(self.brush_actor)
-            except Exception:
-                pass
-            self.brush_actor = None
-
-        # display center = mouse position
         x, y = self.interactor.GetEventPosition()
-        r = max(float(radius), 3.0)  # pixels
-
+        r = max(float(radius), 3.0)
         x_min, x_max = x - r, x + r
         y_min, y_max = y - r, y + r
 
-        pts = vtkPoints()
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_rect_cursor_pts") or self.brush_actor is None:
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
+
+            self._rect_cursor_pts   = vtkPoints()
+            self._rect_cursor_lines = vtkCellArray()
+            self._rect_cursor_poly  = vtkPolyData()
+            self._rect_cursor_poly.SetPoints(self._rect_cursor_pts)
+            self._rect_cursor_poly.SetLines(self._rect_cursor_lines)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._rect_cursor_poly)
+            dc = _C(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.brush_actor = vtkActor2D()
+            self.brush_actor.SetMapper(mapper)
+            prop = self.brush_actor.GetProperty()
+            prop.SetColor(1, 1, 0)
+            prop.SetLineWidth(3)
+            prop.SetOpacity(0.9)
+
+            renderer.AddActor2D(self.brush_actor)
+
+        if not renderer.HasViewProp(self.brush_actor):
+            renderer.AddActor2D(self.brush_actor)
+        self.brush_actor.VisibilityOn()
+
+        # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
+        pts   = self._rect_cursor_pts
+        lines = self._rect_cursor_lines
+        pts.Reset()
+        lines.Reset()
+
         corners = [
             (x_min, y_min, 0.0),
             (x_max, y_min, 0.0),
@@ -4934,34 +5397,14 @@ class ClassificationInteractor:
         ]
         for c in corners:
             pts.InsertNextPoint(*c)
-
-        lines = vtkCellArray()
         for i in range(1, len(corners)):
             lines.InsertNextCell(2)
             lines.InsertCellPoint(i - 1)
             lines.InsertCellPoint(i)
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-
-        display_coord = vtkCoordinate()
-        display_coord.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(display_coord)
-
-        self.brush_actor = vtkActor2D()
-        self.brush_actor.SetMapper(mapper)
-
-        prop = self.brush_actor.GetProperty()
-        prop.SetColor(1, 1, 0)
-        prop.SetLineWidth(3)
-        prop.SetOpacity(0.9)
-
-        renderer.AddActor2D(self.brush_actor)
+        pts.Modified()
+        self._rect_cursor_poly.Modified()
+        # Render batched by caller
         
     def _draw_rectangle_cursor_cut(self, center, radius):
         """Draw rectangle cursor for brush tool in CUT SECTION"""
@@ -5060,9 +5503,9 @@ class ClassificationInteractor:
         # ✅ CRITICAL: Force immediate render
         try:
             if hasattr(vtk_widget, 'GetRenderWindow'):
-                vtk_widget.GetRenderWindow().Render()
+                self._safe_render(vtk_widget)
             elif hasattr(vtk_widget, 'render'):
-                vtk_widget.render()
+                self._safe_render_pyvista(vtk_widget)
             print(f"   ✅ Render called successfully")
         except Exception as e:
             print(f"   ⚠️ Render failed: {e}")
@@ -5206,7 +5649,7 @@ class ClassificationInteractor:
             _mark_actor_dirty(actor)
 
             try:
-                self.app.vtk_widget.render()
+                self._safe_render_pyvista(self.app.vtk_widget)
             except Exception:
                 pass
 
@@ -5667,9 +6110,9 @@ class ClassificationInteractor:
                     
                     # Render
                     if hasattr(plotter, 'GetRenderWindow'):
-                        plotter.GetRenderWindow().Render()
+                        self._safe_render(plotter)
                     elif hasattr(plotter, 'render'):
-                        plotter.render()
+                        self._safe_render_pyvista(plotter)
                     
                     current_step[0] += 1
                     
@@ -5693,7 +6136,7 @@ class ClassificationInteractor:
                 cam.SetPosition(new_pos.tolist())
                 cam.SetFocalPoint(new_focal.tolist())
                 if hasattr(plotter, 'render'):
-                    plotter.render()
+                    self._safe_render_pyvista(plotter)
             except:
                 pass
 
@@ -5840,7 +6283,7 @@ class ClassificationInteractor:
                     label_opacity = 1.0 if t < 0.8 else (1.0 - (t - 0.8) / 0.2)
                     plotter.actors['fly_to_label'].GetProperty().SetOpacity(max(0, label_opacity))
                 
-                plotter.render()
+                self._safe_render_pyvista(plotter)
                 
                 current_step[0] += 1
                 
@@ -5861,7 +6304,7 @@ class ClassificationInteractor:
                             except Exception as e:
                                 print(f"   ⚠️ Failed to remove {name}: {e}")
                     
-                    plotter.render()
+                    self._safe_render_pyvista(plotter)
                     print(f"   ✅ Animation complete. Removed {removed_count} indicators")
                     
             except Exception as e:

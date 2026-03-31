@@ -6,6 +6,35 @@ from PySide6.QtCore import Qt
 import vtk
 from scipy.spatial import cKDTree
 
+# ============ SAFE RENDER HELPER ============
+def _safe_vtk_render(vtk_widget):
+    """
+    Safely render a VTK/PyVista widget. NEVER raises.
+    Prevents crash from stale render windows when switching between
+    cut section and synchronized views.
+    """
+    if vtk_widget is None:
+        return False
+    try:
+        # Check Qt widget is alive
+        if hasattr(vtk_widget, 'isVisible') and callable(vtk_widget.isVisible):
+            if not vtk_widget.isVisible():
+                return False
+        # Validate render window
+        rw = vtk_widget.GetRenderWindow()
+        if rw is None:
+            return False
+        if rw.GetInteractor() is None:
+            return False
+        vtk_widget.render()
+        return True
+    except (RuntimeError, AttributeError, OSError, ReferenceError):
+        return False
+    except Exception:
+        return False
+
+
+
 # ============ INTERACTOR STYLE ============
 class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
     """
@@ -17,9 +46,11 @@ class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
     
     This allows users to navigate the view while placing cut points.
     """
-    def __init__(self):
+    def __init__(self, app=None, vtk_widget=None):
         """Initialize with proper event handlers for zoom and pan."""
         super().__init__()
+        self.app = app
+        self.vtk_widget = vtk_widget
         
         # ❌ DO NOT block these - instead handle them properly!
         # self.AddObserver("MouseWheelForwardEvent", lambda obj, evt: None)  # ← REMOVE
@@ -28,6 +59,7 @@ class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
         # ✅ DO add proper handlers for zoom and pan
         self.AddObserver("MouseWheelForwardEvent", self._on_mouse_wheel_forward)
         self.AddObserver("MouseWheelBackwardEvent", self._on_mouse_wheel_backward)
+        self.AddObserver("LeftButtonPressEvent", self._on_left_press)
         self.AddObserver("MiddleButtonPressEvent", self._on_middle_press)
         self.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release)
         self.AddObserver("MouseMoveEvent", self._on_mouse_move)
@@ -43,16 +75,46 @@ class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
     def _block_event(self, obj, event):
         """Dummy handler to block right-click rotation."""
         pass
-    
-    def _on_mouse_wheel_forward(self, obj, event):
-        """Handle mouse wheel forward (zoom in)."""
+
+    def _on_left_press(self, obj, event):
         try:
             interactor = self.GetInteractor()
             if interactor is None:
                 return
+            if self.app is None or self.vtk_widget is None:
+                return
+            if getattr(self.app, "zoom_behavior", "center") != "picked_point":
+                return
+            if hasattr(self.app, "_store_zoom_anchor"):
+                self.app._store_zoom_anchor(self.vtk_widget, interactor=interactor)
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            pass
+        except Exception:
+            pass
+    
+    def _on_mouse_wheel_forward(self, obj, event):
+        """Handle mouse wheel forward (zoom in). ✅ SAFE render."""
+        try:
+            interactor = self.GetInteractor()
+            if interactor is None:
+                return
+
+            zoom_behavior = getattr(self.app, "zoom_behavior", "center")
+            if self.vtk_widget is not None and self.app is not None:
+                if zoom_behavior == "cursor" and hasattr(self.app, "_zoom_widget_at_cursor"):
+                    if self.app._zoom_widget_at_cursor(self.vtk_widget, 1.2, interactor=interactor):
+                        return
+                elif zoom_behavior == "picked_point" and hasattr(self.app, "_zoom_widget_at_anchor"):
+                    anchor_world = getattr(self.app, "_zoom_anchor_points", {}).get(id(self.vtk_widget))
+                    if anchor_world is not None and self.app._zoom_widget_at_anchor(self.vtk_widget, 1.2, anchor_world):
+                        return
             
             render_window = interactor.GetRenderWindow()
+            if render_window is None or render_window.GetInteractor() is None:
+                return
             renderers = render_window.GetRenderers()
+            if renderers is None or renderers.GetNumberOfItems() == 0:
+                return
             renderer = renderers.GetFirstRenderer()
             
             if renderer is None:
@@ -62,23 +124,37 @@ class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
             if camera is None:
                 return
             
-            # Zoom in by 20%
             camera.Zoom(1.2)
-            interactor.Render()
-            print("🔍 Zoom IN (mouse wheel forward)")
+            render_window.Render()
             
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            pass
         except Exception as e:
             print(f"⚠️ Zoom forward error: {e}")
     
     def _on_mouse_wheel_backward(self, obj, event):
-        """Handle mouse wheel backward (zoom out)."""
+        """Handle mouse wheel backward (zoom out). ✅ SAFE render."""
         try:
             interactor = self.GetInteractor()
             if interactor is None:
                 return
+
+            zoom_behavior = getattr(self.app, "zoom_behavior", "center")
+            if self.vtk_widget is not None and self.app is not None:
+                if zoom_behavior == "cursor" and hasattr(self.app, "_zoom_widget_at_cursor"):
+                    if self.app._zoom_widget_at_cursor(self.vtk_widget, 0.833, interactor=interactor):
+                        return
+                elif zoom_behavior == "picked_point" and hasattr(self.app, "_zoom_widget_at_anchor"):
+                    anchor_world = getattr(self.app, "_zoom_anchor_points", {}).get(id(self.vtk_widget))
+                    if anchor_world is not None and self.app._zoom_widget_at_anchor(self.vtk_widget, 0.833, anchor_world):
+                        return
             
             render_window = interactor.GetRenderWindow()
+            if render_window is None or render_window.GetInteractor() is None:
+                return
             renderers = render_window.GetRenderers()
+            if renderers is None or renderers.GetNumberOfItems() == 0:
+                return
             renderer = renderers.GetFirstRenderer()
             
             if renderer is None:
@@ -88,11 +164,11 @@ class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
             if camera is None:
                 return
             
-            # Zoom out by ~17%
             camera.Zoom(0.833)
-            interactor.Render()
-            print("🔍 Zoom OUT (mouse wheel backward)")
+            render_window.Render()
             
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            pass
         except Exception as e:
             print(f"⚠️ Zoom backward error: {e}")
     
@@ -119,7 +195,7 @@ class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
             print(f"⚠️ Middle release error: {e}")
     
     def _on_mouse_move(self, obj, event):
-        """Handle mouse move for panning."""
+        """Handle mouse move for panning. ✅ SAFE: all VTK access guarded."""
         if not self._is_panning:
             return
         
@@ -130,16 +206,18 @@ class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
             
             current_pos = interactor.GetEventPosition()
             
-            # Calculate pixel movement
             dx = current_pos[0] - self._last_pos[0]
             dy = current_pos[1] - self._last_pos[1]
             
             if dx == 0 and dy == 0:
                 return
             
-            # Get renderer and camera
             render_window = interactor.GetRenderWindow()
+            if render_window is None or render_window.GetInteractor() is None:
+                return
             renderers = render_window.GetRenderers()
+            if renderers is None or renderers.GetNumberOfItems() == 0:
+                return
             renderer = renderers.GetFirstRenderer()
             
             if renderer is None:
@@ -149,38 +227,42 @@ class CutSectionInteractorStyle(vtk.vtkInteractorStyleUser):
             if camera is None:
                 return
             
-            # Get render window size
             size = render_window.GetSize()
             if size[0] == 0 or size[1] == 0:
                 return
             
-            # Ensure view up is orthogonal
             camera.OrthogonalizeViewUp()
             
-            # Get camera axes
             right = np.array(camera.GetViewRight())
             up = np.array(camera.GetViewUp())
             
-            # Calculate scale based on camera distance
-            distance = camera.GetDistance()
-            scale = distance / (size[0] * 0.5) if size[0] > 0 else 0
+            # ✅ FIX: Use ParallelScale for orthographic views (correct 1:1 mapping)
+            if camera.GetParallelProjection():
+                parallel_scale = camera.GetParallelScale()
+                scale = (2.0 * parallel_scale) / max(size[1], 1)
+            else:
+                distance = camera.GetDistance()
+                scale = distance / (size[0] * 0.5) if size[0] > 0 else 0
             
-            # Calculate pan vector
             pan_vector = -dx * scale * right - dy * scale * up
             
-            # Apply pan
             current_cam_pos = np.array(camera.GetPosition())
             new_pos = current_cam_pos + pan_vector
             camera.SetPosition(new_pos)
             
-            # Update focal point
             focal = np.array(camera.GetFocalPoint())
             new_focal = focal + pan_vector
             camera.SetFocalPoint(new_focal)
             
             self._last_pos = current_pos
-            interactor.Render()
             
+            try:
+                render_window.Render()
+            except (RuntimeError, AttributeError, OSError, ReferenceError):
+                pass
+            
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            self._is_panning = False
         except Exception as e:
             print(f"⚠️ Mouse move pan error: {e}")
 
@@ -399,7 +481,7 @@ class CutSectionController:
             self._set_camera_along_tangent(self.cut_vtk, self.cut_points, rotated_tangent)
             
             # Render to apply changes
-            self.cut_vtk.render()
+            _safe_vtk_render(self.cut_vtk)
             
             # ✅ CRITICAL: Restore classification interactor if it was active
             if is_cut_interactor and current_interactor is not None:
@@ -735,7 +817,7 @@ class CutSectionController:
                     
                     # ✅ CRITICAL: Force immediate line update
                     self._draw_dynamic_center_line_in_cut(self.center_point)
-                    self.cut_vtk.render()
+                    _safe_vtk_render(self.cut_vtk)
                     return
                 
                 if self._state == CutSectionState.WAITING_DEPTH:
@@ -906,7 +988,7 @@ class CutSectionController:
         
         # ✅ CRITICAL: Always render after update
         try:
-            self.cut_vtk.render()
+            _safe_vtk_render(self.cut_vtk)
         except Exception as e:
             print(f"  ⚠️ Render failed: {e}")
 
@@ -1145,7 +1227,13 @@ class CutSectionController:
                     return
 
                 try:
-                    ren = vtk_widget.GetRenderWindow().GetRenderers().GetFirstRenderer()
+                    _rw = vtk_widget.GetRenderWindow()
+                    if _rw is None or _rw.GetInteractor() is None:
+                        print("⚠️ Render window not available for viewport bounds")
+                        return
+                    ren = _rw.GetRenderers().GetFirstRenderer()
+                    if ren is None:
+                        return
                     cam = ren.GetActiveCamera()
                     fp = np.array(cam.GetFocalPoint())
                     scale = cam.GetParallelScale()
@@ -1305,7 +1393,7 @@ class CutSectionController:
         
         try:
             if self.active_vtk:
-                self.active_vtk.render()
+                _safe_vtk_render(self.active_vtk)
         except Exception:
             pass
         
@@ -1321,8 +1409,6 @@ class CutSectionController:
         elif self.cut_dock.isHidden():
             print("      → Showing hidden dock")
             self.cut_dock.show()
-            ThemeManager.apply_native_window_theme(self.cut_dock)
-            ThemeManager.refresh_runtime_surfaces(self.app)
         else:
             self.cut_dock.setVisible(True)  # Ensure visible
         
@@ -1352,30 +1438,45 @@ class CutSectionController:
         print("   🔓 Restoring ClassificationInteractor in cross-section views...")
         
         if hasattr(self.app, 'section_vtks'):
-            from .interactor_classify import ClassificationInteractor
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
             
             for view_index, vtk_widget in self.app.section_vtks.items():
                 try:
                     iren = vtk_widget.interactor
-                    
-                    # Create fresh ClassificationInteractor for this view
-                    wrapper = ClassificationInteractor(self.app, iren, mode="2d")
-                    wrapper.vtkwidget = vtk_widget
-                    wrapper.is_cut_section = False
-                    iren.SetInteractorStyle(wrapper.style)
-                    
-                    print(f"   ✅ ClassificationInteractor restored for cross-section View {view_index + 1}")
-                    print(f"      → Camera controls (rotation/pan/zoom) fully enabled")
-                    
+                    # Restore plain pan/zoom style — classification will overlay
+                    # on top only when the user actually picks a classify tool.
+                    style = vtkInteractorStyleImage()
+                    iren.SetInteractorStyle(style)
+                    print(f"   ✅ Pan/zoom style restored for cross-section View {view_index + 1}")
                 except Exception as e:
                     print(f"   ⚠️ Failed to restore interactor for View {view_index + 1}: {e}")
-                    import traceback
-                    traceback.print_exc()
         
         # Clear the saved styles (no longer needed)
         if hasattr(self, '_saved_interactor_styles'):
             self._saved_interactor_styles.clear()
             print("   🧹 Cleared saved interactor styles dictionary")
+
+        # ✅ CRITICAL: Re-install camera sync observers after interactor replacement
+        # Creating new ClassificationInteractor replaces the interactor style,
+        # which destroys the MouseMoveEvent observers that drive camera sync.
+        if hasattr(self.app, 'view_sync_map') and self.app.view_sync_map:
+            print("   🔗 Re-installing camera sync observers...")
+            try:
+                # Clear old observers (they're dead — interactor style was replaced)
+                if hasattr(self.app, '_camera_observers'):
+                    self.app._camera_observers.clear()
+                
+                # Re-install for all synced views
+                for view_idx, vtk_widget in self.app.section_vtks.items():
+                    is_synced = (
+                        view_idx in self.app.view_sync_map or 
+                        any(src == view_idx for src in self.app.view_sync_map.values())
+                    )
+                    if is_synced and hasattr(self.app, '_install_realtime_camera_observer'):
+                        self.app._install_realtime_camera_observer(view_idx, vtk_widget)
+                        print(f"   🔗 Camera sync re-installed for View {view_idx + 1}")
+            except Exception as e:
+                print(f"   ⚠️ Camera sync re-install failed: {e}")
 
         # Re-attach ClassificationInteractor for cut section
         print("   🔧 Re-attaching ClassificationInteractor for cut section...")
@@ -1397,6 +1498,8 @@ class CutSectionController:
         
         if hasattr(self.app, '_shortcut_filter'):
             self.cut_vtk.interactor.installEventFilter(self.app._shortcut_filter)
+        if hasattr(self.app, "_register_canvas_cursor_widget"):
+            self.app._register_canvas_cursor_widget(self.cut_vtk.interactor)
             print("✅ Undo/Redo shortcuts enabled for Cut Section dock")
         
         def on_classify_done_cut(changed_indices):
@@ -1482,7 +1585,7 @@ class CutSectionController:
             
             # ✅ FORCE RENDER to show clean view
             try:
-                self.cut_vtk.render()
+                _safe_vtk_render(self.cut_vtk)
                 print(" ✅ Cut dock view cleared")
             except Exception as e:
                 print(f" ⚠️ Render failed: {e}")
@@ -1540,6 +1643,8 @@ class CutSectionController:
             # dummy_style = vtk.vtkInteractorStyleUser()  # Empty style = no camera interaction
             # iren.SetInteractorStyle(dummy_style)
             cut_style = CutSectionInteractorStyle()     # ← ADD THIS
+            cut_style.app = self.app
+            cut_style.vtk_widget = vtk_widget
             iren.SetInteractorStyle(cut_style) 
             print(f"🔒 Camera rotation BLOCKED in cross-section View {view_index + 1}")
 
@@ -1668,7 +1773,7 @@ class CutSectionController:
                                 ren.RemoveActor(actor)
                             except:
                                 pass
-                    vtk_widget.render()
+                    _safe_vtk_render(vtk_widget)
                 except Exception as e:
                     print(f"   ⚠️ Actor cleanup for view {view_idx}: {e}")
         
@@ -1682,7 +1787,7 @@ class CutSectionController:
                             ren.RemoveActor(actor)
                         except:
                             pass
-                self.active_vtk.render()
+                _safe_vtk_render(self.active_vtk)
             except:
                 pass
         
@@ -1711,7 +1816,7 @@ class CutSectionController:
                     print(f"   🧹 Removed {removed_count} preview actors from cut dock")
                 
                 # Force render to show the cleared view
-                self.cut_vtk.render()
+                _safe_vtk_render(self.cut_vtk)
                 
             except Exception as e:
                 print(f"   ⚠️ Cut dock actor cleanup error: {e}")
@@ -1787,20 +1892,38 @@ class CutSectionController:
         
         # ========== STEP 3: Restore interactor styles (CRITICAL!) ==========
         if hasattr(self, '_saved_interactor_styles') and self._saved_interactor_styles:
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
             restored_count = 0
-            for view_index, saved_style in list(self._saved_interactor_styles.items()):
+            for view_index in list(self._saved_interactor_styles.keys()):
                 if view_index in getattr(self.app, 'section_vtks', {}):
                     try:
                         vtk_widget = self.app.section_vtks[view_index]
-                        vtk_widget.interactor.SetInteractorStyle(saved_style)
+                        # Always restore to plain pan/zoom — never to the old
+                        # CutSectionInteractorStyle or a stale ClassificationInteractor.
+                        style = vtkInteractorStyleImage()
+                        vtk_widget.interactor.SetInteractorStyle(style)
                         restored_count += 1
-                        print(f"   ✅ Restored interactor style for View {view_index + 1}")
+                        print(f"   ✅ Pan/zoom style restored for View {view_index + 1}")
                     except Exception as e:
                         print(f"   ⚠️ Style restore for view {view_index}: {e}")
-            
-            # ✅ CRITICAL: Clear saved styles so they can be re-saved fresh
             self._saved_interactor_styles.clear()
             print(f"   ✅ Restored {restored_count} interactor styles, cleared saved styles dict")
+            
+            # ✅ Re-install camera sync observers
+            if hasattr(self.app, 'view_sync_map') and self.app.view_sync_map:
+                try:
+                    if hasattr(self.app, '_camera_observers'):
+                        self.app._camera_observers.clear()
+                    for v_idx, vw in getattr(self.app, 'section_vtks', {}).items():
+                        is_synced = (
+                            v_idx in self.app.view_sync_map or
+                            any(src == v_idx for src in self.app.view_sync_map.values())
+                        )
+                        if is_synced and hasattr(self.app, '_install_realtime_camera_observer'):
+                            self.app._install_realtime_camera_observer(v_idx, vw)
+                    print("   🔗 Camera sync re-installed after style restore")
+                except Exception as e:
+                    print(f"   ⚠️ Camera sync re-install failed: {e}")
         
         # ========== STEP 4: Reset state machine ==========
         self._state = CutSectionState.IDLE
@@ -1841,13 +1964,36 @@ class CutSectionController:
         while the actual cut dock resources still exist.
         """
         return (
-            self.cut_vtk is not None and 
-            self.cut_points is not None and 
+            self.cut_vtk is not None and
+            self.cut_points is not None and
             len(self.cut_points) > 0
         )
 
+    def deactivate_tool_only(self):
+        """
+        Deactivate pending cut placement without closing a completed cut dock.
+
+        This is used when leaving the Tools ribbon: unfinished interaction should
+        stop, but an existing cut section window must remain visible.
+        """
+        try:
+            has_persistent_cut = self._has_valid_cut_dock() and self._state not in (
+                CutSectionState.WAITING_CENTER,
+                CutSectionState.WAITING_DEPTH,
+            )
+
+            if has_persistent_cut:
+                print("Leaving Tools tab - keeping cut section dock open")
+                return
+
+            self._force_deactivate_pending_state()
+        except Exception as e:
+            print(f"deactivate_tool_only failed: {e}")
+            import traceback
+            traceback.print_exc()
+
     def activate_from_cross_shortcut(self):
-        """Shortcut: Shift+1 – new cut from cross-section, reusing dock if present."""
+        """Shortcut: Shift+1 - new cut from cross-section, reusing dock if present."""
         try:
             # ✅ CRITICAL: Force deactivate any pending state FIRST
             if self._state != CutSectionState.IDLE:
@@ -2048,7 +2194,7 @@ class CutSectionController:
                         
                         # Render to show the removal
                         try:
-                            vtk_widget.render()
+                            _safe_vtk_render(vtk_widget)
                             if removed_count > 0:
                                 print(f"   ✅ Cross-section View {view_idx + 1} rendered (previews cleared)")
                         except Exception as e:
@@ -2082,17 +2228,31 @@ class CutSectionController:
             
             # Restore original interactor styles in cross-section views
             if hasattr(self, '_saved_interactor_styles') and self._saved_interactor_styles:
-                for view_index, saved_style in self._saved_interactor_styles.items():
-                    if view_index in self.app.section_vtks:
-                        vtk_widget = self.app.section_vtks[view_index]
+                from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+                for view_index in list(self._saved_interactor_styles.keys()):
+                    if view_index in getattr(self.app, 'section_vtks', {}):
                         try:
-                            vtk_widget.interactor.SetInteractorStyle(saved_style)
-                            print(f"   ✅ Restored interactor style for cross-section View {view_index + 1}")
+                            vtk_widget = self.app.section_vtks[view_index]
+                            vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
                         except Exception as e:
                             print(f"   ⚠️ Failed to restore interactor style: {e}")
-                
-                # Clear saved styles
                 self._saved_interactor_styles.clear()
+                
+                # ✅ Re-install camera sync observers
+                if hasattr(self.app, 'view_sync_map') and self.app.view_sync_map:
+                    try:
+                        if hasattr(self.app, '_camera_observers'):
+                            self.app._camera_observers.clear()
+                        for v_idx, vw in self.app.section_vtks.items():
+                            is_synced = (
+                                v_idx in self.app.view_sync_map or
+                                any(src == v_idx for src in self.app.view_sync_map.values())
+                            )
+                            if is_synced and hasattr(self.app, '_install_realtime_camera_observer'):
+                                self.app._install_realtime_camera_observer(v_idx, vw)
+                        print("   🔗 Camera sync re-installed")
+                    except Exception as e:
+                        print(f"   ⚠️ Camera sync re-install failed: {e}")
             
             # Reset state to IDLE
             self._state = CutSectionState.IDLE
@@ -2158,7 +2318,7 @@ class CutSectionController:
                         
                         if removed_count > 0:
                             print(f"   🧹 Removed {removed_count} lingering actors from View {view_idx + 1}")
-                            vtk_widget.render()
+                            _safe_vtk_render(vtk_widget)
                     except:
                         pass
 
@@ -2211,13 +2371,10 @@ class CutSectionController:
                 print("🔄 Cut view active - asking user for cut source...")
                 
                 from PySide6.QtWidgets import QMessageBox
-                from gui.theme_manager import get_dialog_stylesheet
                 
                 msg = QMessageBox(self.app)
                 msg.setWindowTitle("Cut Tool Activate")
-                msg.setText("Choose where the next cut should start from.")
-                msg.setInformativeText("Use the current cross-section or continue cutting from the active cut section.")
-                msg.setStyleSheet(get_dialog_stylesheet())
+                msg.setText("")
                 msg.setWindowFlags(msg.windowFlags() | Qt.WindowCloseButtonHint)
                 
                 btn_cross = msg.addButton("Cross Section", QMessageBox.ActionRole)
@@ -2275,6 +2432,8 @@ class CutSectionController:
                 
                 # ✅ Block camera rotation by setting empty interactor style
                 cut_style = CutSectionInteractorStyle()     # ← ADD THIS
+                cut_style.app = self.app
+                cut_style.vtk_widget = vtk_widget
                 iren.SetInteractorStyle(cut_style) 
                 print(f"🔒 Camera rotation BLOCKED in cross-section View {view_index + 1}")
 
@@ -2609,20 +2768,32 @@ class CutSectionController:
             
             # ✅ STEP 4.5: RESTORE camera rotation in cross-section views
             if hasattr(self.app, 'section_vtks') and hasattr(self, '_saved_interactor_styles'):
-                print("   🔓 Restoring camera rotation in cross-section views...")
-                for view_index, vtk_widget in self.app.section_vtks.items():
+                from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+                for view_index in getattr(self.app, 'section_vtks', {}):
                     if view_index in self._saved_interactor_styles:
-                        saved_style = self._saved_interactor_styles[view_index]
                         try:
-                            iren = vtk_widget.interactor
-                            iren.SetInteractorStyle(saved_style)
-                            print(f"   ✅ Camera rotation restored for View {view_index + 1}")
+                            iren = self.app.section_vtks[view_index].interactor
+                            iren.SetInteractorStyle(vtkInteractorStyleImage())
                         except Exception as e:
-                            print(f"   ⚠️ Failed to restore interactor for View {view_index + 1}: {e}")
-                
-                # Clear the saved styles dictionary
+                            print(f"   ⚠️ Interactor restore failed view {view_index}: {e}")
                 self._saved_interactor_styles.clear()
                 print("   🔓 All cross-section views restored")
+                
+                # ✅ Re-install camera sync observers (destroyed when styles were replaced)
+                if hasattr(self.app, 'view_sync_map') and self.app.view_sync_map:
+                    try:
+                        if hasattr(self.app, '_camera_observers'):
+                            self.app._camera_observers.clear()
+                        for v_idx, vw in self.app.section_vtks.items():
+                            is_synced = (
+                                v_idx in self.app.view_sync_map or
+                                any(src == v_idx for src in self.app.view_sync_map.values())
+                            )
+                            if is_synced and hasattr(self.app, '_install_realtime_camera_observer'):
+                                self.app._install_realtime_camera_observer(v_idx, vw)
+                        print("   🔗 Camera sync observers re-installed")
+                    except Exception as e:
+                        print(f"   ⚠️ Camera sync re-install failed: {e}")
             
             # ✅ STEP 5: Detach cross-section view observers
             self._detach_all_view_observers()
@@ -2730,7 +2901,7 @@ class CutSectionController:
                     for view_index, vtk_widget in enumerate(getattr(self.app, 'section_vtks', {}).values()):
                         if vtk_widget is not None:
                             try:
-                                vtk_widget.render()
+                                _safe_vtk_render(vtk_widget)
                                 refreshed_count += 1
                             except Exception as e:
                                 print(f"   ⚠️ Failed to refresh view {view_index}: {e}")
@@ -2788,7 +2959,7 @@ class CutSectionController:
     #                 except Exception: 
     #                     pass
     #         try:
-    #             self.active_vtk.render()
+    #             _safe_vtk_render(self.active_vtk)
     #         except Exception:
     #             pass
     #     self.line_actor = self.buffer_actor_upper = self.buffer_actor_lower = None
@@ -2820,7 +2991,7 @@ class CutSectionController:
     #                 except Exception: 
     #                     pass
     #         try:
-    #             self.cut_vtk.render()
+    #             _safe_vtk_render(self.cut_vtk)
     #         except Exception:
     #             pass
     #     self.cut_preview_upper = self.cut_preview_lower = None
@@ -3017,7 +3188,7 @@ class CutSectionController:
                 pass
         
         try:
-            vtk_widget.render()
+            _safe_vtk_render(vtk_widget)
         except Exception:
             pass
 
@@ -3220,7 +3391,7 @@ class CutSectionController:
 
     #     # ✅ CRITICAL: Always render
     #     try:
-    #         self.cut_vtk.render()
+    #         _safe_vtk_render(self.cut_vtk)
     #     except Exception:
     #         pass
 
@@ -3347,7 +3518,7 @@ class CutSectionController:
         
         # ✅ CRITICAL: Force render
         try:
-            vtk_widget.render()
+            _safe_vtk_render(vtk_widget)
         except Exception as e:
             print(f"⚠️ Render failed in _draw_dynamic_band_preview: {e}")
 
@@ -3458,7 +3629,7 @@ class CutSectionController:
 
         # ✅ CRITICAL: Force render
         try:
-            self.cut_vtk.render()
+            _safe_vtk_render(self.cut_vtk)
         except Exception as e:
             print(f"⚠️ Render failed in _draw_cut_section_preview: {e}")
 
@@ -3635,7 +3806,7 @@ class CutSectionController:
         if av is not None and av in self.app.section_vtks:
             vw = self.app.section_vtks[av]
             self._robust_clear_renderer(vw)
-            vw.render()
+            _safe_vtk_render(vw)
         self.is_cut_view_active = False
         self.restore_section_data()
 
@@ -3864,7 +4035,7 @@ class CutSectionController:
                         
                         # Trigger VTK pipeline update without rebuilding the actor
                         vtk_colors.Modified()
-                        self.cut_vtk.render()
+                        _safe_vtk_render(self.cut_vtk)
                         return  # 🔥 Performance Success: Exit immediately
 
             # 4. Fallback Path: Initial Actor Creation
@@ -3887,7 +4058,7 @@ class CutSectionController:
                 name="cut_core_points" # Named for easy retrieval
             )
             
-            self.cut_vtk.render()
+            _safe_vtk_render(self.cut_vtk)
 
         except Exception as e:
             print(f"❌ Cut color refresh failed: {str(e)}")
@@ -3930,10 +4101,12 @@ class CutSectionController:
 
             # Create DEDICATED VTK widget for cut section
             self.cut_vtk = QtInteractor(container)
-            from gui.theme_manager import ThemeManager
-            bg_color = "white" if ThemeManager.current() == "light" else "black"
-            self.cut_vtk.set_background(bg_color)
+            self.cut_vtk.set_background("black")
             layout.addWidget(self.cut_vtk.interactor)
+            if hasattr(self.app, "_register_canvas_cursor_widget"):
+                self.app._register_canvas_cursor_widget(self.cut_vtk.interactor)
+            if hasattr(self.app, "point_sync_tool") and self.app.point_sync_tool.active:
+                self.app.point_sync_tool.activate_for_cut_view(self.cut_vtk)
 
             # Modern bottom bar with inline depth control
             btn_layout = QHBoxLayout()
@@ -4226,7 +4399,7 @@ class CutSectionController:
             ren.ResetCamera()
             ren.GetActiveCamera().ParallelProjectionOn()
             ren.ResetCameraClippingRange()
-        self.cut_vtk.render()
+        _safe_vtk_render(self.cut_vtk)
         
         print(f"✅ Cut plotted to dedicated widget: {points.shape[0]} pts")
 
@@ -4658,7 +4831,7 @@ class CutSectionController:
                 
                 # Render to show the removal
                 try:
-                    vtk_widget.render()
+                    _safe_vtk_render(vtk_widget)
                 except:
                     pass
             except:

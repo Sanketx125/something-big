@@ -1,11 +1,3 @@
-"""
-Enhanced Grid Label Hyperlink System for NakshaAI-Lidar
-- Automatic LAZ/LAS file detection and loading
-- Smart folder detection from DXF location
-- Pattern-based filename matching
-- Visual feedback and error handling
-"""
-
 import os
 from pathlib import Path
 import vtk
@@ -66,9 +58,25 @@ class GridLabelManager:
                 except Exception:
                     pass
 
+            priority = 2.0 if event_name == "RightButtonPressEvent" else 0.0
             self._interactor_observer_ids[event_name] = interactor.AddObserver(
-                event_name, callback
+                event_name, callback, priority
             )
+
+    def _consume_vtk_event(self, obj):
+        if obj is None:
+            return
+
+        try:
+            if hasattr(obj, 'AbortFlagOn'):
+                obj.AbortFlagOn()
+            elif hasattr(obj, 'SetAbortFlag'):
+                try:
+                    obj.SetAbortFlag(1)
+                except TypeError:
+                    obj.SetAbortFlag(True)
+        except Exception:
+            pass
 
     def on_mouse_move(self, obj, event):
         """Highlight labels on hover"""
@@ -161,11 +169,63 @@ class GridLabelManager:
         self._load_las_file(Path(file_path), grid_name)
 
             
+    def _is_tool_operation_in_progress(self):
+        """Returns True if any user tool is currently performing an operation that uses right-click."""
+        app = self.app
+        if not app: return False
+
+        # 1. Digitize (Draw) Tools: active when a tool is selected and has points
+        digitizer = getattr(app, "digitizer", None)
+        if digitizer and (digitizer.active_tool or getattr(digitizer, "vertex_move_mode", False)):
+            # If in the middle of drawing (any points clicked)
+            if len(getattr(digitizer, "temp_points", [])) > 0:
+                return True
+            # If currently moving/dragging a vertex
+            if getattr(digitizer, "dragging_vertex", None) is not None:
+                return True
+
+        # 2. Measurement Tool: active during measurement drag
+        mtool = getattr(app, "measurement_tool", None)
+        if mtool and getattr(mtool, "is_measuring", False):
+            if len(getattr(mtool, "measurement_points", [])) > 0:
+                return True
+
+        # 3. Curve Tool: active during curve path drawing
+        ctool = getattr(app, "curve_tool", None)
+        if ctool and ctool.active:
+            if len(getattr(ctool, "points", [])) > 0:
+                return True
+
+        # 4. Zoom Rectangle Tool: active when drawing rectangle
+        ztool = getattr(app, "zoom_rectangle_tool", None)
+        if ztool and ztool.active and getattr(ztool, "start_pos", None) is not None:
+            return True
+
+        # 5. Select Rectangle Tool: active when drawing/processing selection
+        stool = getattr(app, "select_rectangle_tool", None)
+        if stool and stool.active:
+            if getattr(stool, "is_drawing", False) or getattr(stool, "start_pos", None) is not None:
+                return True
+
+        return False
+
     def on_right_click(self, obj, event):
         """Handle right-click on grid label OR point cloud"""
         from PySide6.QtWidgets import QMenu, QInputDialog
         from PySide6.QtGui import QAction, QCursor
-        
+
+        # ✅ FIXED: If a tool operation is in progress (drawing, measuring, etc.),
+        # let the tool handle the right-click to finalize its operation.
+        # This prevents the 'Shading controls' dialog from appearing prematurely.
+        if self._is_tool_operation_in_progress():
+            return 0  # Allow other observers (the tools) to handle it
+
+        can_show_shading = getattr(self.app, "_can_show_shading_controls", None)
+        if callable(can_show_shading) and can_show_shading():
+            self._consume_vtk_event(obj)
+            self.app.show_shading_controls()
+            return 1
+
         clickPos = self.app.vtk_widget.interactor.GetEventPosition()
         
         # ═══════════════════════════════════════════════════════
@@ -244,7 +304,7 @@ class GridLabelManager:
                 menu.addAction(clear_action)
                 menu.exec(QCursor.pos())
                 return
-        
+
         # ═══════════════════════════════════════════════════════
         # CASE B: No label found - try picking point cloud
         # ═══════════════════════════════════════════════════════
@@ -279,14 +339,13 @@ class GridLabelManager:
             }
         """)
         
-        if grid_name:
-            # Point belongs to a tracked grid
-            point_count = len(self.loaded_grids[grid_name])
-            clear_action = QAction(f"🧹 Clear Grid: {grid_name} ({point_count:,} pts)", self.app)
-            clear_action.triggered.connect(lambda: self.clear_grid_data(grid_name))
-            menu.addAction(clear_action)
+        # if grid_name:
+        #     # Point belongs to a tracked grid
+        #     point_count = len(self.loaded_grids[grid_name])
+        #     clear_action = QAction(f"🧹 Clear Grid: {grid_name} ({point_count:,} pts)", self.app)
+        #     clear_action.triggered.connect(lambda: self.clear_grid_data(grid_name))
+        #     menu.addAction(clear_action)
 
-        
         menu.exec(QCursor.pos())
         
     def _find_grid_for_point(self, point_id):
@@ -629,13 +688,6 @@ class GridLabelManager:
         print(f"   File: {las_file.name}")
         print(f"{'='*70}")
 
-        from gui.data_loader import prompt_lidar_import_options
-
-        import_options = prompt_lidar_import_options(str(las_file), parent=self.app)
-        if import_options is None:
-            print("   User cancelled import setup")
-            return
-
         # ============================================================================
         # STEP 1: AUTO-SAVE CURRENT FILE (if exists) - SAME AS MENU BAR
         # ============================================================================
@@ -795,13 +847,8 @@ class GridLabelManager:
             update_progress(10, "Loading file...", force=True)
             
             from gui.data_loader import load_lidar_file
-
-            tile_data = load_lidar_file(
-                str(las_file),
-                parent=self.app,
-                import_options=import_options,
-                prompt_user=False,
-            )
+            
+            tile_data = load_lidar_file(str(las_file), parent=self.app)
             
             if not tile_data:
                 progress.finish_error("Load cancelled or failed")
@@ -1818,6 +1865,68 @@ class GridLabelManager:
         
         dialog.setLayout(layout)
         dialog.exec()
+
+    def show_grid_label_menu(self, grid_name):
+        """
+        Show context menu for a grid label.
+        Called by CurveTool.eventFilter when it detects a right-click on a grid label.
+        Extracted from on_right_click() so it can be called externally.
+        """
+        from PySide6.QtWidgets import QMenu, QMessageBox
+        from PySide6.QtGui import QAction, QCursor
+
+        if not grid_name:
+            return
+
+        menu = QMenu(self.app)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #2c2c2c;
+                color: #f0f0f0;
+                border: 1px solid #555;
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 8px 30px;
+                border-radius: 3px;
+            }
+            QMenu::item:selected {
+                background-color: #3c3c3c;
+            }
+        """)
+
+        load_action = QAction("📂 Load Grid Data", self.app)
+        clear_action = QAction("🧹 Clear Grid Data", self.app)
+
+        is_loaded = grid_name in self.loaded_grids
+
+        if is_loaded:
+            load_action.setText("📂 Reload Grid Data")
+            point_count = len(self.loaded_grids[grid_name])
+            clear_action.setText(f"🧹 Clear Grid ({point_count:,} pts)")
+        else:
+            clear_action.setEnabled(False)
+            clear_action.setText("🧹 (Grid not loaded)")
+
+        load_action.triggered.connect(lambda: self.load_grid_las(grid_name))
+
+        def confirm_clear():
+            reply = QMessageBox.question(
+                self.app,
+                "Confirm Clear",
+                f"Clear all points from grid:\n\n{grid_name}\n\n"
+                f"Points will be removed from view.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.clear_grid_data(grid_name)
+
+        clear_action.triggered.connect(confirm_clear)
+
+        menu.addAction(load_action)
+        menu.addAction(clear_action)
+        menu.exec(QCursor.pos())        
 
 def add_grid_label_system_to_app(app):
         """Initialize grid label manager"""

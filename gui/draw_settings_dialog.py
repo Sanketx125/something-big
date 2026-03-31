@@ -367,6 +367,11 @@ class DrawToolSettingsDialog(QDialog):
                 k: dict(v) for k, v in self._working_styles.items()
             }
             print(f"✅ Pushed styles to digitizer.draw_tool_styles")
+            try:
+                if hasattr(digitizer, "_deferred_preview_update"):
+                    digitizer._deferred_preview_update()
+            except Exception:
+                pass
         else:
             print(f"⚠️ Could not find digitizer! app={type(self.app).__name__}, has_digitizer={hasattr(self.app, 'digitizer')}")
 

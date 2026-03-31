@@ -1,4 +1,4 @@
-###
+
 import importlib as _importlib
 import sys as _sys
 import os as _os
@@ -9,7 +9,7 @@ import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QHeaderView, QCheckBox, QColorDialog, QLabel, QLineEdit,
-    QFileDialog, QMenuBar, QComboBox, QWidget, QFrame
+    QFileDialog, QComboBox, QWidget, QFrame, QAbstractItemView, QToolButton, QMenu
 )
 from gui.class_display import update_class_mode
 from gui.theme_manager import get_dialog_stylesheet
@@ -412,6 +412,7 @@ class DisplayModeDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.setProperty("themeStyledDialog", True)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
 
         from PySide6.QtCore import QSettings
         settings = QSettings("NakshaAI", "LidarApp")
@@ -454,8 +455,8 @@ class DisplayModeDialog(QDialog):
 
         self.setStyleSheet(get_dialog_stylesheet())
 
-        self.menu_bar = QMenuBar(self)
-        file_menu    = self.menu_bar.addMenu("File")
+        self.file_menu = QMenu(self)
+        file_menu = self.file_menu
         load_action  = file_menu.addAction("Open...")
         save_action  = file_menu.addAction("Save...")
         save_as_action = file_menu.addAction("Save As...")
@@ -465,7 +466,6 @@ class DisplayModeDialog(QDialog):
         save_action.triggered.connect(self.save_classes)
         save_as_action.triggered.connect(lambda: self.save_classes_as(update_active=False))
         exit_action.triggered.connect(self.close)
-        main_layout.setMenuBar(self.menu_bar)
 
         intro = QLabel(
             "Manage view-specific class visibility, colors, weights, and point-border settings "
@@ -482,6 +482,7 @@ class DisplayModeDialog(QDialog):
         controls_layout.setSpacing(8)
 
         self.slot_box = QComboBox()
+        self.slot_box.setMinimumWidth(170)
         self.slot_box.addItems([
             "Main View",
             "View 1", "View 2", "View 3", "View 4",
@@ -492,55 +493,69 @@ class DisplayModeDialog(QDialog):
         controls_layout.addWidget(self.slot_box)
 
         self.color_mode = QComboBox()
+        self.color_mode.setMinimumWidth(190)
         self.color_mode.addItems([
-            "By Classification",
-            "Shaded Classification",
+            "By Classification",      # idx 0
+            "Shaded Classification",  # idx 1
+            "Depth",                  # idx 2
+            "Intensity",              # idx 3
+            "RGB",                    # idx 4
+            "Elevation",              # idx 5
         ])
         controls_layout.addWidget(self.color_mode)
 
+        self.file_button = QToolButton()
+        self.file_button.setObjectName("displayFileButton")
+        self.file_button.setText("File")
+        self.file_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.file_button.setPopupMode(QToolButton.InstantPopup)
+        self.file_button.setMenu(self.file_menu)
+        self.file_button.setFocusPolicy(Qt.NoFocus)
+        self.file_button.setMinimumWidth(96)
+        controls_layout.addWidget(self.file_button)
+
         border_container = QFrame()
         border_container.setObjectName("displayBorderStrip")
-        border_layout    = QVBoxLayout(border_container)
-        border_layout.setContentsMargins(10, 6, 10, 6)
-        border_layout.setSpacing(4)
+        border_container.setFixedWidth(154)
+        border_layout    = QHBoxLayout(border_container)
+        border_layout.setContentsMargins(8, 5, 8, 5)
+        border_layout.setSpacing(5)
 
-        self.border_label = QLabel("Border: 0%")
+        self.border_label = QLabel("Border")
         self.border_label.setObjectName("displayBorderLabel")
-        self.border_label.setAlignment(Qt.AlignCenter)
+        self.border_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         border_layout.addWidget(self.border_label)
-
-        border_buttons        = QWidget()
-        border_buttons_layout = QHBoxLayout(border_buttons)
-        border_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        border_buttons_layout.setSpacing(6)
+        border_layout.addStretch(1)
 
         self.border_minus_btn = QPushButton("-")
-        self.border_minus_btn.setFixedSize(30, 24)
+        self.border_minus_btn.setObjectName("displayBorderButton")
+        self.border_minus_btn.setFixedSize(22, 22)
         self.border_minus_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
         self.border_minus_btn.setAutoDefault(False)
         self.border_minus_btn.setDefault(False)
         self.border_minus_btn.setFocusPolicy(Qt.NoFocus)
         self.border_minus_btn.clicked.connect(self.decrease_border)
-        border_buttons_layout.addWidget(self.border_minus_btn)
+        border_layout.addWidget(self.border_minus_btn)
 
         self.border_value_display = QLabel("0%")
-        self.border_value_display.setObjectName("valuePill")
-        self.border_value_display.setFixedWidth(50)
+        self.border_value_display.setObjectName("displayBorderValuePill")
+        self.border_value_display.setFixedWidth(36)
+        self.border_value_display.setFixedHeight(22)
         self.border_value_display.setAlignment(Qt.AlignCenter)
         self.border_value_display.setFont(QFont("Segoe UI", 9))
-        border_buttons_layout.addWidget(self.border_value_display)
+        border_layout.addWidget(self.border_value_display)
 
         self.border_plus_btn = QPushButton("+")
-        self.border_plus_btn.setFixedSize(30, 24)
+        self.border_plus_btn.setObjectName("displayBorderButton")
+        self.border_plus_btn.setFixedSize(22, 22)
         self.border_plus_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
         self.border_plus_btn.setAutoDefault(False)
         self.border_plus_btn.setDefault(False)
         self.border_plus_btn.setFocusPolicy(Qt.NoFocus)
         self.border_plus_btn.clicked.connect(self.increase_border)
-        border_buttons_layout.addWidget(self.border_plus_btn)
-
-        border_layout.addWidget(border_buttons)
+        border_layout.addWidget(self.border_plus_btn)
         controls_layout.addWidget(border_container)
+        controls_layout.addStretch(1)
         main_layout.addWidget(controls_card)
 
         table_card = QFrame()
@@ -549,17 +564,42 @@ class DisplayModeDialog(QDialog):
         table_layout.setContentsMargins(12, 12, 12, 12)
         table_layout.setSpacing(12)
         self.table   = QTableWidget(0, 7)
+        self.table.setObjectName("displayClassTable")
         self.table.setHorizontalHeaderLabels(
             ["Show", "Code", "Description", "Draw", "Lvl", "Color", "Weight"]
         )
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(34)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.setWordWrap(False)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        self.table.horizontalHeader().setHighlightSections(False)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 56)
+        self.table.setColumnWidth(1, 68)
+        self.table.setColumnWidth(4, 88)
+        self.table.setColumnWidth(5, 90)
+        self.table.setColumnWidth(6, 82)
         self.table.setShowGrid(False)
         table_layout.addWidget(self.table)
 
-        side = QVBoxLayout()
+        action_rail = QFrame()
+        action_rail.setObjectName("displayActionRail")
+        side = QVBoxLayout(action_rail)
+        side.setContentsMargins(10, 10, 10, 10)
+        side.setSpacing(10)
         self.add_btn    = QPushButton("Add")
         self.edit_btn   = QPushButton("Edit")
         self.del_btn    = QPushButton("Delete")
@@ -567,14 +607,15 @@ class DisplayModeDialog(QDialog):
         self.clear_btn  = QPushButton("Clear All")
         for b in [self.add_btn, self.edit_btn, self.del_btn,
                   self.select_btn, self.clear_btn]:
+            b.setObjectName("displayActionButton")
             b.setMinimumHeight(36)
-            b.setMinimumWidth(92)
+            b.setMinimumWidth(100)
             b.setAutoDefault(False)
             b.setDefault(False)
             b.setFocusPolicy(Qt.NoFocus)
             side.addWidget(b)
         side.addStretch()
-        table_layout.addLayout(side)
+        table_layout.addWidget(action_rail)
         main_layout.addWidget(table_card)
 
         bottom = QHBoxLayout()
@@ -582,6 +623,7 @@ class DisplayModeDialog(QDialog):
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setObjectName("primaryBtn")
         self.close_btn = QPushButton("Close")
+        self.close_btn.setObjectName("secondaryBtn")
         self.apply_btn.setAutoDefault(False)
         self.apply_btn.setDefault(False)
         self.apply_btn.setFocusPolicy(Qt.NoFocus)
@@ -592,7 +634,7 @@ class DisplayModeDialog(QDialog):
         bottom.addWidget(self.close_btn)
         main_layout.addLayout(bottom)
 
-        self.close_btn.clicked.connect(self.accept)
+        self.close_btn.clicked.connect(self._handle_close)
         self.apply_btn.clicked.connect(self.on_apply)
         self.add_btn.clicked.connect(self.on_add)
         self.edit_btn.clicked.connect(self.on_edit)
@@ -681,19 +723,20 @@ class DisplayModeDialog(QDialog):
             }
 
         for view_idx in range(6):
-            self.view_palettes[view_idx] = {}
-            self.slot_shows[view_idx]    = {}
-            # default_weight = 1.0 if view_idx == 0 else 0.5
-            default_weight = 1.0   # same weight for all slots
+            if view_idx not in self.view_palettes:
+                self.view_palettes[view_idx] = {}
+            if view_idx not in self.slot_shows:
+                self.slot_shows[view_idx] = {}
             for code, info in default_palette_template.items():
-                self.view_palettes[view_idx][code] = {
-                    "show":        info["show"],
-                    "description": str(info["description"]),
-                    "lvl":         str(info.get("lvl", "")),
-                    "color":       tuple(info["color"]),
-                    "weight":      default_weight
-                }
-                self.slot_shows[view_idx][code] = info["show"]
+                if code not in self.view_palettes[view_idx]:
+                    self.view_palettes[view_idx][code] = {
+                        "show":        info["show"],
+                        "description": str(info["description"]),
+                        "lvl":         str(info.get("lvl", "")),
+                        "color":       tuple(info["color"]),
+                        "weight":      info.get("weight", 1.0)
+                    }
+                self.slot_shows[view_idx][code] = self.view_palettes[view_idx][code].get("show", info["show"])
 
         self._check_pending_restores()
 
@@ -731,6 +774,12 @@ class DisplayModeDialog(QDialog):
 
         print(f"{'=' * 60}\n")
         self.connect_existing_checkboxes()
+        if parent:
+            try:
+                self.wire_palette_signal(parent)
+                print("   ✅ palette_changed signal auto-wired to GPU sync")
+            except Exception as _wire_err:
+                print(f"   ⚠️ palette_changed wire failed: {_wire_err}")
         print(f"🎯 DisplayModeDialog initialization complete")
 
     @staticmethod
@@ -829,6 +878,11 @@ class DisplayModeDialog(QDialog):
 
         chk = QCheckBox()
         chk.setChecked(show)
+        chk.setFocusPolicy(Qt.NoFocus)
+        chk.setCursor(Qt.PointingHandCursor)
+        chk.setStyleSheet(
+            "QCheckBox { background: transparent; margin-left: 16px; padding: 0px; }"
+        )
         chk.stateChanged.connect(self.on_checkbox_toggled)
         self.table.setCellWidget(row, 0, chk)
 
@@ -837,11 +891,60 @@ class DisplayModeDialog(QDialog):
         self.table.setItem(row, 3, QTableWidgetItem(draw))
         self.table.setItem(row, 4, QTableWidgetItem(str(lvl)))
 
-        color_item = QTableWidgetItem()
-        color_item.setBackground(color)
-        self.table.setItem(row, 5, color_item)
+        self._set_color_cell(row, color)
 
-        self.table.setItem(row, 6, QTableWidgetItem(str(weight)))
+        try:
+            weight_text = f"{float(weight):.2f}"
+        except Exception:
+            weight_text = str(weight)
+        self.table.setItem(row, 6, QTableWidgetItem(weight_text))
+        self._format_table_row(row)
+
+    def _set_color_cell(self, row, color):
+        qcolor = QColor(color)
+        color_item = self.table.item(row, 5)
+        if color_item is None:
+            color_item = QTableWidgetItem()
+            self.table.setItem(row, 5, color_item)
+        color_item.setText("")
+        color_item.setBackground(qcolor)
+
+        border_color = qcolor.darker(145)
+        swatch = QFrame()
+        swatch.setFixedSize(52, 18)
+        swatch.setStyleSheet(
+            f"background-color: rgb({qcolor.red()}, {qcolor.green()}, {qcolor.blue()});"
+            f"border: 1px solid {border_color.name()};"
+            "border-radius: 5px;"
+        )
+        swatch.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        holder = QWidget()
+        holder.setStyleSheet("background: transparent;")
+        holder.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        holder_layout = QHBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setAlignment(Qt.AlignCenter)
+        holder_layout.addWidget(swatch)
+        self.table.setCellWidget(row, 5, holder)
+
+    def _format_table_row(self, row):
+        alignments = {
+            1: Qt.AlignCenter,
+            4: Qt.AlignCenter,
+            5: Qt.AlignCenter,
+            6: Qt.AlignCenter,
+        }
+        for column in range(1, self.table.columnCount()):
+            item = self.table.item(row, column)
+            if item is None:
+                continue
+            item.setTextAlignment(alignments.get(column, Qt.AlignVCenter | Qt.AlignLeft))
+            if column == 2 or column == 3 or column == 4:
+                item.setToolTip(item.text())
+            elif column == 5:
+                rgb = item.background().color().getRgb()[:3]
+                item.setToolTip(f"RGB: {rgb[0]}, {rgb[1]}, {rgb[2]}")
 
     def save_classes(self):
         if not self.current_ptc_path:
@@ -964,7 +1067,7 @@ class DisplayModeDialog(QDialog):
                                        current_color.green(),
                                        current_color.blue())
                             if r + g + b < 30:
-                                color_item.setBackground(QColor(200, 200, 200))
+                                self._set_color_cell(row, QColor(200, 200, 200))
                         break
 
             print(f"\n{'=' * 60}")
@@ -994,16 +1097,18 @@ class DisplayModeDialog(QDialog):
                 self.view_palettes = {}
 
             for view_idx in range(6):
-                self.view_palettes[view_idx] = {}
+                if view_idx not in self.view_palettes:
+                    self.view_palettes[view_idx] = {}
                 for code, info in master_palette.items():
                     if view_idx == 0:
+                        # Slot 0 (Main View) ALWAYS takes weight from the PTC file.
+                        # Never inherit stale weights from a previously-applied cross-section slot.
+                        # Slots 1-5 preserve their own independently-set weights.
                         weight_to_use = float(info.get("weight", 1.0))
+                    elif code in self.view_palettes[view_idx]:
+                        weight_to_use = float(self.view_palettes[view_idx][code].get('weight', info.get("weight", 1.0)))
                     else:
-                        if (view_idx in self.view_palettes and
-                                code in self.view_palettes[view_idx]):
-                            weight_to_use = self.view_palettes[view_idx][code].get('weight', 0.5)
-                        else:
-                            weight_to_use = 0.5
+                        weight_to_use = float(info.get("weight", 1.0))
                     self.view_palettes[view_idx][code] = {
                         "show":        bool(info["show"]),
                         "description": str(info["description"]),
@@ -1066,15 +1171,31 @@ class DisplayModeDialog(QDialog):
             self.table.setItem(row, 2, QTableWidgetItem(dlg.desc()))
             self.table.setItem(row, 3, QTableWidgetItem(dlg.draw()))
             self.table.setItem(row, 4, QTableWidgetItem(dlg.lvl()))
-            color_item = QTableWidgetItem()
-            color_item.setBackground(dlg.color)
-            self.table.setItem(row, 5, color_item)
-            self.table.setItem(row, 6, QTableWidgetItem(str(dlg.weight())))
+            self._set_color_cell(row, dlg.color)
+            self.table.setItem(row, 6, QTableWidgetItem(f"{float(dlg.weight()):.2f}"))
+            self._format_table_row(row)
 
     def on_delete(self):
         row = self.table.currentRow()
         if row >= 0:
             self.table.removeRow(row)
+
+    def _on_color_mode_changed(self, idx):
+        """
+        When user switches to Depth / Intensity / RGB / Elevation (idx 2-5),
+        automatically check ALL classes so every point is visible.
+        By Classification (0) and Shaded Classification (1) are left untouched
+        — they restore whatever the user had previously set.
+        """
+        NON_CLASS_MODES = {2, 3, 4, 5}
+        if idx in NON_CLASS_MODES:
+            for row in range(self.table.rowCount()):
+                chk = self.table.cellWidget(row, 0)
+                if chk:
+                    chk.blockSignals(True)
+                    chk.setChecked(True)
+                    chk.blockSignals(False)
+            print(f"✅ Color mode idx={idx}: all classes auto-selected")
 
     def on_select_all(self):
         for row in range(self.table.rowCount()):
@@ -1148,7 +1269,14 @@ class DisplayModeDialog(QDialog):
     ###########
 
     def on_apply(self):   
-        from PySide6.QtWidgets import QMessageBox, QApplication
+        from PySide6.QtWidgets import QMessageBox, QApplication, QAbstractItemView, QAbstractItemDelegate
+        
+        # Ensure any active editor in the table commits its data
+        if self.table.state() == QAbstractItemView.State.EditingState:
+            editor = self.table.focusWidget()
+            if editor is not None:
+                self.table.commitData(editor)
+                self.table.closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
 
         visible_count = sum(
             1 for row in range(self.table.rowCount())
@@ -1160,7 +1288,7 @@ class DisplayModeDialog(QDialog):
             return
 
         idx          = self.color_mode.currentIndex()
-        is_class_mode = (idx == 0)
+        is_class_mode = (idx == 0)  # Only By Classification is a true class mode
 
         class_map = {}
         for row in range(self.table.rowCount()):
@@ -1197,15 +1325,23 @@ class DisplayModeDialog(QDialog):
             app.view_palettes = {}
         app.view_palettes[self.current_slot] = dict(class_map)
 
+        app.view_borders = dict(self.view_borders)
+
         if self.current_slot == 0:
             app.class_palette = dict(class_map)
-            app.view_borders  = self.view_borders
             if is_class_mode:
                 app._main_view_borders_active = (self.view_borders.get(0, 0) > 0)
                 app.point_border_percent = float(self.view_borders.get(0, 0))
             else:
                 app._main_view_borders_active = False
                 app.point_border_percent      = 0
+
+        # ── Track that this slot was explicitly Applied by the user ──────────
+        # _get_slot_palette uses this to decide whether to trust the weight
+        # stored in view_palettes[slot] vs reset to 1.0 (base).
+        if not hasattr(app, '_slot_weights_applied'):
+            app._slot_weights_applied = set()
+        app._slot_weights_applied.add(self.current_slot)
 
         # palette_changed emit moved to AFTER GPU push below —
         # emitting here caused sync_palette_to_gpu to fire with border=0
@@ -1247,6 +1383,56 @@ class DisplayModeDialog(QDialog):
                 print(f"⚠️ Shading backend failed: {_se}")
             fast_path_handled = True
 
+        elif self.current_slot == 0 and idx in (2, 3, 4, 5):
+            # ── Depth / Intensity / RGB / Elevation modes ──────────────────────
+            # Map combo index → internal display_mode string
+            _IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
+            target_mode = _IDX_TO_MODE[idx]
+
+            # Borders are not used in these modes
+            app._main_view_borders_active = False
+            app.point_border_percent = float(self.view_borders.get(0, 0))
+
+            # Clear any shading override
+            if hasattr(app, '_shading_visibility_override'):
+                del app._shading_visibility_override
+
+            _border_val = app.point_border_percent
+            print(f"🟳 Border {_border_val}% preserved for {target_mode} mode (uniform only)")
+            print(f"🎨 Display mode → {target_mode}")
+
+            # Reset shader visibility LUT — all classes visible for this mode.
+            # One GPU uniform upload only, no geometry/actor change.
+            try:
+                from gui.unified_actor_manager import (
+                    _get_unified_actor, _push_uniforms_direct
+                )
+                _actor = _get_unified_actor(app)
+                if _actor is not None:
+                    _ctx = getattr(_actor, '_naksha_shader_ctx', None)
+                    if _ctx is not None:
+                        _all_vis = {c: dict(v, show=True) for c, v in class_map.items()}
+                        _base_sz = float(getattr(_actor, '_naksha_base_point_size', 2.5))
+                        _ctx.load_from_palette(_all_vis, _border_val, _base_sz)
+                        _push_uniforms_direct(_actor, _ctx)
+                        print(f"⚡ Shader LUT: all {len(_all_vis)} classes visible for {target_mode}")
+            except Exception as _lut_err:
+                print(f"⚠️ Shader LUT reset failed: {_lut_err}")
+
+            if hasattr(app, 'set_display_mode'):
+                app.set_display_mode(target_mode)
+                QApplication.processEvents()
+            else:
+                # Fallback: set flag and call update_pointcloud directly
+                app.display_mode = target_mode
+                try:
+                    from gui.pointcloud_display import update_pointcloud
+                    update_pointcloud(app, target_mode)
+                except Exception as _me:
+                    print(f"⚠️ {target_mode} mode switch failed: {_me}")
+
+            fast_path_handled = True
+
         elif self.current_slot == 0 and idx == 0:
             target_mode  = "class"
             current_mode = getattr(app, 'display_mode', None)
@@ -1254,15 +1440,32 @@ class DisplayModeDialog(QDialog):
             if hasattr(app, '_shading_visibility_override'):
                 del app._shading_visibility_override
 
+            border = float(self.view_borders.get(0, 0))
+
             if current_mode != target_mode:
                 if hasattr(app, 'set_display_mode'):
                     print(f"⚡ Mode switch {current_mode} → {target_mode}")
                     app.set_display_mode(target_mode)
                     QApplication.processEvents()
+                # ✅ FIX: Apply border AFTER mode switch — set_display_mode
+                # rebuilds the actor with border=0 (default parameter).
+                # Must re-push the user's border value to the GPU.
+                if border > 0:
+                    _uam_sync(app, 0, class_map, border, render=True)
+                    print(f"   ✅ Border {border}% re-applied after mode switch")
+                fast_path_handled = True
             else:
-                border = float(self.view_borders.get(0, 0))
-                _uam_fast_refresh(app, class_map, border)
-                print(f"⚡ Main View: fast_palette_refresh (same mode, no rebuild)")
+                refreshed = _uam_fast_refresh(app, class_map, border)
+                if refreshed:
+                    print(f"⚡ Main View: fast_palette_refresh (same mode, no rebuild)")
+                else:
+                    print("⚠️ Main View fast refresh unavailable - forcing rebuild")
+                    update_class_mode(app, force_refresh=True)
+                    # ✅ FIX: Apply border AFTER rebuild — update_class_mode
+                    # calls build_unified_actor with border=0.
+                    if border > 0:
+                        _uam_sync(app, 0, class_map, border, render=True)
+                        print(f"   ✅ Border {border}% applied after rebuild")
                 fast_path_handled = True
 
         elif self.current_slot >= 1:
@@ -1304,12 +1507,116 @@ class DisplayModeDialog(QDialog):
                     if self.current_slot < len(view_names)
                     else f"View {self.current_slot}")
             app.statusBar().showMessage(f"✅ Applied to {v_name}", 2000)  ###
+        self.save_global_settings()
 
     def closeEvent(self, event):
-        super().closeEvent(event)
+        self.save_global_settings()
+        parent = self.parent()
+        if getattr(self, "_allow_native_close", False) or getattr(parent, "_shutdown_in_progress", False):
+            super().closeEvent(event)
+            return
+
+        event.ignore()
+        self.hide()
+
+    def reject(self):
+        self.save_global_settings()
+        self.hide()
+
+    def show_safely(self):
+        if self.windowState() & Qt.WindowMinimized:
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def changeEvent(self, event):
+        """Intercept minimize — hide the dialog instead of collapsing to ugly mini title-bar."""
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.WindowStateChange:
+            if self.windowState() & Qt.WindowMinimized:
+                event.ignore()
+                self.setWindowState(Qt.WindowNoState)
+                self.hide()
+                return
+        super().changeEvent(event)  ##
+
+    
 
     def _handle_close(self):
-        self.close()
+        self.save_global_settings()
+        self.hide()
+
+    def save_global_settings(self):
+        """Persist palettes, weights, show-states, borders, PTC path to QSettings."""
+        try:
+            from PySide6.QtCore import QSettings
+            settings = QSettings("NakshaAI", "LidarApp")
+
+            # 1. Save current table edits into view_palettes for the active slot
+            if self.current_slot not in self.view_palettes:
+                self.view_palettes[self.current_slot] = {}
+            for row in range(self.table.rowCount()):
+                try:
+                    code_item = self.table.item(row, 1)
+                    if not code_item:
+                        continue
+                    code        = int(code_item.text())
+                    chk         = self.table.cellWidget(row, 0)
+                    show        = chk.isChecked() if chk else True
+                    weight_item = self.table.item(row, 6)
+                    weight      = float(weight_item.text()) if weight_item else 1.0
+                    desc        = self.table.item(row, 2).text() if self.table.item(row, 2) else ''
+                    color       = self.table.item(row, 5).background().color().getRgb()[:3] if self.table.item(row, 5) else (128, 128, 128)
+                    self.view_palettes[self.current_slot][code] = {
+                        'show': show, 'description': desc,
+                        'color': tuple(color), 'weight': weight,
+                    }
+                except Exception:
+                    continue
+
+            # 2. Serialize all slot palettes (includes weights)
+            palettes_to_save = {}
+            for view_idx, palette in self.view_palettes.items():
+                if not palette:
+                    continue
+                slot_dict = {}
+                for code, info in palette.items():
+                    slot_dict[str(code)] = {
+                        'show':        bool(info.get('show', True)),
+                        'description': str(info.get('description', '')),
+                        'color':       list(info.get('color', (128, 128, 128))),
+                        'weight':      float(info.get('weight', 1.0)),
+                    }
+                palettes_to_save[str(view_idx)] = slot_dict
+            if palettes_to_save:
+                settings.setValue("global_view_palettes", palettes_to_save)
+
+            # 3. Save checkbox states
+            self._save_slot_checkboxes(self.current_slot)
+            shows_to_save = {
+                str(slot): {str(code): bool(v) for code, v in show_dict.items()}
+                for slot, show_dict in self.slot_shows.items()
+            }
+            if shows_to_save:
+                settings.setValue("global_slot_shows", shows_to_save)
+
+            # 4. Save border values
+            settings.setValue("global_view_borders",
+                              {str(k): v for k, v in self.view_borders.items()})
+
+            # 5. Save PTC path
+            if self.current_ptc_path and os.path.exists(self.current_ptc_path):
+                settings.setValue("global_last_ptc_path", self.current_ptc_path)
+
+            # 6. Save color mode
+            settings.setValue("global_color_mode", self.color_mode.currentIndex())
+
+            settings.sync()
+            print(f"✅ Global display settings saved ({len(palettes_to_save)} palette slots)")
+        except Exception as e:
+            print(f"⚠️ save_global_settings failed: {e}")
 
     # def get_visible_classes_for_view(self, view_idx):
     #     try:
@@ -1479,6 +1786,8 @@ class DisplayModeDialog(QDialog):
             if not hasattr(app, 'view_borders'):
                 app.view_borders = {i: 0 for i in range(6)}
             app.view_borders[self.current_slot] = new_border
+            # ✅ FIX: Immediately push border to GPU for instant feedback
+            self._push_border_to_gpu(app, self.current_slot, new_border)
 
     def decrease_border(self):
         current_border = self.view_borders.get(self.current_slot, 0)
@@ -1490,20 +1799,37 @@ class DisplayModeDialog(QDialog):
             if not hasattr(app, 'view_borders'):
                 app.view_borders = {i: 0 for i in range(6)}
             app.view_borders[self.current_slot] = new_border
+            # ✅ FIX: Immediately push border to GPU for instant feedback
+            self._push_border_to_gpu(app, self.current_slot, new_border)
+
+    def _push_border_to_gpu(self, app, slot_idx, border_value):
+        """Immediately push border change to GPU without needing Apply click."""
+        try:
+            float_border = float(border_value)
+            if slot_idx == 0:
+                app.point_border_percent = float_border
+                if hasattr(app, 'on_border_changed'):
+                    app.on_border_changed(float_border)
+                else:
+                    _uam_sync(app, 0, border=float_border, render=True)
+            else:
+                _uam_sync(app, slot_idx, border=float_border, render=True)
+        except Exception as e:
+            print(f"⚠️ _push_border_to_gpu failed (slot={slot_idx}): {e}")
 
     def on_border_value_changed(self):
         pass
 
     def update_border_display(self):
         value = self.view_borders[self.current_slot]
-        self.border_label.setText(f"Border: {value}%")
+        self.border_label.setText("Border")
         self.border_value_display.setText(f"{value}%")
 
     def load_view_border(self, view_idx):
         if not hasattr(self, 'view_borders'):
             self.view_borders = {i: 0 for i in range(6)}
         border_value = self.view_borders.get(view_idx, 0)
-        self.border_label.setText(f"Border: {border_value}%")
+        self.border_label.setText("Border")
         self.border_value_display.setText(f"{border_value}%")
 
     def on_view_switched_to_cut_section(self):
@@ -1654,21 +1980,54 @@ class EditClassDialog(QDialog):
                     app.view_palettes[current_slot][code] = {}
                 app.view_palettes[current_slot][code]['weight'] = new_weight
 
+            # Keep the active main-view palette in sync before emitting
+            # palette_changed. Slot 0 GPU refreshes read from app.class_palette,
+            # so if only view_palettes[0] changes the next sync can restore the
+            # old weight and make the update appear flaky.
+            if current_slot == 0 and app:
+                if not hasattr(app, 'view_palettes') or app.view_palettes is None:
+                    app.view_palettes = {}
+                if not hasattr(app, 'class_palette') or app.class_palette is None:
+                    app.class_palette = {}
+
+                slot_palette = self.parent_dialog.view_palettes.get(current_slot, {})
+                slot_entry = dict(slot_palette.get(code, {}))
+                if not slot_entry:
+                    slot_entry = dict(app.class_palette.get(code, {}))
+
+                slot_entry['weight'] = new_weight
+                slot_entry.setdefault('show', True)
+                slot_entry.setdefault('color', (128, 128, 128))
+                slot_entry.setdefault('description', '')
+
+                app.class_palette[code] = slot_entry
+                app.view_palettes[current_slot][code] = dict(slot_entry)
+
             # 🚀 THE CRITICAL GPU POKE:
             # We use the local helper functions defined at the top of display_mode.py
             # to bypass circular imports and talk directly to the shader.
             palette = self.parent_dialog.view_palettes.get(current_slot, {})
             
             try:
+                refreshed = False
                 if current_slot == 0:
                     # Main View Path
                     border = float(getattr(app, 'point_border_percent', 0.0) or 0.0)
-                    _uam_fast_refresh(app, palette, border)
+                    refreshed = _uam_fast_refresh(app, palette, border)
+                    if not refreshed and app is not None:
+                        print("⚠️ Main View GPU poke unavailable - forcing rebuild")
+                        update_class_mode(app, force_refresh=True)
+                        refreshed = True
                 else:
                     # Cross-Section Path
                     view_idx = current_slot - 1
                     border = float(self.parent_dialog.view_borders.get(current_slot, 0.0))
-                    _uam_refresh_section(app, view_idx, palette, border)
+                    refreshed = _uam_refresh_section(app, view_idx, palette, border)
+
+                # Mark slot as explicitly weight-applied
+                if not hasattr(app, '_slot_weights_applied'):
+                    app._slot_weights_applied = set()
+                app._slot_weights_applied.add(current_slot)
 
                 # Final hardware poke to force the shader to re-read the LUT
                 self.parent_dialog.palette_changed.emit(current_slot)
@@ -1717,4 +2076,4 @@ class EditClassDialog(QDialog):
     def desc(self):    return self.desc_edit.text()
     def draw(self):    return self.draw_edit.text()
     def lvl(self):     return self.lvl_edit.text()
-    def weight(self):  return self.current_weight
+    def weight(self):  return self.current_weight()

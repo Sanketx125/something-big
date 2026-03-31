@@ -27,7 +27,7 @@ class CurveRibbon(QWidget):
         tools = RibbonSection("Curve Tools", self)
 
         tools.add_button(
-            "Curve\nPoint",
+            "Curve",
             "CP",
             lambda: self.curve_tool_selected.emit("curve_point"),
             toggleable=True

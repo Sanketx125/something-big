@@ -34,47 +34,166 @@ class ThemeColors:
         "text_secondary":   "#aaaaaa",
         "text_muted":       "#888888",
         "text_on_active":   "#ffffff",
+
+        # Global icon fallback
         "icon_primary":     "#d3d1c7",
 
+        # Per-ribbon / per-group icon colors
+        "icon_file":        "#4FC3F7",
+        "icon_edit":        "#FFB74D",
+        "icon_view":        "#81C784",
+        "icon_tools":       "#BA68C8",
+        "icon_classify":    "#FFD54F",
+        "icon_measure":     "#4DD0E1",
+        "icon_identify":    "#E57373",
+        "icon_by_class":    "#AED581",
+        "icon_draw":        "#F48FB1",
+        "icon_curve":       "#90CAF9",
+        "icon_ai":          "#FF8A65",
+        "icon_display":     "#4db6ac",
+        "icon_settings":    "#B0BEC5",
+        "icon_project":     "#A5D6A7",
+        "icon_history":     "#FFCC80",
+        "icon_clipboard":   "#80CBC4",
+        "icon_attachments": "#CE93D8",
+        "icon_vectors":     "#80DEEA",
+        "icon_dxf":         "#F48FB1",
+        "icon_dwg":         "#9FA8DA",
+        "icon_snt":         "#A5D6A7",
+
+        # Individual ribbon icon colors: File
+        "icon_open":          "#42a5f5",
+        "icon_save":          "#26a69a",
+        "icon_save_as":       "#7e57c2",
+        "icon_export":        "#ffb300",
+        "icon_import":        "#ef5350",
+        "icon_attach_dxf":    "#29b6f6",
+        "icon_prj_loader":    "#8d6e63",
+        "icon_verify_labels": "#66bb6a",
+        "icon_attach_dwg":    "#5c6bc0",
+        "icon_attach_snt":    "#26c6da",
+        "icon_clear":         "#ec407a",
+
         # Accent
-        "accent":           "#007acc",
-        "accent_hover":     "#0098ff",
-        "accent_alt":       "#ffaa00",
+        "accent":            "#007acc",
+        "accent_hover":      "#0098ff",
+        "accent_alt":        "#ffaa00",
         "dialog_primary_bg": "#30363c",
         "dialog_primary_hover": "#394148",
         "dialog_primary_border": "#505c66",
         "dialog_primary_text": "#f5f7fa",
-        "dialog_selection": "#2b3138",
+        "dialog_selection":  "#2b3138",
 
         # Borders
-        "border":           "#2a2a2a",
-        "border_light":     "#3a3a3a",
-        "border_active":    "#007acc",
+        "border":            "#2a2a2a",
+        "border_light":      "#3a3a3a",
+        "border_active":     "#007acc",
 
         # Status
-        "danger":           "#d32f2f",
-        "danger_hover":     "#f44336",
-        "danger_dark":      "#b71c1c",
-        "warning":          "#ff6f00",
-        "warning_bg":       "#e65100",
-        "success":          "#41613d",
+        "danger":            "#d32f2f",
+        "danger_hover":      "#f44336",
+        "danger_dark":       "#b71c1c",
+        "warning":           "#ff6f00",
+        "warning_bg":        "#e65100",
+        "success":           "#41613d",
 
         # Ribbon
-        "ribbon_bg":        "#1e1e1c",
-        "ribbon_section":   "#171715",
-        "ribbon_button":    "#222220",
-        "ribbon_btn_hover": "#2a2a28",
+        "ribbon_bg":         "#1e1e1c",
+        "ribbon_section":    "#171715",
+        "ribbon_button":     "#222220",
+        "ribbon_btn_hover":  "#2a2a28",
         "ribbon_btn_pressed":"#31312e",
-        "ribbon_btn_border":"#2e2e2b",
+        "ribbon_btn_border": "#2e2e2b",
         "ribbon_btn_checked":"#2b3540",
         "ribbon_btn_checked_border":"#556675",
-        "ribbon_title":     "#4a4a47",
+        "ribbon_title":      "#4a4a47",
 
         # Misc
-        "shadow":           "#000000",
+        "shadow":            "#000000",
+
+        # ── Individual icon colors: Edit ─────────────────────────────
+        "icon_undo":                 "#ffb74d",
+        "icon_redo":                 "#ff8a65",
+        "icon_cut":                  "#4fc3f7",
+        "icon_copy":                 "#81c784",
+        "icon_paste":                "#ba68c8",
+        "icon_delete":               "#ef5350",
+
+        # ── Individual icon colors: View ─────────────────────────────
+        "icon_top":                  "#64b5f6",
+        "icon_front":                "#4db6ac",
+        "icon_side":                 "#9575cd",
+        "icon_3d":                   "#ffd54f",
+        "icon_depth":                "#90a4ae",
+        "icon_rgb":                  "#ff7043",
+        "icon_intensity":            "#4dd0e1",
+        "icon_elevation":            "#aed581",
+        "icon_class":                "#f06292",
+        "icon_shading":              "#a1887f",
+        "icon_fit":                  "#7986cb",
+
+        # ── Individual icon colors: Tools ────────────────────────────
+        "icon_cross":                "#26a69a",
+        "icon_cut_section":          "#ef5350",
+        "icon_width":                "#5c6bc0",
+        "icon_views":                "#29b6f6",
+        "icon_config":               "#ab47bc",
+        "icon_backup":               "#66bb6a",
+        "icon_preferences":          "#ffa726",
+
+        # ── Individual icon colors: Classify ─────────────────────────
+        "icon_above":                "#42a5f5",
+        "icon_below":                "#ffca28",
+        "icon_classify_rect":        "#26c6da",
+        "icon_classify_circle":      "#7e57c2",
+        "icon_classify_free":        "#ec407a",
+        "icon_brush":                "#8d6e63",
+        "icon_point":                "#d4e157",
+
+        # ── Individual icon colors: Display ──────────────────────────
+        "icon_measure_line":         "#26a69a",
+        "icon_measure_path":         "#42a5f5",
+        "icon_measure_clear":        "#ec407a",
+
+        # ── Individual icon colors: Identify ─────────────────────────
+        "icon_identify":             "#ffb300",
+        "icon_zoom":                 "#66bb6a",
+        "icon_select":               "#90caf9",
+
+        # ── Individual icon colors: By Class ─────────────────────────
+        "icon_convert":              "#4fc3f7",
+        "icon_close":                "#9575cd",
+        "icon_height":               "#ffb74d",
+        "icon_fence":                "#81c784",
+        "icon_low_points":           "#ef5350",
+        "icon_isolated":             "#26c6da",
+        "icon_ground":               "#a1887f",
+        "icon_surface":              "#ffd54f",
+
+        # ── Individual icon colors: Draw ─────────────────────────────
+        "icon_smart_line":           "#26a69a",
+        "icon_line":                 "#64b5f6",
+        "icon_draw_rect":            "#ab47bc",
+        "icon_draw_circle":          "#ffca28",
+        "icon_draw_free":            "#ec407a",
+        "icon_text":                 "#90a4ae",
+        "icon_move_vertex":          "#4dd0e1",
+        "icon_vertex":               "#81c784",
+        "icon_grid":                 "#7986cb",
+        "icon_select_drawing":       "#ffb300",
+        "icon_deselect_all":         "#ef5350",
+        "icon_draw_clear":           "#ec407a",
+        "icon_draw_settings":        "#b0bec5",
+
+        # ── Individual icon colors: Curve ────────────────────────────
+        "icon_curve_point":          "#f06292",
+        "icon_curve_clear":          "#ec407a",
+
+        # ── Individual icon colors: AI ───────────────────────────────
+        "icon_start":                "#ff7043",
     }
 
-    # ── Light palette (Ring app inspired) ───────────────────────────
+    # ── Light palette ──────────────────────────────────────────────
     LIGHT = {
         # Base
         "bg_primary":       "#f0f2f5",
@@ -91,44 +210,163 @@ class ThemeColors:
         "text_secondary":   "#607d8b",
         "text_muted":       "#90a4ae",
         "text_on_active":   "#1c1c1a",
+
+        # Global icon fallback
         "icon_primary":     "#1c1c1a",
 
+        # Per-ribbon / per-group icon colors
+        "icon_file":        "#1565C0",
+        "icon_edit":        "#EF6C00",
+        "icon_view":        "#2E7D32",
+        "icon_tools":       "#6A1B9A",
+        "icon_classify":    "#F9A825",
+        "icon_measure":     "#00838F",
+        "icon_identify":    "#C62828",
+        "icon_by_class":    "#558B2F",
+        "icon_draw":        "#AD1457",
+        "icon_curve":       "#1976D2",
+        "icon_ai":          "#D84315",
+        "icon_display":     "#00897b",
+        "icon_settings":    "#546E7A",
+        "icon_project":     "#2E7D32",
+        "icon_history":     "#FB8C00",
+        "icon_clipboard":   "#00897B",
+        "icon_attachments": "#8E24AA",
+        "icon_vectors":     "#00ACC1",
+        "icon_dxf":         "#C2185B",
+        "icon_dwg":         "#3949AB",
+        "icon_snt":         "#43A047",
+
+        # Individual ribbon icon colors: File
+        "icon_open":          "#1976d2",
+        "icon_save":          "#00897b",
+        "icon_save_as":       "#5e35b1",
+        "icon_export":        "#fb8c00",
+        "icon_import":        "#e53935",
+        "icon_attach_dxf":    "#039be5",
+        "icon_prj_loader":    "#795548",
+        "icon_verify_labels": "#43a047",
+        "icon_attach_dwg":    "#3949ab",
+        "icon_attach_snt":    "#00acc1",
+        "icon_clear":         "#d81b60",
+
         # Accent
-        "accent":           "#0077b6",
-        "accent_hover":     "#00b4d8",
-        "accent_alt":       "#0096c7",
+        "accent":            "#0077b6",
+        "accent_hover":      "#00b4d8",
+        "accent_alt":        "#0096c7",
         "dialog_primary_bg": "#e7ebef",
         "dialog_primary_hover": "#dde3e9",
         "dialog_primary_border": "#c3ccd5",
         "dialog_primary_text": "#26313a",
-        "dialog_selection": "#edf1f4",
+        "dialog_selection":  "#edf1f4",
 
         # Borders
-        "border":           "#d0d5dd",
-        "border_light":     "#e0e4ea",
-        "border_active":    "#00b4d8",
+        "border":            "#d0d5dd",
+        "border_light":      "#e0e4ea",
+        "border_active":     "#00b4d8",
 
         # Status
-        "danger":           "#d32f2f",
-        "danger_hover":     "#f44336",
-        "danger_dark":      "#b71c1c",
-        "warning":          "#ff6f00",
-        "warning_bg":       "#fff3e0",
-        "success":          "#2e7d32",
+        "danger":            "#d32f2f",
+        "danger_hover":      "#f44336",
+        "danger_dark":       "#b71c1c",
+        "warning":           "#ff6f00",
+        "warning_bg":        "#fff3e0",
+        "success":           "#2e7d32",
 
         # Ribbon
-        "ribbon_bg":        "#f4f2ec",
-        "ribbon_section":   "#f0efea",
-        "ribbon_button":    "#ffffff",
-        "ribbon_btn_hover": "#fbfaf7",
+        "ribbon_bg":         "#f4f2ec",
+        "ribbon_section":    "#f0efea",
+        "ribbon_button":     "#ffffff",
+        "ribbon_btn_hover":  "#fbfaf7",
         "ribbon_btn_pressed":"#ece8df",
-        "ribbon_btn_border":"#d6d1c7",
+        "ribbon_btn_border": "#d6d1c7",
         "ribbon_btn_checked":"#e6edf3",
         "ribbon_btn_checked_border":"#c0cdda",
-        "ribbon_title":     "#a09f99",
+        "ribbon_title":      "#a09f99",
 
         # Misc
-        "shadow":           "#b0bec5",
+        "shadow":            "#b0bec5",
+
+        # ── Individual icon colors: Edit ─────────────────────────────
+        "icon_undo":                 "#fb8c00",
+        "icon_redo":                 "#f4511e",
+        "icon_cut":                  "#039be5",
+        "icon_copy":                 "#43a047",
+        "icon_paste":                "#8e24aa",
+        "icon_delete":               "#d32f2f",
+
+        # ── Individual icon colors: View ─────────────────────────────
+        "icon_top":                  "#1e88e5",
+        "icon_front":                "#00897b",
+        "icon_side":                 "#5e35b1",
+        "icon_3d":                   "#f9a825",
+        "icon_depth":                "#607d8b",
+        "icon_rgb":                  "#f4511e",
+        "icon_intensity":            "#00acc1",
+        "icon_elevation":            "#7cb342",
+        "icon_class":                "#d81b60",
+        "icon_shading":              "#8d6e63",
+        "icon_fit":                  "#3949ab",
+
+        # ── Individual icon colors: Tools ────────────────────────────
+        "icon_cross":                "#00897b",
+        "icon_cut_section":          "#e53935",
+        "icon_width":                "#3949ab",
+        "icon_views":                "#039be5",
+        "icon_config":               "#8e24aa",
+        "icon_backup":               "#43a047",
+        "icon_preferences":          "#fb8c00",
+
+        # ── Individual icon colors: Classify ─────────────────────────
+        "icon_above":                "#1e88e5",
+        "icon_below":                "#fbc02d",
+        "icon_classify_rect":        "#00acc1",
+        "icon_classify_circle":      "#5e35b1",
+        "icon_classify_free":        "#d81b60",
+        "icon_brush":                "#6d4c41",
+        "icon_point":                "#9e9d24",
+
+        # ── Individual icon colors: Display / Measure ────────────────
+        "icon_measure_line":         "#00897b",
+        "icon_measure_path":         "#1e88e5",
+        "icon_measure_clear":        "#d81b60",
+
+        # ── Individual icon colors: Identify ─────────────────────────
+        "icon_identify":             "#fb8c00",
+        "icon_zoom":                 "#43a047",
+        "icon_select":               "#1e88e5",
+
+        # ── Individual icon colors: By Class ─────────────────────────
+        "icon_convert":              "#039be5",
+        "icon_close":                "#5e35b1",
+        "icon_height":               "#fb8c00",
+        "icon_fence":                "#43a047",
+        "icon_low_points":           "#e53935",
+        "icon_isolated":             "#00acc1",
+        "icon_ground":               "#8d6e63",
+        "icon_surface":              "#f9a825",
+
+        # ── Individual icon colors: Draw ─────────────────────────────
+        "icon_smart_line":           "#00897b",
+        "icon_line":                 "#1e88e5",
+        "icon_draw_rect":            "#8e24aa",
+        "icon_draw_circle":          "#fbc02d",
+        "icon_draw_free":            "#d81b60",
+        "icon_text":                 "#78909c",
+        "icon_move_vertex":          "#00acc1",
+        "icon_vertex":               "#43a047",
+        "icon_grid":                 "#3949ab",
+        "icon_select_drawing":       "#fb8c00",
+        "icon_deselect_all":         "#e53935",
+        "icon_draw_clear":           "#d81b60",
+        "icon_draw_settings":        "#546e7a",
+
+        # ── Individual icon colors: Curve ────────────────────────────
+        "icon_curve_point":          "#d81b60",
+        "icon_curve_clear":          "#d81b60",
+
+        # ── Individual icon colors: AI ───────────────────────────────
+        "icon_start":                "#f4511e",
     }
 
     _current = "dark"
@@ -161,10 +399,13 @@ def get_active_button_style() -> str:
     return f"""
     QPushButton {{
         background-color: {c.get('ribbon_btn_checked')};
-        color: {c.get('icon_primary')};
+        color: {c.get('text_primary')};
         font-weight: 600;
+        font-size: 10px;
         border: 1px solid {c.get('ribbon_btn_checked_border')};
         border-radius: 10px;
+        padding: 4px 6px 8px 6px;
+        text-align: center;
     }}
     QPushButton:hover {{
         background-color: {c.get('ribbon_btn_checked')};
@@ -178,13 +419,41 @@ def get_inactive_button_style() -> str:
     return f"""
     QPushButton {{
         background-color: {c.get('ribbon_button')};
-        color: {c.get('icon_primary')};
+        color: {c.get('text_primary')};
         border: 1px solid {c.get('ribbon_btn_border')};
         border-radius: 10px;
+        font-size: 10px;
+        font-weight: 500;
+        padding: 4px 6px 8px 6px;
+        text-align: center;
     }}
     QPushButton:hover {{
         background-color: {c.get('ribbon_btn_hover')};
         border: 1px solid {c.get('ribbon_btn_border')};
+    }}
+    """
+
+
+def get_ribbon_button_text_style(active: bool = False) -> str:
+    """Return inline style for ribbon button text under icons."""
+    c = ThemeColors
+    bg = c.get("ribbon_btn_checked") if active else c.get("ribbon_button")
+    border = c.get("ribbon_btn_checked_border") if active else c.get("ribbon_btn_border")
+
+    return f"""
+    QPushButton {{
+        background-color: {bg};
+        color: {c.get('text_primary')};
+        border: 1px solid {border};
+        border-radius: 10px;
+        font-size: 10px;
+        font-weight: 500;
+        padding: 4px 6px 8px 6px;
+        text-align: center;
+    }}
+    QPushButton:hover {{
+        background-color: {c.get('ribbon_btn_checked') if active else c.get('ribbon_btn_hover')};
+        border: 1px solid {border};
     }}
     """
 
@@ -195,7 +464,7 @@ def get_status_label_style() -> str:
     return f"""
     QLabel {{
         color: {c.get('text_secondary')};
-        font-size: 9px;
+        font-size: 11px;
         padding: 4px;
         background-color: {c.get('ribbon_button')};
         border-radius: 3px;
@@ -210,8 +479,7 @@ def get_status_label_active_style(color_key="warning") -> str:
         return f"""
         QLabel {{
             color: #ffb74d;
-            font-size: 9px;
-            font-weight: bold;
+            font-size: 11px;
             padding: 4px;
             background-color: {c.get('warning_bg')};
             border-radius: 3px;
@@ -270,7 +538,7 @@ def get_sharpness_value_style() -> str:
     return f"""
     QLabel {{
         color: {c.get('text_primary')};
-        font-size: 10px;
+        font-size: 12px;
         font-weight: 700;
         background-color: {c.get('bg_input')};
         border: 1px solid {c.get('border_light')};
@@ -286,20 +554,21 @@ def get_reset_btn_style() -> str:
     return f"""
     QPushButton {{
         background-color: {c.get('success')};
-        color: #f0f0f0;
+        color: {c.get('text_on_active')};
         border: 1px solid {c.get('border')};
         border-radius: 3px;
-        font-size: 9px;
+        font-size: 11px;
         font-weight: bold;
         padding: 2px;
     }}
     QPushButton:hover {{
         background-color: {c.get('bg_button_hover')};
         border: 1px solid {c.get('accent_alt')};
+        color: {c.get('text_primary')};
     }}
     QPushButton:pressed {{
         background-color: {c.get('accent_alt')};
-        color: black;
+        color: {c.get('text_primary')};
     }}
     """
 
@@ -311,7 +580,7 @@ def get_delete_btn_style() -> str:
     QPushButton {{
         background-color: {c.get('danger')};
         color: white;
-        font-size: 9px;
+        font-size: 11px;
         font-weight: bold;
         border: 1px solid {c.get('danger_dark')};
         border-radius: 4px;
@@ -344,7 +613,7 @@ def get_select_active_btn_style() -> str:
 def get_sharp_label_style() -> str:
     """Style for the 'Sharp:' label in ViewRibbon."""
     c = ThemeColors
-    return f"color: {c.get('text_primary')}; font-size: 10px; font-weight: bold;"
+    return f"color: {c.get('text_primary')}; font-size: 12px; font-weight: bold;"
 
 
 class _ThemeWindowEventFilter(QObject):
@@ -387,11 +656,9 @@ class ThemeManager:
         try:
             with open(qss_path, "r", encoding="utf-8") as f:
                 qss = f.read()
-            
-            # Apply to app_window locally
+
             app_window.setStyleSheet(qss)
-            
-            # Apply to application globally so dialogs and popups inherit it
+
             try:
                 from PySide6.QtWidgets import QApplication
                 app = QApplication.instance()
@@ -404,7 +671,6 @@ class ThemeManager:
         except Exception as e:
             print(f"⚠️ Failed to apply {theme_name} theme: {e}")
 
-        # Refresh any open dialogs that opt into the shared dialog stylesheet
         try:
             from PySide6.QtWidgets import QApplication
             app = QApplication.instance()
@@ -414,14 +680,10 @@ class ThemeManager:
         except Exception as e:
             print(f"⚠️ Failed to refresh themed dialogs: {e}")
 
-        # Refresh floating docks and VTK surfaces that do not restyle from QSS alone.
         cls._refresh_open_windows()
         cls.refresh_runtime_surfaces(app_window)
-
-        # Re-apply inline styles on ribbon system
         cls._refresh_ribbon_styles(app_window)
 
-        # Save preference
         settings = QSettings("NakshaAI", "LidarApp")
         settings.setValue("ui_theme", theme_name)
 
@@ -440,6 +702,27 @@ class ThemeManager:
         """Load the saved theme preference, default to dark."""
         settings = QSettings("NakshaAI", "LidarApp")
         return settings.value("ui_theme", "dark")
+
+    @classmethod
+    def canvas_background_for_theme(cls, theme_name: str = None) -> str:
+        """Return the preferred canvas background for a theme."""
+        settings = QSettings("NakshaAI", "LidarApp")
+        background = settings.value("ui_canvas_background", None)
+        if background:
+            return str(background).lower()
+
+        theme_name = (theme_name or cls.current() or cls.load_saved_theme()).lower()
+        if theme_name == "light":
+            return str(settings.value("ui_canvas_light", "white")).lower()
+        return str(settings.value("ui_canvas_dark", "black")).lower()
+
+    @classmethod
+    def canvas_background_rgb(cls, theme_name: str = None):
+        """Return normalized RGB for the preferred canvas background."""
+        bg_name = cls.canvas_background_for_theme(theme_name)
+        if bg_name == "black":
+            return (0.0, 0.0, 0.0)
+        return (1.0, 1.0, 1.0)
 
     @classmethod
     def _ensure_window_event_filter(cls):
@@ -568,8 +851,8 @@ class ThemeManager:
 
     @classmethod
     def _apply_vtk_widget_theme(cls, vtk_widget):
-        bg_color = "white" if cls.current() == "light" else "black"
-        rgb = (1.0, 1.0, 1.0) if cls.current() == "light" else (0.0, 0.0, 0.0)
+        bg_color = cls.canvas_background_for_theme()
+        rgb = cls.canvas_background_rgb()
 
         try:
             vtk_widget.set_background(bg_color)
@@ -602,16 +885,11 @@ class ThemeManager:
             from PySide6.QtWidgets import QPushButton
             from PySide6.QtCore import QSize
 
-            icon_color = ThemeColors.get("icon_primary")
-
             for name, ribbon in app_window.ribbon_manager.ribbons.items():
-                # Update all ribbon sections
                 for section in ribbon.findChildren(RibbonSection):
-                    # Reset active button style
                     if section.active_button:
                         section.active_button.setStyleSheet(get_active_button_style())
 
-                    # Refresh icons on all buttons with new theme color
                     for btn in section.findChildren(QPushButton):
                         btn_text = btn.property("ribbonText")
                         section_title = btn.property("ribbonSection") or getattr(section, "section_title", None)
@@ -622,19 +900,29 @@ class ThemeManager:
                             if tooltip.startswith("<b>") and tooltip.endswith("</b>"):
                                 btn_text = tooltip[3:-4]
 
+                        try:
+                            if section.active_button is not None and btn is section.active_button:
+                                btn.setStyleSheet(get_active_button_style())
+                            else:
+                                btn.setStyleSheet(get_inactive_button_style())
+                        except Exception:
+                            pass
+
                         if btn_text:
-                            icon = get_button_icon(btn_text, section_title=section_title,
-                                                   ribbon_scope=ribbon_scope,
-                                                   color=icon_color, size=24)
+                            icon = get_button_icon(
+                                btn_text,
+                                section_title=section_title,
+                                ribbon_scope=ribbon_scope,
+                                color=None,
+                                size=24,
+                            )
                             if not icon.isNull():
                                 btn.setIcon(icon)
                                 btn.setIconSize(QSize(24, 24))
 
-                # Special: ViewRibbon sharpness controls
                 if name == "view":
                     _refresh_view_ribbon_styles(ribbon)
 
-                # Special: IdentificationRibbon
                 if name == "identify":
                     _refresh_identify_ribbon_styles(ribbon)
 
@@ -654,6 +942,10 @@ def get_dialog_stylesheet() -> str:
     primary_text = c.get("dialog_primary_text")
     selection_bg = c.get("dialog_selection")
     selection_text = c.get("text_primary") if c.is_light() else c.get("text_on_active")
+    progress_start = c.get("accent") if c.is_light() else primary_border
+    progress_end = c.get("accent_hover") if c.is_light() else c.get("accent")
+    checkbox_checked = c.get("accent") if c.is_light() else primary_border
+    checkbox_checked_border = c.get("bg_active_border") if c.is_light() else primary_border
     return f"""
     QDialog, QMessageBox {{
         background-color: {c.get('bg_primary')};
@@ -691,8 +983,17 @@ def get_dialog_stylesheet() -> str:
         font-size: 9pt;
     }}
     QLabel#displayBorderLabel {{
-        color: {c.get('text_primary')};
+        color: {c.get('text_secondary')};
         font-weight: 600;
+        font-size: 8.8pt;
+    }}
+    QLabel#displayBorderValuePill {{
+        background-color: {c.get('bg_secondary')};
+        color: {c.get('accent') if c.is_light() else primary_text};
+        border: 1px solid {c.get('border_light')};
+        border-radius: 6px;
+        padding: 0px 4px;
+        font-weight: 700;
     }}
     QLabel#valuePill {{
         background-color: {c.get('bg_input')};
@@ -715,9 +1016,92 @@ def get_dialog_stylesheet() -> str:
         border-radius: 12px;
     }}
     QFrame#displayBorderStrip {{
+        background-color: {c.get('bg_secondary')};
+        border: 1px solid {c.get('border_light')};
+        border-radius: 8px;
+    }}
+    QPushButton#displayBorderButton {{
+        background-color: {c.get('bg_input')};
+        color: {c.get('text_primary')};
+        border: 1px solid {c.get('border_light')};
+        border-radius: 6px;
+        padding: 0px;
+        min-height: 20px;
+        font-size: 9.5pt;
+        font-weight: 700;
+    }}
+    QPushButton#displayBorderButton:hover {{
+        background-color: {c.get('bg_button_hover')};
+        border: 1px solid {primary_border};
+    }}
+    QPushButton#displayBorderButton:pressed {{
+        background-color: {c.get('bg_button_hover')};
+        border: 1px solid {primary_border};
+    }}
+    QToolButton#displayFileButton {{
+        background-color: {c.get('bg_input')};
+        color: {c.get('text_primary')};
+        border: 1px solid {c.get('border_light')};
+        border-radius: 6px;
+        padding: 4px 24px 4px 12px;
+        min-height: 28px;
+        font-weight: 500;
+    }}
+    QToolButton#displayFileButton:hover,
+    QToolButton#displayFileButton:focus {{
+        background-color: {c.get('bg_button_hover')};
+        border: 1px solid {primary_border};
+    }}
+    QToolButton#displayFileButton:pressed {{
+        background-color: {c.get('bg_button_hover')};
+        border: 1px solid {primary_border};
+    }}
+    QToolButton#displayFileButton::menu-indicator {{
+        subcontrol-origin: padding;
+        subcontrol-position: right center;
+        right: 8px;
+    }}
+    QFrame#displayActionRail {{
         background-color: {c.get('bg_input')};
         border: 1px solid {c.get('border_light')};
+        border-radius: 12px;
+    }}
+    QPushButton#displayActionButton {{
+        background-color: {c.get('bg_secondary')};
+        color: {c.get('text_primary')};
+        border: 1px solid {c.get('border')};
         border-radius: 10px;
+        padding: 8px 12px;
+        font-weight: 600;
+        text-align: center;
+    }}
+    QPushButton#displayActionButton:hover {{
+        background-color: {c.get('bg_button_hover')};
+        border: 1px solid {primary_border};
+    }}
+    QPushButton#displayActionButton:pressed {{
+        background-color: {c.get('bg_button_hover')};
+        border: 1px solid {primary_border};
+    }}
+    QMenuBar#displayMenuBar {{
+        background: transparent;
+        color: {c.get('text_primary')};
+        border: none;
+        padding: 0px;
+    }}
+    QMenuBar#displayMenuBar::item {{
+        background: transparent;
+        padding: 5px 8px;
+        margin: 0px 2px 0px 0px;
+        border-radius: 4px;
+    }}
+    QMenuBar#displayMenuBar::item:selected {{
+        background-color: {c.get('bg_button_hover')};
+        color: {c.get('text_primary')};
+    }}
+    QMenuBar#displayMenuBar::item:pressed {{
+        background-color: {selection_bg};
+        color: {selection_text};
     }}
     QFrame#progressHero {{
         background-color: {c.get('bg_secondary')};
@@ -749,8 +1133,8 @@ def get_dialog_stylesheet() -> str:
         border-radius: 10px;
         background: qlineargradient(
             x1:0, y1:0, x2:1, y2:0,
-            stop:0 {primary_border},
-            stop:1 {c.get('accent')}
+            stop:0 {progress_start},
+            stop:1 {progress_end}
         );
     }}
     QGroupBox {{
@@ -945,6 +1329,41 @@ def get_dialog_stylesheet() -> str:
         background-color: {c.get('bg_button')};
         border: 1px solid {c.get('border')};
     }}
+    QTableWidget#displayClassTable {{
+        background-color: {c.get('bg_secondary')};
+        alternate-background-color: {c.get('bg_input')};
+        border: 1px solid {c.get('border_light')};
+        border-radius: 10px;
+        gridline-color: transparent;
+        selection-background-color: {selection_bg};
+    }}
+    QTableWidget#displayClassTable::item {{
+        padding: 6px 10px;
+        border: none;
+        border-bottom: 1px solid {c.get('border_light')};
+    }}
+    QTableWidget#displayClassTable::item:selected {{
+        background-color: {selection_bg};
+        color: {selection_text};
+    }}
+    QTableWidget#displayClassTable::item:hover {{
+        background-color: {c.get('bg_button_hover')};
+    }}
+    QTableWidget#displayClassTable QHeaderView::section {{
+        background-color: {c.get('bg_input')};
+        color: {c.get('text_primary')};
+        border: none;
+        border-bottom: 1px solid {c.get('border')};
+        border-right: 1px solid {c.get('border_light')};
+        padding: 8px 10px;
+        font-weight: 700;
+    }}
+    QTableWidget#displayClassTable QTableCornerButton::section {{
+        background-color: {c.get('bg_input')};
+        border: none;
+        border-bottom: 1px solid {c.get('border')};
+        border-right: 1px solid {c.get('border_light')};
+    }}
     QSlider::groove:horizontal {{
         height: 4px;
         background: {c.get('border_light')};
@@ -969,8 +1388,8 @@ def get_dialog_stylesheet() -> str:
         background-color: {c.get('bg_input')};
     }}
     QCheckBox::indicator:checked {{
-        background-color: {primary_border};
-        border: 1px solid {primary_border};
+        background-color: {checkbox_checked};
+        border: 1px solid {checkbox_checked_border};
     }}
     QRadioButton {{
         color: {c.get('text_primary')};
@@ -1052,6 +1471,8 @@ def get_progress_dialog_stylesheet() -> str:
     c = ThemeColors
     primary_bg = c.get("dialog_primary_bg")
     primary_border = c.get("dialog_primary_border")
+    progress_start = c.get("accent") if c.is_light() else primary_border
+    progress_end = c.get("accent_hover") if c.is_light() else primary_bg
     return f"""
     QProgressDialog {{
         background: {c.get('bg_secondary')};
@@ -1078,8 +1499,8 @@ def get_progress_dialog_stylesheet() -> str:
     QProgressBar::chunk {{
         background: qlineargradient(
             x1:0, y1:0, x2:1, y2:0,
-            stop:0 {primary_border},
-            stop:1 {primary_bg}
+            stop:0 {progress_start},
+            stop:1 {progress_end}
         );
         border-radius: 9px;
     }}

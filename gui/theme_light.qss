@@ -1,3 +1,5 @@
+
+
 /* ═══════════════════════════════════════════════════════════════
    NakshaAI Light Theme — Ring-App Inspired
    Clean white/light aesthetic with blue accents
@@ -334,7 +336,7 @@ QProgressBar {
     height: 20px;
 }
 QProgressBar::chunk {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #00b4d8,stop:1 #48cae4);
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #0077b6,stop:1 #00b4d8);
     border-radius: 4px;
 }
 
@@ -352,9 +354,47 @@ QSplitter::handle:vertical {
     height: 3px;
 }
 
+/* ── Tool Buttons ───────────────────────────────────────────── */
+QToolButton {
+    background-color: #eef0f4;
+    border: 1.5px solid #d0d5dd;
+    border-radius: 5px;
+    padding: 5px 10px;
+    color: #1b2838;
+    font-weight: 600;
+}
+QToolButton:hover {
+    background-color: #e0e4ea;
+    border-color: #00b4d8;
+}
+QToolButton:pressed {
+    background-color: #d0eaf6;
+    border-color: #0077b6;
+}
+QToolButton:checked {
+    background-color: #0077b6;
+    border-color: #005f8a;
+    color: #ffffff;
+}
+QToolButton::menu-indicator {
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    right: 6px;
+}
+
+/* ── Frames ─────────────────────────────────────────────────── */
+QFrame {
+    border: none;
+}
+QFrame[frameShape="4"],
+QFrame[frameShape="5"] {
+    border: 1px solid #d0d5dd;
+}
+
 /* ── Dialog ─────────────────────────────────────────────────── */
 QDialog {
     background-color: #f0f2f5;
+    color: #1b2838;
 }
 QGroupBox {
     border: 1.5px solid #d0d5dd;
@@ -383,27 +423,31 @@ QGroupBox::title {
 /* Menu Buttons (Top Bar) */
 QPushButton#menuButton {
     background-color: transparent;
-    color: #1b2838;
+    color: #000000;
     border: none;
-    border-radius: 5px;
+    border-radius: 4px;
     outline: none;
-    padding: 4px 8px;
+    padding: 3px 8px;
+    min-width: 0px;
     font-size: 10pt;
     font-weight: 500;
+    text-align: center;
 }
+
 QPushButton#menuButton:hover {
     background-color: #e0e4ea;
-    border: none;
+    color: #000000;
 }
+
 QPushButton#menuButton:pressed {
     background-color: #d0eaf6;
-    color: #1b2838;
+    color: #000000;
 }
+
 QPushButton#menuButton:checked {
     background-color: #cce8f6;
-    border: none;
-    color: #0077b6;
-    font-weight: bold;
+    color: #000000;
+    font-weight: 600;
 }
 
 /* Ribbon Container */
@@ -430,9 +474,24 @@ QPushButton#menuButton:checked {
 /* Ribbon Section Title */
 #ribbonSectionTitle {
     color: #a09f99;
-    font-size: 7.5pt;
+    font-size: 8.5pt;
     font-weight: 500;
     padding: 0px 0px 3px 0px;
+}
+
+/* Ribbon Button Label (below icon) */
+#ribbonButtonLabel {
+    color: #9a9993;
+    font-size: 8.6pt;
+    font-weight: 500;
+    padding: 1px 0px 0px 0px;
+    background: transparent;
+    border: none;
+}
+
+/* Ribbon Button Container */
+#ribbonButtonContainer {
+    background: transparent;
 }
 
 /* Ribbon Buttons */
@@ -441,6 +500,7 @@ QPushButton#ribbonButton {
     border: 1px solid #d6d1c7;
     border-radius: 10px;
     color: #1c1c1a;
+    font-size: 9pt;
     outline: none;
     padding: 0px;
 }

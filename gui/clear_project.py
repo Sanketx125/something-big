@@ -942,9 +942,14 @@ def clear_project(app):
         # ============================================================================
         if hasattr(app, "shading_dock") and app.shading_dock:
             try:
-                app.removeDockWidget(app.shading_dock)
+                if hasattr(app, "removeDockWidget") and hasattr(app.shading_dock, "setWidget"):
+                    app.removeDockWidget(app.shading_dock)
+                else:
+                    app.shading_dock.close()
                 app.shading_dock.deleteLater()
                 app.shading_dock = None
+                if hasattr(app, "shading_panel"):
+                    app.shading_panel = None
                 print("✅ Shading dock closed")
             except Exception as e:
                 print(f"⚠️ Shading dock close failed: {e}")

@@ -220,8 +220,7 @@ class ZoomRectangleTool(QObject):
         renderer = self.app.vtk_widget.renderer
         renderer.AddActor(self.rubber_band_actor)
         self.app.vtk_widget.GetRenderWindow().Render()
-        
-        
+               
     def zoom_to_bounds(self, min_x, max_x, min_y, max_y):
         """Zoom to fit EXACTLY the drawn rectangle (tight fit) - FIXED clipping"""
         renderer = self.app.vtk_widget.renderer

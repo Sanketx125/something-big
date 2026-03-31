@@ -862,6 +862,9 @@ class MeasurementTool:
         self.distance_labels = []
         self.vertex_markers = []
         self._temp_vertex_stack = []
+        # Clear undo/redo stacks so history doesn't bleed after a full clear
+        self.undo_stack.clear()
+        self.redo_stack.clear()
         
         # Clear temp visuals
         self._hide_preview_line()

@@ -2,6 +2,99 @@ import numpy as np
 from matplotlib.path import Path
 from vtkmodules.util import numpy_support
 
+def _shading_mesh_exists(app):
+    """Return True if the shaded mesh has been built and is active."""
+    return (
+        bool(getattr(app, '_shaded_mesh_actor', None)) or
+        getattr(app, '_shaded_mesh_polydata', None) is not None
+    )
+
+
+def _get_palette_color_lut(app):
+    """Cache a dense class->RGB lookup table for fast vectorized color writes."""
+    palette = getattr(app, "class_palette", {}) or {}
+
+    signature = []
+    max_code = 0
+    for code, info in palette.items():
+        try:
+            class_code = int(code)
+        except Exception:
+            continue
+        if class_code < 0:
+            continue
+
+        color = info.get("color", (128, 128, 128))
+        if hasattr(color, "red"):
+            rgb = (int(color.red()), int(color.green()), int(color.blue()))
+        else:
+            rgb = tuple(int(c) for c in color[:3])
+        signature.append((class_code, rgb))
+        if class_code > max_code:
+            max_code = class_code
+
+    signature = tuple(sorted(signature))
+    cache = getattr(app, "_class_color_lut_cache", None)
+    if cache and cache.get("signature") == signature:
+        return cache["lut"]
+
+    lut = np.empty((max_code + 1, 3), dtype=np.uint8)
+    lut[:] = np.array((128, 128, 128), dtype=np.uint8)
+
+    for class_code, rgb in signature:
+        lut[class_code] = np.array(rgb, dtype=np.uint8)
+
+    app._class_color_lut_cache = {
+        "signature": signature,
+        "lut": lut,
+    }
+    return lut
+
+
+def _get_section_global_to_local_map(app, view_idx, combined_mask):
+    """Cache global->local point remapping for repeated section color updates."""
+    if combined_mask is None:
+        return None
+
+    cache = getattr(app, "_section_global_to_local_cache", None)
+    if cache is None:
+        cache = {}
+        app._section_global_to_local_cache = cache
+
+    key = (
+        id(combined_mask),
+        int(combined_mask.shape[0]),
+        int(np.count_nonzero(combined_mask)),
+    )
+    entry = cache.get(view_idx)
+    if entry and entry.get("key") == key:
+        return entry["map"]
+
+    global_to_local = np.cumsum(combined_mask, dtype=np.int64) - 1
+    cache[view_idx] = {"key": key, "map": global_to_local}
+    return global_to_local
+
+
+def _consume_pending_main_view_indices(app):
+    """Return deduplicated pending indices accumulated during brush/box updates."""
+    chunks = getattr(app, "_pending_main_view_index_chunks", None)
+    if chunks:
+        valid_chunks = [np.asarray(chunk, dtype=np.int64).ravel() for chunk in chunks if chunk is not None and len(chunk) > 0]
+        app._pending_main_view_index_chunks = []
+        if not valid_chunks:
+            return np.array([], dtype=np.int64)
+        if len(valid_chunks) == 1:
+            return np.unique(valid_chunks[0])
+        return np.unique(np.concatenate(valid_chunks))
+
+    legacy_set = getattr(app, "_pending_main_view_indices", None)
+    if legacy_set:
+        indices = np.array(list(legacy_set), dtype=np.int64)
+        legacy_set.clear()
+        return np.unique(indices)
+
+    return np.array([], dtype=np.int64)
+
 def sync_main_view_instant(app, global_mask, new_class):
     """🚀 Direct GPU Pointer Update - Millisecond Speed"""
     from gui.unified_actor_manager import fast_classify_update
@@ -1736,6 +1829,10 @@ def _fast_update_colors(app, indices, new_class, is_cut_section):
     Updates colors in ~1ms instead of ~200ms.
     """
     try:
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.size == 0:
+            return
+
         # Get new color
         new_rgb = app.class_palette.get(new_class, {}).get('color', (128, 128, 128))
         new_rgb = np.array(new_rgb, dtype=np.uint8)
@@ -1777,11 +1874,21 @@ def _fast_update_colors(app, indices, new_class, is_cut_section):
                     combined_mask = getattr(app, f"section_{active_view}_combined_mask", None)
                     
                     if combined_mask is not None:
-                        # Map global indices to local view indices
-                        global_to_local = np.cumsum(combined_mask) - 1
-                        
-                        # Filter indices that are in this view
-                        valid_global = indices[combined_mask[indices]]
+                        global_to_local = _get_section_global_to_local_map(
+                            app,
+                            active_view,
+                            combined_mask,
+                        )
+
+                        valid_bounds = (
+                            (indices >= 0) &
+                            (indices < combined_mask.shape[0])
+                        )
+                        if not np.any(valid_bounds):
+                            continue
+
+                        candidate_global = indices[valid_bounds]
+                        valid_global = candidate_global[combined_mask[candidate_global]]
                         
                         if len(valid_global) > 0:
                             local_indices = global_to_local[valid_global]
@@ -1835,11 +1942,11 @@ def _fast_update_colors(app, indices, new_class, is_cut_section):
         # Update MAIN VIEW (deferred - only on mouse release)
         # ═══════════════════════════════════════════════════════════════════
         
-        # Mark for deferred update (don't update during drag)
-        if not hasattr(app, '_pending_main_view_indices'):
-            app._pending_main_view_indices = set()
-        
-        app._pending_main_view_indices.update(indices.tolist())
+        # Mark for deferred update without Python set churn on every stamp.
+        if not hasattr(app, '_pending_main_view_index_chunks') or app._pending_main_view_index_chunks is None:
+            app._pending_main_view_index_chunks = []
+
+        app._pending_main_view_index_chunks.append(indices.copy())
         
     except Exception as e:
         # Silent fail - don't slow down brush with error logging
@@ -1852,10 +1959,9 @@ def clear_brush_cache(app):
         del app._brush_cache
     
     # Flush pending main view updates
-    if hasattr(app, '_pending_main_view_indices') and len(app._pending_main_view_indices) > 0:
+    indices = _consume_pending_main_view_indices(app)
+    if len(indices) > 0:
         try:
-            indices = np.array(list(app._pending_main_view_indices), dtype=np.int64)
-            
             # Update main view in one batch
             if hasattr(app, 'vtk_widget') and hasattr(app.vtk_widget, 'actors'):
                 actor = app.vtk_widget.actors.get("main_points_cloud")
@@ -1866,19 +1972,13 @@ def clear_brush_cache(app):
                     
                     if vtk_colors is not None:
                         vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
-                        
-                        # Get colors for all changed indices
-                        classes = app.data["classification"][indices].astype(int)
-                        palette = app.class_palette
-                        
-                        for idx, cls in zip(indices, classes):
-                            color = palette.get(cls, {}).get('color', (128, 128, 128))
-                            vtk_ptr[idx] = color
-                        
+                        classes = app.data["classification"][indices].astype(np.int64, copy=False)
+                        color_lut = _get_palette_color_lut(app)
+                        safe_classes = np.clip(classes, 0, color_lut.shape[0] - 1)
+                        vtk_ptr[indices] = color_lut[safe_classes]
                         vtk_colors.Modified()
                         app.vtk_widget.render()
             
-            app._pending_main_view_indices.clear()
             
         except Exception as e:
             print(f"⚠️ Main view flush failed: {e}")

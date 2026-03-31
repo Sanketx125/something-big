@@ -1,4 +1,5 @@
 import numpy as np
+import os
 from scipy.spatial import cKDTree, Delaunay
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
@@ -8,308 +9,132 @@ from PySide6.QtWidgets import (
     QSizePolicy, QWidget
 )
 from PySide6.QtCore import Qt, QThread, Signal, QRect, QTimer, QEvent
-
-# ═══════════════════════════════════════════════════════════════════════
-# COLOR PATCH HELPER — fetches class colors from loaded PTC
-# ═══════════════════════════════════════════════════════════════════════
 from PySide6.QtGui import QColor, QPixmap, QIcon, QPainter, QBrush
-import re as _re
+
+
+def _apply_dialog_icon(dialog, app=None):
+    """Apply main app icon/logo to classification dialogs."""
+    try:
+        icon = None
+        if app is not None and hasattr(app, "windowIcon"):
+            app_icon = app.windowIcon()
+            if app_icon is not None and not app_icon.isNull():
+                icon = app_icon
+        if icon is None:
+            logo_path = os.path.join(os.path.dirname(__file__), "icons", "logo.png")
+            if os.path.exists(logo_path):
+                icon = QIcon(logo_path)
+        if icon is not None and not icon.isNull():
+            dialog.setWindowIcon(icon)
+    except Exception:
+        pass
 
 
 def _get_class_colors(app) -> dict:
     """
-    Build {class_code: QColor} from every possible color source on app.
-    
-    FIXED: Now handles all common storage patterns:
-      - Table cell background brush (QBrush with SolidPattern)
-      - Table cellWidget with stylesheet background-color
-      - Table cellWidget QPushButton/QLabel palette
-      - Table cellWidget that IS a colored widget (background role)
-      - class_palette dict with 'color' as tuple/list (0-255 or 0.0-1.0)
-      - class_palette dict with 'r','g','b' keys
-      - Separate class_colors dict
+    Build {class_code: QColor} from available display/palette sources.
+    Falls back to deterministic LAS default colors when runtime colors
+    are not exposed yet.
     """
     colors = {}
-
     if not app:
         return colors
 
-    # ── SOURCE 1: display_mode_dialog table ──────────────────────
-    for dlg_attr in ('display_mode_dialog', 'display_dialog',
-                     'class_display_dialog', 'classification_dialog'):
+    # Source 1: table backgrounds in display dialogs
+    for dlg_attr in ("display_mode_dialog", "display_dialog",
+                     "class_display_dialog", "classification_dialog"):
         dlg = getattr(app, dlg_attr, None)
-        if dlg is None:
-            continue
-        table = getattr(dlg, 'table', None)
+        table = getattr(dlg, "table", None) if dlg is not None else None
         if table is None:
             continue
-
         for row in range(table.rowCount()):
-            try:
-                # ── Find class code ──────────────────────────────
-                code = None
-                for col in (1, 0, 2):
-                    item = table.item(row, col)
-                    if item:
-                        try:
-                            code = int(item.text())
-                            break
-                        except (ValueError, TypeError):
-                            continue
-                if code is None:
+            code = None
+            for col in (1, 0, 2):
+                item = table.item(row, col)
+                if item is None:
                     continue
-                if code in colors:
+                try:
+                    code = int(item.text())
+                    break
+                except Exception:
                     continue
-
-                color = None
-
-                # ── Method 1: cellWidget in any column ───────────
-                # This is the most common pattern — a QPushButton or
-                # QLabel used as a color swatch
-                for col in range(table.columnCount()):
-                    widget = table.cellWidget(row, col)
-                    if widget is None:
-                        continue
-
-                    # 1a: Parse stylesheet for background-color
-                    ss = widget.styleSheet()
-                    if ss:
-                        # Try rgb(r,g,b)
-                        m = _re.search(
-                            r'background(?:-color)?\s*:\s*rgb\s*\(\s*'
-                            r'(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)',
-                            ss, _re.IGNORECASE)
-                        if m:
-                            color = QColor(int(m.group(1)),
-                                           int(m.group(2)),
-                                           int(m.group(3)))
-                            break
-
-                        # Try #hex
-                        m = _re.search(
-                            r'background(?:-color)?\s*:\s*(#[0-9a-fA-F]{3,8})',
-                            ss, _re.IGNORECASE)
-                        if m:
-                            c = QColor(m.group(1))
-                            if c.isValid():
-                                color = c
-                                break
-
-                        # Try rgba(r,g,b,a)
-                        m = _re.search(
-                            r'background(?:-color)?\s*:\s*rgba\s*\(\s*'
-                            r'(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)',
-                            ss, _re.IGNORECASE)
-                        if m:
-                            color = QColor(int(m.group(1)),
-                                           int(m.group(2)),
-                                           int(m.group(3)),
-                                           int(m.group(4)))
-                            break
-
-                    # 1b: Widget palette autoFillBackground
-                    try:
-                        if widget.autoFillBackground():
-                            pal_c = widget.palette().color(widget.backgroundRole())
-                            if pal_c.isValid() and pal_c.alpha() > 0:
-                                # Skip if it's just the default dark background
-                                if not (pal_c.red() < 50 and pal_c.green() < 50
-                                        and pal_c.blue() < 50):
-                                    color = pal_c
-                                    break
-                    except Exception:
-                        pass
-
-                    # 1c: Check if widget has a 'color' property
-                    try:
-                        wc = widget.property('color')
-                        if isinstance(wc, QColor) and wc.isValid():
-                            color = wc
-                            break
-                    except Exception:
-                        pass
-
-                    # 1d: For QPushButton — check icon pixmap
-                    try:
-                        from PySide6.QtWidgets import QPushButton as _QPB
-                        if isinstance(widget, _QPB):
-                            ic = widget.icon()
-                            if not ic.isNull():
-                                pm = ic.pixmap(16, 16)
-                                if not pm.isNull():
-                                    img = pm.toImage()
-                                    # Sample center pixel
-                                    cx, cy = img.width() // 2, img.height() // 2
-                                    pc = img.pixelColor(cx, cy)
-                                    if pc.isValid() and pc.alpha() > 0:
-                                        color = pc
-                                        break
-                    except Exception:
-                        pass
-
-                # ── Method 2: Table item background brush ────────
-                if color is None:
-                    for col in range(table.columnCount()):
-                        item = table.item(row, col)
-                        if item is None:
-                            continue
-                        bg = item.background()
-                        if isinstance(bg, QBrush) and bg.style() != 0:
-                            c = bg.color()
-                            if (c.isValid() and c.alpha() > 0
-                                    and not (c.red() == 0 and c.green() == 0
-                                             and c.blue() == 0 and c.alpha() == 255)):
-                                color = c
-                                break
-
-                # ── Method 3: Table item DecorationRole ──────────
-                if color is None:
-                    for col in range(table.columnCount()):
-                        item = table.item(row, col)
-                        if item is None:
-                            continue
-                        deco = item.data(Qt.DecorationRole)
-                        if isinstance(deco, QColor) and deco.isValid():
-                            color = deco
-                            break
-                        if isinstance(deco, QIcon) and not deco.isNull():
-                            pm = deco.pixmap(16, 16)
-                            if not pm.isNull():
-                                img = pm.toImage()
-                                pc = img.pixelColor(
-                                    img.width() // 2, img.height() // 2)
-                                if pc.isValid() and pc.alpha() > 0:
-                                    color = pc
-                                    break
-                        if isinstance(deco, QPixmap) and not deco.isNull():
-                            img = deco.toImage()
-                            pc = img.pixelColor(
-                                img.width() // 2, img.height() // 2)
-                            if pc.isValid() and pc.alpha() > 0:
-                                color = pc
-                                break
-
-                # ── Method 4: item foreground as color hint ──────
-                if color is None:
-                    for col in range(table.columnCount()):
-                        item = table.item(row, col)
-                        if item is None:
-                            continue
-                        fg = item.foreground()
-                        if isinstance(fg, QBrush) and fg.style() != 0:
-                            c = fg.color()
-                            if (c.isValid() and c.alpha() > 0
-                                    and c != QColor(240, 240, 240)
-                                    and c != QColor(0, 0, 0)):
-                                color = c
-                                break
-
-                if color is not None:
-                    colors[code] = color
-
-            except Exception:
+            if code is None:
                 continue
-
+            # Prefer dedicated color column background, then any background.
+            color = None
+            for col in (5, 4, 3, 2, 1, 0):
+                item = table.item(row, col)
+                if item is None:
+                    continue
+                bg = item.background()
+                if isinstance(bg, QBrush) and bg.style() != 0:
+                    c = bg.color()
+                    if c.isValid() and c.alpha() > 0:
+                        color = c
+                        break
+            if color is not None and code not in colors:
+                colors[code] = color
         if colors:
             break
 
-    # ── SOURCE 2: class_palette dict ─────────────────────────────
-    for palette_attr in ('class_palette', 'classification_palette',
-                         'las_class_palette', 'point_classes'):
+    # Source 2: palette dicts
+    for palette_attr in ("class_palette", "classification_palette",
+                         "las_class_palette", "point_classes"):
         palette = getattr(app, palette_attr, None)
-        if not palette or not isinstance(palette, dict):
+        if not isinstance(palette, dict):
             continue
         for code_key, info in palette.items():
             try:
                 code = int(code_key)
-            except (ValueError, TypeError):
+            except Exception:
                 continue
-            if code in colors:
+            if code in colors or not isinstance(info, dict):
                 continue
-            if not isinstance(info, dict):
-                continue
-
-            color = None
-
-            # Try color/colour/rgb keys
-            for key in ('color', 'colour', 'rgb', 'clr', 'bg',
-                        'background', 'col', 'swatch'):
-                val = info.get(key)
-                if val is None:
-                    continue
-                if isinstance(val, QColor):
-                    color = val
-                elif isinstance(val, (tuple, list)) and len(val) >= 3:
-                    vals = [float(v) for v in val[:3]]
-                    if all(v <= 1.0 for v in vals):
-                        color = QColor.fromRgbF(vals[0], vals[1], vals[2])
+            val = (info.get("color") or info.get("colour") or info.get("rgb")
+                   or info.get("swatch") or info.get("background"))
+            c = None
+            if isinstance(val, QColor):
+                c = val
+            elif isinstance(val, (tuple, list)) and len(val) >= 3:
+                try:
+                    r, g, b = [float(x) for x in val[:3]]
+                    if all(v <= 1.0 for v in (r, g, b)):
+                        c = QColor.fromRgbF(r, g, b)
                     else:
-                        color = QColor(int(vals[0]), int(vals[1]),
-                                       int(vals[2]))
-                elif isinstance(val, str):
-                    c = QColor(val)
-                    if c.isValid():
-                        color = c
-                if color is not None:
-                    break
-
-            # Try r/g/b keys
-            if color is None:
-                r = info.get('r', info.get('red'))
-                g = info.get('g', info.get('green'))
-                b = info.get('b', info.get('blue'))
+                        c = QColor(int(r), int(g), int(b))
+                except Exception:
+                    pass
+            elif isinstance(val, str):
+                qc = QColor(val)
+                if qc.isValid():
+                    c = qc
+            if c is None:
+                r = info.get("r", info.get("red"))
+                g = info.get("g", info.get("green"))
+                b = info.get("b", info.get("blue"))
                 if r is not None and g is not None and b is not None:
                     try:
                         rf, gf, bf = float(r), float(g), float(b)
                         if all(v <= 1.0 for v in (rf, gf, bf)):
-                            color = QColor.fromRgbF(rf, gf, bf)
+                            c = QColor.fromRgbF(rf, gf, bf)
                         else:
-                            color = QColor(int(rf), int(gf), int(bf))
-                    except (ValueError, TypeError):
+                            c = QColor(int(rf), int(gf), int(bf))
+                    except Exception:
                         pass
+            if c is not None and c.isValid():
+                colors[code] = c
 
-            if color is not None:
-                colors[code] = color
-
-    # ── SOURCE 3: class_colors / classification_colors dict ──────
-    for attr in ('class_colors', 'classification_colors',
-                 'las_class_colors', 'point_class_colors'):
-        cc = getattr(app, attr, None)
-        if not cc or not isinstance(cc, dict):
+    # Final fallback: deterministic LAS colors for any known class codes
+    fallback_map = _default_las_colors()
+    for code in _get_las_classes(app).keys():
+        try:
+            code = int(code)
+        except Exception:
             continue
-        for code_key, val in cc.items():
-            try:
-                code = int(code_key)
-            except (ValueError, TypeError):
-                continue
-            if code in colors:
-                continue
-            if isinstance(val, QColor):
-                colors[code] = val
-            elif isinstance(val, (tuple, list)) and len(val) >= 3:
-                vals = [float(v) for v in val[:3]]
-                if all(v <= 1.0 for v in vals):
-                    colors[code] = QColor.fromRgbF(vals[0], vals[1], vals[2])
-                else:
-                    colors[code] = QColor(int(vals[0]), int(vals[1]),
-                                          int(vals[2]))
-            elif isinstance(val, str):
-                c = QColor(val)
-                if c.isValid():
-                    colors[code] = c
-
-    # ── DEBUG: Print what we found (remove after confirming) ─────
-    if colors:
-        print(f"🎨 _get_class_colors: found {len(colors)} class colors")
-        for code in sorted(colors.keys())[:5]:
-            c = colors[code]
-            print(f"   class {code}: rgb({c.red()},{c.green()},{c.blue()})")
-    else:
-        print(f"⚠️ _get_class_colors: NO colors found! Dumping app attributes for debug...")
-        _debug_color_sources(app)
+        if code not in colors and code in fallback_map:
+            colors[code] = fallback_map[code]
 
     return colors
-
 
 def _debug_color_sources(app):
     """Print diagnostic info about where colors might be stored."""
@@ -635,85 +460,128 @@ def _default_las_classes():
             for code, name in _standard_las_names().items()}
 
 
+def _default_las_colors():
+    """Deterministic fallback class colors (QColor) keyed by LAS class code."""
+    rgb = {
+        0: (160, 160, 160), 1: (235, 235, 235), 2: (166, 124, 82),
+        3: (141, 211, 99), 4: (88, 180, 66), 5: (40, 124, 46),
+        6: (232, 179, 86), 7: (216, 69, 69), 8: (120, 120, 120),
+        9: (65, 143, 222), 10: (234, 172, 74), 11: (120, 120, 120),
+        12: (120, 120, 120), 13: (255, 220, 88), 14: (255, 201, 40),
+        15: (176, 112, 255), 16: (204, 160, 255), 17: (115, 189, 255),
+        18: (255, 64, 129), 19: (255, 133, 0), 20: (115, 115, 115),
+        21: (245, 250, 255), 22: (255, 105, 180),
+    }
+    return {code: QColor(r, g, b) for code, (r, g, b) in rgb.items()}
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # DIALOG STYLE
 # ═══════════════════════════════════════════════════════════════════════
-_DIALOG_STYLE = """
-QDialog {
-    background-color: #1e1e1e;
-    color: #f0f0f0;
-}
-QGroupBox {
-    background-color: #2a2a2a;
-    border: 1px solid #444;
-    border-radius: 6px;
-    margin-top: 12px;
-    padding-top: 18px;
-    font-weight: bold;
-    color: #e0e0e0;
-}
-QGroupBox::title {
+def _get_dialog_style():
+    from gui.theme_manager import ThemeColors as _TC
+    return f"""
+QDialog {{
+    background-color: {_TC.get('bg_primary')};
+    color: {_TC.get('text_primary')};
+}}
+QGroupBox {{
+    background-color: transparent;
+    border: none;
+    margin-top: 6px;
+    padding-top: 6px;
+    font-weight: normal;
+    color: {_TC.get('text_primary')};
+}}
+QGroupBox::title {{
     subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 6px;
-    color: #ffaa00;
-}
-QLabel { color: #d0d0d0; font-size: 11px; }
-QComboBox, QDoubleSpinBox, QSpinBox {
-    background-color: #2c2c2c; color: #f0f0f0;
-    border: 1px solid #555; border-radius: 4px;
+    left: 0px;
+    padding: 0 0px;
+    font-size: 10pt;
+    font-weight: 600;
+    color: {_TC.get('text_primary')};
+}}
+QLabel {{ color: {_TC.get('text_primary')}; font-size: 11px; }}
+QComboBox, QDoubleSpinBox, QSpinBox {{
+    background-color: {_TC.get('bg_input')}; color: {_TC.get('text_primary')};
+    border: 1px solid {_TC.get('border_light')}; border-radius: 4px;
     padding: 3px 6px; min-height: 22px;
-}
-QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover { border: 1px solid #ffaa00; }
-QComboBox::drop-down { border: none; width: 20px; }
-QCheckBox { color: #d0d0d0; spacing: 6px; }
-QCheckBox::indicator {
+}}
+QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover {{ border: 1px solid {_TC.get('accent')}; }}
+QComboBox::drop-down {{ border: none; width: 20px; }}
+QCheckBox {{ color: {_TC.get('text_primary')}; spacing: 6px; }}
+QCheckBox::indicator {{
     width: 16px; height: 16px;
-    border: 1px solid #555; border-radius: 3px;
-    background-color: #2c2c2c;
-}
-QCheckBox::indicator:checked { background-color: #ffaa00; border-color: #ffaa00; }
-QPushButton {
-    background-color: #2c2c2c; color: #f0f0f0;
-    border: 1px solid #555; border-radius: 5px;
+    border: 1px solid {_TC.get('border_light')}; border-radius: 3px;
+    background-color: {_TC.get('bg_input')};
+}}
+QCheckBox::indicator:checked {{ background-color: {_TC.get('accent')}; border-color: {_TC.get('accent')}; }}
+QPushButton {{
+    background-color: {_TC.get('bg_button')}; color: {_TC.get('text_primary')};
+    border: 1px solid {_TC.get('border_light')}; border-radius: 5px;
     padding: 6px 20px; font-weight: bold; min-width: 70px;
-}
-QPushButton:hover { background-color: #3c3c3c; border-color: #ffaa00; }
-QPushButton:pressed { background-color: #ffaa00; color: black; }
-QPushButton#okButton { background-color: #1a5e1a; border-color: #2a8e2a; }
-QPushButton#okButton:hover { background-color: #2a8e2a; }
-QPushButton#arrowBtn {
-    background-color: #3a3a3a; border: 1px solid #666; border-radius: 3px;
+}}
+QPushButton:hover {{ background-color: {_TC.get('bg_button_hover')}; border-color: {_TC.get('accent')}; }}
+QPushButton:pressed {{ background-color: {_TC.get('accent')}; color: {_TC.get('text_on_active')}; }}
+QPushButton#okButton {{ background-color: {_TC.get('bg_button')}; border-color: {_TC.get('border_light')}; color: {_TC.get('text_primary')}; }}
+QPushButton#okButton:hover {{ background-color: {_TC.get('bg_button_hover')}; border-color: {_TC.get('accent')}; }}
+QPushButton#arrowBtn {{
+    background-color: {_TC.get('bg_button')}; border: 1px solid {_TC.get('border_light')}; border-radius: 3px;
     padding: 2px 6px; min-width: 28px; max-width: 28px;
-    font-weight: bold; font-size: 10px;
-}
-QPushButton#arrowBtn:hover { border-color: #ffaa00; background-color: #4a4a4a; }
-QPushButton#fenceBtn {
-    background-color: #4a2a6a; border: 1px solid #9c27b0;
+    font-weight: normal; font-size: 10px;
+}}
+QPushButton#arrowBtn:hover {{ border-color: {_TC.get('accent')}; background-color: {_TC.get('bg_button_hover')}; }}
+QPushButton#fenceBtn {{
+    background-color: {_TC.get('bg_button')}; border: 1px solid {_TC.get('border_light')};
     border-radius: 4px; padding: 4px 10px;
     font-weight: bold; font-size: 10px; min-width: 130px;
-}
-QPushButton#fenceBtn:hover { background-color: #6a2a9a; border-color: #ce93d8; }
-QPushButton#fenceClearBtn {
-    background-color: #3a1a1a; border: 1px solid #777;
+    color: {_TC.get('text_primary')};
+}}
+QPushButton#fenceBtn:hover {{ background-color: {_TC.get('bg_button_hover')}; border-color: {_TC.get('accent')}; }}
+QPushButton#fenceClearBtn {{
+    background-color: {_TC.get('bg_button')}; border: 1px solid {_TC.get('border_light')};
     border-radius: 4px; padding: 4px 8px;
     font-size: 10px; min-width: 50px;
-}
-QPushButton#fenceClearBtn:hover { background-color: #5a2a2a; border-color: #f44336; }
-QPushButton#minimizeBtn {
-    background-color: #3a3a2a; border: 1px solid #777;
+}}
+QPushButton#fenceClearBtn:hover {{ background-color: {_TC.get('danger_hover')}; border-color: {_TC.get('danger_hover')}; color: {_TC.get('text_on_active')}; }}
+QPushButton#minimizeBtn {{
+    background-color: {_TC.get('bg_button')}; border: 1px solid {_TC.get('border_light')};
     border-radius: 4px; padding: 3px 10px;
     font-size: 11px; font-weight: bold; min-width: 28px; max-width: 36px;
-    color: #ffcc44;
-}
-QPushButton#minimizeBtn:hover { background-color: #5a5a2a; border-color: #ffaa00; }
-QListWidget {
-    background-color: #1e1e1e; color: #f0f0f0;
-    border: 1px solid #555; border-radius: 4px;
-}
-QListWidget::item:selected { background-color: #ffaa00; color: #000; }
-QListWidget::item:hover { background-color: #3a3a3a; }
-QFrame[frameShape="4"] { color: #444; }
+    color: {_TC.get('text_primary')};
+}}
+QPushButton#minimizeBtn:hover {{ background-color: {_TC.get('bg_button_hover')}; border-color: {_TC.get('accent')}; }}
+QListWidget {{
+    background-color: {_TC.get('bg_input')}; color: {_TC.get('text_primary')};
+    border: 1px solid {_TC.get('border_light')}; border-radius: 4px;
+}}
+QListWidget::item:selected {{ background-color: {_TC.get('bg_button_hover')}; color: {_TC.get('text_primary')}; }}
+QListWidget::item:hover {{ background-color: {_TC.get('bg_button_hover')}; }}
+QFrame[frameShape="4"] {{ color: {_TC.get('border_light')}; }}
+"""
+
+
+def _note_text_style():
+    from gui.theme_manager import ThemeColors as _TC
+    return (
+        f"color:{_TC.get('text_secondary')}; "
+        "font-size:9px; font-style:italic; padding:2px 4px;"
+    )
+
+
+def _get_inline_multiselect_style():
+    from gui.theme_manager import ThemeColors as _TC
+    return f"""
+QListWidget {{
+    background-color: {_TC.get('bg_input')};
+    border: 1px solid {_TC.get('border_light')};
+    border-radius: 4px;
+    min-height: 90px;
+    max-height: 120px;
+}}
+QListWidget::item {{ padding: 2px 6px; }}
+QListWidget::item:selected {{ background-color: {_TC.get('accent')}; color: {_TC.get('text_on_active')}; }}
+QListWidget::item:hover:!selected {{ background-color: {_TC.get('bg_button_hover')}; }}
 """
 
 def _get_fence_picker_style():
@@ -849,7 +717,8 @@ class ClassSelectorDialog(QDialog):
     def __init__(self, current_codes, app, multi=True, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Select Classes")
-        self.setStyleSheet(_DIALOG_STYLE)
+        self.setStyleSheet(_get_dialog_style())
+        _apply_dialog_icon(self, app)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.setMinimumWidth(260)
         self.app = app
@@ -864,11 +733,12 @@ class ClassSelectorDialog(QDialog):
         colors = _get_class_colors(self.app)
         
         for code, name in sorted(las_classes.items()):
+            color = colors.get(code)
             item = QListWidgetItem(name)
             item.setData(Qt.UserRole, code)
             # Add color swatch icon
-            if code in colors:
-                item.setIcon(_make_color_icon(colors[code], 14))
+            if color is not None:
+                item.setIcon(_make_color_icon(color, 14))
             self.list_widget.addItem(item)
             if code in current_codes:
                 item.setSelected(True)
@@ -891,11 +761,13 @@ def _class_combo(app, selected=1):
     cb = QComboBox(); cb.setMinimumWidth(185)
     colors = _get_class_colors(app)
     for code, name in sorted(_get_las_classes(app).items()):
-        if code in colors:
-            icon = _make_color_icon(colors[code], 14)
-            cb.addItem(icon, name, code)
+        color = colors.get(code)
+        label = name
+        if color is not None:
+            icon = _make_color_icon(color, 14)
+            cb.addItem(icon, label, code)
         else:
-            cb.addItem(name, code)
+            cb.addItem(label, code)
     idx = cb.findData(selected)
     if idx >= 0: cb.setCurrentIndex(idx)
     return cb
@@ -1433,12 +1305,12 @@ class FenceSelectorWidget(QWidget):
     def _update_status(self):
         n = len(self.selected_fences)
         if n == 0:
-            self.status_lbl.setText("No fence — runs on all points")
+            self.status_lbl.setText("No fence selected - runs on all points")
             self.status_lbl.setStyleSheet("color:#888; font-size:10px; padding:2px 0;")
         else:
-            mode = "🔄 PERMANENT" if self.permanent_fence_mode else "TEMP"
+            mode = "PERMANENT" if self.permanent_fence_mode else "TEMP"
             total_pts = sum(len(f.get('coords', [])) for f in self.selected_fences)
-            self.status_lbl.setText(f"✅ {n} fence(s) active ({total_pts} pts) — {mode}")
+            self.status_lbl.setText(f"{n} fence(s) active ({total_pts} pts) - {mode}")
             self.status_lbl.setStyleSheet(
                 "color:#4caf50; font-size:10px; font-weight:bold; padding:2px 0;")
 
@@ -2063,8 +1935,6 @@ class _BaseClassifyDialog(QDialog):
     • When the chip's "▲ Restore" button (or anywhere on the chip) is
       clicked, the dialog re-appears at exactly the position and size it
       had before minimization.
-    • If the OS sends a WindowDeactivate event (user clicks away to
-      another OS-level window or taskbar), the dialog auto-minimizes.
     • Calling the public-API open_* function while the dialog is already
       open and minimized will restore it rather than create a duplicate.
     """
@@ -2075,60 +1945,42 @@ class _BaseClassifyDialog(QDialog):
         super().__init__(parent or app)
         self.app = app
         self.setWindowTitle(title)
-        self.setStyleSheet(_DIALOG_STYLE)
-        # WindowMinimizeButtonHint → puts native "─" button in OS title bar
-        # WindowStaysOnTopHint     → floats above the main window
+        self.setStyleSheet(_get_dialog_style())
+        _apply_dialog_icon(self, app)
+
         self.setWindowFlags(
             Qt.Dialog |
             Qt.WindowCloseButtonHint |
             Qt.WindowMinimizeButtonHint
         )
         self.setMinimumWidth(370)
+
         self._worker = None
         self._focus_conn = None
         self._connect_focus_watcher()
+
         # ── Minimize state ────────────────────────────────────────
         self._chip: _MinimizedChip | None = None
         self._saved_geometry: QRect | None = None
 
     def _connect_focus_watcher(self):
-        try:
-            app_instance = QApplication.instance()
-            self._focus_conn = app_instance.focusWindowChanged.connect(
-                self._on_focus_window_changed)
-        except Exception:
-            pass
-    def _disconnect_focus_watcher(self):
-            try:
-                if self._focus_conn is not None:
-                    QApplication.instance().focusWindowChanged.disconnect(
-                        self._on_focus_window_changed)
-                    self._focus_conn = None
-            except Exception:
-                pass
-    def _on_focus_window_changed(self, focused_window):
-        if focused_window is None:
-            return  # focus went nowhere — ignore (screen lock, etc.)
-        try:
-            # Collect QWindow handles of ALL our app's top-level widgets
-            our_handles = set()
-            for w in QApplication.topLevelWidgets():
-                try:
-                    h = w.windowHandle()
-                    if h is not None:
-                        our_handles.add(h)
-                except Exception:
-                    pass
+        pass
 
-            if focused_window not in our_handles:
-                # Focus genuinely went to another OS process
-                if self.isVisible() and not self._is_minimized_to_chip:
-                    self._do_minimize_to_chip()
-            else:
-                if self._is_minimized_to_chip:
-                    self._do_restore_from_chip()
+    def _disconnect_focus_watcher(self):
+        pass
+
+    def _on_focus_window_changed(self, focused_window):
+        pass
+
+    def refresh_theme(self):
+        """Re-apply current theme styles to this dialog."""
+        try:
+            self.setStyleSheet(_get_dialog_style())
+            if self._chip is not None:
+                self._chip.setStyleSheet(_get_chip_style())
         except Exception:
             pass
+
     # ──────────────────────────────────────────────────────────────
     # MINIMIZE / RESTORE  — driven by native OS title-bar button
     # ──────────────────────────────────────────────────────────────
@@ -2136,9 +1988,12 @@ class _BaseClassifyDialog(QDialog):
         """Intercept native minimize → replace with bottom-left chip."""
         super().changeEvent(event)
         if event.type() == QEvent.WindowStateChange and self.isMinimized():
-            # Reset OS state immediately; we manage visibility ourselves
             self.setWindowState(Qt.WindowNoState)
             QTimer.singleShot(0, self._do_minimize_to_chip)
+
+    def showEvent(self, event):
+        self.refresh_theme()
+        super().showEvent(event)
 
     def _do_minimize_to_chip(self):
         if self._chip is not None:
@@ -2146,6 +2001,7 @@ class _BaseClassifyDialog(QDialog):
             self._chip.place_bottom_left()
             self.hide()
             return
+
         self._saved_geometry = self.geometry()
         self._chip = _MinimizedChip(self.windowTitle())
         self._chip.restore_requested.connect(self._do_restore_from_chip)
@@ -2154,7 +2010,6 @@ class _BaseClassifyDialog(QDialog):
         self.hide()
 
     def _do_restore_from_chip(self):
-        # Clear self._chip BEFORE show() to prevent re-entry race
         chip, self._chip = self._chip, None
         if chip is not None:
             try:
@@ -2163,16 +2018,20 @@ class _BaseClassifyDialog(QDialog):
                 pass
             chip.hide()
             chip.deleteLater()
+
         if self._saved_geometry is not None:
             self.setGeometry(self._saved_geometry)
+
         self.setWindowState(Qt.WindowNoState)
         self.show()
         self.raise_()
         self.activateWindow()
 
-    # Public aliases kept for _open_or_restore()
-    def minimize_to_chip(self):  self._do_minimize_to_chip()
-    def restore_from_chip(self): self._do_restore_from_chip()
+    def minimize_to_chip(self):
+        self._do_minimize_to_chip()
+
+    def restore_from_chip(self):
+        self._do_restore_from_chip()
 
     @property
     def _is_minimized_to_chip(self):
@@ -2188,20 +2047,23 @@ class _BaseClassifyDialog(QDialog):
         val = PersistentClassSettings.get_value(self._pk(key_suffix), default)
         spin.setValue(val)
         spin.valueChanged.connect(
-            lambda v: PersistentClassSettings.set_value(self._pk(key_suffix), v))
+            lambda v: PersistentClassSettings.set_value(self._pk(key_suffix), v)
+        )
 
     def _persist_combo_index(self, combo, key_suffix, default_index):
         idx = PersistentClassSettings.get_value(self._pk(key_suffix), default_index)
         if 0 <= idx < combo.count():
             combo.setCurrentIndex(idx)
         combo.currentIndexChanged.connect(
-            lambda i: PersistentClassSettings.set_value(self._pk(key_suffix), i))
+            lambda i: PersistentClassSettings.set_value(self._pk(key_suffix), i)
+        )
 
     def _persist_checkbox(self, chk, key_suffix, default_checked):
         val = PersistentClassSettings.get_value(self._pk(key_suffix), default_checked)
         chk.setChecked(bool(val))
         chk.stateChanged.connect(
-            lambda s: PersistentClassSettings.set_value(self._pk(key_suffix), bool(s)))
+            lambda s: PersistentClassSettings.set_value(self._pk(key_suffix), bool(s))
+        )
 
     def _get_fence_mask(self, fence_widget: FenceSelectorWidget):
         if not fence_widget.selected_fences or self.app.data is None:
@@ -2219,7 +2081,7 @@ class _BaseClassifyDialog(QDialog):
             return
 
         old_cls = self.app.data["classification"].copy()
-        kwargs["xyz"]            = self.app.data["xyz"]
+        kwargs["xyz"] = self.app.data["xyz"]
         kwargs["classification"] = self.app.data["classification"]
 
         self._prog = QProgressDialog(f"Running {name}…", "Cancel", 0, 100, self.app)
@@ -2238,23 +2100,27 @@ class _BaseClassifyDialog(QDialog):
         self._worker.start()
 
     def _on_prog(self, pct, msg):
-        if hasattr(self, '_prog') and self._prog:
-            self._prog.setValue(pct); self._prog.setLabelText(msg)
+        if hasattr(self, "_prog") and self._prog:
+            self._prog.setValue(pct)
+            self._prog.setLabelText(msg)
 
     # ──────────────────────────────────────────────────────────────
     # SECTION SYNC
     # ──────────────────────────────────────────────────────────────
     def _sync_section_classifications(self, changed_indices):
-        sc = getattr(self.app, 'section_controller', None)
+        sc = getattr(self.app, "section_controller", None)
         if sc is None or self.app.data is None:
             return
-        new_cls = self.app.data["classification"]
-        ch_idx  = np.asarray(changed_indices)
-        synced  = False
 
-        for attr_name in ('_section_data', 'section_data', '_sections',
-                          'sections', '_view_data', 'view_data',
-                          '_stored_sections'):
+        new_cls = self.app.data["classification"]
+        ch_idx = np.asarray(changed_indices)
+        synced = False
+
+        for attr_name in (
+            "_section_data", "section_data", "_sections",
+            "sections", "_view_data", "view_data",
+            "_stored_sections"
+        ):
             storage = getattr(sc, attr_name, None)
             if not isinstance(storage, dict) or not storage:
                 continue
@@ -2267,23 +2133,24 @@ class _BaseClassifyDialog(QDialog):
         if synced:
             return
 
-        for gi_attr, cls_attr in [('global_indices', 'classification'),
-                                   ('_global_indices', '_classification'),
-                                   ('section_indices', 'section_cls')]:
+        for gi_attr, cls_attr in [
+            ("global_indices", "classification"),
+            ("_global_indices", "_classification"),
+            ("section_indices", "section_cls"),
+        ]:
             gi = getattr(sc, gi_attr, None)
             cl = getattr(sc, cls_attr, None)
             if gi is not None and cl is not None and isinstance(cl, np.ndarray):
                 gi_arr = np.asarray(gi)
-                mask   = np.isin(gi_arr, ch_idx)
+                mask = np.isin(gi_arr, ch_idx)
                 if mask.any():
                     cl[mask] = new_cls[gi_arr[mask]]
                     print(f"   📋 Synced {int(mask.sum())} section cls values")
                 return
 
     def _sync_one_section(self, section_data, new_cls, changed_indices, view_id):
-        GI_KEYS  = ('global_indices', 'indices', 'point_indices', 'idx',
-                     'core_indices', 'all_indices')
-        CLS_KEYS = ('classification', 'cls', 'classes', 'point_classes')
+        GI_KEYS = ("global_indices", "indices", "point_indices", "idx", "core_indices", "all_indices")
+        CLS_KEYS = ("classification", "cls", "classes", "point_classes")
 
         def _get(obj, keys):
             for k in keys:
@@ -2303,7 +2170,7 @@ class _BaseClassifyDialog(QDialog):
             return
 
         mask = np.isin(gi_arr, changed_indices)
-        n    = int(mask.sum())
+        n = int(mask.sum())
         if n > 0:
             cl[mask] = new_cls[gi_arr[mask]]
             print(f"   📋 Synced {n} classification values in section view {view_id}")
@@ -2312,7 +2179,7 @@ class _BaseClassifyDialog(QDialog):
     # ON DONE
     # ──────────────────────────────────────────────────────────────
     def _on_done(self, result, old_cls, name):
-        if hasattr(self, '_prog') and self._prog:
+        if hasattr(self, "_prog") and self._prog:
             try:
                 self._prog.close()
             except Exception:
@@ -2322,18 +2189,18 @@ class _BaseClassifyDialog(QDialog):
         changed = result.get("changed", 0)
         indices = result.get("indices", np.array([]))
 
-        to_class     = None
+        to_class = None
         from_classes = None
-        mask         = None
+        mask = None
 
         if changed > 0 and len(indices) > 0:
-            mask  = np.zeros(len(self.app.data["xyz"]), dtype=bool)
+            mask = np.zeros(len(self.app.data["xyz"]), dtype=bool)
             mask[indices] = True
             old_c = old_cls[indices]
             new_c = self.app.data["classification"][indices].copy()
 
             to_class_arr = np.unique(new_c)
-            to_class     = int(to_class_arr[0]) if len(to_class_arr) == 1 else None
+            to_class = int(to_class_arr[0]) if len(to_class_arr) == 1 else None
             from_classes = list(set(int(c) for c in np.unique(old_c)))
             if to_class is not None and to_class not in from_classes:
                 from_classes.append(to_class)
@@ -2341,23 +2208,20 @@ class _BaseClassifyDialog(QDialog):
             self.app._last_changed_mask = mask
             self._sync_section_classifications(indices)
 
-            _stack = getattr(self.app, "undo_stack",
-                             getattr(self.app, "undostack", None))
+            _stack = getattr(self.app, "undo_stack", getattr(self.app, "undostack", None))
             if _stack is not None:
                 try:
                     _stack.append({
-                        "mask":        mask,
+                        "mask": mask,
                         "old_classes": old_c,
                         "new_classes": new_c,
                         "is_cut_locked": False,
                     })
-                    # Clear stale redo entries after new action
-                    _redo = getattr(self.app, "redo_stack",
-                                    getattr(self.app, "redostack", None))
+                    _redo = getattr(self.app, "redo_stack", getattr(self.app, "redostack", None))
                     if _redo is not None:
                         _redo.clear()
-                    # Cap undo stack size
-                    max_steps = getattr(self.app, '_max_undo_steps', 30)
+
+                    max_steps = getattr(self.app, "_max_undo_steps", 30)
                     while len(_stack) > max_steps:
                         from gui.memory_manager import _free_undo_entry
                         _free_undo_entry(_stack.pop(0))
@@ -2366,41 +2230,48 @@ class _BaseClassifyDialog(QDialog):
 
         print(f"🔄 Classification done — refreshing view ({changed:,} pts changed)…")
         self._refresh(to_class=to_class, from_classes=from_classes)
-        print(f"✅ View refresh complete")
+        print("✅ View refresh complete")
 
         self._worker = None
         QTimer.singleShot(200, self._clear_changed_mask)
 
         mb = QMessageBox(self.app)
-        mb.setIcon(QMessageBox.Information); mb.setWindowTitle(name)
-        mb.setText(f"✅ {name} complete.\nPoints reclassified: {changed:,}")
-        mb.setWindowModality(Qt.NonModal); mb.setAttribute(Qt.WA_DeleteOnClose); mb.show()
+        mb.setIcon(QMessageBox.Information)
+        mb.setWindowTitle(name)
+        mb.setText(f"{name} complete.\nPoints reclassified: {changed:,}")
+        mb.setWindowModality(Qt.NonModal)
+        mb.setAttribute(Qt.WA_DeleteOnClose)
+        mb.show()
 
     def _clear_changed_mask(self):
-        if hasattr(self.app, '_last_changed_mask'):
+        if hasattr(self.app, "_last_changed_mask"):
             self.app._last_changed_mask = None
 
     def _on_err(self, msg):
-        if hasattr(self, '_prog') and self._prog:
+        if hasattr(self, "_prog") and self._prog:
             try:
                 self._prog.close()
             except Exception:
                 pass
             self._prog = None
+
         self._worker = None
         eb = QMessageBox(self.app)
-        eb.setIcon(QMessageBox.Critical); eb.setWindowTitle("Error")
+        eb.setIcon(QMessageBox.Critical)
+        eb.setWindowTitle("Error")
         eb.setText(f"Classification failed:\n{msg}")
-        eb.setWindowModality(Qt.NonModal); eb.setAttribute(Qt.WA_DeleteOnClose); eb.show()
+        eb.setWindowModality(Qt.NonModal)
+        eb.setAttribute(Qt.WA_DeleteOnClose)
+        eb.show()
 
     # ──────────────────────────────────────────────────────────────
     # REFRESH
     # ──────────────────────────────────────────────────────────────
     def _refresh(self, to_class=None, from_classes=None):
         try:
-            display_mode = getattr(self.app, 'display_mode', 'class')
+            display_mode = getattr(self.app, "display_mode", "class")
 
-            if display_mode == 'class' and to_class is not None:
+            if display_mode == "class" and to_class is not None:
                 try:
                     from gui.optimized_refresh import get_optimizer
                     optimizer = get_optimizer(self.app)
@@ -2414,36 +2285,35 @@ class _BaseClassifyDialog(QDialog):
                         from_classes=from_classes,
                         fallback_func=_fallback,
                     )
-                    print(f"   ⚡ Used optimized refresh pipeline")
+                    print("   ⚡ Used optimized refresh pipeline")
                     return
                 except ImportError:
-                    print(f"   ℹ️ optimized_refresh not available, using fallback")
+                    print("   ℹ️ optimized_refresh not available, using fallback")
                 except Exception as e:
                     print(f"   ⚠️ Optimized refresh failed: {e}, using fallback")
-                    import traceback; traceback.print_exc()
+                    import traceback
+                    traceback.print_exc()
 
-            if display_mode == 'class':
+            if display_mode == "class":
                 from gui.class_display import update_class_mode
                 update_class_mode(self.app, force_refresh=True)
 
-            elif display_mode == 'shaded_class':
+            elif display_mode == "shaded_class":
                 try:
-                    from gui.shading_display import (
-                        clear_shading_cache, update_shaded_class
-                    )
+                    from gui.shading_display import clear_shading_cache, update_shaded_class
                     clear_shading_cache("classification changed")
                     update_shaded_class(
                         self.app,
                         getattr(self.app, "last_shade_azimuth", 45.0),
-                        getattr(self.app, "last_shade_angle",   45.0),
-                        getattr(self.app, "shade_ambient",      0.2),
+                        getattr(self.app, "last_shade_angle", 45.0),
+                        getattr(self.app, "shade_ambient", 0.2),
                         force_rebuild=True,
                     )
                 except Exception:
-                    if hasattr(self.app, 'apply_display_mode'):
+                    if hasattr(self.app, "apply_display_mode"):
                         self.app.apply_display_mode()
 
-            elif hasattr(self.app, 'apply_display_mode'):
+            elif hasattr(self.app, "apply_display_mode"):
                 self.app.apply_display_mode()
             else:
                 try:
@@ -2451,7 +2321,7 @@ class _BaseClassifyDialog(QDialog):
                 except Exception:
                     pass
 
-            if hasattr(self.app, 'section_controller'):
+            if hasattr(self.app, "section_controller"):
                 try:
                     self.app.section_controller._refresh_all_section_colors()
                 except Exception as e:
@@ -2459,7 +2329,8 @@ class _BaseClassifyDialog(QDialog):
 
         except Exception as e:
             print(f"⚠️ View refresh failed: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             try:
                 self.app.vtk_widget.render()
             except Exception:
@@ -2469,17 +2340,23 @@ class _BaseClassifyDialog(QDialog):
     # BUTTON ROW
     # ──────────────────────────────────────────────────────────────
     def _make_buttons(self, layout):
-        row = QHBoxLayout(); row.addStretch()
-        ok = QPushButton("OK"); ok.setObjectName("okButton")
-        ok.clicked.connect(self._on_ok); ok.setDefault(True)
-        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
-        row.addWidget(ok); row.addWidget(cancel)
+        row = QHBoxLayout()
+        row.addStretch()
+        ok = QPushButton("OK")
+        ok.setObjectName("okButton")
+        ok.clicked.connect(self._on_ok)
+        ok.setDefault(True)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(ok)
+        row.addWidget(cancel)
         layout.addLayout(row)
 
-    def _on_ok(self): pass
+    def _on_ok(self):
+        pass
 
     # ──────────────────────────────────────────────────────────────
-    # CLOSE / REJECT  — clean up chip if still showing
+    # CLOSE / REJECT
     # ──────────────────────────────────────────────────────────────
     def _cleanup_chip(self):
         if self._chip is not None:
@@ -2492,15 +2369,15 @@ class _BaseClassifyDialog(QDialog):
             self._chip = None
 
     def closeEvent(self, event):
-            self._disconnect_focus_watcher()
-            if hasattr(self, '_fence_sel'):
-                self._fence_sel.cleanup_actors()
-            self._cleanup_chip()
-            super().closeEvent(event)
+        self._disconnect_focus_watcher()
+        if hasattr(self, "_fence_sel"):
+            self._fence_sel.cleanup_actors()
+        self._cleanup_chip()
+        super().closeEvent(event)
 
     def reject(self):
         self._disconnect_focus_watcher()
-        if hasattr(self, '_fence_sel'):
+        if hasattr(self, "_fence_sel"):
             self._fence_sel.cleanup_actors()
         self._cleanup_chip()
         super().reject()
@@ -2551,7 +2428,7 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
         f.addRow("To class:",       _w(r2))
 
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color:#444;")
+        sep.setStyleSheet(_note_text_style())
         f.addRow(sep)
 
         f.addRow("Ground ref class:", _w(r3))
@@ -2559,8 +2436,7 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
         ref_note = QLabel(
             "⚠️  Ground ref must be TRUE GROUND only (e.g. class 2).\n"
             "    Including vegetation/buildings gives wrong results.")
-        ref_note.setStyleSheet(
-            "color:#e0a030; font-size:9px; font-style:italic; padding:2px 4px;")
+        ref_note.setStyleSheet(_note_text_style())
         ref_note.setWordWrap(True)
         f.addRow("", ref_note)
 
@@ -2607,19 +2483,16 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
         self._persist_spin(self.mt_spin, "more_than", 0.50)
 
         self._direction_lbl = QLabel()
-        self._direction_lbl.setStyleSheet("font-size:10px;")
+        self._direction_lbl.setStyleSheet(_note_text_style())
 
         def _update_direction_label(val):
-            from gui.theme_manager import ThemeColors
             if val > 0:
                 self._direction_lbl.setText("m  lower than ground  (below surface)")
-                self._direction_lbl.setStyleSheet(f"color:{ThemeColors.get('danger_hover')}; font-size:10px;")
             elif val < 0:
                 self._direction_lbl.setText("m  higher than ground  (above surface)")
-                self._direction_lbl.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:10px;")
             else:
                 self._direction_lbl.setText("m  at ground level")
-                self._direction_lbl.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px;")
+            self._direction_lbl.setStyleSheet(_note_text_style())
 
         self.mt_spin.valueChanged.connect(_update_direction_label)
         _update_direction_label(self.mt_spin.value())
@@ -2632,7 +2505,7 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
 
         hint = QLabel(
             "  + = classify BELOW ground surface  |  − = classify ABOVE ground")
-        hint.setStyleSheet("color:#666; font-size:9px; font-style:italic;")
+        hint.setStyleSheet(_note_text_style())
         f3.addRow("", hint)
 
         self.within_spin = QDoubleSpinBox()
@@ -2689,32 +2562,22 @@ class ClassifyIsolatedPointsDialog(_BaseClassifyDialog):
 
         self._from_list = QListWidget()
         self._from_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self._from_list.setStyleSheet("""
-            QListWidget {
-                background-color: #1e1e1e;
-                border: 1px solid #555;
-                border-radius: 4px;
-                min-height: 90px;
-                max-height: 120px;
-            }
-            QListWidget::item { padding: 2px 6px; }
-            QListWidget::item:selected { background-color: #ffaa00; color: #000; }
-            QListWidget::item:hover:!selected { background-color: #3a3a3a; }
-        """)
+        self._from_list.setStyleSheet(_get_inline_multiselect_style())
         las_classes = _get_las_classes(self.app)
         colors = _get_class_colors(self.app)
         for code, name in sorted(las_classes.items()):
+            color = colors.get(code)
             item = QListWidgetItem(name)
             item.setData(Qt.UserRole, code)
             # Add color swatch from loaded PTC
-            if code in colors:
-                item.setIcon(_make_color_icon(colors[code], 14))
+            if color is not None:
+                item.setIcon(_make_color_icon(color, 14))
             self._from_list.addItem(item)
             if code in from_initial:
                 item.setSelected(True)
 
         hint = QLabel("Ctrl+click = multi-select  •  Shift+click = range")
-        hint.setStyleSheet("color:#666; font-size:9px; font-style:italic; padding:1px 2px;")
+        hint.setStyleSheet(_note_text_style())
 
         from_col = QVBoxLayout(); from_col.setSpacing(2)
         from_col.addWidget(self._from_list)
@@ -2795,8 +2658,7 @@ class ClassifyIsolatedPointsDialog(_BaseClassifyDialog):
             "     wires) will be caught even if they have nearby neighbors\n"
             "     at the same height — because ground-level neighbors\n"
             "     don't count as 'in-class' for the sphere check.")
-        hf_info.setStyleSheet(
-            "color:#e0a030; font-size:9px; font-style:italic; padding:2px 4px;")
+        hf_info.setStyleSheet(_note_text_style())
         hf_info.setWordWrap(True)
         hf_lay.addWidget(hf_info)
 
@@ -2830,7 +2692,7 @@ class ClassifyIsolatedPointsDialog(_BaseClassifyDialog):
             "ℹ️ Counts neighbors of 'In class' within 3D sphere.\n"
             "   Self-excluded. From class ≠ In class is allowed.\n"
             "   MicroStation equivalent: 3D outlier filter.")
-        info.setStyleSheet("color:#888; font-size:9px; padding:4px;")
+        info.setStyleSheet(_note_text_style())
         info.setWordWrap(True)
         ol.addWidget(info)
 
@@ -3077,7 +2939,7 @@ class ClassifyBelowSurfaceDialog(_BaseClassifyDialog):
             "ℹ️ Fits local surface through K neighbors.\n"
             "   Flags points below surface by > limit × ave|residual|.\n"
             "   MicroStation equivalent: post-ground cleanup.")
-        info.setStyleSheet("color:#888; font-size:9px; padding:4px;")
+        info.setStyleSheet(_note_text_style())
         info.setWordWrap(True)
         ol.addWidget(info)
 
