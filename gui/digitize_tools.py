@@ -1052,6 +1052,15 @@ class DigitizeManager:
                 self.temp_points = []
                 print("🧹 Cancelled unfinished Polyline on tool switch")
 
+            # Cancel any active OrthogonalPolygon before switching to another tool
+            if getattr(self, "active_tool", None) == "orthopolygon":
+                old_inst = getattr(self, '_ortho_polygon_tool', None)
+                if old_inst:
+                    old_inst._cancel()
+                    old_inst.deactivate()
+                    self._ortho_polygon_tool = None
+                print("🧹 Cancelled OrthogonalPolygon on tool switch")
+
         # Normalize tool name
         if tool:
             tool = tool.lower().replace(" ", "").replace("_", "")
@@ -1142,6 +1151,19 @@ class DigitizeManager:
             print("🔵 Vertex insertion mode activated - click on any line to add a vertex")
         else:
             print(f"🖊️ Tool activated: {self.active_tool or 'select'}")
+
+
+        # ── Ortho-Polygon tool ────────────────────────────────────────────────────
+        if tool == 'orthopolygon':
+            from gui.orthogonal_polygon_tool import OrthogonalPolygonTool
+            old = getattr(self, '_ortho_polygon_tool', None)
+            if old:
+                old.deactivate()
+            inst = OrthogonalPolygonTool(self)
+            inst.activate()
+            self._ortho_polygon_tool = inst
+            return
+        # ─────────────────────────────────────────────────────────────────────────
 
         # ✅ Re-attach event observers for drawing tools
         if self.active_tool and self.active_tool not in ("text", "movevertex"):
@@ -5333,17 +5355,42 @@ class DigitizeManager:
                 else:
                     return False
             
-            elif shape_type in ['polyline', 'polygon']:
+            # ✅ Add 'smartline' alongside 'line' and 'line_segment'
+            elif shape_type in ['line', 'line_segment', 'smartline']:
+                if len(coords) >= 2:
+                    actor = self._make_polyline_actor(coords, color=color_vtk, width=3)
+                else:
+                    return False
+
+            # ✅ Add 'freehand' alongside 'polyline' and 'polygon'
+            elif shape_type in ['polyline', 'polygon', 'freehand']:
                 if len(coords) >= 3:
                     if coords[0] != coords[-1]:
                         coords = list(coords) + [coords[0]]
                     actor = self._make_polyline_actor(coords, color=color_vtk, width=3)
                 else:
                     return False
-            
-            elif shape_type in ['line', 'line_segment']:
-                if len(coords) >= 2:
-                    actor = self._make_polyline_actor(coords, color=color_vtk, width=3)
+
+            elif shape_type == 'text':
+                if len(coords) >= 1:
+                    pos = coords[0]
+                    text_value = str(drawing_data.get('text', '') or 'Text')
+
+                    actor = vtk.vtkTextActor()
+                    actor.SetInput(text_value)
+
+                    prop = actor.GetTextProperty()
+                    prop.SetColor(*color_vtk)
+                    prop.BoldOn()
+                    prop.SetFontSize(18)
+                    prop.SetJustificationToCentered()
+                    prop.SetVerticalJustificationToCentered()
+
+                    coord = actor.GetActualPositionCoordinate()
+                    coord.SetCoordinateSystemToWorld()
+                    coord.SetValue(pos[0], pos[1], pos[2] if len(pos) > 2 else 0)
+
+                    actor.GetProperty().SetDisplayLocationToForeground()
                 else:
                     return False
             
@@ -5354,23 +5401,36 @@ class DigitizeManager:
                     return False
             
             if actor:
-                actor.PickableOn()
-                actor.VisibilityOn()
-                
-                self._add_actor_to_overlay(actor)
+                if hasattr(actor, 'PickableOn'):
+                    actor.PickableOn()
+                if hasattr(actor, 'VisibilityOn'):
+                    actor.VisibilityOn()
+
+                if shape_type == 'text':
+                    self.renderer.AddActor2D(actor)
+                else:
+                    self._add_actor_to_overlay(actor)
+
+                try:
+                    bounds = actor.GetBounds()
+                except Exception:
+                    bounds = None
                 
                 drawing = {
                     'type': shape_type,
                     'coords': coords,
                     'coordinates': coords,
                     'actor': actor,
-                    'bounds': actor.GetBounds(),
+                    'bounds': bounds,
                     'original_color': color_vtk,
                     'original_width': 3,
                     'color': color,
                     'text': drawing_data.get('text', ''),
                     'radius': drawing_data.get('radius', 0)
                 }
+
+                if shape_type == 'text':
+                    drawing['original_text_color'] = color_vtk
                 
                 self.drawings.append(drawing)
                 print(f"✅ Added {shape_type} to scene\n")
@@ -5483,6 +5543,13 @@ class DigitizeManager:
             self._remove_preview_actor_2d('_circle_preview_actor_2d')
             self._remove_preview_actor_2d('_circle_preview_actor')
             self.temp_points = []
+
+        elif tool == 'orthopolygon':
+            inst = getattr(self, '_ortho_polygon_tool', None)
+            if inst:
+                inst._cancel()
+                inst.deactivate()
+                self._ortho_polygon_tool = None
 
         elif tool == "rectangle":
             self._remove_preview_actor_2d('_rectangle_preview_actor')

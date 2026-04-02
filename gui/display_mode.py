@@ -1337,32 +1337,11 @@ class DisplayModeDialog(QDialog):
                 app.point_border_percent      = 0
 
         # ── Track that this slot was explicitly Applied by the user ──────────
-        # _get_slot_palette uses this to decide whether to trust the weight
-        # stored in view_palettes[slot] vs reset to 1.0 (base).
         if not hasattr(app, '_slot_weights_applied'):
             app._slot_weights_applied = set()
         app._slot_weights_applied.add(self.current_slot)
 
-        # palette_changed emit moved to AFTER GPU push below —
-        # emitting here caused sync_palette_to_gpu to fire with border=0
-        # before app.point_border_percent was set, wiping the border value.
-
         fast_path_handled = False
-
-        # if self.current_slot == 0 and idx in [0, 1]:
-        #     target_mode  = "class" if idx == 0 else "rgb"
-        #     current_mode = getattr(app, 'display_mode', None)
-
-        #     if current_mode != target_mode:
-        #         if hasattr(app, 'set_display_mode'):
-        #             print(f"⚡ Mode switch {current_mode} → {target_mode}")
-        #             app.set_display_mode(target_mode)
-        #             QApplication.processEvents()
-        #     else:
-        #         border = float(self.view_borders.get(0, 0)) if is_class_mode else 0.0
-        #         _uam_fast_refresh(app, class_map, border)
-        #         print(f"⚡ Main View: fast_palette_refresh (same mode, no rebuild)")
-        #         fast_path_handled = True
 
         if self.current_slot == 0 and idx == 1:
             # Shaded Classification — trigger shading backend
@@ -1370,15 +1349,40 @@ class DisplayModeDialog(QDialog):
             print("🔳 Borders DISABLED for shaded_class mode (forced to 0%)")
             print("🎨 Display mode → shaded_class")
             try:
-                from gui.shading_display import update_shaded_class, clear_shading_cache
+                from gui.shading_display import (
+                    update_shaded_class, clear_shading_cache, get_cache
+                )
                 azimuth = getattr(app, 'last_shade_azimuth', 45.0)
                 angle   = getattr(app, 'last_shade_angle',   45.0)
                 ambient = getattr(app, 'shade_ambient',       0.25)
-                app._shading_visibility_override = set(
+                new_vis = set(
                     int(c) for c, e in class_map.items() if e.get("show", True)
                 )
-                clear_shading_cache("display mode shading applied")
-                update_shaded_class(app, azimuth, angle, ambient, force_rebuild=True)
+                app._shading_visibility_override = new_vis
+ 
+                # ── Guard: only clear cache + force_rebuild when necessary ──
+                # is_geometry_valid() is weaker than is_fully_current() — it
+                # does NOT require the VTK actor to exist, so it stays True
+                # after switching to "By Classification" and back.
+                _xyz = (app.data.get("xyz")
+                        if hasattr(app, 'data') and app.data else None)
+                _cache = get_cache()
+ 
+                if _xyz is not None and _cache.is_geometry_valid(_xyz, new_vis):
+                    # Geometry (triangulation + normals) is still valid.
+                    # update_shaded_class will take Early-Exit 1 or 2:
+                    #   • actor present + params same → full no-op
+                    #   • actor gone (mode switch) → re-render from cache
+                    #   • params changed → re-shade from cache
+                    print("   ⚡ Geometry cached — skipping clear + force_rebuild")
+                    update_shaded_class(app, azimuth, angle, ambient,
+                                        force_rebuild=False)
+                else:
+                    # Geometry invalid (new data, new visible set, first run).
+                    clear_shading_cache("display mode shading applied")
+                    update_shaded_class(app, azimuth, angle, ambient,
+                                        force_rebuild=True)
+                # ─────────────────────────────────────────────────────────────
             except Exception as _se:
                 print(f"⚠️ Shading backend failed: {_se}")
             fast_path_handled = True

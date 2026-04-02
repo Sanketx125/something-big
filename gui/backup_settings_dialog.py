@@ -26,7 +26,7 @@ class BackupSettingsDialog(QDialog):
         self.setObjectName("BackupSettingsDialog")
         self.setProperty("themeStyledDialog", True)
         self.setWindowTitle("Auto-Backup Settings")
-        self.setFixedSize(620, 340)
+        self.setFixedSize(680, 440)
 
         # Load settings object
         self.settings = QSettings("NakshaAI", "LidarApp")
@@ -70,8 +70,8 @@ class BackupSettingsDialog(QDialog):
         # ============================================
         location_group = QGroupBox("Backup Location")
         location_layout = QVBoxLayout()
-        location_layout.setContentsMargins(8, 6, 8, 6)
-        location_layout.setSpacing(4)
+        location_layout.setContentsMargins(8, 8, 8, 8)
+        location_layout.setSpacing(6)
 
         # Option 1: Same folder
         self.same_folder_radio = QRadioButton("Same folder as original file")
@@ -89,7 +89,7 @@ class BackupSettingsDialog(QDialog):
         self.path_input.setPlaceholderText("Example: C:/Backups/LidarBackups")
         self.path_input.setMinimumWidth(380)
 
-        self.browse_btn = QPushButton("Browse…")
+        self.browse_btn = QPushButton("Browse")
         self.browse_btn.setFixedWidth(90)
         self.browse_btn.setObjectName("secondaryBtn")
         self.browse_btn.setAutoDefault(False)

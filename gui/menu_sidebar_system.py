@@ -625,7 +625,7 @@ class FileRibbon(QWidget):
             show_export_dialog(app)
         except Exception as e:
             print(f"⚠️ Export failed: {e}")
-    
+
     def _import_drawings(self):
         """Show import dialog for drawings"""
         try:
@@ -1300,6 +1300,7 @@ class DrawRibbon(QWidget):
         
         tools.add_button("Smart", "🔮", lambda: self._handle_smartline_click())
         tools.add_button("Line", "📏", lambda: self._handle_line_click())
+        tools.add_button("Ortho", "📐", lambda: self._handle_ortho_click())
         tools.add_button("Polyline", "⬡", lambda: self._handle_polyline_click())
         tools.add_button("Rect",  "⬜", lambda: self._handle_rect_click())
         tools.add_button("Circle","⭕", lambda: self._handle_circle_click())
@@ -1710,6 +1711,17 @@ class DrawRibbon(QWidget):
             # Activate Line
             self.draw_tool_selected.emit("Line")
    
+    # ========================================================================
+    # ORTHO SETTINGS
+    # ========================================================================
+    def _handle_ortho_click(self):
+        """Handle Ortho button click with Shift detection"""
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.ShiftModifier:
+            self._show_tool_permanent_settings('orthopolygon', 'orthopolygon_permanent_mode', 'Orthopolygon')
+        else:
+            self.draw_tool_selected.emit("orthopolygon")
+
     # ========================================================================
     # POLYLINE SETTINGS (existing)
     # ========================================================================
@@ -2611,13 +2623,80 @@ class ByClassDialog(QDialog):
         self.init_ui()
         self.populate_classes()
         self._last_conversion_info = None
+        self._connected_display_dialog = None
 
-        # Display mode connection
-        display_dialog = getattr(self.app, 'display_mode_dialog', getattr(self.app, 'display_dialog', None))
-        if display_dialog:
+        self._connect_display_dialog()
+
+    def _get_display_dialog(self):
+        return getattr(self.app, 'display_mode_dialog', getattr(self.app, 'display_dialog', None))
+
+    def _connect_display_dialog(self):
+        """Keep the dialog wired to the current Display Mode instance."""
+        display_dialog = self._get_display_dialog()
+        if display_dialog is None or display_dialog is self._connected_display_dialog:
+            return
+
+        if self._connected_display_dialog is not None:
             try:
-                display_dialog.classes_loaded.connect(self.on_classes_changed)
-            except Exception: pass
+                self._connected_display_dialog.classes_loaded.disconnect(self.on_classes_changed)
+            except Exception:
+                pass
+
+        try:
+            display_dialog.classes_loaded.connect(self.on_classes_changed)
+        except Exception as e:
+            print(f"⚠️ ByClassDialog could not connect to Display Mode updates: {e}")
+            return
+
+        self._connected_display_dialog = display_dialog
+        print("✅ ByClassDialog connected to display_mode_dialog.classes_loaded")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._connect_display_dialog()
+        self.refresh_class_lists(reason="dialog shown", update_status=False)
+
+    def _get_selected_from_classes(self):
+        return [item.data(Qt.UserRole) for item in self.from_list.selectedItems()]
+
+    def refresh_class_lists(self, reason="classes changed", update_status=True):
+        """Rebuild the class pickers while preserving current selections."""
+        old_from_classes = self._get_selected_from_classes()
+        old_to = self.to_combo.currentData()
+
+        print("\n" + "=" * 60)
+        print(f"🔄 BY CLASS DIALOG: Refresh requested ({reason})")
+        print("=" * 60)
+        print(f"   📋 Saving selections: From={old_from_classes}, To={old_to}")
+
+        self.populate_classes()
+
+        restored_count = 0
+        if old_to is not None:
+            idx = self.to_combo.findData(old_to)
+            if idx >= 0:
+                self.to_combo.setCurrentIndex(idx)
+                restored_count += 1
+
+        if old_from_classes:
+            for code in old_from_classes:
+                for i in range(self.from_list.count()):
+                    item = self.from_list.item(i)
+                    if item.data(Qt.UserRole) == code:
+                        item.setSelected(True)
+                        restored_count += 1
+                        break
+
+        print(f"✅ ByClassDialog updated ({restored_count} selections restored)")
+        print("=" * 60 + "\n")
+
+        if update_status:
+            self.info_label.setText("Class definitions refreshed")
+            if hasattr(self.app, 'statusBar'):
+                self.app.statusBar().showMessage(
+                    "✅ Convert Classes updated with latest PTC definitions",
+                    2000
+                )
 
     
     def perform_undo(self):
@@ -2934,142 +3013,8 @@ class ByClassDialog(QDialog):
         print(f"✅ Populated ByClassDialog with {len(class_list)} classes")
     
     def on_classes_changed(self):
-        """Preserve selections when classes change"""
-        print("\n" + "="*60)
-        print("🔄 INSIDE FENCE DIALOG: Detected PTC change from Display Mode")
-        print("="*60)
-        
-        # Save current selections
-        old_from_classes = self._get_selected_from_classes()
-        old_to = self.to_combo.currentData()
-        has_fences = bool(self.selected_fences)
-        
-        print(f"   📋 Saving selections:")
-        print(f"     From: {old_from_classes}")
-        print(f"     To: {old_to}")
-        print(f"     Fences: {len(self.selected_fences) if has_fences else 0} selected")
-        print(f"     Permanent mode: {self.permanent_fence_mode}")
-        
-        # Rebuild lists
-        self.populate_classes()
-        
-        # Restore To selection
-        restored_count = 0
-        if old_to is not None:
-            idx = self.to_combo.findData(old_to)
-            if idx >= 0:
-                self.to_combo.setCurrentIndex(idx)
-                print(f"     ✅ Restored To: Class {old_to}")
-                restored_count += 1
-        
-        # Restore From selections
-        if old_from_classes:
-            for code in old_from_classes:
-                for i in range(self.from_list.count()):
-                    item = self.from_list.item(i)
-                    if item.data(Qt.UserRole) == code:
-                        self.from_list.setItemSelected(item, True)
-                        restored_count += 1
-                        break
-            print(f"     ✅ Restored {len(old_from_classes)} From classes")
-        
-        # ✅ NEW: Schedule fence highlight restoration AFTER Display Mode finishes
-        if has_fences and self.selected_fences:
-            print(f"     🔵 Scheduling fence highlight restoration...")
-            from PySide6.QtCore import QTimer
-            # Use single-shot timer to restore highlights after current event loop completes
-            QTimer.singleShot(100, self._restore_fence_highlights)
-            restored_count += 1
-        
-        print(f"✅ InsideFenceDialog updated ({restored_count} settings restored)")
-        print("="*60 + "\n")
-        
-        self.on_from_selection_changed()
-        if hasattr(self.app, 'statusBar'):
-            self.app.statusBar().showMessage(
-                "✅ Inside Fence updated with new definitions",
-                2000
-            )
-    
-    def _restore_fence_highlights(self):
-        """Re-add blue highlights for selected fences (called after Display Mode refresh)"""
-        if not self.selected_fences:
-            return
-        
-        print(f"\n🔵 RESTORING FENCE HIGHLIGHTS...")
-        print(f"   Number of fences to restore: {len(self.selected_fences)}")
-        
-        try:
-            # Clear any existing highlight actors first
-            if hasattr(self, '_selection_highlight_actors'):
-                for actor in self._selection_highlight_actors:
-                    try:
-                        self.app.vtk_widget.renderer.RemoveActor(actor)
-                    except Exception:
-                        pass
-            
-            self._selection_highlight_actors = []
-            
-            # Re-create blue highlights for all selected fences
-            for idx, fence in enumerate(self.selected_fences):
-                coords = fence.get('coords', [])
-                fence_type = fence.get('type', 'unknown')
-                
-                print(f"   🔵 Restoring fence #{idx+1} ({fence_type}, {len(coords)} points)")
-                
-                # Create blue highlight actor
-                if hasattr(self.app, 'digitizer'):
-                    highlight_actor = self.app.digitizer._make_polyline_actor(
-                        coords,
-                        color=(0, 0.5, 1),  # Blue
-                        width=5
-                    )
-                else:
-                    # Fallback: create basic actor
-                    import vtk
-                    import numpy as np
-                    
-                    if isinstance(coords, list):
-                        coords = np.array(coords)
-                    
-                    points = vtk.vtkPoints()
-                    for c in coords:
-                        points.InsertNextPoint(c)
-                    
-                    line = vtk.vtkPolyLine()
-                    line.GetPointIds().SetNumberOfIds(len(coords))
-                    for i in range(len(coords)):
-                        line.GetPointIds().SetId(i, i)
-                    
-                    cells = vtk.vtkCellArray()
-                    cells.InsertNextCell(line)
-                    
-                    polydata = vtk.vtkPolyData()
-                    polydata.SetPoints(points)
-                    polydata.SetLines(cells)
-                    
-                    mapper = vtk.vtkPolyDataMapper()
-                    mapper.SetInputData(polydata)
-                    
-                    highlight_actor = vtk.vtkActor()
-                    highlight_actor.SetMapper(mapper)
-                    highlight_actor.GetProperty().SetColor(0, 0.5, 1)  # Blue
-                    highlight_actor.GetProperty().SetLineWidth(5)
-                    highlight_actor.SetUserData("FENCE_HIGHLIGHT") 
-                    self.app.vtk_widget.renderer.AddActor(highlight_actor)
-                    self._selection_highlight_actors.append(highlight_actor)
-                    print(f"      ✅ Actor added to renderer")
-            
-            # Force render to show highlights
-            self.app.vtk_widget.render()
-            
-            print(f"✅ Restored {len(self.selected_fences)} fence highlight(s)")
-            print(f"   Total highlight actors: {len(self._selection_highlight_actors)}\n")
-            
-        except Exception as e:
-            print(f"❌ Fence highlight restore failed: {e}")
-            import traceback
-            traceback.print_exc()
+        """Refresh class lists when Display Mode loads a different PTC."""
+        self.refresh_class_lists(reason="PTC changed in Display Mode", update_status=True)
     
     def perform_conversion(self):
         """Perform the class conversion with visibility-aware refresh"""

@@ -627,6 +627,402 @@ def import_drawings_from_shapefile(app, input_path: str) -> bool:
         return False
 
 
+# Normalized export path used by the File ribbon actions.
+def _normalize_drawing_coords(raw_coords) -> List[Tuple[float, float, float]]:
+    coords: List[Tuple[float, float, float]] = []
+    if raw_coords is None:
+        return coords
+
+    if hasattr(raw_coords, "tolist"):
+        raw_coords = raw_coords.tolist()
+
+    for coord in raw_coords:
+        if hasattr(coord, "tolist"):
+            coord = coord.tolist()
+        if not isinstance(coord, (list, tuple)) or len(coord) < 2:
+            continue
+
+        x = float(coord[0])
+        y = float(coord[1])
+        z = float(coord[2]) if len(coord) > 2 else 0.0
+        coords.append((x, y, z))
+    return coords
+
+
+def _normalize_rgb_triplet(color) -> Tuple[int, int, int]:
+    if not isinstance(color, (list, tuple)) or len(color) < 3:
+        return (255, 255, 255)
+
+    try:
+        values = [float(color[0]), float(color[1]), float(color[2])]
+    except (TypeError, ValueError):
+        return (255, 255, 255)
+
+    if max(abs(v) for v in values) <= 1.0:
+        values = [v * 255.0 for v in values]
+
+    return tuple(max(0, min(255, int(round(v)))) for v in values)
+
+
+def _extract_drawing_color(drawing: dict) -> Tuple[int, int, int]:
+    return _normalize_rgb_triplet(
+        drawing.get("color")
+        or drawing.get("original_color")
+        or drawing.get("original_text_color")
+        or (255, 255, 255)
+    )
+
+
+def _extract_circle_center_and_radius(
+    drawing: dict,
+    coords: List[Tuple[float, float, float]],
+) -> Tuple[Optional[Tuple[float, float]], float]:
+    center = drawing.get("center")
+    radius = float(drawing.get("radius", 0.0) or 0.0)
+
+    if isinstance(center, (list, tuple)) and len(center) >= 2:
+        center_xy = (float(center[0]), float(center[1]))
+    elif coords:
+        ring = coords[:-1] if len(coords) > 1 and coords[0][:2] == coords[-1][:2] else coords
+        center_xy = (
+            float(sum(pt[0] for pt in ring) / len(ring)),
+            float(sum(pt[1] for pt in ring) / len(ring)),
+        )
+    else:
+        center_xy = None
+
+    if center_xy is not None and radius <= 0.0 and coords:
+        ring = coords[:-1] if len(coords) > 1 and coords[0][:2] == coords[-1][:2] else coords
+        radius = max(
+            (
+                float(np.hypot(pt[0] - center_xy[0], pt[1] - center_xy[1]))
+                for pt in ring
+            ),
+            default=0.0,
+        )
+
+    return center_xy, radius
+
+
+def _build_polygon_geometry(coords, polygon_cls):
+    # ── FIX: preserve Z if coords carry it ─────────────────────────────────
+    has_z = bool(coords) and len(coords[0]) >= 3
+    ring = (
+        [(pt[0], pt[1], pt[2]) for pt in coords]
+        if has_z
+        else [(pt[0], pt[1]) for pt in coords]
+    )
+    if len(ring) < 3:
+        return None
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+    if len(ring) < 4:
+        return None
+
+    geom = polygon_cls(ring)
+    if geom.is_empty:
+        return None
+
+    if not geom.is_valid:
+        geom = geom.buffer(0)
+        if geom.is_empty:
+            return None
+
+    if geom.geom_type == "MultiPolygon":
+        geom = max(geom.geoms, key=lambda part: part.area, default=None)
+
+    if geom is None or geom.geom_type != "Polygon" or not geom.is_valid:
+        return None
+    return geom
+
+
+def _drawing_to_shapefile_feature(drawing: dict):
+    """
+    Convert ONE digitize drawing dict into a (bucket, feature) pair ready
+    for GeoDataFrame insertion.
+ 
+    bucket  : "points" | "lines" | "polygons" | None
+    feature : dict with 'geometry' + property columns, or None on failure
+ 
+    Geometry mapping (matches how digitize_tools.py stores shapes):
+      text        → Point   (anchor position)
+      circle      → Polygon (the stored circle outline in coords)
+      rectangle   → Polygon (the 5-point closed outline in coords)
+      polygon     → Polygon
+      polyline    → Polygon (digitize polyline is ALWAYS a closed loop)
+      freehand    → Polygon when closed, LineString otherwise
+      smartline   → LineString
+      line        → LineString
+      line_segment→ LineString
+    """
+    from shapely.geometry import LineString, Point, Polygon
+ 
+    shape_type = str(drawing.get("type", "unknown") or "unknown")
+ 
+    # Read coords from whichever key the drawing uses
+    # (digitize tools use "coords"; imported drawings also set "coordinates")
+    raw = drawing.get("coordinates") or drawing.get("coords") or []
+    coords = _normalize_drawing_coords(raw)
+ 
+    color_r, color_g, color_b = _extract_drawing_color(drawing)
+ 
+    props = {
+        "type":    shape_type,
+        "color_r": color_r,
+        "color_g": color_g,
+        "color_b": color_b,
+        "text":    str(drawing.get("text", "") or ""),
+        "radius":  float(drawing.get("radius", 0.0) or 0.0),
+        # Preserve line width and style so a future re-import can restore them
+        "lwidth":  int(drawing.get("original_width", 2) or 2),
+        "lstyle":  str(drawing.get("original_style", "solid") or "solid"),
+    }
+ 
+    # ── TEXT ─────────────────────────────────────────────────────────────────
+    if shape_type == "text":
+        if not coords:
+            return None, None
+        x, y, _ = coords[0]
+        return "points", {"geometry": Point(x, y), **props}
+ 
+    # ── CIRCLE ───────────────────────────────────────────────────────────────
+    # digitize_tools stores the full circle outline (n+1 closed points) in
+    # drawing["coords"].  Export that as a Polygon so the shape is preserved
+    # exactly.  We also keep the radius attribute for reference.
+    if shape_type == "circle":
+        if len(coords) >= 3:
+            geom = _build_polygon_geometry(coords, Polygon)
+            if geom is not None:
+                props["radius"] = float(drawing.get("radius", 0.0) or 0.0)
+                return "polygons", {"geometry": geom, **props}
+        # Fallback: center point only (e.g. imported circle with just 1 coord)
+        center_xy, radius = _extract_circle_center_and_radius(drawing, coords)
+        if center_xy is None:
+            return None, None
+        props["radius"] = radius
+        return "points", {"geometry": Point(center_xy[0], center_xy[1]), **props}
+ 
+    # ── RECTANGLE ────────────────────────────────────────────────────────────
+    # Two-corner format → expand to 5-point closed outline first
+    if shape_type == "rectangle" and len(coords) == 2:
+        p1, p2 = coords[0], coords[1]
+        coords = [
+            (p1[0], p1[1], p1[2]),
+            (p2[0], p1[1], p1[2]),
+            (p2[0], p2[1], p2[2]),
+            (p1[0], p2[1], p2[2]),
+            (p1[0], p1[1], p1[2]),
+        ]
+ 
+    if shape_type in {"polygon", "rectangle"}:
+        geom = _build_polygon_geometry(coords, Polygon)
+        if geom is None:
+            return None, None
+        return "polygons", {"geometry": geom, **props}
+ 
+    # ── POLYLINE ─────────────────────────────────────────────────────────────
+    # In digitize_tools, the polyline tool ALWAYS produces a closed loop
+    # (first point == last point).  Export as Polygon, not LineString, so
+    # the enclosed area is preserved and the round-trip import is correct.
+    if shape_type == "polyline":
+        if len(coords) >= 3:
+            geom = _build_polygon_geometry(coords, Polygon)
+            if geom is not None:
+                return "polygons", {"geometry": geom, **props}
+        # Safety fallback for very short or degenerate polylines
+        if len(coords) >= 2:
+            return "lines", {
+                "geometry": LineString([(pt[0], pt[1]) for pt in coords]),
+                **props,
+            }
+        return None, None
+ 
+    # ── FREEHAND ─────────────────────────────────────────────────────────────
+    # digitize freehand is auto-closed on finalisation; export as Polygon.
+    if shape_type == "freehand":
+        if len(coords) >= 3 and coords[0][:2] == coords[-1][:2]:
+            geom = _build_polygon_geometry(coords, Polygon)
+            if geom is not None:
+                return "polygons", {"geometry": geom, **props}
+        if len(coords) >= 2:
+            return "lines", {
+                "geometry": LineString([(pt[0], pt[1]) for pt in coords]),
+                **props,
+            }
+        return None, None
+ 
+    # ── LINE TYPES ────────────────────────────────────────────────────────────
+    if shape_type in {"line", "line_segment", "smartline"}:
+        if len(coords) < 2:
+            return None, None
+        return "lines", {
+            "geometry": LineString([(pt[0], pt[1]) for pt in coords]),
+            **props,
+        }
+ 
+    # ── GENERIC FALLBACK ─────────────────────────────────────────────────────
+    if len(coords) >= 3 and coords[0][:2] == coords[-1][:2]:
+        geom = _build_polygon_geometry(coords, Polygon)
+        if geom is not None:
+            return "polygons", {"geometry": geom, **props}
+ 
+    if len(coords) >= 2:
+        return "lines", {
+            "geometry": LineString([(pt[0], pt[1]) for pt in coords]),
+            **props,
+        }
+ 
+    if len(coords) == 1:
+        x, y, _ = coords[0]
+        return "points", {"geometry": Point(x, y), **props}
+ 
+    return None, None
+
+
+def _geometry_to_linestring(geom, shape_type: str):
+    """
+    Convert ANY Shapely geometry to a LineString for single-file SHP export.
+    This is the MicroStation "linework" approach — everything is represented as
+    line work in the output Shapefile so all shapes go into one file.
+
+    Conversion rules:
+      LineString  → returned as-is
+      Polygon     → exterior ring as LineString (closing point removed)
+      Point       → two-point stub line [(x,y),(x+tiny,y)] so SHP accepts it
+    """
+    from shapely.geometry import LineString, Polygon, Point
+
+    if geom is None or geom.is_empty:
+        return None
+
+    gtype = geom.geom_type
+
+    if gtype == "LineString":
+        return geom
+
+    if gtype == "Polygon":
+        # Extract exterior ring; drop the repeated closing point so shapely
+        # gives us a clean open ring which LineString handles correctly.
+        ring = list(geom.exterior.coords)
+        if len(ring) > 1 and ring[0] == ring[-1]:
+            ring = ring[:-1]
+        # Re-close it so the outline looks identical to the drawn polygon.
+        ring.append(ring[0])
+        if len(ring) < 2:
+            return None
+        return LineString([(pt[0], pt[1]) for pt in ring])
+
+    if gtype == "Point":
+        # Represent a point as an infinitesimally small line stub.
+        # The 1e-9 offset is invisible at any real-world scale but satisfies
+        # the Shapefile requirement that a LineString has at least 2 different points.
+        x, y = geom.x, geom.y
+        return LineString([(x, y), (x + 1e-9, y)])
+
+    # MultiGeometry fallback — convert first part
+    if hasattr(geom, "geoms"):
+        for part in geom.geoms:
+            result = _geometry_to_linestring(part, shape_type)
+            if result is not None:
+                return result
+
+    return None
+
+
+def export_drawings_to_shapefile(app, output_path: str) -> bool:
+    """
+    Export ALL drawings to a SINGLE Shapefile (.shp).
+
+    Uses the MicroStation "linework" approach: every geometry type
+    (point, line, polyline, polygon, rectangle, circle, text) is converted
+    to a LineString so that all features share one common geometry type and
+    can be stored in a single .shp file without any splitting.
+
+    Attribute columns preserved per feature:
+      type, color_r, color_g, color_b, text, radius, lwidth, lstyle
+    """
+    try:
+        import geopandas as gpd
+        from shapely.geometry import LineString
+
+        print(f"\n{'='*60}")
+        print("📤 EXPORTING DRAWINGS TO SINGLE SHAPEFILE (Linework mode)")
+        print(f"   Output: {output_path}")
+
+        digitizer = getattr(app, "digitizer", None)
+        drawings = list(getattr(digitizer, "drawings", []) or [])
+        if not drawings:
+            print("   ⚠️  No drawings to export")
+            return False
+
+        print(f"   📊 Total drawings: {len(drawings)}")
+
+        all_features = []   # Everything goes here — single list, single file
+        skipped = 0
+
+        for idx, drawing in enumerate(drawings, start=1):
+            shape_type = drawing.get("type", "unknown")
+            try:
+                # ── Step 1: classify into bucket + get native geometry ──
+                bucket, feature = _drawing_to_shapefile_feature(drawing)
+                if bucket is None or feature is None:
+                    print(f"   ⚠️  Skipping drawing {idx} ({shape_type}): could not build geometry")
+                    skipped += 1
+                    continue
+
+                native_geom = feature["geometry"]
+                props = {k: v for k, v in feature.items() if k != "geometry"}
+
+                # ── Step 2: force to LineString ─────────────────────────
+                line_geom = _geometry_to_linestring(native_geom, shape_type)
+                if line_geom is None or line_geom.is_empty:
+                    print(f"   ⚠️  Skipping drawing {idx} ({shape_type}): linework conversion failed")
+                    skipped += 1
+                    continue
+
+                all_features.append({"geometry": line_geom, **props})
+                print(f"   ✅ Drawing {idx} ({shape_type}) → LineString "
+                      f"({len(list(line_geom.coords))} pts)")
+
+            except Exception as e:
+                print(f"   ❌ Drawing {idx} ({shape_type}) failed: {e}")
+                import traceback
+                traceback.print_exc()
+                skipped += 1
+
+        if not all_features:
+            print("   ❌ No valid geometries to export")
+            return False
+
+        # ── Step 3: build GeoDataFrame and save ────────────────────────
+        crs = (f"EPSG:{app.project_crs_epsg}"
+               if getattr(app, "project_crs_epsg", None) else "EPSG:4326")
+        print(f"   🌍 CRS: {crs}")
+
+        # Ensure output path ends in .shp
+        shp_path = str(Path(output_path).with_suffix(".shp"))
+
+        gdf = gpd.GeoDataFrame(all_features, crs=crs)
+        gdf.to_file(shp_path, driver="ESRI Shapefile")
+
+        print(f"\n   ✅ Saved {len(all_features)} feature(s) to single file:")
+        print(f"      {shp_path}")
+        if skipped:
+            print(f"   ⚠️  {skipped} drawing(s) were skipped")
+        print(f"{'='*60}\n")
+        return True
+
+    except ImportError as e:
+        print(f"   ❌ Missing required library: {e}")
+        print("   💡 Install: pip install geopandas shapely")
+        return False
+    except Exception as e:
+        print(f"   ❌ Shapefile export failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 # ============================================================================
 # MAIN EXPORT DIALOG
 # ============================================================================
@@ -960,140 +1356,256 @@ def create_vtk_actor_from_drawing(drawing, renderer ,z_offset=10.0):
         traceback.print_exc()
         return None
     
+
+def _infer_import_scene_z(app) -> float:
+    """Choose a visible Z plane for imported vector data when the source has no Z."""
+    try:
+        data = getattr(app, "data", None)
+        if isinstance(data, dict):
+            xyz = data.get("xyz")
+            if xyz is not None:
+                xyz = np.asarray(xyz)
+                if xyz.ndim == 2 and xyz.shape[1] >= 3 and len(xyz) > 0:
+                    return float(np.median(xyz[:, 2]))
+    except Exception:
+        pass
+
+    try:
+        renderer = getattr(getattr(app, "vtk_widget", None), "renderer", None)
+        if renderer is not None:
+            return float(renderer.GetActiveCamera().GetFocalPoint()[2])
+    except Exception:
+        pass
+
+    return 0.0
+
+
+def _coords_to_scene_z(coord_iterable, default_z: float):
+    coords = []
+    for coord in coord_iterable:
+        if len(coord) >= 3:
+            z = float(coord[2])
+        else:
+            z = float(default_z)
+        coords.append([float(coord[0]), float(coord[1]), z])
+    return coords
+
     
 def import_drawings_from_shapefile_with_rendering(app, input_path: str) -> bool:
     """
-    Import shapefile and ensure VTK actors are created and visible
+    Import shapefile and reconstruct VTK actors for every feature.
+ 
+    Geometry → digitize type mapping:
+      Point   → type from 'type' attribute (default 'circle')
+      Line    → type from 'type' attribute (default 'smartline')
+      Polygon → type from 'type' attribute (default 'polygon')
+ 
+    Supports all types written by the export function above:
+      circle, rectangle, polyline, freehand, polygon, smartline,
+      line, line_segment, text.
     """
     try:
         import geopandas as gpd
         from pathlib import Path
-        
+ 
         print(f"\n{'='*60}")
         print(f"📥 IMPORTING DRAWINGS FROM SHAPEFILE")
         print(f"   Path: {input_path}")
-        
-        # ✅ Verify digitizer exists
-        if not hasattr(app, 'digitizer'):
-            print(f"   ❌ app.digitizer does not exist!")
+ 
+        if not hasattr(app, 'digitizer') or not app.digitizer:
+            print(f"   ❌ app.digitizer not available")
             return False
-        
-        if not app.digitizer:
-            print(f"   ❌ app.digitizer is None!")
-            return False
-        
+ 
         if not hasattr(app.digitizer, 'add_drawing_from_data'):
-            print(f"   ❌ app.digitizer.add_drawing_from_data method does not exist!")
+            print(f"   ❌ app.digitizer.add_drawing_from_data not available")
             return False
-        
-        print(f"   ✅ Digitizer found and ready")
-        
+ 
         base_path = Path(input_path).with_suffix('')
+        scene_z   = _infer_import_scene_z(app)
+        print(f"   📐 Scene Z = {scene_z:.2f}")
+ 
         imported_count = 0
-        failed_count = 0
-        
-        # Try to load all geometry types
-        for suffix in ['_points', '_lines', '_polygons', '']:
+        failed_count   = 0
+        imported_points = []
+ 
+        # Build the list of candidate SHP files to try.
+        # Priority: single-file (the new format) first, then legacy split files
+        # for backward-compatibility with older exports.
+        single_file = str(base_path) + ".shp"
+        legacy_suffixes = ['_points', '_lines', '_polygons']
+        candidate_files = []
+
+        if Path(single_file).exists():
+            # New single-file export — load it directly
+            candidate_files.append(single_file)
+        else:
+            # Fall back to the old split-file format
+            for suffix in legacy_suffixes:
+                p = f"{base_path}{suffix}.shp"
+                if Path(p).exists():
+                    candidate_files.append(p)
+            # Also check bare stem (no suffix), just in case
+            bare = f"{base_path}.shp"
+            if Path(bare).exists() and bare not in candidate_files:
+                candidate_files.append(bare)
+
+        if not candidate_files:
+            print(f"   ❌ No matching .shp file(s) found near: {input_path}")
+            return False
+
+        for shp_path in candidate_files:
+            print(f"\n   📂 Loading: {shp_path}")
             try:
-                shp_path = f"{base_path}{suffix}.shp"
-                if not Path(shp_path).exists():
-                    continue
-                
-                print(f"\n   📂 Loading: {shp_path}")
                 gdf = gpd.read_file(shp_path)
-                print(f"   📊 Found {len(gdf)} features")
-                
-                for idx, row in gdf.iterrows():
-                    try:
-                        geom = row.geometry
-                        
-                        # Build drawing data dict
-                        drawing_data = {
-                            'color': (
-                                int(row.get('color_r', 255)),
-                                int(row.get('color_g', 255)),
-                                int(row.get('color_b', 255))
-                            ),
-                            'text': str(row.get('text', '')),
-                            'radius': float(row.get('radius', 5.0))
-                        }
-                        
-                        # Convert geometry to coordinates
-                        if geom.geom_type == 'Point':
-                            drawing_data['type'] = str(row.get('type', 'circle'))
-                            drawing_data['coordinates'] = [[float(geom.x), float(geom.y), 0.0]]
-                        
-                        elif geom.geom_type == 'LineString':
-                            drawing_data['type'] = str(row.get('type', 'polyline'))
-                            drawing_data['coordinates'] = [
-                                [float(x), float(y), 0.0] for x, y in geom.coords
-                            ]
-                        
-                        elif geom.geom_type == 'Polygon':
-                            drawing_data['type'] = str(row.get('type', 'polygon'))
-                            # ✅ Keep ALL points including closing point
-                            coords = list(geom.exterior.coords)
-                            drawing_data['coordinates'] = [
-                                [float(x), float(y), 0.0] for x, y in coords
-                            ]
-                        
-                        else:
-                            print(f"      ⚠️ Unsupported geometry type: {geom.geom_type}")
-                            failed_count += 1
-                            continue
-                        
-                        # ✅ USE DIGITIZER METHOD (not direct actor creation)
-                        print(f"      🔄 Importing {drawing_data['type']}...")
-                        
-                        try:
-                            success = app.digitizer.add_drawing_from_data(drawing_data)
-                            
-                            if success:
-                                imported_count += 1
-                            else:
-                                failed_count += 1
-                        except Exception as e:
-                            failed_count += 1
-                            print(f"      ❌ Exception: {e}")
-                            import traceback
-                            traceback.print_exc()
-                        
-                    except Exception as e:
-                        failed_count += 1
-                        print(f"      ❌ Failed to process feature: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        continue
-                        
             except Exception as e:
-                print(f"   ⚠️ Could not load {suffix}: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"   ⚠️ Could not read {shp_path}: {e}")
                 continue
-        
-        # Summary
-        print(f"\n   📊 Import Summary:")
-        print(f"      Successful: {imported_count}")
-        print(f"      Failed: {failed_count}")
-        
-        # Force render
+ 
+            print(f"   📊 {len(gdf)} feature(s)")
+ 
+            for idx, row in gdf.iterrows():
+                try:
+                    geom = row.geometry
+                    if geom is None or geom.is_empty:
+                        continue
+ 
+                    # ── read stored attributes ────────────────────────────
+                    try:
+                        color_r = int(row.get('color_r', 255))
+                    except (TypeError, ValueError):
+                        color_r = 255
+                    try:
+                        color_g = int(row.get('color_g', 255))
+                    except (TypeError, ValueError):
+                        color_g = 255
+                    try:
+                        color_b = int(row.get('color_b', 255))
+                    except (TypeError, ValueError):
+                        color_b = 255
+                    try:
+                        radius = float(row.get('radius', 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        radius = 0.0
+                    try:
+                        lwidth = int(row.get('lwidth', 2) or 2)
+                    except (TypeError, ValueError):
+                        lwidth = 2
+                    try:
+                        lstyle = str(row.get('lstyle', 'solid') or 'solid')
+                    except (TypeError, ValueError):
+                        lstyle = 'solid'
+ 
+                    drawing_data = {
+                        'color':          (color_r, color_g, color_b),
+                        'text':           str(row.get('text', '') or ''),
+                        'radius':         radius,
+                        'original_width': lwidth,
+                        'original_style': lstyle,
+                    }
+ 
+                    # ── convert geometry to coordinates + assign type ─────
+                    if geom.geom_type == 'Point':
+                        # Default: circle (text has its own type stored)
+                        stored_type = str(row.get('type', '') or '')
+                        drawing_data['type'] = stored_type or 'circle'
+ 
+                        has_z = getattr(geom, 'has_z', False)
+                        raw = [(geom.x, geom.y, geom.z)] if has_z else [(geom.x, geom.y)]
+                        drawing_data['coordinates'] = _coords_to_scene_z(raw, scene_z)
+                        imported_points.extend(drawing_data['coordinates'])
+ 
+                    elif geom.geom_type == 'LineString':
+                        # Default: smartline (open multi-point line)
+                        # NOTE: 'polyline' is never a LineString after our fix —
+                        # it's now a Polygon.  But if someone imports an external
+                        # shapefile without our type attribute, default to smartline
+                        # (an open line) rather than polyline (a closed loop).
+                        stored_type = str(row.get('type', '') or '')
+                        drawing_data['type'] = stored_type or 'smartline'
+ 
+                        line_coords = _coords_to_scene_z(list(geom.coords), scene_z)
+                        drawing_data['coordinates'] = line_coords
+                        imported_points.extend(line_coords)
+ 
+                    elif geom.geom_type == 'Polygon':
+                        # Could be: circle, polyline, rectangle, freehand, polygon
+                        stored_type = str(row.get('type', '') or '')
+                        drawing_data['type'] = stored_type or 'polygon'
+ 
+                        # Use exterior ring; shapely already closes it (first==last)
+                        poly_coords = _coords_to_scene_z(
+                            list(geom.exterior.coords), scene_z
+                        )
+                        drawing_data['coordinates'] = poly_coords
+                        imported_points.extend(poly_coords)
+ 
+                        # Pass radius for circles so add_drawing_from_data can use it
+                        if stored_type == 'circle' and radius > 0:
+                            drawing_data['radius'] = radius
+ 
+                    else:
+                        # MultiPolygon, MultiLineString, etc. — skip
+                        print(f"      ⚠️ Unsupported geometry: {geom.geom_type}")
+                        failed_count += 1
+                        continue
+ 
+                    # ── send to digitizer ─────────────────────────────────
+                    print(f"      ← {drawing_data['type']} "
+                          f"({len(drawing_data['coordinates'])} pts)")
+ 
+                    success = app.digitizer.add_drawing_from_data(drawing_data)
+                    if success:
+                        imported_count += 1
+                    else:
+                        failed_count += 1
+                        print(f"      ❌ add_drawing_from_data returned False")
+ 
+                except Exception as e:
+                    failed_count += 1
+                    print(f"      ❌ Feature error: {e}")
+                    import traceback
+                    traceback.print_exc()
+ 
+        # ── final render + camera ─────────────────────────────────────────
+        print(f"\n   📊 Import summary: ✅ {imported_count}  ❌ {failed_count}")
+ 
         if imported_count > 0:
-            print(f"\n   🎨 Rendering scene...")
-            
+            print(f"   🎨 Rendering scene...")
             try:
-                if hasattr(app, 'vtk_widget') and app.vtk_widget:
-                    app.vtk_widget.GetRenderWindow().Render()
-                    print(f"   ✅ Render complete")
-            except Exception as e:
-                print(f"   ⚠️ Render error: {e}")
-        
+                if hasattr(app.digitizer, 'overlay_renderer') and app.digitizer.overlay_renderer:
+                    app.digitizer.overlay_renderer.Modified()
+                    app.digitizer.overlay_renderer.ResetCameraClippingRange()
+                app.digitizer.renderer.Modified()
+                app.digitizer.renderer.ResetCameraClippingRange()
+            except Exception:
+                pass
+ 
+            if hasattr(app, 'vtk_widget') and app.vtk_widget:
+                rw = app.vtk_widget.GetRenderWindow()
+                renderer = rw.GetRenderers().GetFirstRenderer()
+                if renderer:
+                    renderer.ResetCameraClippingRange()
+                rw.Render()
+                try:
+                    app.vtk_widget.render()
+                except Exception:
+                    pass
+ 
+            # Fit view to imported drawings
+            fit_view = getattr(app, 'fit_view', None)
+            if imported_points and callable(fit_view):
+                try:
+                    fit_view()
+                    print(f"   ✅ View fitted to imported drawings")
+                except Exception as e:
+                    print(f"   ⚠️ fit_view: {e}")
+ 
         print(f"{'='*60}\n")
-        
         return imported_count > 0
-        
+ 
     except ImportError as e:
         print(f"   ❌ Missing library: {e}")
-        print(f"   💡 Install: pip install geopandas shapely")
+        print(f"   💡 pip install geopandas shapely")
         return False
     except Exception as e:
         print(f"   ❌ Shapefile import failed: {e}")
@@ -1637,175 +2149,10 @@ def export_drawings_to_tiff(app, output_path: str) -> bool:
         traceback.print_exc()
         return False
 
-# def import_drawings_from_tiff(app, input_path: str) -> bool:
-#     """
-#     Import drawings from GeoTIFF - vectorizes raster data.
-#     """
-#     # FIRST: Confirm function is called
-#     print("\n" + "="*60)
-#     print("🚀 IMPORT_DRAWINGS_FROM_TIFF CALLED")
-#     print(f"   Input path: {input_path}")
-#     print("="*60)
-#     try:
-#         import rasterio
-#         from rasterio.features import shapes
-#         from shapely.geometry import shape, Polygon
-        
-#         print(f"\n{'='*60}")
-#         print(f"📥 IMPORTING DRAWINGS FROM TIFF")
-#         print(f"   Path: {input_path}")
-        
-#         # Verify file exists
-#         from pathlib import Path
-#         if not Path(input_path).exists():
-#             print(f"   ❌ File does not exist: {input_path}")
-#             return False
-        
-#         print(f"   📂 Opening TIFF file...")
-#         with rasterio.open(input_path) as src:
-#             print(f"   ✅ TIFF opened successfully")
-#             print(f"   📊 Raster info:")
-#             print(f"      - Size: {src.width}x{src.height}")
-#             print(f"      - Bands: {src.count}")
-#             print(f"      - CRS: {src.crs}")
-#             print(f"      - Bounds: {src.bounds}")
-            
-#             # Read first band
-#             image = src.read(1)
-#             transform = src.transform
-            
-#             print(f"   🔍 Raster value range: {image.min()} to {image.max()}")
-            
-#             # Check if raster has any non-zero values
-#             non_zero = (image > 0).sum()
-#             print(f"   📊 Non-zero pixels: {non_zero} / {image.size}")
-            
-#             if non_zero == 0:
-#                 print(f"   ⚠️ TIFF is empty (all pixels are zero)")
-#                 return False
-            
-#             # Vectorize raster
-#             print(f"   🔄 Vectorizing raster data...")
-#             mask = image > 0
-#             results = list(shapes(image, mask=mask, transform=transform))
-            
-#             print(f"   ✅ Found {len(results)} shapes")
-            
-#             if not results:
-#                 print(f"   ⚠️ No shapes extracted from TIFF")
-#                 return False
-            
-#             imported_count = 0
-#             failed_count = 0
-            
-#             for idx, (geom, value) in enumerate(results):
-#                 try:
-#                     poly = shape(geom)
-                    
-#                     print(f"   🔍 Processing shape {idx+1}:")
-#                     print(f"      Geometry type: {poly.geom_type}")
-#                     print(f"      Area: {poly.area:.6f}")
-#                     print(f"      Pixel value: {value}")
-                    
-#                     # Skip very small polygons (noise)
-#                     if poly.area < 0.0001:
-#                         print(f"      ⚠️ Skipped (area too small: {poly.area:.6f})")
-#                         continue
-                    
-#                     # Convert to drawing format
-#                     if poly.geom_type == 'Polygon':
-#                         coords = list(poly.exterior.coords)
-#                         print(f"      → Polygon has {len(coords)} coordinates")
-#                         print(f"      → First coord: {coords[0]}")
-#                         print(f"      → Last coord: {coords[-1]}")
-                        
-#                         drawing = {
-#                             'type': 'polygon',
-#                             'coordinates': [[float(x), float(y), 0.0] for x, y in coords[:-1]],
-#                             'color': (255, 255, 0)  # Yellow for imported
-#                         }
-                        
-#                         print(f"      → Drawing dict created: {len(drawing['coordinates'])} coords")
-                        
-#                         if hasattr(app, 'digitizer') and app.digitizer:
-#                             print(f"      → Calling app.digitizer.add_drawing_from_data...")
-#                             success = app.digitizer.add_drawing_from_data(drawing)
-#                             print(f"      → Result: {success}")
-                            
-#                             if success:
-#                                 imported_count += 1
-#                                 print(f"      ✅ Successfully imported")
-#                             else:
-#                                 failed_count += 1
-#                                 print(f"      ❌ Failed to import")
-#                         else:
-#                             print(f"      ❌ No digitizer found")
-#                             return False
-                    
-#                     elif poly.geom_type == 'MultiPolygon':
-#                         print(f"      → MultiPolygon with {len(poly.geoms)} parts")
-#                         # Handle multipolygons
-#                         for sub_idx, sub_poly in enumerate(poly.geoms):
-#                             coords = list(sub_poly.exterior.coords)
-#                             print(f"         Part {sub_idx+1}: {len(coords)} coordinates, area: {sub_poly.area:.6f}")
-                            
-#                             if sub_poly.area < 0.0001:
-#                                 print(f"         ⚠️ Skipped (area too small)")
-#                                 continue
-                            
-#                             drawing = {
-#                                 'type': 'polygon',
-#                                 'coordinates': [[float(x), float(y), 0.0] for x, y in coords[:-1]],
-#                                 'color': (255, 255, 0)
-#                             }
-                            
-#                             if hasattr(app, 'digitizer') and app.digitizer:
-#                                 success = app.digitizer.add_drawing_from_data(drawing)
-#                                 if success:
-#                                     imported_count += 1
-#                                     print(f"         ✅ Successfully imported")
-#                                 else:
-#                                     failed_count += 1
-#                                     print(f"         ❌ Failed to import")
-#                     else:
-#                         print(f"      ⚠️ Unsupported geometry type: {poly.geom_type}")
-                
-#                 except Exception as e:
-#                     failed_count += 1
-#                     print(f"   ❌ Failed to import shape {idx}: {e}")
-#                     import traceback
-#                     traceback.print_exc()
-#                     continue
-        
-#         # Force render update
-#         if imported_count > 0:
-#             print(f"\n   🎨 Updating display...")
-#             if hasattr(app, 'vtk_widget') and app.vtk_widget:
-#                 app.vtk_widget.GetRenderWindow().Render()
-            
-#             print(f"\n   ✅ Import Summary:")
-#             print(f"      - Successful: {imported_count}")
-#             print(f"      - Failed: {failed_count}")
-#         else:
-#             print(f"\n   ⚠️ No drawings imported")
-        
-#         print(f"{'='*60}\n")
-        
-#         return imported_count > 0
-        
-#     except ImportError as e:
-#         print(f"   ❌ Missing library: {e}")
-#         print(f"   💡 Install: pip install rasterio shapely")
-#         return False
-#     except Exception as e:
-#         print(f"   ❌ TIFF import failed: {e}")
-#         import traceback
-#         traceback.print_exc()
-#         return False
-
 def import_drawings_from_tiff(app, input_path: str) -> bool:
     """
-    Import drawings from GeoTIFF - optimized with progress bar for large files.
+    Import drawings from GeoTIFF — optimized with progress bar for large files.
+    Z coordinates are placed at the scene median so drawings are visible.
     """
     try:
         import rasterio
@@ -1814,273 +2161,225 @@ def import_drawings_from_tiff(app, input_path: str) -> bool:
         from pathlib import Path
         from PySide6.QtWidgets import QProgressDialog, QMessageBox
         from PySide6.QtCore import Qt, QCoreApplication
-        
+        import numpy as np
+ 
         print(f"\n{'='*60}")
         print(f"📥 IMPORTING DRAWINGS FROM TIFF")
         print(f"   Path: {input_path}")
-        
-        # Verify file exists
+ 
         if not Path(input_path).exists():
             print(f"   ❌ File does not exist: {input_path}")
             return False
-        
-        # ============================================================
-        # STEP 1: Read TIFF with progress dialog (RGB Support)
-        # ============================================================
+ 
+        # ── infer Z so polygons appear on the point cloud ─────────────────
+        scene_z = _infer_import_scene_z(app)
+        print(f"   📐 Using scene Z = {scene_z:.2f}")
+ 
         progress = QProgressDialog("Loading GeoTIFF...", "Cancel", 0, 100, app)
         progress.setWindowTitle("Import GeoTIFF")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(5)
         QCoreApplication.processEvents()
-        
+ 
         with rasterio.open(input_path) as src:
             print(f"   📊 Raster: {src.width}x{src.height} @ {src.crs}")
             print(f"   📊 Bands: {src.count}")
-            
-            # ✅ READ RGB BANDS if available
+ 
             is_rgb = src.count >= 3
-            
             if is_rgb:
-                print(f"   🎨 Detected RGB GeoTIFF")
-                red = src.read(1)
+                red   = src.read(1)
                 green = src.read(2)
-                blue = src.read(3)
-                
-                # Create composite image for vectorization
-                # Use intensity (average of RGB) to detect features
-                image = (red.astype(np.float32) + green.astype(np.float32) + blue.astype(np.float32)) / 3
+                blue  = src.read(3)
+                image = (red.astype(np.float32) +
+                         green.astype(np.float32) +
+                         blue.astype(np.float32)) / 3
                 image = image.astype(np.uint8)
             else:
-                print(f"   ⚫ Single-band GeoTIFF")
                 image = src.read(1)
                 red = green = blue = None
-            
+ 
             transform = src.transform
-            
-            # Quick check for data
+ 
             non_zero = (image > 0).sum()
             if non_zero == 0:
                 progress.close()
                 print(f"   ⚠️ TIFF is empty")
                 return False
-            
+ 
             progress.setLabelText(f"Vectorizing {non_zero:,} pixels...")
             progress.setValue(10)
             QCoreApplication.processEvents()
-            
-            print(f"   🔄 Vectorizing {non_zero:,} pixels...")
-            
-            # Use connectivity=8 for better grouping
-            mask = image > 0
+ 
+            mask    = image > 0
             results = list(shapes(image, mask=mask, transform=transform, connectivity=8))
-            
             print(f"   📦 Found {len(results):,} raw shapes")
-        
+ 
         if progress.wasCanceled():
             progress.close()
             return False
-        
+ 
         progress.setValue(20)
         QCoreApplication.processEvents()
-        
-        # ============================================================
-        # STEP 2: AGGRESSIVE FILTERING for large datasets
-        # ============================================================
-        pixel_area = abs(transform[0] * transform[4])  # dx * dy
-        
-        # Dynamic threshold based on shape count
-        if len(results) > 100000:
-            # Very large file - use aggressive filtering
-            min_area = pixel_area * 500  # At least 500 pixels (~22x22)
-            print(f"   ⚠️ Large dataset detected ({len(results):,} shapes)")
-            print(f"   🔍 Using aggressive filter: minimum area = {min_area:.4f}")
-        elif len(results) > 10000:
-            # Large file - moderate filtering
-            min_area = pixel_area * 100  # At least 100 pixels (~10x10)
-            print(f"   🔍 Using moderate filter: minimum area = {min_area:.4f}")
+ 
+        # ── filter small noise ────────────────────────────────────────────
+        pixel_area = abs(transform[0] * transform[4])
+ 
+        if len(results) > 100_000:
+            min_area = pixel_area * 500
+        elif len(results) > 10_000:
+            min_area = pixel_area * 100
         else:
-            # Small file - gentle filtering
-            min_area = pixel_area * 25  # At least 25 pixels (5x5)
-            print(f"   🔍 Using gentle filter: minimum area = {min_area:.4f}")
-        
+            min_area = pixel_area * 25
+ 
         progress.setLabelText(f"Filtering {len(results):,} shapes...")
         progress.setValue(30)
         QCoreApplication.processEvents()
-        
-        # Pre-filter by area (fast calculation without full geometry)
+ 
         filtered_results = []
         for g, v in results:
             try:
                 poly = shape(g)
-                if poly.area >= min_area:
-                    # ✅ EXTRACT COLOR from RGB bands at polygon centroid
-                    color = (255, 255, 0)  # Default yellow
-                    
-                    if is_rgb and red is not None:
-                        try:
-                            # Get centroid of polygon
-                            centroid = poly.centroid
-                            
-                            # Convert to pixel coordinates
-                            col = int((centroid.x - transform[2]) / transform[0])
-                            row = int((centroid.y - transform[5]) / transform[4])
-                            
-                            # Ensure within bounds
-                            if 0 <= row < red.shape[0] and 0 <= col < red.shape[1]:
-                                r = int(red[row, col])
-                                g = int(green[row, col])
-                                b = int(blue[row, col])
-                                
-                                # Only use color if not black (0,0,0)
-                                if r > 0 or g > 0 or b > 0:
-                                    color = (r, g, b)
-                        except:
-                            pass  # Keep default color on error
-                    
-                    filtered_results.append((g, v, poly, color))
-            except:
+                if poly.area < min_area:
+                    continue
+ 
+                color = (255, 255, 0)
+                if is_rgb and red is not None:
+                    try:
+                        cx = poly.centroid
+                        col = int((cx.x - transform[2]) / transform[0])
+                        row = int((cx.y - transform[5]) / transform[4])
+                        if 0 <= row < red.shape[0] and 0 <= col < red.shape[1]:
+                            r, g_c, b = int(red[row, col]), int(green[row, col]), int(blue[row, col])
+                            if r > 0 or g_c > 0 or b > 0:
+                                color = (r, g_c, b)
+                    except Exception:
+                        pass
+ 
+                filtered_results.append((g, v, poly, color))
+            except Exception:
                 continue
-        
+ 
         skipped = len(results) - len(filtered_results)
-        print(f"   ✅ Filtered: {len(filtered_results):,} valid shapes (removed {skipped:,} tiny shapes)")
-        
+        print(f"   ✅ Filtered: {len(filtered_results):,} valid shapes (removed {skipped:,})")
+ 
         if not filtered_results:
             progress.close()
-            print(f"   ⚠️ No shapes large enough to import")
-            QMessageBox.warning(
-                app,
-                "No Valid Shapes",
-                f"All {len(results):,} shapes were too small.\n"
-                f"Minimum area threshold: {min_area:.4f}\n\n"
-                f"Try exporting with larger features or lower resolution."
-            )
+            QMessageBox.warning(app, "No Valid Shapes",
+                                f"All {len(results):,} shapes were too small.")
             return False
-        
+ 
         if progress.wasCanceled():
             progress.close()
             return False
-        
-        # ============================================================
-        # STEP 3: Limit maximum shapes for performance
-        # ============================================================
-        MAX_SHAPES = 10000  # Hard limit for UI performance
-        
+ 
+        MAX_SHAPES = 10_000
         if len(filtered_results) > MAX_SHAPES:
-            print(f"   ⚠️ Too many shapes ({len(filtered_results):,}), limiting to {MAX_SHAPES:,}")
-            
-            # Sort by area (largest first) and keep top N
             filtered_results.sort(key=lambda x: x[2].area, reverse=True)
             filtered_results = filtered_results[:MAX_SHAPES]
-            
-            QMessageBox.information(
-                app,
-                "Large Dataset",
-                f"Found {len(filtered_results):,} shapes after filtering.\n\n"
-                f"Importing the largest {MAX_SHAPES:,} shapes for performance.\n\n"
-                f"💡 Tip: For complete import, increase minimum area threshold."
-            )
-        
+ 
         progress.setValue(40)
         QCoreApplication.processEvents()
-        
-        # ============================================================
-        # STEP 4: Process shapes with progress bar
-        # ============================================================
+ 
         if not (hasattr(app, 'digitizer') and app.digitizer):
             progress.close()
             print(f"   ❌ No digitizer found")
             return False
-        
+ 
         imported_count = 0
-        failed_count = 0
-        total = len(filtered_results)
-        
-        progress.setLabelText(f"Importing shapes...")
+        failed_count   = 0
+        total          = len(filtered_results)
+ 
+        progress.setLabelText("Importing shapes...")
         progress.setMaximum(total)
-        
+ 
         for idx, (geom, value, poly, color) in enumerate(filtered_results):
             if progress.wasCanceled():
                 break
-            
-            # Update progress every 100 shapes
+ 
             if idx % 100 == 0:
                 progress.setValue(idx)
                 progress.setLabelText(f"Importing shapes: {idx:,}/{total:,}")
                 QCoreApplication.processEvents()
-            
+ 
             try:
-                # Simplify complex polygons
                 if poly.geom_type == 'Polygon':
                     coords = list(poly.exterior.coords)
-                    
-                    # Aggressive simplification for large polygons
                     if len(coords) > 100:
-                        tolerance = min_area * 0.2  # 20% of minimum area
-                        poly = poly.simplify(tolerance=tolerance, preserve_topology=True)
+                        poly = poly.simplify(min_area * 0.2, preserve_topology=True)
                         coords = list(poly.exterior.coords)
-                    
+ 
                     drawing = {
                         'type': 'polygon',
-                        'coordinates': [[float(x), float(y), 0.0] for x, y in coords[:-1]],
-                        'color': color  # ✅ USE EXTRACTED RGB COLOR
+                        # ✅ Use scene_z instead of hard-coded 0.0
+                        'coordinates': [[float(x), float(y), float(scene_z)]
+                                        for x, y in coords[:-1]],
+                        'color': color,
                     }
-                    
                     if app.digitizer.add_drawing_from_data(drawing):
                         imported_count += 1
                     else:
                         failed_count += 1
-                
+ 
                 elif poly.geom_type == 'MultiPolygon':
-                    # Handle multipolygons
-                    for sub_poly in poly.geoms:
-                        if sub_poly.area < min_area:
+                    for sub in poly.geoms:
+                        if sub.area < min_area:
                             continue
-                        
-                        coords = list(sub_poly.exterior.coords)
-                        
-                        # Simplify if needed
+                        coords = list(sub.exterior.coords)
                         if len(coords) > 100:
-                            tolerance = min_area * 0.2
-                            sub_poly = sub_poly.simplify(tolerance=tolerance, preserve_topology=True)
-                            coords = list(sub_poly.exterior.coords)
-                        
+                            sub = sub.simplify(min_area * 0.2, preserve_topology=True)
+                            coords = list(sub.exterior.coords)
                         drawing = {
                             'type': 'polygon',
-                            'coordinates': [[float(x), float(y), 0.0] for x, y in coords[:-1]],
-                            'color': color  # ✅ USE EXTRACTED RGB COLOR
+                            'coordinates': [[float(x), float(y), float(scene_z)]
+                                            for x, y in coords[:-1]],
+                            'color': color,
                         }
-                        
                         if app.digitizer.add_drawing_from_data(drawing):
                             imported_count += 1
                         else:
                             failed_count += 1
-                
-            except Exception as e:
+ 
+            except Exception:
                 failed_count += 1
                 continue
-        
-        # ============================================================
-        # STEP 5: Final rendering
-        # ============================================================
+ 
+        # ── final render + camera reset ───────────────────────────────────
         progress.setLabelText(f"Rendering {imported_count:,} drawings...")
         progress.setValue(total)
         QCoreApplication.processEvents()
-        
+ 
         print(f"   🎨 Rendering {imported_count:,} drawings...")
+ 
         if hasattr(app, 'vtk_widget') and app.vtk_widget:
-            app.vtk_widget.GetRenderWindow().Render()
-        
+            rw = app.vtk_widget.GetRenderWindow()
+ 
+            # ✅ Reset camera so the drawings are visible
+            renderer = rw.GetRenderers().GetFirstRenderer()
+            if renderer:
+                renderer.ResetCamera()
+                renderer.ResetCameraClippingRange()
+ 
+            rw.Render()
+ 
+        # Also call fit_view if available
+        fit_view = getattr(app, 'fit_view', None)
+        if callable(fit_view):
+            try:
+                fit_view()
+            except Exception:
+                pass
+ 
         progress.close()
-        
+ 
         print(f"\n   ✅ Import Complete:")
-        print(f"      - Imported: {imported_count:,}")
-        if failed_count > 0:
-            print(f"      - Failed: {failed_count:,}")
+        print(f"      Imported : {imported_count:,}")
+        if failed_count:
+            print(f"      Failed   : {failed_count:,}")
         print(f"{'='*60}\n")
-        
+ 
         return imported_count > 0
-        
+ 
     except ImportError as e:
         if 'progress' in locals():
             progress.close()
@@ -2103,151 +2402,139 @@ def import_geotiff_as_texture(app, input_path: str) -> bool:
     try:
         import rasterio
         import vtk
+        from vtk.util import numpy_support
         from pathlib import Path
         from PySide6.QtWidgets import QProgressDialog
         from PySide6.QtCore import Qt, QCoreApplication
         import numpy as np
-        
+ 
         print(f"\n{'='*60}")
         print(f"📥 IMPORTING GEOTIFF AS TEXTURED SURFACE")
         print(f"   Path: {input_path}")
-        
+ 
         if not Path(input_path).exists():
             print(f"   ❌ File does not exist")
             return False
-        
-        # Progress dialog
+ 
         progress = QProgressDialog("Loading GeoTIFF texture...", "Cancel", 0, 100, app)
         progress.setWindowTitle("Import GeoTIFF")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(10)
         QCoreApplication.processEvents()
-        
-        # ============================================================
-        # STEP 1: Read GeoTIFF with RGB bands
-        # ============================================================
+ 
+        # ── Step 1: read raster ───────────────────────────────────────────
         with rasterio.open(input_path) as src:
             print(f"   📊 Raster: {src.width}x{src.height}")
             print(f"   📊 Bands: {src.count}")
             print(f"   🌍 CRS: {src.crs}")
-            print(f"   📐 Bounds: {src.bounds}")
-            
-            # Read RGB bands
+ 
             if src.count >= 3:
-                print(f"   🎨 Reading RGB bands...")
-                red = src.read(1)
+                red   = src.read(1)
                 green = src.read(2)
-                blue = src.read(3)
+                blue  = src.read(3)
             else:
-                print(f"   ⚠️ Single-band image, converting to grayscale")
-                gray = src.read(1)
+                gray  = src.read(1)
                 red = green = blue = gray
-            
-            # Get georeferencing info
-            bounds = src.bounds
-            transform = src.transform
-            width = src.width
-            height = src.height
-        
+ 
+            bounds    = src.bounds
+            width     = src.width
+            height    = src.height
+ 
         progress.setValue(30)
         QCoreApplication.processEvents()
-        
-        # ============================================================
-        # STEP 2: Create VTK texture from RGB data
-        # ============================================================
-        print(f"   🎨 Creating VTK texture...")
-        
-        # Stack RGB into (height, width, 3) array
-        rgb_array = np.stack([red, green, blue], axis=-1)
-        
-        # Flip vertically (VTK convention)
-        rgb_array = np.flipud(rgb_array)
-        
-        # Convert to VTK image data
+ 
+        # ── Step 2: build VTK image using numpy (FAST) ───────────────────
+        print(f"   🎨 Creating VTK texture (numpy path)...")
+ 
+        # Stack to (H, W, 3), flip rows so VTK origin is bottom-left
+        rgb_array = np.stack([red, green, blue], axis=-1)  # (H, W, 3)
+        rgb_array = np.flipud(rgb_array)                    # VTK convention
+        rgb_flat  = rgb_array.reshape(-1, 3)               # (H*W, 3) — row-major
+ 
+        # Convert to VTK scalar array in one shot
+        vtk_colors = numpy_support.numpy_to_vtk(
+            rgb_flat, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
+        )
+        vtk_colors.SetNumberOfComponents(3)
+        vtk_colors.SetName("Colors")
+ 
         vtk_image = vtk.vtkImageData()
         vtk_image.SetDimensions(width, height, 1)
-        vtk_image.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 3)
-        
-        # Copy data to VTK
-        for y in range(height):
-            for x in range(width):
-                pixel = rgb_array[y, x]
-                idx = (y * width + x) * 3
-                vtk_image.GetPointData().GetScalars().SetTuple3(
-                    y * width + x,
-                    int(pixel[0]),
-                    int(pixel[1]),
-                    int(pixel[2])
-                )
-        
-        progress.setValue(50)
+        vtk_image.GetPointData().SetScalars(vtk_colors)
+ 
+        progress.setValue(55)
         QCoreApplication.processEvents()
-        
-        # ============================================================
-        # STEP 3: Create textured plane geometry
-        # ============================================================
-        print(f"   📐 Creating textured plane...")
-        
-        # Create plane with correct world coordinates
+ 
+        # ── Step 3: infer scene Z so the plane sits on the point cloud ───
+        scene_z = _infer_import_scene_z(app)
+        print(f"   📐 Placing texture plane at Z = {scene_z:.2f}")
+ 
         plane = vtk.vtkPlaneSource()
-        plane.SetOrigin(bounds.left, bounds.bottom, 0)
-        plane.SetPoint1(bounds.right, bounds.bottom, 0)
-        plane.SetPoint2(bounds.left, bounds.top, 0)
-        plane.SetResolution(1, 1)  # Simple quad
+        plane.SetOrigin(bounds.left,  bounds.bottom, scene_z)
+        plane.SetPoint1(bounds.right, bounds.bottom, scene_z)
+        plane.SetPoint2(bounds.left,  bounds.top,    scene_z)
+        plane.SetResolution(1, 1)
         plane.Update()
-        
-        # Create texture
+ 
         texture = vtk.vtkTexture()
         texture.SetInputData(vtk_image)
         texture.InterpolateOn()
         texture.Update()
-        
+ 
         progress.setValue(70)
         QCoreApplication.processEvents()
-        
-        # ============================================================
-        # STEP 4: Create actor and add to scene
-        # ============================================================
+ 
+        # ── Step 4: add actor ─────────────────────────────────────────────
         print(f"   🎭 Adding to scene...")
-        
+ 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(plane.GetOutputPort())
-        
+ 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.SetTexture(texture)
-        
-        # Make slightly transparent so point cloud shows through
         actor.GetProperty().SetOpacity(0.9)
-        
-        # Add to renderer
-        if hasattr(app, 'vtk_widget') and app.vtk_widget:
-            renderer = app.vtk_widget.GetRenderWindow().GetRenderers().GetFirstRenderer()
-            renderer.AddActor(actor)
-            
-            # Store reference to actor so it can be removed later
-            if not hasattr(app, 'geotiff_actors'):
-                app.geotiff_actors = []
-            app.geotiff_actors.append(actor)
-            
-            # Render
-            app.vtk_widget.GetRenderWindow().Render()
-            
-            print(f"   ✅ GeoTIFF texture added successfully")
-            print(f"   📏 Coverage: {bounds.left:.2f} to {bounds.right:.2f} (X)")
-            print(f"              {bounds.bottom:.2f} to {bounds.top:.2f} (Y)")
-        else:
+ 
+        if not (hasattr(app, 'vtk_widget') and app.vtk_widget):
             print(f"   ❌ No VTK widget found")
             progress.close()
             return False
-        
+ 
+        renderer = app.vtk_widget.GetRenderWindow().GetRenderers().GetFirstRenderer()
+        renderer.AddActor(actor)
+ 
+        if not hasattr(app, 'geotiff_actors'):
+            app.geotiff_actors = []
+        app.geotiff_actors.append(actor)
+ 
+        progress.setValue(85)
+        QCoreApplication.processEvents()
+ 
+        # ── Step 5: reset camera so the imported image is actually visible ─
+        print(f"   📷 Resetting camera to show imported texture...")
+        renderer.ResetCamera()
+        renderer.ResetCameraClippingRange()
+ 
+        app.vtk_widget.GetRenderWindow().Render()
+ 
+        # Also call the app's fit_view if available
+        fit_view = getattr(app, 'fit_view', None)
+        if callable(fit_view):
+            try:
+                fit_view()
+            except Exception:
+                pass
+ 
         progress.setValue(100)
         progress.close()
-        
+ 
+        print(f"   ✅ GeoTIFF texture added successfully")
+        print(f"   📏 Coverage: X({bounds.left:.2f} → {bounds.right:.2f})  "
+              f"Y({bounds.bottom:.2f} → {bounds.top:.2f})  Z={scene_z:.2f}")
         print(f"{'='*60}\n")
         return True
-        
+ 
     except ImportError as e:
         if 'progress' in locals():
             progress.close()
@@ -2259,121 +2546,5 @@ def import_geotiff_as_texture(app, input_path: str) -> bool:
         print(f"   ❌ GeoTIFF texture import failed: {e}")
         import traceback
         traceback.print_exc()
-        return False    
+        return False 
 
-def import_drawings_from_shapefile(app, input_path: str) -> bool:
-    """Import drawings from Shapefile with proper rendering"""
-    try:
-        import geopandas as gpd
-        from pathlib import Path
-        
-        print(f"\n{'='*60}")
-        print(f"📥 IMPORTING DRAWINGS FROM SHAPEFILE")
-        print(f"   Path: {input_path}")
-        
-        base_path = Path(input_path).with_suffix('')
-        
-        # Try to load all geometry types
-        imported_count = 0
-        
-        for suffix in ['_points', '_lines', '_polygons', '']:
-            try:
-                shp_path = f"{base_path}{suffix}.shp"
-                if not Path(shp_path).exists():
-                    continue
-                
-                print(f"   📂 Loading: {shp_path}")
-                gdf = gpd.read_file(shp_path)
-                print(f"   📊 Found {len(gdf)} features")
-                
-                for idx, row in gdf.iterrows():
-                    geom = row.geometry
-                    
-                    drawing = {
-                        'color': (
-                            int(row.get('color_r', 255)),
-                            int(row.get('color_g', 255)),
-                            int(row.get('color_b', 255))
-                        ),
-                        'text': str(row.get('text', '')),
-                        'radius': float(row.get('radius', 0))
-                    }
-                    
-                    if geom.geom_type == 'Point':
-                        drawing['type'] = row.get('type', 'circle')
-                        drawing['coordinates'] = [[geom.x, geom.y, 0]]
-                    
-                    elif geom.geom_type == 'LineString':
-                        drawing['type'] = row.get('type', 'polyline')
-                        drawing['coordinates'] = [
-                            [x, y, 0] for x, y in geom.coords
-                        ]
-                    
-                    elif geom.geom_type == 'Polygon':
-                        drawing['type'] = row.get('type', 'polygon')
-                        coords = list(geom.exterior.coords)[:-1]
-                        drawing['coordinates'] = [
-                            [x, y, 0] for x, y in coords
-                        ]
-                    
-                    if hasattr(app, 'digitizer'):
-                        # Use proper import method
-                        if hasattr(app.digitizer, 'add_imported_drawing'):
-                            app.digitizer.add_imported_drawing(drawing)
-                        else:
-                            app.digitizer.add_drawing_from_data(drawing)
-                        imported_count += 1
-                        print(f"   ✅ Added {drawing['type']} from import")
-                        
-            except Exception as e:
-                print(f"   ⚠️ Could not load {suffix}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-        
-        # CRITICAL: Force render update
-        if imported_count > 0:
-            print(f"\n   🎨 Updating display...")
-            
-            # Try multiple render methods
-            if hasattr(app, 'vtk_widget') and app.vtk_widget:
-                try:
-                    app.vtk_widget.GetRenderWindow().Render()
-                    print(f"   ✅ VTK render triggered")
-                except:
-                    pass
-            
-            # Try calling update method
-            if hasattr(app, 'update_display'):
-                try:
-                    app.update_display()
-                    print(f"   ✅ Display update called")
-                except:
-                    pass
-            
-            # Try refresh method
-            if hasattr(app, 'refresh'):
-                try:
-                    app.refresh()
-                    print(f"   ✅ Refresh called")
-                except:
-                    pass
-            
-            print(f"   ✅ Imported {imported_count} drawings")
-        else:
-            print(f"   ⚠️ No drawings imported")
-        
-        print(f"{'='*60}\n")
-        
-        return imported_count > 0
-        
-    except ImportError:
-        print("   ⚠️ geopandas not installed")
-        return False
-    except Exception as e:
-        print(f"   ❌ Shapefile import failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-    
- 

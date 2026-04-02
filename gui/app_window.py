@@ -3293,10 +3293,15 @@ class NakshaApp(QMainWindow):
                 self.section_controller.unlock_after_classification()
 
 
-    def toggle_view_mode(self, mode: str):
+    def toggle_view_mode(self, mode: str, preserve_camera: bool = False):
         """
         Switch between 2D plan view (locked top view) and full 3D orbit view.
         ✅ SIMPLE FIX: Backs up and restores section view actors
+
+        preserve_camera:
+            When True for 2D mode, keep the current camera orientation/position
+            and only re-apply orthographic + interactor locking. This avoids
+            a temporary top-view flash before a follow-up explicit view change.
         """
         from vtkmodules.vtkInteractionStyle import (
             vtkInteractorStyleImage,
@@ -3339,14 +3344,18 @@ class NakshaApp(QMainWindow):
  
         elif mode == "2d":
             self.is_3d_mode = False
-            print("📐 Switching to 2D Plan View (tools enabled)")
+            view_label = "2D orthographic view" if preserve_camera else "2D Plan View"
+            print(f"📐 Switching to {view_label} (tools enabled)")
  
             cam = self.vtk_widget.renderer.GetActiveCamera()
             cam.ParallelProjectionOn()
-            cam.SetFocalPoint(0, 0, 0)
-            cam.SetPosition(0, 0, 1)
-            cam.SetViewUp(0, 1, 0)
-            self.vtk_widget.renderer.ResetCamera()
+            if preserve_camera:
+                self.vtk_widget.renderer.ResetCameraClippingRange()
+            else:
+                cam.SetFocalPoint(0, 0, 0)
+                cam.SetPosition(0, 0, 1)
+                cam.SetViewUp(0, 1, 0)
+                self.vtk_widget.renderer.ResetCamera()
  
             self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
             self.vtk_widget.render()
@@ -3358,7 +3367,12 @@ class NakshaApp(QMainWindow):
             ):
                 self.digitizer.enabled = True
 
-            self.statusBar().showMessage("2D Plan View locked (no 3D rotation)", 4000)
+            self.statusBar().showMessage(
+                "2D orthographic view locked (no 3D rotation)"
+                if preserve_camera
+                else "2D Plan View locked (no 3D rotation)",
+                4000,
+            )
         else:
             print(f"⚠️ Unknown view mode: {mode}")
             return
@@ -8771,11 +8785,12 @@ class NakshaApp(QMainWindow):
             from vtk import vtkInteractorStyleTrackballCamera
             self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
         
-        # Change the view (this resets camera)
+        # Switch interaction mode first, then apply the explicit target view.
         if mode == '3d':
             self.toggle_view_mode('3d')
         else:
-            self.toggle_view_mode('2d')
+            # Preserve the active camera until the explicit target view is applied.
+            self.toggle_view_mode('2d', preserve_camera=True)
 
         allow_3d_switch = mode == '3d'
         previous_allow_3d = getattr(self, "_allow_3d_switch", False)
@@ -11056,7 +11071,41 @@ class NakshaApp(QMainWindow):
 
 
                 # ============================================================
-                # 3. Calculate combined bounds
+                # 4. Get digitized drawing bounds
+                # ============================================================
+                digitizer = getattr(self, 'digitizer', None)
+                drawings = list(getattr(digitizer, 'drawings', []) or [])
+                if drawings:
+                    print(f"   ✏️ Checking {len(drawings)} drawing(s)...")
+
+                    for i, drawing in enumerate(drawings):
+                        try:
+                            raw_coords = drawing.get('coords') or drawing.get('coordinates') or []
+                            if hasattr(raw_coords, 'tolist'):
+                                raw_coords = raw_coords.tolist()
+
+                            coords_xy = []
+                            for coord in raw_coords:
+                                if hasattr(coord, 'tolist'):
+                                    coord = coord.tolist()
+                                if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                                    coords_xy.append((float(coord[0]), float(coord[1])))
+
+                            if not coords_xy:
+                                continue
+
+                            xs, ys = zip(*coords_xy)
+                            bounds_list.append({
+                                'xmin': min(xs),
+                                'xmax': max(xs),
+                                'ymin': min(ys),
+                                'ymax': max(ys),
+                            })
+                        except Exception as e:
+                            print(f"      ⚠️ Drawing {i}: Error - {e}")
+
+                # ============================================================
+                # 5. Calculate combined bounds
                 # ============================================================
                 if not bounds_list:
                     print(f"   ⚠️ No visible data to fit")
@@ -11074,7 +11123,7 @@ class NakshaApp(QMainWindow):
                 print(f"      Y: {ymin:.2f} → {ymax:.2f} (height: {ymax-ymin:.2f})")
                 
                 # ============================================================
-                # 4. Set camera to fit combined bounds
+                # 6. Set camera to fit combined bounds
                 # ============================================================
                 if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
                     print(f"   ⚠️ No VTK widget")
@@ -11088,10 +11137,10 @@ class NakshaApp(QMainWindow):
                 center_y = (ymin + ymax) / 2.0
                 width = xmax - xmin
                 height = ymax - ymin
-                
+
                 # Add 10% margin
                 margin = 1.1
-                max_dim = max(width, height) * margin
+                max_dim = max(width, height, 1.0) * margin
                 center_z = 0.0
                 if hasattr(self, 'data') and self.data is not None:
                     xyz = self.data.get('xyz')

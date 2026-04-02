@@ -459,7 +459,18 @@ class GlobalShortcutFilter(QObject):
                 # =====================================
                 # PRIORITY 2: Tool Shortcuts (F1–F12, digits, etc.)
                 # ====================================================================
-    
+
+                # ── Ortho-polygon tool owns Space/Shift+Space ──────────────────────
+                # Space is mapped to TopView in the shortcut table, but when the
+                # ortho-polygon tool is active those keys must reach VTK so the tool
+                # can toggle ORTHO↔FREEHAND (Space) or CURVE mode (Shift+Space).
+                _digitizer = getattr(self.app_window, 'digitizer', None)
+                if (_digitizer and
+                        getattr(_digitizer, 'active_tool', None) == 'orthopolygon' and
+                        event.key() == Qt.Key_Space):
+                    return False   # let it through to VTK
+                # ──────────────────────────────────────────────────────────────────
+
                 key = event.key()
     
                 # Build modifier string

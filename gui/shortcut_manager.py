@@ -1368,46 +1368,28 @@ class ClassVisibilityPicker(QDialog):
                 widget.setStyleSheet(f"{current_style}; opacity: 0.4;")
                 
     def _on_weight_changed(self, code, value):
-        """Called when user changes weight - persist to app_window"""
-        if code not in self.app_window.class_palette:
-            return
+        """Called when user changes weight spinbox in the shortcut picker.
 
-        self.app_window.class_palette[code]["weight"] = value
-
-        if not hasattr(self.app_window, 'view_palettes') or self.app_window.view_palettes is None:
-            self.app_window.view_palettes = {}
-        if 0 not in self.app_window.view_palettes:
-            self.app_window.view_palettes[0] = {}
-
-        main_entry = dict(self.app_window.view_palettes[0].get(code, {}))
-        main_entry.update(self.app_window.class_palette[code])
-        main_entry["weight"] = value
-        self.app_window.view_palettes[0][code] = main_entry
-        self.app_window.class_palette[code] = dict(main_entry)
-
-        dlg = getattr(self.app_window, 'display_mode_dialog', None)
-        if dlg and hasattr(dlg, 'view_palettes'):
-            if 0 not in dlg.view_palettes:
-                dlg.view_palettes[0] = {}
-            dlg.view_palettes[0][code] = dict(main_entry)
-
-        if not hasattr(self.app_window, '_slot_weights_applied'):
-            self.app_window._slot_weights_applied = set()
-        self.app_window._slot_weights_applied.add(0)
-
-        print(f"✅ Updated weight for class {code}: {value}")
-        
-        try:
-            from gui.unified_actor_manager import fast_palette_refresh
-            from gui.class_display import update_class_mode
-
-            border = float(getattr(self.app_window, 'point_border_percent', 0.0) or 0.0)
-            refreshed = fast_palette_refresh(self.app_window, self.app_window.class_palette, border)
-            if not refreshed and getattr(self.app_window, 'display_mode', 'class') == 'class':
-                print("⚠️ Main View fast weight refresh unavailable - forcing rebuild")
-                update_class_mode(self.app_window, force_refresh=True)
-        except Exception as e:
-            print(f"⚠️ GPU Weight Poke failed: {e}")
+        ✅ FIX: Only update LOCAL picker state (view_configs).
+        Do NOT touch app_window.class_palette, view_palettes, or refresh the view.
+        Those changes are applied ONLY when the user clicks OK and the
+        shortcut key is actually pressed at runtime.
+        """
+        # Store the weight in the local view_configs dict for the
+        # currently selected view so that:
+        #   - _on_view_selector_changed preserves it when switching views
+        #   - _on_ok_clicked / get_all_view_configs picks it up on save
+        if self.mode == "display" and hasattr(self, 'view_selector'):
+            current_view_idx = self.view_selector.currentIndex()
+            if not hasattr(self, 'view_configs'):
+                self.view_configs = {}
+            if current_view_idx not in self.view_configs:
+                self.view_configs[current_view_idx] = {}
+            if code in self.view_configs[current_view_idx]:
+                self.view_configs[current_view_idx][code]["weight"] = value
+            else:
+                # First weight edit for a class not yet in view_configs
+                self.view_configs[current_view_idx][code] = {"weight": value}
 
     def _sync_from_display_mode(self):
         """Sync border and weights from current Display Mode state"""
@@ -2191,8 +2173,12 @@ class ShortcutManager(QWidget):
                     picker.view_configs = {}
                 picker.view_configs[first_view_idx] = view_classes
 
-                # ✅ FIX: Sync live weights so picker reflects latest Display Mode Apply
-                self._sync_live_weights_into(view_classes, first_view_idx)
+                # ✅ FIX: DO NOT sync live weights — each shortcut has
+                #    INDEPENDENT weights. The table cell is the single
+                #    source of truth. _sync_live_weights_into would
+                #    overwrite user-saved preset weights with class_palette
+                #    values (which are always 1.0 by default).
+                # REMOVED: self._sync_live_weights_into(view_classes, first_view_idx)
 
                 picker._populate_classes()
 
@@ -3117,43 +3103,15 @@ class ShortcutManager(QWidget):
 
             self.app_window.shortcuts = shortcuts
         
-            # Sync shortcut presets into view_palettes
+            # ✅ FIX: Do NOT overwrite shortcut preset weights with live
+            #    class_palette / view_palettes values. Each shortcut has
+            #    INDEPENDENT weights configured by the user in the picker
+            #    dialog. The picker's OK button already saves the correct
+            #    weights into the table cell (the single source of truth).
+            #    The old code here was reading class_palette (default 1.0)
+            #    and replacing every preset's user-configured weights.
             if not hasattr(self.app_window, 'view_palettes'):
                 self.app_window.view_palettes = {}
-            if hasattr(self.app_window, 'display_mode_dialog') and self.app_window.display_mode_dialog:
-                dlg = self.app_window.display_mode_dialog
-                
-                # Save current weights from dialog
-                # Save current weights from dialog
-                saved_weights = {}
-                if hasattr(dlg, 'view_palettes'):
-                    for view_idx, palette in dlg.view_palettes.items():
-                        saved_weights[view_idx] = {}
-                        for code, info in palette.items():
-                            saved_weights[view_idx][code] = info.get('weight', 1.0)
-
-                # ✅ FIX: Main View weights live in class_palette (Display Mode Apply writes there,
-                # not to view_palettes[0]), so read from there too.
-                saved_weights.setdefault(0, {})
-                if hasattr(self.app_window, 'class_palette'):
-                    for code, info in self.app_window.class_palette.items():
-                        saved_weights[0][int(code)] = info.get('weight', 1.0)
-                
-                # Inject preserved weights INTO the shortcut presets (not the other way)
-                for (mod, key), shortcut_info in shortcuts.items():
-                    if shortcut_info.get("tool") != "DisplayMode":
-                        continue
-                    preset = shortcut_info.get("preset")
-                    if not preset or not preset.get("views"):
-                        continue
-                    for view_idx_raw, class_configs in preset.get("views", {}).items():
-                        view_idx = int(view_idx_raw)
-                        for code_raw, info in class_configs.items():
-                            code = int(code_raw)
-                            if view_idx in saved_weights and code in saved_weights[view_idx]:
-                                info["weight"] = saved_weights[view_idx][code]
-                
-                print("✅ Preserved dialog weights into shortcut presets")
 
             print(f"   ℹ️ Shortcut presets stored (applied on keypress, not now)")
                     #
