@@ -1,14 +1,65 @@
-from PySide6.QtCore import QObject, QEvent, Qt
+from PySide6.QtCore import QObject, QEvent, Qt, QTimer, QElapsedTimer
 from PySide6.QtGui import QKeySequence
 from flask import views
 from .execute_tool import execute_tool
+# ✅ ADD this class in the same file as GlobalShortcutFilter, BEFORE it
+
+class ShortcutExecutionGuard:
+    """Prevents concurrent shortcut execution that crashes VTK/OpenGL."""
+
+    COOLDOWN_NORMAL  = 150   # ms — simple tools
+    COOLDOWN_DISPLAY = 400   # ms — DisplayMode (actor rebuild)
+    COOLDOWN_SHADING = 800   # ms — ShadingMode (mesh + GPU heavy)
+    COOLDOWN_DRAW    = 200   # ms — DrawSettings
+
+    def __init__(self):
+        self._locked = False
+        self._cooldown_timer = QTimer()
+        self._cooldown_timer.setSingleShot(True)
+        self._cooldown_timer.timeout.connect(self._unlock)
+        self._elapsed = QElapsedTimer()
+        self._last_tool = None
+
+    def try_acquire(self, tool_name: str = "") -> bool:
+        if self._locked:
+            elapsed_ms = self._elapsed.elapsed() if self._elapsed.isValid() else 0
+            print(f"⚠️ SHORTCUT BLOCKED: '{tool_name}' rejected "
+                  f"(locked by '{self._last_tool}', {elapsed_ms}ms ago)")
+            return False
+        self._locked = True
+        self._last_tool = tool_name
+        self._elapsed.start()
+
+        if tool_name == "ShadingMode":
+            cooldown = self.COOLDOWN_SHADING
+        elif tool_name == "DisplayMode":
+            cooldown = self.COOLDOWN_DISPLAY
+        elif tool_name == "DrawSettings":
+            cooldown = self.COOLDOWN_DRAW
+        else:
+            cooldown = self.COOLDOWN_NORMAL
+
+        self._cooldown_timer.start(cooldown)
+        return True
+
+    def _unlock(self):
+        self._locked = False
+        self._last_tool = None
+
+    def force_unlock(self):
+        self._locked = False
+        self._last_tool = None
+        self._cooldown_timer.stop()
 
 class GlobalShortcutFilter(QObject):
     def __init__(self, app_window):
         super().__init__()
         self.app_window = app_window
+        self._shortcut_guard = ShortcutExecutionGuard()  # ✅ ADD THIS
 
     def eventFilter(self, obj, event):
+            _QTimer = QTimer  # noqa — intentional alias
+
             if event.type() == QEvent.KeyPress:
                 
                 # ====================================================================
@@ -195,9 +246,14 @@ class GlobalShortcutFilter(QObject):
                             return True
 
                     # ✅ Measurement undo/redo — when measurement tool is active
+                    # ✅ Measurement undo/redo — ONLY when measurement tool is active
+                    #    AND no classification tool has taken over via shortcut
                     elif hasattr(self.app_window, 'measurement_tool') and \
                          hasattr(self.app_window.measurement_tool, 'active') and \
-                         self.app_window.measurement_tool.active:
+                         self.app_window.measurement_tool.active and \
+                         not getattr(self.app_window, 'active_classify_tool', None) and \
+                         not getattr(self.app_window, 'classify_interactor', None) and \
+                         not getattr(self.app_window, 'classify_interactors', None):
 
                         measurement_tool = self.app_window.measurement_tool
 
@@ -282,6 +338,9 @@ class GlobalShortcutFilter(QObject):
                             return True
                     if (event.modifiers() & Qt.ShiftModifier):
                         if event.key() == Qt.Key_D:
+                            # ✅ GUARD
+                            if not self._shortcut_guard.try_acquire("Ctrl+Shift+D"):
+                                return True
                             print("🎛️ Ctrl+Shift+D → Apply Display Settings")
                             try:
                                 # Check if point cloud data is loaded
@@ -376,6 +435,9 @@ class GlobalShortcutFilter(QObject):
                                         f"❌ Failed to apply display settings: {e}",
                                         3000
                                     )
+                            finally:
+                                # ✅ Always release guard — even on crash
+                                self._shortcut_guard.force_unlock()
                             return True
                         
                         
@@ -513,6 +575,14 @@ class GlobalShortcutFilter(QObject):
                         print("⚠️ DisplayMode shortcut has no preset")
                         return True
 
+                    # ✅ GUARD: Block if another shortcut is still executing
+                    if not self._shortcut_guard.try_acquire("DisplayMode"):
+                        if hasattr(self.app_window, 'statusBar'):
+                            self.app_window.statusBar().showMessage(
+                                "⚠️ Please wait — previous shortcut still processing", 1500
+                            )
+                        return True
+
                     try:
                         print(f"\n{'='*60}")
                         print(f"🎨 APPLYING DISPLAYMODE PRESET FROM SHORTCUT")
@@ -525,7 +595,49 @@ class GlobalShortcutFilter(QObject):
                         # ✅ Get the TARGET VIEW from the preset (MUST be done first!)
                         target_view = int(list(views.keys())[0]) if views else 0
                         print(f"   🎯 TARGET VIEW FROM SHORTCUT: {target_view}")
-                        
+
+                        # ====================================================================
+                        # ✅ STEP 0: CHECK IF SAME SHORTCUT ALREADY APPLIED — skip rebuild
+                        # Only skips when the EXACT SAME shortcut key is pressed consecutively.
+                        # Pressing a different shortcut (alt+F2) then back (alt+F1) will
+                        # correctly re-apply because the shortcut ID differs.
+                        # ====================================================================
+                        _current_shortcut_id = combo  # e.g. ('alt', 'F1')
+                        _last_applied_id = getattr(self.app_window, '_last_display_shortcut_id', None)
+
+                        if _last_applied_id == _current_shortcut_id:
+                            # Same key pressed again — verify GPU state actually matches
+                            _state_ok = True
+                            try:
+                                if target_view == 0 and getattr(self.app_window, 'display_mode', None) != 'class':
+                                    _state_ok = False
+                                if _state_ok and target_view == 0:
+                                    _cp = getattr(self.app_window, 'class_palette', None)
+                                    if _cp:
+                                        view_key = str(target_view) if str(target_view) in views else target_view
+                                        _pclasses = views.get(view_key, views.get(str(view_key), {}))
+                                        for _pc, _pi in _pclasses.items():
+                                            _ci = _cp.get(int(_pc))
+                                            if _ci is None or _ci.get('show', True) != _pi.get('show', False):
+                                                _state_ok = False
+                                                break
+                                            if abs(float(_ci.get('weight', 1.0)) - float(_pi.get('weight', 1.0))) > 0.001:
+                                                _state_ok = False
+                                                break
+                            except Exception:
+                                _state_ok = False
+
+                            if _state_ok:
+                                print(f"   ⏭️  SKIPPING — same shortcut {_current_shortcut_id} already applied (no-op)")
+                                print(f"{'='*60}\n")
+                                if hasattr(self.app_window, 'statusBar'):
+                                    self.app_window.statusBar().showMessage(
+                                        "✅ DisplayMode already applied (no rebuild needed)", 2000)
+                                self._shortcut_guard.force_unlock()
+                                return True
+
+                        print(f"   🔄 Applying preset (last={_last_applied_id}, current={_current_shortcut_id})...")
+
                         # ============================================================================
                         # ✅ STEP 0A: RESET class_palette VISIBILITY FROM PRESET
                         # ✅ CRITICAL FIX: ONLY if target is Main View (0)
@@ -587,13 +699,27 @@ class GlobalShortcutFilter(QObject):
                                 self.app_window.current_display_mode = 'class'
                             print(f"      ✅ Set Main View display mode to 'class'")
  
-                            # Force immediate classification render for Main View
+                            # ✅ FAST PATH: Use GPU sync if actor exists, full rebuild only if needed
                             try:
+                                from gui.unified_actor_manager import sync_palette_to_gpu, _get_unified_actor
+                                _actor = _get_unified_actor(self.app_window)
+                                if _actor is not None:
+                                    # Actor exists — GPU uniform poke only (~300ms)
+                                    sync_palette_to_gpu(
+                                        self.app_window, 0,
+                                        self.app_window.class_palette,
+                                        border_percent, render=True
+                                    )
+                                    print(f"      ⚡ Fast GPU sync (actor exists)")
+                                else:
+                                    # No actor — need full build (first time / after mode switch)
+                                    from gui.class_display import update_class_mode
+                                    update_class_mode(self.app_window, force_refresh=True)
+                                    print(f"      ✅ Full classification render (no actor)")
+                            except Exception as e:
+                                print(f"      ⚠️ Fast path failed, falling back: {e}")
                                 from gui.class_display import update_class_mode
                                 update_class_mode(self.app_window, force_refresh=True)
-                                print(f"      ✅ Forced Main View classification render")
-                            except Exception as e:
-                                print(f"      ⚠️ Could not force render: {e}")
                         else:
                             # ✅ Target is Cross Section or Cut View - DO NOT TOUCH MAIN VIEW!
                             print(f"   ⏭️  Target is View {target_view}, NOT Main View")
@@ -806,10 +932,28 @@ class GlobalShortcutFilter(QObject):
                         if target_view == 0 and 0 in views:
                             dlg.view_borders[0] = border_percent
                             
-                            from gui.class_display import update_class_mode
-                            self.app_window._preserve_view = True
-                            update_class_mode(self.app_window, force_refresh=True)
-                            print(f"   ✅ Main view refreshed with border={border_percent}%")
+                            # ✅ FAST PATH: GPU sync only (actor already built in STEP 0A)
+                            try:
+                                from gui.unified_actor_manager import sync_palette_to_gpu, _get_unified_actor
+                                _actor = _get_unified_actor(self.app_window)
+                                if _actor is not None:
+                                    self.app_window._preserve_view = True
+                                    sync_palette_to_gpu(
+                                        self.app_window, 0,
+                                        self.app_window.class_palette,
+                                        border_percent, render=True
+                                    )
+                                    print(f"   ⚡ Main view GPU sync with border={border_percent}%")
+                                else:
+                                    from gui.class_display import update_class_mode
+                                    self.app_window._preserve_view = True
+                                    update_class_mode(self.app_window, force_refresh=True)
+                                    print(f"   ✅ Main view rebuilt (no actor)")
+                            except Exception as _sync_err:
+                                print(f"   ⚠️ GPU sync failed, falling back: {_sync_err}")
+                                from gui.class_display import update_class_mode
+                                self.app_window._preserve_view = True
+                                update_class_mode(self.app_window, force_refresh=True)
 
                         # Cross-section views refresh
                         all_section_views = [v for v in views.keys() if 1 <= int(v) <= 5]
@@ -872,6 +1016,9 @@ class GlobalShortcutFilter(QObject):
                                     import traceback
                                     traceback.print_exc()
                         
+                        # ✅ Track which shortcut was last applied (for skip-if-same guard)
+                        self.app_window._last_display_shortcut_id = _current_shortcut_id
+
                         # Status message
                         total_visible = sum(
                             sum(1 for c in classes.values() if c.get("show"))
@@ -899,8 +1046,19 @@ class GlobalShortcutFilter(QObject):
                         traceback.print_exc()
                     
                     finally:
-                        from PySide6.QtCore import QTimer
-                        QTimer.singleShot(1000, lambda: setattr(self.app_window, '_preserve_shortcut_visibility', False))
+                        # ✅ NO import here — use module-level QTimer via _QTimer alias
+                        _QTimer.singleShot(
+                            1000,
+                            lambda: setattr(
+                                self.app_window,
+                                '_preserve_shortcut_visibility',
+                                False
+                            )
+                        )
+                        _QTimer.singleShot(
+                            ShortcutExecutionGuard.COOLDOWN_DISPLAY,
+                            self._shortcut_guard.force_unlock
+                        )
 
                     return True
                     
@@ -912,10 +1070,53 @@ class GlobalShortcutFilter(QObject):
                         print("⚠️ ShadingMode shortcut has no preset")
                         return True
 
+                    # ✅ GUARD: Block if another shortcut is still executing
+                    if not self._shortcut_guard.try_acquire("ShadingMode"):
+                        if hasattr(self.app_window, 'statusBar'):
+                            self.app_window.statusBar().showMessage(
+                                "⚠️ Please wait — previous shortcut still processing", 1500
+                            )
+                        return True
+
                     try:
                         print(f"\n{'='*60}")
                         print(f"🌗 APPLYING SHADINGMODE PRESET FROM SHORTCUT")
                         print(f"{'='*60}")
+
+                        # ====================================================================
+                        # ✅ GUARD: Skip if this exact shading is already active
+                        # ====================================================================
+                        _skip_shading = False
+                        try:
+                            if getattr(self.app_window, 'display_mode', None) == 'shaded_class' \
+                                    and hasattr(self.app_window, '_shaded_mesh_actor') \
+                                    and self.app_window._shaded_mesh_actor is not None:
+                                # Check params match
+                                _az_match = abs(getattr(self.app_window, 'last_shade_azimuth', -1) - preset.get('azimuth', 45.0)) < 0.01
+                                _an_match = abs(getattr(self.app_window, 'last_shade_angle', -1) - preset.get('angle', 45.0)) < 0.01
+                                _am_match = abs(getattr(self.app_window, 'shade_ambient', -1) - preset.get('ambient', 0.2)) < 0.01
+                                if _az_match and _an_match and _am_match:
+                                        # Check visibility match
+                                        _p_vis = set(int(c) for c, i in preset.get("classes", {}).items() if i.get("show", False))
+                                        _c_vis = getattr(self.app_window, '_shading_visibility_override', None)
+                                        if _c_vis is None:
+                                            # Override is cleared 200ms after shortcut completes,
+                                            # fall back to the persisted visible-classes set
+                                            # (written by update_shaded_class and never cleared)
+                                            _c_vis = getattr(self.app_window, '_shading_visible_classes', None)
+                                        if _c_vis is not None and isinstance(_c_vis, set) and _c_vis == _p_vis:
+                                            _skip_shading = True
+                        except Exception:
+                            _skip_shading = False
+
+                        if _skip_shading:
+                            print(f"   ⏭️  SKIPPING — same shading already active (no-op)")
+                            print(f"{'='*60}\n")
+                            if hasattr(self.app_window, 'statusBar'):
+                                self.app_window.statusBar().showMessage(
+                                    "✅ ShadingMode already applied (no rebuild needed)", 2000)
+                            self._shortcut_guard.force_unlock()
+                            return True
 
                         # STEP 1: Hide classification point actors
                         if hasattr(self.app_window, 'vtk_widget'):
@@ -931,7 +1132,6 @@ class GlobalShortcutFilter(QObject):
                         # STEP 3: Reset ALL classes hidden, apply preset visibility
                         classes = preset.get("classes", {})
 
-                        # ✅ Reset ALL to hidden first
                         if hasattr(self.app_window, 'class_palette'):
                             for code in self.app_window.class_palette:
                                 self.app_window.class_palette[code]["show"] = False
@@ -957,74 +1157,47 @@ class GlobalShortcutFilter(QObject):
                         # ✅ Set override BEFORE calling update_shaded_class
                         self.app_window._shading_visibility_override = visible_set
 
-                        # STEP 4: ✅ CRITICAL FIX - Sync to display_mode_dialog AND UPDATE CHECKBOXES
+                        # STEP 4: Sync to display_mode_dialog AND UPDATE CHECKBOXES
                         if hasattr(self.app_window, 'display_mode_dialog') and \
-                        self.app_window.display_mode_dialog is not None:
+                                self.app_window.display_mode_dialog is not None:
                             dlg = self.app_window.display_mode_dialog
-                            
+
                             if not hasattr(dlg, 'view_palettes'):
                                 dlg.view_palettes = {}
                             if 0 not in dlg.view_palettes:
                                 dlg.view_palettes[0] = {}
-                            
-                            # Sync visibility to dialog palette
+
                             for code, entry in self.app_window.class_palette.items():
                                 dlg.view_palettes[0][int(code)] = {
                                     "show": entry.get("show", False),
                                     "color": entry.get("color", (128, 128, 128)),
                                     "weight": entry.get("weight", 1.0),
                                 }
-                            
-                            # ✅ CRITICAL FIX: Update the actual checkboxes in the table
+
                             if hasattr(dlg, 'table') and dlg.table is not None:
-                                print(f"   🔄 Updating Display Mode dialog checkboxes...")
-                                
                                 for row in range(dlg.table.rowCount()):
                                     try:
                                         code_item = dlg.table.item(row, 1)
                                         if not code_item:
                                             continue
-                                        
                                         code = int(code_item.text())
                                         chk = dlg.table.cellWidget(row, 0)
-                                        
                                         if chk:
-                                            # Block signals to prevent triggering updates
                                             chk.blockSignals(True)
-                                            
-                                            # Set checkbox based on visibility
-                                            is_visible = (code in visible_set)
-                                            chk.setChecked(is_visible)
-                                            
-                                            # Unblock signals
+                                            chk.setChecked(code in visible_set)
                                             chk.blockSignals(False)
-                                            
-                                            print(f"      Class {code}: {'✓' if is_visible else '✗'}")
-                                    except Exception as e:
-                                        print(f"      ⚠️ Row {row} error: {e}")
+                                    except Exception:
                                         continue
-                                
-                                print(f"   ✅ Updated {dlg.table.rowCount()} checkboxes")
-                            
-                            # ✅ Also update slot_shows for this view
+
                             if not hasattr(dlg, 'slot_shows'):
                                 dlg.slot_shows = {}
                             if 0 not in dlg.slot_shows:
                                 dlg.slot_shows[0] = {}
-                            
+
                             for code in self.app_window.class_palette:
                                 dlg.slot_shows[0][int(code)] = (int(code) in visible_set)
-                            
-                            print(f"   ✅ Synced to display_mode_dialog slot 0")
 
-                        # STEP 5: Clear shading cache
-                        try:
-                            from gui.shading_display import clear_shading_cache
-                            clear_shading_cache("shading shortcut applied")
-                        except Exception as e:
-                            print(f"   ⚠️ Could not clear shading cache: {e}")
-
-                        # STEP 6: Store params
+                        # STEP 5: Store params
                         azimuth = preset.get("azimuth", 45.0)
                         angle   = preset.get("angle",   45.0)
                         ambient = preset.get("ambient",  0.2)
@@ -1033,37 +1206,55 @@ class GlobalShortcutFilter(QObject):
                         self.app_window.last_shade_angle   = angle
                         self.app_window.shade_ambient      = ambient
 
-                        # STEP 7: Apply shading with override STILL SET
+                        # STEP 6: Apply shading with override STILL SET
                         from gui.shading_display import update_shaded_class
                         update_shaded_class(
                             self.app_window,
                             azimuth=azimuth,
                             angle=angle,
                             ambient=ambient,
-                            force_rebuild=True
+                            force_rebuild=False
                         )
 
-                        # ✅ Clear override AFTER shading is complete
-                        from PySide6.QtCore import QTimer
-                        QTimer.singleShot(100, lambda: setattr(self.app_window, '_shading_visibility_override', None))
+                        # ✅ Clear override AFTER shading — use pre-captured _QTimer
+                        _QTimer.singleShot(
+                            200,
+                            lambda: setattr(
+                                self.app_window,
+                                '_shading_visibility_override',
+                                None
+                            )
+                        )
 
-                        print(f"   ✅ Shading done: az={azimuth}° angle={angle}° | {visible_count} classes")
+                        print(f"   ✅ Shading done: az={azimuth}° angle={angle}° "
+                              f"| {visible_count} classes")
                         print(f"{'='*60}\n")
 
                         if hasattr(self.app_window, 'statusBar'):
                             self.app_window.statusBar().showMessage(
-                                f"🌗 ShadingMode: {azimuth}°/{angle}°, {visible_count} classes visible",
+                                f"🌗 ShadingMode: {azimuth}°/{angle}°, "
+                                f"{visible_count} classes visible",
                                 2500
                             )
 
                     except Exception as e:
-                        self.app_window._shading_visibility_override = None
+                        # ✅ Always clear override on any exception
+                        try:
+                            self.app_window._shading_visibility_override = None
+                        except Exception:
+                            pass
                         print(f"⚠️ Failed to apply ShadingMode preset: {e}")
                         import traceback
                         traceback.print_exc()
 
+                    finally:
+                        # ✅ Use pre-captured _QTimer — never unbound here
+                        _QTimer.singleShot(
+                            ShortcutExecutionGuard.COOLDOWN_SHADING,
+                            self._shortcut_guard.force_unlock
+                        )
+
                     return True
-                    ####
                 
                 if tool == "DrawSettings":
                     preset = shortcut.get("preset")
@@ -1139,19 +1330,48 @@ class GlobalShortcutFilter(QObject):
                         print(f"⚠️ Failed to apply DrawSettings preset: {e}")
                         import traceback
                         traceback.print_exc()
+                    finally:
+                        _QTimer.singleShot(
+                            ShortcutExecutionGuard.COOLDOWN_DRAW,
+                            self._shortcut_guard.force_unlock
+                        )
 
                     return True
 
                 if not shortcut:
-                   return False 
-                
-                # ✅ Existing shortcuts (classification tools)
+                    return False
+
+                # ✅ ShadingMode/DisplayMode/DrawSettings handled inline above
+                if tool in ("ShadingMode", "DisplayMode", "DrawSettings"):
+                    print(f"⚠️ {tool} reached fallback — already handled inline")
+                    return True
+
+                # ✅ Classification tools — guard prevents concurrent execution
+                if not self._shortcut_guard.try_acquire(tool or "tool"):
+                    if hasattr(self.app_window, 'statusBar'):
+                        self.app_window.statusBar().showMessage(
+                            "⚠️ Please wait — previous shortcut still processing",
+                            1500
+                        )
+                    return True
+
                 from_cls = shortcut.get("from")
                 to_cls = shortcut.get("to")
-                
-                print(f"✅ SHORTCUT MATCH: {combo} → {tool}, from={from_cls}, to={to_cls}")
-                execute_tool(self.app_window, tool, from_cls, to_cls)
-                return True            
+
+                print(f"✅ SHORTCUT MATCH: {combo} → {tool}, "
+                      f"from={from_cls}, to={to_cls}")
+                try:
+                    execute_tool(self.app_window, tool, from_cls, to_cls)
+                except Exception as e:
+                    print(f"⚠️ execute_tool failed for {tool}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    _QTimer.singleShot(
+                        ShortcutExecutionGuard.COOLDOWN_NORMAL,
+                        self._shortcut_guard.force_unlock
+                    )
+                return True
             return False
              
     def _refresh_cut_section(self, view_idx):

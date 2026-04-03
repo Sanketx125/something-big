@@ -33,7 +33,7 @@ from gui.draw_settings_dialog import (
     save_draw_settings,
     vtk_color_to_qcolor,
 )
-from gui.shortcut_manager import ShortcutManager, TOOLS
+from gui.shortcut_manager import ShortcutManager, TOOLS, SIMPLE_SHORTCUT_TOOLS
 
 
 SHORTCUT_MODIFIERS = [
@@ -49,18 +49,7 @@ SHORTCUT_MODIFIERS = [
 
 SHORTCUT_KEYS = [f"F{i}" for i in range(1, 13)] + [chr(i) for i in range(65, 91)] + ["Space"]
 
-SHORTCUT_SIMPLE_TOOLS = {
-    "CrossSectionRect",
-    "CutSectionRect",
-    "CutFromCross",
-    "CutFromCut",
-    "TopView",
-    "Depth",
-    "RGB",
-    "Intensity",
-    "Elevation",
-    "Class",
-}
+SHORTCUT_SIMPLE_TOOLS = set(SIMPLE_SHORTCUT_TOOLS)
 
 
 class SettingsPreviewWidget(QWidget):

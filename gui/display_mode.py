@@ -1350,7 +1350,7 @@ class DisplayModeDialog(QDialog):
             print("🎨 Display mode → shaded_class")
             try:
                 from gui.shading_display import (
-                    update_shaded_class, clear_shading_cache, get_cache
+                    update_shaded_class, has_cached_geometry
                 )
                 azimuth = getattr(app, 'last_shade_azimuth', 45.0)
                 angle   = getattr(app, 'last_shade_angle',   45.0)
@@ -1359,30 +1359,18 @@ class DisplayModeDialog(QDialog):
                     int(c) for c, e in class_map.items() if e.get("show", True)
                 )
                 app._shading_visibility_override = new_vis
- 
-                # ── Guard: only clear cache + force_rebuild when necessary ──
-                # is_geometry_valid() is weaker than is_fully_current() — it
-                # does NOT require the VTK actor to exist, so it stays True
-                # after switching to "By Classification" and back.
+
+                # Guard: reuse cached geometry even if the shaded actor was removed.
                 _xyz = (app.data.get("xyz")
                         if hasattr(app, 'data') and app.data else None)
-                _cache = get_cache()
- 
-                if _xyz is not None and _cache.is_geometry_valid(_xyz, new_vis):
-                    # Geometry (triangulation + normals) is still valid.
-                    # update_shaded_class will take Early-Exit 1 or 2:
-                    #   • actor present + params same → full no-op
-                    #   • actor gone (mode switch) → re-render from cache
-                    #   • params changed → re-shade from cache
-                    print("   ⚡ Geometry cached — skipping clear + force_rebuild")
+
+                if _xyz is not None and has_cached_geometry(_xyz, new_vis):
+                    print("   ⚡ Geometry cached — skipping rebuild")
                     update_shaded_class(app, azimuth, angle, ambient,
                                         force_rebuild=False)
                 else:
-                    # Geometry invalid (new data, new visible set, first run).
-                    clear_shading_cache("display mode shading applied")
                     update_shaded_class(app, azimuth, angle, ambient,
                                         force_rebuild=True)
-                # ─────────────────────────────────────────────────────────────
             except Exception as _se:
                 print(f"⚠️ Shading backend failed: {_se}")
             fast_path_handled = True

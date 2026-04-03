@@ -11,6 +11,9 @@ TOOL_MAP = {
     "CutFromCross": "CutFromCross",  
     "CutFromCut": "CutFromCut",  
     "TopView": "top_view",
+    "MeasureLine": "measure_line",
+    "MeasurePath": "measure_path",
+    "ClearMeasurements": "clear_measurements",
     "DisplayMode": "display_mode",      # ✅ ADDED
     "ShadingMode": "shading_mode",      # ✅ ADDED
 }
@@ -248,6 +251,47 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     # VIEW NAVIGATION TOOLS (Non-classification)
     # ========================================================================
 
+    if tool_name in ("measure_line", "measure_path"):
+        print(f"📏 Activating measurement shortcut: {tool_name}")
+
+        try:
+            if hasattr(app_window, "_sync_tools_for_ribbon_tab"):
+                app_window._sync_tools_for_ribbon_tab("measure")
+            elif hasattr(app_window, "_enter_measure_tab_mode"):
+                app_window._enter_measure_tab_mode()
+
+            if hasattr(app_window, "activate_measurement_tool"):
+                app_window.activate_measurement_tool(tool_name)
+                _return_focus_to_main_view(app_window)
+                print(f"   ✅ Measurement tool activated: {tool_name}")
+            else:
+                print("   ⚠️ Measurement activation handler not available")
+        except Exception as e:
+            print(f"⚠️ Measurement shortcut failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return
+
+    if tool_name == "clear_measurements":
+        print("🗑️ Clearing measurements from shortcut")
+
+        try:
+            if hasattr(app_window, "clear_all_measurements"):
+                app_window.clear_all_measurements()
+            elif hasattr(app_window, "measurement_tool") and app_window.measurement_tool:
+                app_window.measurement_tool.clear_all_measurements()
+            else:
+                print("   ⚠️ No measurement tool available to clear")
+                return
+
+            _return_focus_to_main_view(app_window)
+            print("   ✅ Measurements cleared")
+        except Exception as e:
+            print(f"⚠️ Clear measurements shortcut failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return
+
     if tool_name == "top_view":
         print("🔝 Activating Top View")
         
@@ -418,10 +462,50 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     # ========================================================================
     if tool_name == "cross_section":
         print("🔧 Activating Cross Section tool - SHOWING POPUP DIALOG")
-        # ✅ DON'T clear classification parameters - they should persist!
-        # Only clear the active drawing tool
-        app_window.active_classify_tool = None
+        # ✅ Clear any active classification session first so preview actors
+        # are cleaned up before the cross-section interactor takes over.
+        class_picker = getattr(app_window, "class_picker", None)
+        classification_active = bool(
+            getattr(app_window, "active_classify_tool", None)
+            or (class_picker and class_picker.isVisible())
+            or getattr(app_window, "classify_interactor", None)
+            or getattr(app_window, "classify_interactors", None)
+            or getattr(app_window, "cut_classify_interactor", None)
+        )
+
+        if classification_active and hasattr(app_window, "deactivate_classification_tool"):
+            # Guard: ensure cross_action exists and is not None before preserve logic
+            has_cross_action = (
+                hasattr(app_window, 'cross_action') 
+                and app_window.cross_action is not None
+            )
+            app_window.deactivate_classification_tool(
+                preserve_cross_section=has_cross_action
+            )
+
+                # ✅ DON'T clear classification parameters - they should persist.
+                # We only need the active tool state reset before switching.
+            app_window.active_classify_tool = None
         
+    if tool_name == "cross_section":
+        print("🔧 Activating Cross Section tool - SHOWING POPUP DIALOG")
+        
+        # ✅ Deactivate measurement tool
+        if hasattr(app_window, 'measurement_tool') and app_window.measurement_tool:
+            mt = app_window.measurement_tool
+            if getattr(mt, 'active', False):
+                print("   📏 Deactivating measurement tool (switching to cross-section)")
+                if hasattr(mt, 'deactivate'):
+                    try:
+                        mt.deactivate()
+                    except Exception as e:
+                        print(f"      ⚠️ Measurement deactivate failed: {e}")
+                mt.active = False
+                if hasattr(mt, 'is_drawing'):
+                    mt.is_drawing = False
+        
+        # ... rest of cross-section code ...
+
         # ✅ CRITICAL: Use enable_cross_section_mode() to show popup dialog FIRST
         if hasattr(app_window, "enable_cross_section_mode"):
             app_window.enable_cross_section_mode()
@@ -487,6 +571,24 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     
     print(f"   📍 Classification target: {classification_target}")
     
+    # ========================================================================
+    # ✅ CRITICAL: Deactivate measurement tool when switching to classification
+    # This prevents Ctrl+Z from routing to measurement undo after shortcut switch
+    # ========================================================================
+    if hasattr(app_window, 'measurement_tool') and app_window.measurement_tool:
+        mt = app_window.measurement_tool
+        if getattr(mt, 'active', False):
+            print("   📏 Deactivating measurement tool (switching to classification)")
+            if hasattr(mt, 'deactivate'):
+                try:
+                    mt.deactivate()
+                except Exception as e:
+                    print(f"      ⚠️ Measurement deactivate failed: {e}")
+            # Force flags even if deactivate() didn't clear them
+            mt.active = False
+            if hasattr(mt, 'is_drawing'):
+                mt.is_drawing = False
+
     # Set classification parameters
     app_window.from_classes = from_cls
     app_window.to_class = to_cls

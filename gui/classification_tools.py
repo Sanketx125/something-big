@@ -490,6 +490,10 @@ def classify_with_stats_update(classify_func):
             app._gpu_sync_done = False
             return result
 
+        changed_mask = getattr(app, "_last_changed_mask", None)
+        if changed_mask is None or not isinstance(changed_mask, np.ndarray) or not np.any(changed_mask):
+            return result
+
         # ✅ Determine which view is actually active
         is_cut_active = (
             hasattr(app, 'cut_section_controller') and 
@@ -510,7 +514,6 @@ def classify_with_stats_update(classify_func):
         if not is_cut_active and hasattr(app, 'section_vtks') and app.section_vtks:
             try:
                 from gui.unified_actor_manager import fast_cross_section_update
-                changed_mask = getattr(app, '_last_changed_mask', None)
 
                 for view_idx, vtk_widget in app.section_vtks.items():
                     if vtk_widget is None:
@@ -714,12 +717,15 @@ def _apply_classification(app, update_mask, from_classes, to_class):
     MicroStation-style: only touched points updated, no full RGB rewrite.
     """
     if app.data is None or to_class is None:
-        return
+        return False
+
+    app._gpu_sync_done = False
+    app._last_changed_mask = None
  
     classes = app.data["classification"]
     update_idx = np.where(update_mask)[0]
     if update_idx.size == 0:
-        return
+        return False
  
     # --- 1. Visibility & Filter Protection ---
     visible_classes = _get_visible_classes_for_current_view(app)
@@ -732,7 +738,9 @@ def _apply_classification(app, update_mask, from_classes, to_class):
         update_idx = update_idx[class_mask]
  
     if update_idx.size == 0:
-        return
+        if hasattr(app, "statusBar"):
+            app.statusBar().showMessage("No visible/from-class points in selection.", 2500)
+        return False
  
     # --- 2. LOG FOR UNDO ---
     final_bool_mask = np.zeros(len(classes), dtype=bool)
@@ -748,6 +756,8 @@ def _apply_classification(app, update_mask, from_classes, to_class):
  
     # --- 3. APPLY TO DATA (CPU) ---
     classes[update_idx] = to_class
+    app._last_changed_mask = final_bool_mask
+    app._last_from_classes = list(from_classes or [])
  
     # --- 4. SYNC TO GPU ---
     # DO NOT call sync_palette_to_gpu here — that rewrites ALL 13.4M points (290ms).
@@ -838,6 +848,7 @@ def _apply_classification(app, update_mask, from_classes, to_class):
         print(f"⚠️ GPU Sync Error: {e}")
  
     print(f"⚡ Global Sync: All viewports updated via GPU uniforms.")
+    return True
 
 
 

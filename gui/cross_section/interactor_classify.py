@@ -151,6 +151,136 @@ class ClassificationInteractor:
         print("✅ ClassificationInteractor initialized with live previews")
         self.style.AddObserver("RightButtonPressEvent", self.on_right_press)
 
+    def cleanup(self):
+        """Clear transient preview state before this interactor is discarded."""
+        try:
+            self._finalize_pending_main_brush_stroke()
+        except Exception as e:
+            print(f"⚠️ ClassificationInteractor cleanup brush finalize failed: {e}")
+
+        try:
+            self._clear_all_previews()
+        except Exception as e:
+            print(f"⚠️ ClassificationInteractor cleanup preview clear failed: {e}")
+
+        overlay = getattr(self, "_preview_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.hide()
+                overlay.deleteLater()
+            except Exception as e:
+                print(f"⚠️ ClassificationInteractor overlay cleanup failed: {e}")
+            self._preview_overlay = None
+
+        self.P1 = None
+        self.is_dragging = False
+        self.drawing_points = []
+        self.is_drawing_freehand = False
+
+    def _finalize_pending_main_brush_stroke(self):
+        """
+        Finalize a live main-view brush stroke when the tool ends without a
+        normal mouse-release event, so undo/redo still works.
+        """
+        if not self._is_main_view():
+            return None
+
+        mask = getattr(self, "_brush_accumulated_mask", None)
+        old_classes_dict = getattr(self, "_brush_old_classes", None) or {}
+        to_class = getattr(self.app, "to_class", None)
+        undo_mask = None
+
+        if mask is not None and np.any(mask):
+            if old_classes_dict and to_class is not None:
+                indices = np.array(sorted(old_classes_dict.keys()), dtype=np.int64)
+                old_cls = np.array(
+                    [old_classes_dict[int(i)] for i in indices],
+                    dtype=self.app.data["classification"].dtype,
+                )
+                new_cls = np.full(len(indices), to_class, dtype=old_cls.dtype)
+
+                undo_mask = np.zeros(len(self.app.data["xyz"]), dtype=bool)
+                undo_mask[indices] = True
+
+                self.app.undo_stack.append({
+                    "mask": undo_mask,
+                    "old_classes": old_cls,
+                    "new_classes": new_cls,
+                })
+                self.app.redo_stack.clear()
+                self.app._last_changed_mask = undo_mask
+
+                max_steps = getattr(self.app, "_max_undo_steps", 30)
+                while len(self.app.undo_stack) > max_steps:
+                    from gui.memory_manager import _free_undo_entry
+                    _free_undo_entry(self.app.undo_stack.pop(0))
+
+                try:
+                    from gui.point_count_widget import refresh_point_statistics
+                    refresh_point_statistics(self.app)
+                except Exception:
+                    pass
+
+                if hasattr(self.app, "statusBar"):
+                    self.app.statusBar().showMessage(
+                        f"✅ {len(indices):,} points → class {to_class}", 3000
+                    )
+
+            if getattr(self.app, "display_mode", "class") != "shaded_class":
+                self.app._gpu_sync_done = True
+            elif _shading_mesh_exists(self.app):
+                try:
+                    from gui.shading_display import refresh_shaded_after_classification_fast
+                    refresh_shaded_after_classification_fast(
+                        self.app,
+                        changed_mask=mask,
+                    )
+                except Exception as e:
+                    print(f"⚠️ Brush cleanup shading refresh: {e}")
+            else:
+                self.app._gpu_sync_done = True
+
+            try:
+                if hasattr(self.app, "section_vtks") and undo_mask is not None:
+                    from gui.unified_actor_manager import fast_cross_section_update
+                    for view_idx in self.app.section_vtks:
+                        try:
+                            fast_cross_section_update(self.app, view_idx, undo_mask)
+                        except Exception:
+                            pass
+
+                self._safe_render_pyvista(self.app.vtk_widget)
+                if hasattr(self.app, "section_vtks"):
+                    for vtk_widget in self.app.section_vtks.values():
+                        if vtk_widget:
+                            self._safe_render_pyvista(vtk_widget)
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.app, "cut_section_controller"):
+                    ctrl = self.app.cut_section_controller
+                    if (
+                        ctrl.is_cut_view_active
+                        and ctrl.cut_points is not None
+                        and ctrl._cut_index_map is not None
+                        and ctrl.cut_vtk is not None
+                    ):
+                        ctrl._refresh_cut_colors_fast()
+            except Exception as e:
+                print(f"⚠️ Brush cleanup cut refresh failed: {e}")
+
+        self._brush_accumulated_mask = None
+        self._brush_old_classes = {}
+        self._brush_frame_chunks = []
+        self._brush_stroke_positions = []
+        self._last_brush_center = None
+        self._brush_needs_render = False
+        self.app._suppress_section_refresh = False
+        self.is_dragging = False
+
+        return undo_mask
+
     # ═══════════════════════════════════════════════════════════════════════
     # ✅ SAFE RENDER GUARDS - Prevents crash on stale VTK render windows
     # Root cause: switching between cut section ↔ synchronized views leaves
@@ -1883,9 +2013,12 @@ class ClassificationInteractor:
                                         _get_unified_actor, _mark_actor_dirty,
                                         fast_cross_section_update
                                     )
-                                    palette = getattr(self.app, 'class_palette', {})
+                                    palette = self._get_main_view_palette() or {}
+                                    entry = palette.get(int(to_class), {})
                                     color = np.array(
-                                        palette.get(to_class, {}).get('color', (128, 128, 128)),
+                                        entry.get('color', (128, 128, 128))
+                                        if entry.get('show', True)
+                                        else (0, 0, 0),
                                         dtype=np.uint8
                                     )
 
@@ -2777,6 +2910,11 @@ class ClassificationInteractor:
             traceback.print_exc()
             
     def _refresh_all_views_after_classification(self, to_class):
+        changed_mask = getattr(self.app, "_last_changed_mask", None)
+        if changed_mask is None or not isinstance(changed_mask, np.ndarray) or not np.any(changed_mask):
+            print("⏭️ Skipping post-classification refresh - no changed points in current operation")
+            return
+
         try:
             # ✅ CRITICAL FIX: ALWAYS use optimizer for multi-view scenarios
             # The optimizer is specifically designed to handle this efficiently
@@ -3539,17 +3677,20 @@ class ClassificationInteractor:
             in Display Mode (slot 0). Hidden classes are protected.
         ✅ Also enforces from_classes here (so brush + any caller is consistent).
         """
+        self.app._gpu_sync_done = False
+        self.app._last_changed_mask = None
+
         if mask is None or not np.any(mask):
             if hasattr(self.app, 'statusBar'):
                 self.app.statusBar().showMessage("No points found in selection.", 2000)
-            return
+            return False
 
         if to_class is None:
             to_class = getattr(self.app, "to_class", None)
         if to_class is None:
             if hasattr(self.app, 'statusBar'):
                 self.app.statusBar().showMessage("Target class not set.", 2000)
-            return
+            return False
 
         classes = self.app.data["classification"]
 
@@ -3568,7 +3709,7 @@ class ClassificationInteractor:
             if visible_classes == []:
                 if hasattr(self.app, 'statusBar'):
                     self.app.statusBar().showMessage("No visible classes selected in Display Mode.", 2500)
-                return
+                return False
 
             # If we can filter, protect hidden classes
             if visible_classes is not None:
@@ -3579,7 +3720,7 @@ class ClassificationInteractor:
         if not np.any(mask):
             if hasattr(self.app, 'statusBar'):
                 self.app.statusBar().showMessage("No visible/from-class points in selection.", 2500)
-            return
+            return False
 
         # ---------------------------------------------------------
         # Apply + Undo/Redo
@@ -3697,6 +3838,9 @@ class ClassificationInteractor:
             import traceback
             traceback.print_exc()
             self._refresh_all_views_after_classification(to_class)
+            return True
+
+        return True
 
     def _get_visible_classes_for_slot(self, slot: int):
         """
@@ -5848,40 +5992,10 @@ class ClassificationInteractor:
             
             # ✅ ADD: Set flag to trigger fly-to after next classification
             self._fly_to_after_classify = pt
-            
-            # Show menu
-            self._show_fly_to_menu(pt)
-            
+                        
         except Exception as e:
             print(f"⚠️ Right-click handler failed: {e}")
 
-    def _show_fly_to_menu(self, world_point):
-        """Show context menu with 'Fly To' option"""
-        from PySide6.QtWidgets import QMenu, QApplication
-        from PySide6.QtGui import QCursor, QAction
-        
-        try:
-            menu = QMenu()
-            
-            # Add "Fly To in Main View" action
-            fly_action = QAction("🎯 Fly To in Main View", menu)
-            fly_action.triggered.connect(lambda: self._execute_fly_to(world_point))  # ✅ Changed
-            menu.addAction(fly_action)
-            
-            # Add separator
-            menu.addSeparator()
-            
-            # Add "Show Coordinates" for debugging
-            coords_text = f"📍 ({world_point[0]:.2f}, {world_point[1]:.2f}, {world_point[2]:.2f})"
-            coords_action = QAction(coords_text, menu)
-            coords_action.setEnabled(False)
-            menu.addAction(coords_action)
-            
-            # Show menu
-            menu.exec(QCursor.pos())
-            
-        except Exception as e:
-            print(f"⚠️ Menu creation failed: {e}")
 
     def _execute_fly_to(self, world_point):
         """Execute fly-to with delay"""
@@ -6421,3 +6535,42 @@ class ClassificationInteractor:
                         break
         
         print(f"{'='*60}\n")
+
+
+    # In interactor_classify.py — wherever classification is committed:
+    def _commit_classification(self, mask, from_classes, to_class):
+        """Apply classification and maintain undo/redo stacks correctly."""
+        import numpy as np
+
+        classification = self.app.data["classification"]
+        old_classes = classification[mask].copy()
+
+        # Apply to ground truth
+        classification[mask] = to_class
+
+        # Push undo step
+        step = {
+            "mask": mask.copy(),
+            "old_classes": old_classes,
+            "new_classes": np.full(mask.sum(), to_class, dtype=classification.dtype),
+        }
+        self.app.undo_stack.append(step)
+
+        # *** CRITICAL: Always clear redo when new classification is committed ***
+        # Without this, stale redo steps pollute subsequent undo/redo cycles.
+        self.app.redo_stack.clear()
+
+        # Cap undo stack
+        max_steps = getattr(self.app, '_max_undo_steps', 30)
+        while len(self.app.undo_stack) > max_steps:
+            from gui.memory_manager import _free_undo_entry
+            _free_undo_entry(self.app.undo_stack.pop(0))
+
+        # Invalidate section mirrors BEFORE emitting so _on_classification_finished
+        # gets clean mirrors to work with
+        if hasattr(self.app, 'section_vtks'):
+            for view_idx in self.app.section_vtks.keys():
+                self.app._sync_section_mirror_from_data(view_idx)
+
+        # Emit signal — triggers cross-section refresh via _on_classification_finished
+        self.app.classification_finished.emit(mask)

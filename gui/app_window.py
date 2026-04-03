@@ -5991,7 +5991,7 @@ class NakshaApp(QMainWindow):
        
       
         # ✅ BETTER: Check if cross-section button is checked, not if interactor exists
-        if (not preserve_cross_section) and hasattr(self, 'cross_action') and self.cross_action.isChecked():
+        if (not preserve_cross_section) and hasattr(self, 'cross_action') and self.cross_action is not None and self.cross_action.isChecked():
             print("   🛑 Also deactivating cross-section mode")
            
             try:
@@ -6017,7 +6017,7 @@ class NakshaApp(QMainWindow):
             except Exception as e:
                 print(f"   ⚠️ Error deactivating cross-section: {e}")
  
-        elif preserve_cross_section and hasattr(self, 'cross_action') and self.cross_action.isChecked():
+        elif preserve_cross_section and hasattr(self, 'cross_action') and self.cross_action is not None and self.cross_action.isChecked():
             print("   ℹ️ Preserving cross-section mode while deactivating classification")
        
         print(f"{'='*60}")
@@ -6596,19 +6596,18 @@ class NakshaApp(QMainWindow):
 
 
     def undo_classification(self):
-        """🚀 ZERO-BLINK UNDO: In-place memory swap"""
         if not self.undo_stack: return
         step = self.undo_stack.pop()
         mask = step.get('mask')
         if mask is None or not mask.any(): return
 
         old_cls = step.get('old_classes')
-        if old_cls is None: return  # Guard against malformed entry
+        if old_cls is None: return
 
         # 1. Revert CPU RAM
         self.data["classification"][mask] = old_cls
         self.redo_stack.append(step)
-        # Cap redo stack
+        
         max_steps = getattr(self, '_max_undo_steps', 30)
         while len(self.redo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
@@ -6618,21 +6617,42 @@ class NakshaApp(QMainWindow):
         from gui.unified_actor_manager import fast_undo_update
         fast_undo_update(self, changed_mask=mask)
 
-        # 3. ⚡ FAST GPU POKE: Cross-Sections (The fix for the blink)
+        # 3. ⚡ CRITICAL FIX: Invalidate ALL section view mirrors
+        #    so they are rebuilt from fresh self.data["classification"]
+        #    instead of stale pre-undo GPU cache
         if hasattr(self, 'section_vtks') and self.section_vtks:
+            for view_idx, vtk_widget in self.section_vtks.items():
+                try:
+                    # Wipe the stale mirror so fast_cross_section_update
+                    # is forced to rebuild from self.data["classification"]
+                    actor = getattr(vtk_widget, '_naksha_unified_actor', None)
+                    if actor is not None:
+                        mirror = getattr(actor, '_naksha_section_class', None)
+                        if mirror is not None:
+                            # Re-read from ground truth classification for THIS view's points
+                            section_indices = getattr(self, f'_section_{view_idx}_global_indices', None)
+                            if section_indices is not None and len(section_indices) > 0:
+                                import numpy as np
+                                actor._naksha_section_class = (
+                                    self.data["classification"][section_indices].copy()
+                                )
+                            else:
+                                # No index map yet → mark mirror as invalid
+                                actor._naksha_section_class = None
+                except Exception as e:
+                    print(f"⚠️ Mirror invalidation for view {view_idx}: {e}")
+
+            # Now do the fast GPU poke with clean mirrors
             from gui.unified_actor_manager import fast_cross_section_update
             for view_idx in self.section_vtks.keys():
-                # We use the same 'Fast' function used during drawing
-                # This updates the GPU buffer WITHOUT rebuilding the actor
                 fast_cross_section_update(self, view_idx, mask)
 
-        # Refresh shaded mesh if in shaded mode
+        # 4. Refresh shaded mesh if in shaded mode
         if getattr(self, "display_mode", None) == "shaded_class":
             try:
                 from gui.shading_display import refresh_shaded_after_undo_fast
                 refresh_shaded_after_undo_fast(self, changed_mask=mask)
             except Exception as _se:
-                print(f"Warning: Shading undo refresh failed: {_se}")
                 try:
                     from gui.shading_display import update_shaded_class, clear_shading_cache
                     clear_shading_cache("undo fallback")
@@ -6640,7 +6660,8 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
 
-        # 4. Final Render
+        self._last_changed_mask = None
+        self._gpu_sync_done = False
         self.vtk_widget.render()
 
     def redo_classification(self):
@@ -6651,29 +6672,31 @@ class NakshaApp(QMainWindow):
         if mask is None or not mask.any(): return
 
         new_cls = step.get('new_classes')
-        if new_cls is None: return  # Guard against malformed entry
+        if new_cls is None: return
 
         # 1. Update RAM
         self.data["classification"][mask] = new_cls
         self.undo_stack.append(step)
-        # Cap undo stack
         max_steps = getattr(self, '_max_undo_steps', 30)
         while len(self.undo_stack) > max_steps:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.undo_stack.pop(0))
 
-        # 2. ⚡ Direct GPU Patch
+        # 2. ⚡ Direct GPU Patch: Main View
         from gui.unified_actor_manager import fast_undo_update
         fast_undo_update(self, changed_mask=mask)
 
-        # 3. 📡 CRITICAL: Emit signal
-        # Refresh shaded mesh if in shaded mode
+        # 3. CRITICAL FIX: Invalidate section mirrors before cross-section update
+        if hasattr(self, 'section_vtks') and self.section_vtks:
+            for view_idx in self.section_vtks.keys():
+                self._sync_section_mirror_from_data(view_idx)
+
+        # 4. Refresh shaded mesh if needed
         if getattr(self, "display_mode", None) == "shaded_class":
             try:
                 from gui.shading_display import refresh_shaded_after_undo_fast
                 refresh_shaded_after_undo_fast(self, changed_mask=mask)
             except Exception as _se:
-                print(f"Warning: Shading redo refresh failed: {_se}")
                 try:
                     from gui.shading_display import update_shaded_class, clear_shading_cache
                     clear_shading_cache("redo fallback")
@@ -6681,9 +6704,12 @@ class NakshaApp(QMainWindow):
                 except Exception:
                     pass
 
+        # 5. Emit signal (now mirrors are clean before _on_classification_finished runs)
         self.classification_finished.emit(mask)
-        
-        self.vtk_widget.render() ###
+        self._last_changed_mask = None
+        self._gpu_sync_done = False
+
+        self.vtk_widget.render()
 
 
     def _refresh_main_view_after_undo(self, affected_classes, changed_mask):
@@ -9093,19 +9119,28 @@ class NakshaApp(QMainWindow):
 
     def apply_classification_signal(self, changed_mask, to_class):
         """🚀 ZERO-LAG SYNC: Main View + All Sub-views"""
-        # 1. Update Core CPU Memory (26.9M points)
+        import numpy as np
+
+        # 1. Update Core CPU Memory
         self.data["classification"][changed_mask] = to_class
-        
-        # 2. ⚡ POKE MAIN VIEW GPU (13.4M points)
+
+        # *** CRITICAL FIX: Clear redo stack — new classification invalidates redo history ***
+        self.redo_stack.clear()
+
+        # 2. ⚡ POKE MAIN VIEW GPU
         from gui.unified_actor_manager import fast_classify_update
-        # This triggers the LOD bridge we added in Fix #1
         fast_classify_update(self, changed_mask, to_class)
-        
-        # 3. POKE ALL OTHER VIEWPORTS (Signal Bus)
+
+        # 3. Invalidate section mirrors before signal fires
+        if hasattr(self, 'section_vtks'):
+            for view_idx in self.section_vtks.keys():
+                self._sync_section_mirror_from_data(view_idx)
+
+        # 4. POKE ALL OTHER VIEWPORTS (Signal Bus)
         self.classification_finished.emit(changed_mask)
-        
-        # 4. Final Render
-        self.vtk_widget.render() ####
+
+        # 5. Final Render
+        self.vtk_widget.render()
 
     def activate_dock_by_view(self, view_index):
         """
@@ -11339,52 +11374,41 @@ class NakshaApp(QMainWindow):
     # Add this inside the NakshaApp class
     def _on_classification_finished(self, changed_mask):
         """
-        🚀 MASTER VIEW SYNC: Triggered after any classification or Undo/Redo.
-
-        CRITICAL FIX: when called after a real classification (not undo),
-        changed_mask is a boolean array marking the newly re-classified points.
-        We must call fast_cross_section_update (which reads from the already-
-        updated master classification array) — NOT sync_palette_to_gpu (which
-        re-paints from the stale _naksha_section_class mirror and wipes the change).
+        FIXED: Never reads from _naksha_section_class mirror.
+        Always derives colors from self.data["classification"] (ground truth).
         """
         try:
             from gui.unified_actor_manager import fast_cross_section_update, sync_palette_to_gpu
 
-            # ── 1. Update all active Cross-Sections (Slots 1-4) ──────────────────
             if hasattr(self, 'section_vtks') and self.section_vtks:
                 for view_idx in self.section_vtks.keys():
-
                     if (changed_mask is not None
                             and isinstance(changed_mask, np.ndarray)
                             and changed_mask.dtype == bool):
-                        # Real classification: poke only the changed points via the
-                        # master array (already updated by apply_classification_signal).
-                        # This also keeps _naksha_section_class mirror in sync.
+                        # *** CRITICAL FIX ***
+                        # Before calling fast_cross_section_update,
+                        # ensure the section mirror is in sync with
+                        # self.data["classification"] for the WHOLE section,
+                        # not just changed_mask. This prevents stale mirror
+                        # data from being used as source of truth.
+                        self._sync_section_mirror_from_data(view_idx)
                         fast_cross_section_update(self, view_idx, changed_mask)
                     else:
-                        # Fallback (e.g. undo/redo emits None or a different type):
-                        # full palette repaint is safe here because undo already
-                        # wrote the correct values back into _naksha_section_class
-                        # before this signal fires.
                         sync_palette_to_gpu(self, slot_idx=view_idx + 1, render=True)
 
-            # ── 2. Update Cut Section (Slot 5) ────────────────────────────────────
             if hasattr(self, 'cut_section_controller'):
                 ctrl = self.cut_section_controller
                 if getattr(ctrl, 'is_cut_view_active', False):
                     b = float(getattr(self, 'view_borders', {}).get(5, 0))
-                    sync_palette_to_gpu(self, slot_idx=5, border=b, render=True)  ##
+                    sync_palette_to_gpu(self, slot_idx=5, border=b, render=True)
 
-            # ── 3. Refresh Point Statistics UI ───────────────────────────────────
             from gui.point_count_widget import refresh_point_statistics
             refresh_point_statistics(self)
-
-            print("⚡ Global Sync: All viewports updated via GPU uniforms.")
 
         except Exception as e:
             print(f"⚠️ Global Sync Error: {e}")
             import traceback
-            traceback.print_exc()  ##
+            traceback.print_exc()
 
         finally:
             if hasattr(self, "_last_classified_to_class"):
@@ -11447,3 +11471,59 @@ class NakshaApp(QMainWindow):
         except Exception as e:
             print(f"⚠️ Failed to enforce 2D main interaction: {e}")
             return False        
+
+
+    def _sync_section_mirror_from_data(self, view_idx: int):
+        """
+        CRITICAL GUARD: Rebuild the _naksha_section_class mirror for a section view
+        entirely from self.data["classification"] (ground truth).
+
+        This prevents fast_cross_section_update from ever reading stale mirror
+        data (e.g. left over from before an undo) and writing it back into
+        self.data["classification"], which is the core of the regression bug.
+
+        Called before every fast_cross_section_update.
+        """
+        if self.data is None or "classification" not in self.data:
+            return
+
+        vtk_widget = (getattr(self, 'section_vtks', {}) or {}).get(view_idx)
+        if vtk_widget is None:
+            return
+
+        try:
+            import numpy as np
+
+            # --- find the actor ---
+            actor = None
+            for attr in ('_naksha_unified_actor', '_section_unified_actor'):
+                actor = getattr(vtk_widget, attr, None)
+                if actor is not None:
+                    break
+
+            if actor is None:
+                return
+
+            # --- find global indices for this section view ---
+            section_global_indices = None
+            for attr in (
+                f'_section_{view_idx}_global_indices',
+                f'section_{view_idx}_indices',
+                f'section_{view_idx}_core_indices',
+            ):
+                section_global_indices = getattr(self, attr, None)
+                if section_global_indices is not None:
+                    break
+
+            if section_global_indices is None or len(section_global_indices) == 0:
+                # No index map → mark mirror invalid so downstream rebuilds fully
+                if hasattr(actor, '_naksha_section_class'):
+                    actor._naksha_section_class = None
+                return
+
+            # --- rebuild mirror from ground truth ---
+            fresh_classes = self.data["classification"][section_global_indices]
+            actor._naksha_section_class = fresh_classes.copy()
+
+        except Exception as e:
+            print(f"⚠️ _sync_section_mirror_from_data view={view_idx}: {e}")

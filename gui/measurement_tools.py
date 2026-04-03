@@ -211,6 +211,82 @@ class MeasurementTool:
         # Fallback: ray parallel to Z plane — return near point at cached Z
         return (float(near[0]), float(near[1]), float(self._last_z))
 
+    def _is_valid_world_point(self, pos):
+        """Return True when a picked world position is usable for measurement."""
+        if pos is None:
+            return False
+        try:
+            arr = np.asarray(pos, dtype=np.float64).reshape(-1)
+        except Exception:
+            return False
+        return arr.size >= 3 and np.all(np.isfinite(arr[:3]))
+
+    def _get_measurement_world_point(self, display_pos=None, allow_focal_fallback=True):
+        """
+        Resolve the clicked world point robustly across point-cloud and shading modes.
+        Prefer actual prop hits first; only fall back to the focal plane when needed.
+        """
+        if display_pos is None:
+            display_pos = self.interactor.GetEventPosition()
+        x, y = display_pos
+
+        app_pick = getattr(self.app, "_pick_world_point", None)
+        if callable(app_pick):
+            try:
+                pos = app_pick(
+                    getattr(self.app, "vtk_widget", None),
+                    interactor=self.interactor,
+                    display_x=x,
+                    display_y=y,
+                )
+                if self._is_valid_world_point(pos):
+                    arr = np.asarray(pos, dtype=np.float64)
+                    return (float(arr[0]), float(arr[1]), float(arr[2]))
+            except Exception:
+                pass
+
+        picker_specs = []
+        try:
+            point_picker = vtk.vtkPointPicker()
+            point_picker.SetTolerance(0.01)
+            picker_specs.append((point_picker, lambda p: p.GetPointId() >= 0))
+        except Exception:
+            pass
+        try:
+            cell_picker = vtk.vtkCellPicker()
+            cell_picker.SetTolerance(0.001)
+            picker_specs.append((cell_picker, lambda p: p.GetCellId() >= 0))
+        except Exception:
+            pass
+        try:
+            prop_picker = vtk.vtkPropPicker()
+            picker_specs.append((prop_picker, lambda p: p.GetViewProp() is not None))
+        except Exception:
+            pass
+
+        for picker, is_valid in picker_specs:
+            try:
+                if picker.Pick(float(x), float(y), 0.0, self.renderer) and is_valid(picker):
+                    pos = picker.GetPickPosition()
+                    if self._is_valid_world_point(pos):
+                        arr = np.asarray(pos, dtype=np.float64)
+                        return (float(arr[0]), float(arr[1]), float(arr[2]))
+            except Exception:
+                continue
+
+        if allow_focal_fallback:
+            focal_pick = getattr(self.app, "_display_to_world_on_focal_plane", None)
+            if callable(focal_pick):
+                try:
+                    pos = focal_pick(self.renderer, x, y)
+                    if self._is_valid_world_point(pos):
+                        arr = np.asarray(pos, dtype=np.float64)
+                        return (float(arr[0]), float(arr[1]), float(arr[2]))
+                except Exception:
+                    pass
+
+        return None
+
     def _hide_preview_line(self):
         """Remove preview actor from scene without deleting VTK objects."""
         if self._preview_actor_in_scene and self._overlay_renderer is not None:
@@ -494,8 +570,11 @@ class MeasurementTool:
             pass
 
         self._temp_vertex_stack.append(list(self.measurement_points))
-        
-        pos = self.digitizer._get_mouse_world()
+
+        pos = self._get_measurement_world_point()
+        if pos is None:
+            self.app.statusBar().showMessage("⚠️ Unable to pick a measurement point here", 2000)
+            return
         self._last_z = pos[2]  # ← cache Z for fast preview
         self.measurement_points.append(pos)
         
@@ -1319,7 +1398,8 @@ class MeasurementTool:
         picker.SetTolerance(0.01)  # Increase tolerance for easier picking
         
         pos = self.interactor.GetEventPosition()
-        picker.Pick(pos[0], pos[1], 0, self.renderer)
+        picker_renderer = self._overlay_renderer if self._overlay_renderer is not None else self.renderer
+        picker.Pick(pos[0], pos[1], 0, picker_renderer)
         picked_actor = picker.GetActor()
         
         if not picked_actor:
@@ -1502,7 +1582,7 @@ class MeasurementTool:
     def _select_measurement_at_cursor_alternative(self):
         """Alternative selection using world coordinates."""
         # Get the 3D world position of the click
-        click_pos = self.digitizer._get_mouse_world()
+        click_pos = self._get_measurement_world_point(allow_focal_fallback=False)
         
         if click_pos is None:
             print("⚠️ Could not get world position")
@@ -1564,7 +1644,7 @@ class MeasurementTool:
 
     def _select_closest_segment_to_click(self, measurement_index):
         """Select the segment closest to the click position."""
-        click_pos = self.digitizer._get_mouse_world()
+        click_pos = self._get_measurement_world_point(allow_focal_fallback=False)
         
         if click_pos is None:
             print("⚠️ Could not get world position")

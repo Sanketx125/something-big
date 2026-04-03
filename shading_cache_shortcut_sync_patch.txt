@@ -1,0 +1,441 @@
+================================================================================
+PATCH: Sync Shading Shortcut Presets, Multi-Cache Reuse, and Rendered State
+================================================================================
+Files Modified:
+  1. gui\display_mode.py
+  2. gui\global_shortcuts.py
+  3. gui\shading_display.py
+================================================================================
+
+
+================================================================================
+FILE: gui\display_mode.py
+================================================================================
+
+
+--- CHANGE 1: Use cache-store lookup instead of only checking the currently active cache (line ~1350) ---
+
+OLD BLOCK:
+            # Shaded Classification - trigger shading backend
+            app.display_mode = "shaded_class"
+            print("Borders DISABLED for shaded_class mode (forced to 0%)")
+            print("Display mode -> shaded_class")
+            try:
+                from gui.shading_display import (
+                    update_shaded_class, clear_shading_cache, get_cache
+                )
+                azimuth = getattr(app, 'last_shade_azimuth', 45.0)
+                angle   = getattr(app, 'last_shade_angle',   45.0)
+                ambient = getattr(app, 'shade_ambient',       0.25)
+                new_vis = set(
+                    int(c) for c, e in class_map.items() if e.get("show", True)
+                )
+                app._shading_visibility_override = new_vis
+
+                # Guard: only clear cache + force_rebuild when necessary
+                _xyz = (app.data.get("xyz")
+                        if hasattr(app, 'data') and app.data else None)
+                _cache = get_cache()
+
+                if _xyz is not None and _cache.is_geometry_valid(_xyz, new_vis):
+                    print("   Geometry cached - skipping clear + force_rebuild")
+                    update_shaded_class(app, azimuth, angle, ambient,
+                                        force_rebuild=False)
+                else:
+                    clear_shading_cache("display mode shading applied")
+                    update_shaded_class(app, azimuth, angle, ambient,
+                                        force_rebuild=True)
+            except Exception as _se:
+                print(f"Shading backend failed: {_se}")
+
+UPDATED BLOCK:
+            # Shaded Classification - trigger shading backend
+            app.display_mode = "shaded_class"
+            print("Borders DISABLED for shaded_class mode (forced to 0%)")
+            print("Display mode -> shaded_class")
+            try:
+                from gui.shading_display import (
+                    update_shaded_class, has_cached_geometry
+                )
+                azimuth = getattr(app, 'last_shade_azimuth', 45.0)
+                angle   = getattr(app, 'last_shade_angle',   45.0)
+                ambient = getattr(app, 'shade_ambient',       0.25)
+                new_vis = set(
+                    int(c) for c, e in class_map.items() if e.get("show", True)
+                )
+                app._shading_visibility_override = new_vis
+
+                # Guard: reuse cached geometry even if another preset is currently rendered.
+                _xyz = (app.data.get("xyz")
+                        if hasattr(app, 'data') and app.data else None)
+
+                if _xyz is not None and has_cached_geometry(_xyz, new_vis):
+                    print("   Geometry cached - skipping rebuild")
+                    update_shaded_class(app, azimuth, angle, ambient,
+                                        force_rebuild=False)
+                else:
+                    update_shaded_class(app, azimuth, angle, ambient,
+                                        force_rebuild=True)
+            except Exception as _se:
+                print(f"Shading backend failed: {_se}")
+
+
+================================================================================
+FILE: gui\global_shortcuts.py
+================================================================================
+
+
+--- CHANGE 1: Stop clearing shading cache for ShadingMode shortcuts and reuse cached geometry (line ~1020) ---
+
+OLD BLOCK:
+                        # STEP 5: Clear shading cache
+                        try:
+                            from gui.shading_display import clear_shading_cache
+                            clear_shading_cache("shading shortcut applied")
+                        except Exception as e:
+                            print(f"Could not clear shading cache: {e}")
+
+                        # STEP 6: Store params
+                        azimuth = preset.get("azimuth", 45.0)
+                        angle   = preset.get("angle",   45.0)
+                        ambient = preset.get("ambient",  0.2)
+
+                        self.app_window.last_shade_azimuth = azimuth
+                        self.app_window.last_shade_angle   = angle
+                        self.app_window.shade_ambient      = ambient
+
+                        # STEP 7: Apply shading with override STILL SET
+                        from gui.shading_display import update_shaded_class
+                        update_shaded_class(
+                            self.app_window,
+                            azimuth=azimuth,
+                            angle=angle,
+                            ambient=ambient,
+                            force_rebuild=True
+                        )
+
+UPDATED BLOCK:
+                        # STEP 5: Store params
+                        azimuth = preset.get("azimuth", 45.0)
+                        angle   = preset.get("angle",   45.0)
+                        ambient = preset.get("ambient",  0.2)
+
+                        self.app_window.last_shade_azimuth = azimuth
+                        self.app_window.last_shade_angle   = angle
+                        self.app_window.shade_ambient      = ambient
+
+                        # STEP 6: Apply shading with override STILL SET
+                        from gui.shading_display import update_shaded_class
+                        update_shaded_class(
+                            self.app_window,
+                            azimuth=azimuth,
+                            angle=angle,
+                            ambient=ambient,
+                            force_rebuild=False
+                        )
+
+
+================================================================================
+FILE: gui\shading_display.py
+================================================================================
+
+
+--- CHANGE 1: Add a two-entry shading cache store instead of a single singleton cache (top of file / cache section) ---
+
+OLD BLOCK:
+import vtk
+
+_LARGE_MESH_THRESHOLD = 50_000_000
+_rebuild_timer = None
+_rebuild_reason = ""
+_rebuild_changed_indices = None
+
+
+class ShadingGeometryCache:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._clear_internal()
+        ...
+
+_cache = None
+
+def get_cache():
+    global _cache
+    if _cache is None:
+        _cache = ShadingGeometryCache()
+    return _cache
+
+def clear_shading_cache(reason=""):
+    get_cache().clear(reason)
+
+def invalidate_cache_for_new_file(file_path=""):
+    get_cache().clear("new file")
+
+UPDATED BLOCK:
+import vtk
+from collections import OrderedDict
+
+_LARGE_MESH_THRESHOLD = 50_000_000
+_MAX_STORED_SHADING_CACHES = 2
+_rebuild_timer = None
+_rebuild_reason = ""
+_rebuild_changed_indices = None
+
+
+class ShadingGeometryCache:
+    def __init__(self):
+        self.cache_key = None
+        self._clear_internal()
+        ...
+
+def _compute_xyz_hash(xyz):
+    try:
+        return hash((len(xyz), float(xyz[0,0]), float(xyz[-1,2])))
+    except Exception:
+        return None
+
+def _normalize_visible_classes(vc):
+    return tuple(sorted(int(c) for c in vc)) if vc else tuple()
+
+def _build_cache_key(xyz, visible_classes, single_class_max_edge=None):
+    if len(visible_classes) == 1:
+        edge_key = "auto" if single_class_max_edge is None else round(float(single_class_max_edge), 6)
+        mode_key = ("single", edge_key)
+    else:
+        mode_key = ("multi",)
+    return (_compute_xyz_hash(xyz), _normalize_visible_classes(visible_classes), mode_key)
+
+_cache_store = OrderedDict()
+_active_cache_key = None
+
+def _trim_cache_store():
+    global _active_cache_key
+    while len(_cache_store) > _MAX_STORED_SHADING_CACHES:
+        key, cache = _cache_store.popitem(last=False)
+        cache.clear(f"evicted (limit {_MAX_STORED_SHADING_CACHES})")
+        if key == _active_cache_key:
+            _active_cache_key = None
+
+def get_cache(cache_key=None, activate=True):
+    global _active_cache_key
+    if cache_key is None:
+        if _active_cache_key is None:
+            return ShadingGeometryCache()
+        cache = _cache_store.get(_active_cache_key)
+        if cache is None:
+            _active_cache_key = None
+            return ShadingGeometryCache()
+        return cache
+    cache = _cache_store.get(cache_key)
+    if cache is None:
+        cache = ShadingGeometryCache()
+        _cache_store[cache_key] = cache
+    cache.cache_key = cache_key
+    if activate:
+        _cache_store.move_to_end(cache_key)
+        _active_cache_key = cache_key
+        _trim_cache_store()
+    return cache
+
+def has_cached_geometry(xyz, visible_classes, single_class_max_edge=None):
+    cache = _cache_store.get(_build_cache_key(xyz, visible_classes, single_class_max_edge))
+    return bool(cache and cache.is_geometry_valid(xyz, visible_classes))
+
+def clear_shading_cache(reason="", all_entries=True):
+    global _active_cache_key
+    if all_entries:
+        for cache in _cache_store.values():
+            cache.clear(reason)
+        _cache_store.clear()
+        _active_cache_key = None
+        return
+    if _active_cache_key is None:
+        return
+    cache = _cache_store.pop(_active_cache_key, None)
+    if cache is not None:
+        cache.clear(reason)
+    _active_cache_key = None
+
+def invalidate_cache_for_new_file(fp=""):
+    clear_shading_cache("new file", all_entries=True)
+
+
+--- CHANGE 2: Track which shading cache is actually rendered on screen (after get_cache helpers) ---
+
+OLD BLOCK:
+    # No rendered preset tracking existed here.
+
+UPDATED BLOCK:
+def _get_rendered_cache_key(app):
+    return getattr(app, '_rendered_shading_cache_key', None)
+
+def _set_rendered_cache_key(app, cache=None, cache_key=None):
+    if cache_key is None and cache is not None:
+        cache_key = getattr(cache, 'cache_key', None)
+    setattr(app, '_rendered_shading_cache_key', cache_key)
+
+
+--- CHANGE 3: Fix update_shaded_class so same preset is a no-op, different preset restores from cache, and no-visibility clears rendered state (line ~510) ---
+
+OLD BLOCK:
+def update_shaded_class(app, azimuth=45.0, angle=45.0, ambient=0.25,
+                        max_edge_factor=3.0, force_rebuild=False,
+                        single_class_max_edge=None, **kwargs):
+    cache = get_cache()
+    xyz_raw = app.data.get("xyz")
+    classes_raw = app.data.get("classification")
+    if xyz_raw is None or classes_raw is None:
+        return
+
+    azimuth = getattr(app, 'last_shade_azimuth', azimuth)
+    angle   = getattr(app, 'last_shade_angle',   angle)
+    ambient = getattr(app, 'shade_ambient',       ambient)
+
+    visible_classes = _get_shading_visibility(app)
+
+    if cache.is_fully_current(xyz_raw, visible_classes, azimuth, angle, ambient, app):
+        print("   Shading fully current - skipping rebuild")
+        return
+
+    if not force_rebuild and cache.is_geometry_valid(xyz_raw, visible_classes):
+        print("   Geometry cached - re-rendering without triangulation")
+        _refresh_from_cache(app, cache, azimuth, angle, ambient)
+        return
+
+    ...
+
+    if not visible_classes:
+        if hasattr(app, '_shaded_mesh_actor'):
+            app.vtk_widget.remove_actor("shaded_mesh")
+            app._shaded_mesh_actor = None
+        _remove_shaded_edge_overlay(app)
+        app.vtk_widget.render()
+        return
+
+UPDATED BLOCK:
+
+def update_shaded_class(app, azimuth=45., angle=45., ambient=0.25,
+                        max_edge_factor=3.0, force_rebuild=False,
+                        single_class_max_edge=None, **kwargs):
+    xyz_raw = app.data.get("xyz"); classes_raw = app.data.get("classification")
+    if xyz_raw is None or classes_raw is None: return
+    azimuth = getattr(app, 'last_shade_azimuth', azimuth)
+    angle = getattr(app, 'last_shade_angle', angle)
+    ambient = getattr(app, 'shade_ambient', ambient)
+    vc = _get_shading_visibility(app)
+    requested_cache_key = _build_cache_key(xyz_raw, vc, single_class_max_edge) if vc else None
+    cache = get_cache(requested_cache_key) if vc else get_cache()
+    rendered_cache_key = _get_rendered_cache_key(app)
+
+    if rendered_cache_key == requested_cache_key and cache.is_fully_current(xyz_raw, vc, azimuth, angle, ambient, app):
+        print("   Requested shading preset already current")
+        return
+
+    if not force_rebuild and cache.is_geometry_valid(xyz_raw, vc):
+        if rendered_cache_key != requested_cache_key:
+            print("   Restoring requested shading preset from cache")
+        _refresh_from_cache(app, cache, azimuth, angle, ambient); return
+
+    ...
+
+    if not vc:
+        if hasattr(app, '_shaded_mesh_actor'):
+            app.vtk_widget.remove_actor("shaded_mesh")
+            app._shaded_mesh_actor = None
+        app._shaded_mesh_polydata = None
+        _set_rendered_cache_key(app, cache_key=None)
+        _remove_shaded_edge_overlay(app); app.vtk_widget.render(); return
+
+
+--- CHANGE 4: Clear rendered preset marker when shading cannot render any visible geometry (inside _build_visible_geometry) ---
+
+OLD BLOCK:
+        if len(vi) < 3:
+            if hasattr(app, '_shaded_mesh_actor') and app._shaded_mesh_actor:
+                try: app.vtk_widget.remove_actor("shaded_mesh", render=False)
+                except: pass
+                app._shaded_mesh_actor = None
+            if hasattr(app, '_shaded_mesh_polydata'): app._shaded_mesh_polydata = None
+            _remove_shaded_edge_overlay(app)
+            cache.n_visible_classes = nv; cache.visible_classes_set = visible_classes.copy()
+            cache.single_class_id = list(visible_classes)[0] if is_sc else None
+            _restore_camera(app, saved_camera); app.vtk_widget.render(); progress.close(); return
+
+UPDATED BLOCK:
+        if len(vi) < 3:
+            if hasattr(app, '_shaded_mesh_actor') and app._shaded_mesh_actor:
+                try: app.vtk_widget.remove_actor("shaded_mesh", render=False)
+                except: pass
+                app._shaded_mesh_actor = None
+            if hasattr(app, '_shaded_mesh_polydata'): app._shaded_mesh_polydata = None
+            _set_rendered_cache_key(app, cache_key=None)
+            _remove_shaded_edge_overlay(app)
+            cache.n_visible_classes = nv; cache.visible_classes_set = visible_classes.copy()
+            cache.single_class_id = list(visible_classes)[0] if is_sc else None
+            _restore_camera(app, saved_camera); app.vtk_widget.render(); progress.close(); return
+
+
+--- CHANGE 5: Stamp the rendered cache key whenever a cached mesh is reused or a new shaded mesh is built (inside _render_mesh) ---
+
+OLD BLOCK:
+        if em is not None and ea is not None and em.GetNumberOfPoints() == nv and em.GetNumberOfCells() == nf:
+            try:
+                vtc = em.GetCellData().GetScalars()
+                if vtc is not None:
+                    numpy_support.vtk_to_numpy(vtc)[:] = fc
+                    vtc.Modified(); em.Modified(); ea.GetMapper().Modified()
+                    _restore_camera(app, saved_camera); app.vtk_widget.render(); return
+            except: pass
+
+        ...
+
+        if not sc2 and em is not None and ea is not None and em.GetNumberOfPoints() == nv and em.GetNumberOfCells() == nf:
+            try:
+                vtc = em.GetPointData().GetScalars()
+                if vtc is not None:
+                    numpy_support.vtk_to_numpy(vtc)[:] = vco
+                    vtc.Modified(); em.Modified(); ea.GetMapper().Modified()
+                    _restore_camera(app, saved_camera); app.vtk_widget.render(); return
+            except: pass
+
+        ...
+
+    app._shaded_mesh_polydata = mesh
+    cache._vtk_colors_ptr = cache.get_gpu_color_pointer(app)
+
+UPDATED BLOCK:
+        if em is not None and ea is not None and em.GetNumberOfPoints() == nv and em.GetNumberOfCells() == nf:
+            try:
+                vtc = em.GetCellData().GetScalars()
+                if vtc is not None:
+                    numpy_support.vtk_to_numpy(vtc)[:] = fc; vtc.Modified(); em.Modified(); ea.GetMapper().Modified()
+                    _set_rendered_cache_key(app, cache)
+                    _restore_camera(app, saved_camera); app.vtk_widget.render(); return
+            except: pass
+
+        ...
+
+        if not sc2 and em is not None and ea is not None and em.GetNumberOfPoints() == nv and em.GetNumberOfCells() == nf:
+            try:
+                vtc = em.GetPointData().GetScalars()
+                if vtc is not None:
+                    numpy_support.vtk_to_numpy(vtc)[:] = vco; vtc.Modified(); em.Modified(); ea.GetMapper().Modified()
+                    _set_rendered_cache_key(app, cache)
+                    _restore_camera(app, saved_camera); app.vtk_widget.render(); return
+            except: pass
+
+        ...
+
+    app._shaded_mesh_polydata = mesh; cache._vtk_colors_ptr = None
+    _set_rendered_cache_key(app, cache)
+

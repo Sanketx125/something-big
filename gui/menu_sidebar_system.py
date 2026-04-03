@@ -214,17 +214,20 @@ RIBBON_TOOLTIP_META = {
         "description": "Open the display mode dialog and manage saved display presets.",
         "shortcut_tools": ("DisplayMode",),
     },
-    ("MeasurementRibbon", "Distance", "Measure Line"): {
+    ("MeasurementRibbon", "Distance", "Line"): {
         "title": "Measure Line",
         "description": "Measure straight-line distance between two points.",
+        "shortcut_tools": ("MeasureLine",),
     },
-    ("MeasurementRibbon", "Distance", "Measure Path"): {
+    ("MeasurementRibbon", "Distance", "Path"): {
         "title": "Measure Path",
         "description": "Measure total distance along a multi-point path.",
+        "shortcut_tools": ("MeasurePath",),
     },
     ("MeasurementRibbon", "Actions", "Clear"): {
         "title": "Clear Measurements",
         "description": "Remove all measurements from the scene.",
+        "shortcut_tools": ("ClearMeasurements",),
     },
     ("IdentificationRibbon", "Identify", "Identify"): {
         "title": "Identify Point",
@@ -2606,7 +2609,7 @@ class ByClassDialog(QDialog):
         # This prevents "StaysOnTop" behavior which causes the weird stacking.
         # It will now minimize nicely to the bottom like the other dialogs.
         super().__init__(None, Qt.Window)
-        
+        self.setAttribute(Qt.WA_NativeWindow, True) 
         # Remove any self.setWindowFlags() calls that were here before!
         
         self.setWindowModality(Qt.NonModal)
@@ -3048,7 +3051,7 @@ class ByClassDialog(QDialog):
         
         reply = QMessageBox.question(
             self, "Confirm Conversion", msg,
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
         )
         
         if reply != QMessageBox.Yes:
@@ -3656,7 +3659,7 @@ class ClosedByClassDialog(QDialog):
             target_parent = app.window
 
         super().__init__(None, Qt.Window)
-        
+        self.setAttribute(Qt.WA_NativeWindow, True) 
         # ✅ FIX 2: Use Qt.Window (Buttons + Minimize logic)
         # self.setWindowFlags(Qt.Window)
 
@@ -5113,7 +5116,7 @@ class ByClassHeightDialog(QDialog):
             target_parent = app.window
 
         super().__init__(None, Qt.Window)
-        
+        self.setAttribute(Qt.WA_NativeWindow, True) 
         # ✅ FIX 2: Use Qt.Window (Buttons + Minimize logic)
         # self.setWindowFlags(Qt.Window)
         
@@ -5704,6 +5707,7 @@ class ByClassHeightDialog(QDialog):
                 item_widget = QWidget()
                 item_widget.setStyleSheet("QWidget { background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 6px; padding: 8px; margin: 2px; } QWidget:hover { background-color: #3c3c3c; border: 1px solid #555555; }")
                 item_widget.setMouseTracking(True)
+                item_widget.setAttribute(Qt.WA_NativeWindow, True) 
                 il = QHBoxLayout(item_widget); il.setContentsMargins(8, 8, 8, 8)
                 
                 cb = QCheckBox()
@@ -8655,6 +8659,7 @@ class InsideFenceDialog(QDialog):
                 """)
                 
                 item_widget.setMouseTracking(True)
+                item_widget.setAttribute(Qt.WA_NativeWindow, True) 
                 item_layout = QHBoxLayout(item_widget)
                 item_layout.setContentsMargins(8, 8, 8, 8)
                 
@@ -10210,7 +10215,7 @@ class InsideFenceDialog(QDialog):
         fence_desc = f"{len(self.selected_fences)} fence(s)" if len(self.selected_fences) > 1 else self.selected_fences[0]['type']
         msg = f"Convert points inside {fence_desc} to class {to_class}?"
         
-        if QMessageBox.question(self, "Confirm", msg, QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+        if QMessageBox.question(self, "Confirm", msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
             return
 
         try:
@@ -10725,6 +10730,7 @@ class VertexInsertSettingsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True) 
         ok_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setObjectName("cancel_btn")
@@ -10768,6 +10774,7 @@ class VertexMoveSettingsDialog(QDialog):
         # Buttons
         button_layout = QHBoxLayout()
         ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True) 
         ok_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setObjectName("cancel_btn")

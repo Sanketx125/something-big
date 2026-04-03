@@ -620,6 +620,7 @@ class SNTDisplayOptionsDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         ok_btn     = QPushButton("OK")
+        ok_btn.setDefault(True)
         cancel_btn = QPushButton("Cancel")
         ok_btn.clicked.connect(self.accept)
         cancel_btn.clicked.connect(self.reject)
@@ -1419,9 +1420,10 @@ class MultiSNTAttachmentDialog(QDialog):
             msg += "You can reload LAZ files after SNT attachment\n"
 
         if QMessageBox.question(
-            self, "Confirm SNT Attachment", msg,
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        ) != QMessageBox.Yes:
+                self, "Confirm SNT Attachment", msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,  # Fix: Enter triggers Yes
+            ) != QMessageBox.Yes:
             return
 
         # ── Clear current project ──────────────────────────────────────────
