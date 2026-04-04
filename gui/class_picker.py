@@ -91,19 +91,23 @@ class ClassPicker(QWidget):
         self._update_title()
 
         layout = QVBoxLayout()
-        
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
         # --- From class (multi-select)
-        layout.addWidget(QLabel("From class (Ctrl+Click for multiple):"))
+        layout.addWidget(QLabel("From class:"))
+
         self.from_list = QListWidget()
         self.from_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self.from_list.setMaximumHeight(150)
+        self.from_list.setMinimumHeight(80)      # ← prevents collapsing too small
+        # NOTE: Do NOT call setMaximumHeight here — that was the bug
         self.from_list.setUniformItemSizes(True)
-        
+
         # Add "Any class" option
         any_item = QListWidgetItem("Any class")
         any_item.setData(Qt.UserRole, None)
         self.from_list.addItem(any_item)
-        
+
         # Populate from classes
         for code, entry in sorted(app.class_palette.items()):
             desc = entry.get("description", "")
@@ -115,8 +119,8 @@ class ClassPicker(QWidget):
             item = QListWidgetItem(make_color_icon(color), text)
             item.setData(Qt.UserRole, code)
             self.from_list.addItem(item)
-        
-        layout.addWidget(self.from_list)
+
+        layout.addWidget(self.from_list, stretch=1)   # ← stretch=1 makes it expand
 
         # --- To class dropdown (single selection)
         layout.addWidget(QLabel("To class:"))
@@ -130,7 +134,7 @@ class ClassPicker(QWidget):
             if desc:
                 text += f" ({desc})"
             self.to_combo.addItem(make_color_icon(color), text, code)
-        layout.addWidget(self.to_combo)
+        layout.addWidget(self.to_combo, stretch=0)    # ← stretch=0 stays fixed size
 
         # --- Invert button
         btn_row = QHBoxLayout()

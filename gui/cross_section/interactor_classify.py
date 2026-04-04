@@ -5992,7 +5992,7 @@ class ClassificationInteractor:
             
             # ✅ ADD: Set flag to trigger fly-to after next classification
             self._fly_to_after_classify = pt
-                        
+            
         except Exception as e:
             print(f"⚠️ Right-click handler failed: {e}")
 

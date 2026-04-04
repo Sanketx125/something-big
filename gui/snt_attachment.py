@@ -149,10 +149,63 @@ def _label_color_and_height(
         return (255, 255, 0), 2.5
     
 
+def _snt_enable_gl_point_size(app) -> bool:
+    """
+    Synchronously enable GL_PROGRAM_POINT_SIZE (0x8642) and install the
+    persistent StartEvent observer so it stays enabled across future renders.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OVERLAY RENDERER — ensures SNT always renders ON TOP of point cloud
-# ─────────────────────────────────────────────────────────────────────────────
+    Called from restore_snt_actors() which fires BEFORE the 500ms deferred
+    init in build_unified_actor. Without this, gl_PointSize writes are ignored
+    and points render at 1px — no border ring pixels, border invisible.
+    """
+    try:
+        rw = app.vtk_widget.GetRenderWindow()
+        if rw is None:
+            return False
+        state = rw.GetState() if hasattr(rw, 'GetState') else None
+        if state and hasattr(state, 'vtkglEnable'):
+            state.vtkglEnable(0x8642)
+
+            # Also install/refresh the persistent StartEvent observer
+            # so VTK's state machine can't clear the flag between renders.
+            try:
+                from gui.unified_actor_manager import (
+                    _install_program_point_size_observer,
+                    _try_enable_program_point_size,
+                )
+                ua = getattr(app, '_unified_actor', None)
+                if ua is not None:
+                    _try_enable_program_point_size(rw)
+                    _install_program_point_size_observer(ua, rw)
+            except Exception:
+                pass
+
+            return True
+    except Exception as e:
+        print(f"  ⚠️ _snt_enable_gl_point_size: {e}")
+    return False
+
+
+def _snt_push_border_uniforms(app) -> None:
+    """
+    Push weight_lut / visibility_lut / border_ring_val uniforms to the
+    unified point-cloud actor right now, before the impending render.
+
+    The deferred GPU init (500ms) would do this later, but restore_snt_actors
+    renders immediately. If uniforms aren't pushed first, border_ring_val = 0
+    in the shader → border condition never triggers → invisible border.
+    """
+    try:
+        from gui.unified_actor_manager import _push_uniforms_direct
+        ua = getattr(app, '_unified_actor', None)
+        if ua is None:
+            return
+        ctx = getattr(ua, '_naksha_shader_ctx', None)
+        if ctx is None:
+            return
+        _push_uniforms_direct(ua, ctx)
+    except Exception as e:
+        print(f"  ⚠️ _snt_push_border_uniforms: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Z-OFFSET APPROACH: SNT actors rendered above point cloud in same renderer
@@ -620,7 +673,6 @@ class SNTDisplayOptionsDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         ok_btn     = QPushButton("OK")
-        ok_btn.setDefault(True)
         cancel_btn = QPushButton("Cancel")
         ok_btn.clicked.connect(self.accept)
         cancel_btn.clicked.connect(self.reject)
@@ -680,6 +732,7 @@ class SNTLayerSelectionDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)  # Fix: Enter triggers OK
         ok_btn.setObjectName("primaryBtn")
         ok_btn.setAutoDefault(False)
         ok_btn.setDefault(False)
@@ -1301,13 +1354,6 @@ class MultiSNTAttachmentDialog(QDialog):
         gc.collect()
 
     def restore_snt_actors(self) -> None:
-        """
-        Re-add all SNT actors whose checkbox is ON back into the VTK renderer.
-        Recalculates Z offset so SNT always renders above the current point cloud.
-
-        Call this after any operation that wipes the renderer
-        (e.g. classification refresh, LAZ reload, RemoveAllViewProps).
-        """
         try:
             renderer = self.app.vtk_widget.renderer
         except Exception:
@@ -1325,9 +1371,8 @@ class MultiSNTAttachmentDialog(QDialog):
                                 or layer_name in item.selected_layers)
                     for actor in actors:
                         try:
-                            # Update Z offset for current point cloud
                             _apply_z_offset_to_actor(actor, z_offset)
-                            renderer.AddActor(actor)   # idempotent
+                            renderer.AddActor(actor)
                             actor.SetVisibility(1 if layer_ok else 0)
                             restored += 1
                         except Exception:
@@ -1347,16 +1392,23 @@ class MultiSNTAttachmentDialog(QDialog):
                                     pass
 
         if restored:
-            # Expand clipping range to include Z-offset actors
+            # FIX 1: No manual SetClippingRange — ResetCameraClippingRange already correct.
             renderer.ResetCameraClippingRange()
-            # Extra safety: widen clipping range so offset actors aren't culled
-            try:
-                camera = renderer.GetActiveCamera()
-                near, far = camera.GetClippingRange()
-                camera.SetClippingRange(near * 0.01, far * 100.0)
-            except Exception:
-                pass
-            print(f"  🔄 restore_snt_actors: re-added {restored} actors (z_offset={z_offset:.1f})")
+
+            # FIX 2: Explicitly enable GL_PROGRAM_POINT_SIZE RIGHT NOW.
+            # restore_snt_actors() fires in the same callstack as build_unified_actor,
+            # BEFORE the 500ms deferred timer. Without this, gl_PointSize writes in the
+            # vertex shader are silently ignored → all points render at 1px → no border
+            # ring pixels exist → border "applies" in data but is completely invisible.
+            # This is why DXF works (attached later, GL already warm) but SNT doesn't.
+            _snt_enable_gl_point_size(self.app)
+
+            # FIX 3: Push border uniforms before the render that follows.
+            # The 500ms deferred init would push them later, but we need them NOW.
+            _snt_push_border_uniforms(self.app)
+
+            print(f"  🔄 restore_snt_actors: re-added {restored} actors "
+                f"(z_offset={z_offset:.1f})")
             try:
                 rw = self.app.vtk_widget.GetRenderWindow()
                 if rw:
@@ -1366,6 +1418,7 @@ class MultiSNTAttachmentDialog(QDialog):
                     self.app.vtk_widget.render()
                 except Exception:
                     pass
+
     def _update_file_count(self):
         count = len(self.snt_items)
         if count == 0:
@@ -1420,10 +1473,11 @@ class MultiSNTAttachmentDialog(QDialog):
             msg += "You can reload LAZ files after SNT attachment\n"
 
         if QMessageBox.question(
-                self, "Confirm SNT Attachment", msg,
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,  # Fix: Enter triggers Yes
-            ) != QMessageBox.Yes:
+                        self, "Confirm SNT Attachment", msg,
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes,  # Fix: Enter triggers Yes
+                    ) != QMessageBox.Yes:
+        
             return
 
         # ── Clear current project ──────────────────────────────────────────

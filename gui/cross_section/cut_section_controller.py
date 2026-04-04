@@ -330,6 +330,7 @@ class CutSectionController:
 
         # ✅ ADD THIS: Track saved interactor styles per view
         self._saved_interactor_styles = {}
+        self._cut_source = None
 
         # Data
         self.cut_points = None
@@ -727,6 +728,8 @@ class CutSectionController:
     def _activate_from_cut_dock(self):
         """Activate cut section INSIDE the existing cut view (nested cut)."""
         print(f"📐 Nested cut: taking cut from existing cut view")
+        self._cut_source = 'cut'
+
         self._temporarily_disable_classification()
         
         # ✅ BUG #2 FIX: Remove old observers with VERIFICATION
@@ -1550,8 +1553,11 @@ class CutSectionController:
     def _reuse_cut_dock_for_new_cross_cut(self):
         """Reuse existing cut dock for NEW cut from cross-section (without closing)."""
         print("📐 NEW FEATURE: Reusing cut dock for fresh cross-section cut...")
-        
-        # ✅ STEP 1: Clear old observers ONLY from cut dock
+
+        # ✅ NEW: Mark source as cross-section
+        self._cut_source = 'cross'
+
+        # ✅ STEP 1: Clear old observers from cut dock (tracked IDs)
         if 'cut_dock' in self._view_observer_ids:
             old_ids = self._view_observer_ids['cut_dock']
             if self.cut_vtk is not None:
@@ -1559,52 +1565,69 @@ class CutSectionController:
                 for oid in old_ids:
                     try:
                         iren.RemoveObserver(oid)
-                        print(f" 🧹 Removed old observer: {oid}")
+                        print(f"  🧹 Removed tracked observer: {oid}")
                     except:
                         pass
             del self._view_observer_ids['cut_dock']
-        
-        # ✅ STEP 2: Clear ALL preview actors from cut dock (CRITICAL FIX)
+
+        # ═══════════════════════════════════════════════════════════════
+        # ✅ CRITICAL FIX: Nuclear cleanup of ALL mouse observers on
+        #    the cut dock.  After a cut-in-cut the old on_mouse_move
+        #    handler from _activate_from_cut_dock() may still be alive
+        #    (observer IDs survive SetInteractorStyle changes).  When
+        #    state flips to WAITING_CENTER these ghosts would draw
+        #    preview lines inside the cut dock.
+        # ═══════════════════════════════════════════════════════════════
+        if self.cut_vtk is not None:
+            try:
+                iren_cut = self.cut_vtk.interactor
+                iren_cut.RemoveObservers("LeftButtonPressEvent")
+                iren_cut.RemoveObservers("MouseMoveEvent")
+                print("  🧹 Nuclear cleanup: ALL LeftButton/MouseMove "
+                    "observers removed from cut dock")
+            except Exception as e:
+                print(f"  ⚠️ Cut dock nuclear cleanup warning: {e}")
+        # ═══════════════════════════════════════════════════════════════
+
+        # ✅ STEP 2: Clear ALL preview actors from cut dock
         if self.cut_vtk and hasattr(self.cut_vtk, "renderer") and self.cut_vtk.renderer:
             ren_cut = self.cut_vtk.renderer
-            
-            # Clear ALL preview actors (including line_actor from cut dock)
+
             actors_to_clear = [
                 self.cut_preview_upper,
                 self.cut_preview_lower,
-                self.line_actor,  # ✅ CRITICAL: Clear center line too
+                self.line_actor,
             ]
-            
+
             for a in actors_to_clear:
                 if a:
                     try:
                         ren_cut.RemoveActor(a)
-                        print(f" 🧹 Removed preview actor from cut dock")
+                        print(f"  🧹 Removed preview actor from cut dock")
                     except Exception as e:
-                        print(f" ⚠️ Failed to remove actor: {e}")
-            
-            # ✅ FORCE RENDER to show clean view
+                        print(f"  ⚠️ Failed to remove actor: {e}")
+
             try:
                 _safe_vtk_render(self.cut_vtk)
-                print(" ✅ Cut dock view cleared")
+                print("  ✅ Cut dock view cleared")
             except Exception as e:
-                print(f" ⚠️ Render failed: {e}")
-            
-            # ✅ Reset actor references
+                print(f"  ⚠️ Render failed: {e}")
+
             self.cut_preview_upper = None
             self.cut_preview_lower = None
             self.line_actor = None
-            
-            # ✅ Clear cached geometry objects too
+
             for attr in ['_line_actor_points', '_line_actor_poly',
-                        '_cut_preview_upper_points', '_cut_preview_upper_lines', '_cut_preview_upper_poly',
-                        '_cut_preview_lower_points', '_cut_preview_lower_lines', '_cut_preview_lower_poly']:
+                        '_cut_preview_upper_points', '_cut_preview_upper_lines',
+                        '_cut_preview_upper_poly',
+                        '_cut_preview_lower_points', '_cut_preview_lower_lines',
+                        '_cut_preview_lower_poly']:
                 if hasattr(self, attr):
                     delattr(self, attr)
-        
+
         # ✅ STEP 3: Clear preview actors from cross-section views too
         self._clear_preview_actors()
-        
+
         # ✅ STEP 4: Reset state for NEW cross→cut
         self._detach_all_view_observers()
         self._state = CutSectionState.WAITING_CENTER
@@ -1615,37 +1638,34 @@ class CutSectionController:
         self.is_cut_view_active = False
         self.accumulated_rotation = 0
         self.original_section_tangent = None
-        
+
         # ✅ STEP 5: Reset depth spinbox
         if self.depth_spin:
             self.depth_spin.blockSignals(True)
             self.depth_spin.setValue(self.dynamic_depth)
             self.depth_spin.blockSignals(False)
-        
+
         # ✅ STEP 6: Save cross-section state
         self._save_section_controller_state()
-        
-        # ✅ STEP 6.5: Initialize saved interactor styles dictionary if not exists
+
+        # ✅ STEP 6.5: Initialize saved interactor styles dictionary
         if not hasattr(self, '_saved_interactor_styles'):
             self._saved_interactor_styles = {}
-        
+
         # ✅ STEP 7: Attach observers to CROSS-SECTION views (not cut dock)
-        print(" 🔄 Attaching observers to cross-section views for NEW cut...")
+        print("  🔄 Attaching observers to cross-section views for NEW cut...")
         for view_index, vtk_widget in self.app.section_vtks.items():
             iren = vtk_widget.interactor
 
-            # ✅ CRITICAL FIX: Save and block camera rotation (same as activate)
             if view_index not in self._saved_interactor_styles:
                 current_style = iren.GetInteractorStyle()
                 self._saved_interactor_styles[view_index] = current_style
                 print(f"📌 Saved interactor style for cross-section View {view_index + 1}")
-            
-            # dummy_style = vtk.vtkInteractorStyleUser()  # Empty style = no camera interaction
-            # iren.SetInteractorStyle(dummy_style)
-            cut_style = CutSectionInteractorStyle()     # ← ADD THIS
+
+            cut_style = CutSectionInteractorStyle()
             cut_style.app = self.app
             cut_style.vtk_widget = vtk_widget
-            iren.SetInteractorStyle(cut_style) 
+            iren.SetInteractorStyle(cut_style)
             print(f"🔒 Camera rotation BLOCKED in cross-section View {view_index + 1}")
 
             def make_click_handler(vw, v_idx):
@@ -1690,35 +1710,47 @@ class CutSectionController:
                         axis = 0 if getattr(self.app, "cross_view_mode", "side") == "side" else 1
                         old_depth = self.dynamic_depth
                         self.dynamic_depth = abs(curr[axis] - self.center_point[axis])
-                        
-                        # ✅ FIX: Always update preview (removed threshold check)
-                        # This enables BOTH interaction modes like cut dock:
-                        # Mode 1: Click → Drag (hold button) → Click
-                        # Mode 2: Click → Move (release button) → Click
+
+                        # ✅ Draw preview ONLY in cross-section views
                         self._draw_dynamic_band_preview(self.center_point, self.dynamic_depth)
-                        if self.cut_vtk is not None:
-                            self._draw_cut_section_preview(self.center_point, self.dynamic_depth)
-                        
-                        # Update spinbox (keep signal blocking to prevent recursion)
+
+                        # ═══════════════════════════════════════════════════
+                        # ✅ FIX: Do NOT draw preview in cut dock.
+                        #    We are cutting FROM cross-section, so the
+                        #    preview lines belong in cross-section views
+                        #    only.  Drawing them in the cut dock confused
+                        #    users after a cut-in-cut sequence.
+                        # ═══════════════════════════════════════════════════
+                        # REMOVED:
+                        # if self.cut_vtk is not None:
+                        #     self._draw_cut_section_preview(
+                        #         self.center_point, self.dynamic_depth)
+                        # ═══════════════════════════════════════════════════
+
                         if self.depth_spin:
                             self.depth_spin.blockSignals(True)
                             self.depth_spin.setValue(self.dynamic_depth)
                             self.depth_spin.blockSignals(False)
                         return
                 return on_mouse_move
-            
-            #<----------
+
+            # <----------
             try:
-                lid = iren.AddObserver("LeftButtonPressEvent", make_click_handler(vtk_widget, view_index))
-                mid = iren.AddObserver("MouseMoveEvent", make_move_handler(vtk_widget, view_index))
+                lid = iren.AddObserver("LeftButtonPressEvent",
+                                    make_click_handler(vtk_widget, view_index))
+                mid = iren.AddObserver("MouseMoveEvent",
+                                    make_move_handler(vtk_widget, view_index))
                 self._view_observer_ids[view_index] = [lid, mid]
-                print(f"✅ Cut tool observers attached to cross-section View {view_index + 1}: LeftButton={lid}, MouseMove={mid}")
+                print(f"✅ Cut tool observers attached to cross-section "
+                    f"View {view_index + 1}: LeftButton={lid}, MouseMove={mid}")
             except Exception as e:
                 print(f"⚠️ Observer attachment failed for View {view_index + 1}: {e}")
                 if view_index in self._view_observer_ids:
                     del self._view_observer_ids[view_index]
 
-        self.app.statusBar().showMessage("✂️ Cut Section (Reusing dock): click center in cross-section, adjust depth, click to finalize", 0)
+        self.app.statusBar().showMessage(
+            "✂️ Cut Section (Reusing dock): click center in cross-section, "
+            "adjust depth, click to finalize", 0)
         print("✅ Cut dock reused - ready for new cross-section cut")
 
     def _force_deactivate_pending_state(self):
@@ -2412,6 +2444,7 @@ class CutSectionController:
             self.is_cut_view_active = False
             self.accumulated_rotation = 0
             self.original_section_tangent = None
+            self._cut_source = 'cross'
 
             # Save section controller state
             self._save_section_controller_state()
@@ -2464,59 +2497,66 @@ class CutSectionController:
                     def on_mouse_move(obj, evt):
                         if self._state == CutSectionState.IDLE:
                             return
-                        
+
                         pos = vw.interactor.GetEventPosition()
                         picker = vtk.vtkWorldPointPicker()
                         picker.Pick(pos[0], pos[1], 0, vw.renderer)
                         curr = np.array(picker.GetPickPosition())
-                        
+
                         if np.allclose(curr, (0, 0, 0), atol=1e-6):
                             return
-                        
+
                         if self._state == CutSectionState.WAITING_CENTER:
                             self.app.section_controller.active_view = v_idx
                             self.active_vtk = vw
                             self._draw_dynamic_center_line(curr)
                             return
-                        
+
                         if self._state == CutSectionState.WAITING_DEPTH and self.center_point is not None:
                             axis = 0 if getattr(self.app, "cross_view_mode", "side") == "side" else 1
                             old_depth = self.dynamic_depth
                             self.dynamic_depth = abs(curr[axis] - self.center_point[axis])
-                            
-                            # ✅ FIX: Always update preview (removed threshold check)
-                            # This enables BOTH interaction modes like cut dock:
-                            # Mode 1: Click → Drag (hold button) → Click
-                            # Mode 2: Click → Move (release button) → Click
+
+                            # ✅ Draw preview ONLY in cross-section views
                             self._draw_dynamic_band_preview(self.center_point, self.dynamic_depth)
-                            if self.cut_vtk is not None:
-                                self._draw_cut_section_preview(self.center_point, self.dynamic_depth)
-                            
-                            # Update spinbox (keep signal blocking to prevent recursion)
+
+                            # ✅ FIX: Do NOT draw preview in cut dock when cutting
+                            #    from cross-section. Preview belongs only in
+                            #    the cross-section views for this mode.
+                            # REMOVED:
+                            # if self.cut_vtk is not None:
+                            #     self._draw_cut_section_preview(
+                            #         self.center_point, self.dynamic_depth)
+
                             if self.depth_spin:
                                 self.depth_spin.blockSignals(True)
                                 self.depth_spin.setValue(self.dynamic_depth)
                                 self.depth_spin.blockSignals(False)
                             return
-                    
+
                     return on_mouse_move
 
                 # -----------
                 try:
-                    lid = iren.AddObserver("LeftButtonPressEvent", make_click_handler(vtk_widget, view_index))
-                    mid = iren.AddObserver("MouseMoveEvent", make_move_handler(vtk_widget, view_index))
+                    lid = iren.AddObserver("LeftButtonPressEvent",
+                                        make_click_handler(vtk_widget, view_index))
+                    mid = iren.AddObserver("MouseMoveEvent",
+                                        make_move_handler(vtk_widget, view_index))
                     self._view_observer_ids[view_index] = [lid, mid]
-                    print(f"✅ Cut tool observers attached to cross-section View {view_index + 1}: LeftButton={lid}, MouseMove={mid}")
+                    print(f"✅ Cut tool observers attached to cross-section "
+                        f"View {view_index + 1}: LeftButton={lid}, MouseMove={mid}")
                 except Exception as e:
                     print(f"⚠️ Observer attachment failed for View {view_index + 1}: {e}")
                     if view_index in self._view_observer_ids:
                         del self._view_observer_ids[view_index]
 
-            self.app.statusBar().showMessage("✂️ Cut Section: click center, adjust depth, click to finalize", 0)
+            self.app.statusBar().showMessage(
+                "✂️ Cut Section: click center, adjust depth, click to finalize", 0)
 
         except Exception as e:
             print(f"[CutSection.activate] {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
 
     # def _save_section_controller_state(self):
     #     """Save current section controller state before cut takes over."""

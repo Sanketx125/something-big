@@ -16,7 +16,7 @@ _BASE_POINT_SIZE = 2.5
 _BORDER_GROWTH_SCALE_PX = 4.0
 _BORDER_GROWTH_CUBIC_PX = 8.0
 _MAX_BORDER_GROWTH_PX = 3.0
-_BORDER_DEPTH_BIAS = 0.003
+_BORDER_DEPTH_BIAS = 0.001
  
  
 # ─────────────────────────────────────────────────────────────────────────────
@@ -866,13 +866,16 @@ def _get_lut(view_key: str = "main") -> ColorLUT:
 def _restore_snt_overlays(app):
     if hasattr(app, 'snt_dialog') and app.snt_dialog is not None:
         try:
-            app.snt_dialog.restore_snt_actors()
+            app.snt_dialog.restore_snt_actors()  # Already has the fixes above
             return
         except Exception as e:
             print(f"  ⚠️ SNT dialog restore: {e}")
 
     try:
-        from gui.snt_attachment import _get_snt_z_offset, _apply_z_offset_to_actor
+        from gui.snt_attachment import (
+            _get_snt_z_offset, _apply_z_offset_to_actor,
+            _snt_enable_gl_point_size, _snt_push_border_uniforms,
+        )
     except ImportError:
         return
 
@@ -897,14 +900,14 @@ def _restore_snt_overlays(app):
                     pass
 
     if count > 0:
+        # FIX: No clipping range expansion — tight range preserves depth precision.
         renderer.ResetCameraClippingRange()
-        try:
-            camera = renderer.GetActiveCamera()
-            near, far = camera.GetClippingRange()
-            camera.SetClippingRange(near * 0.01, far * 100.0)
-        except Exception:
-            pass
-        print(f"  🔄 SNT overlays: {count} actors moved above point cloud (z_offset={z_offset:.1f})")
+
+        # FIX: Enable GL_PROGRAM_POINT_SIZE + push uniforms before render.
+        _snt_enable_gl_point_size(app)
+        _snt_push_border_uniforms(app)
+
+        print(f"  🔄 SNT overlays: {count} actors restored (z_offset={z_offset:.1f})")
  
   
 # ─────────────────────────────────────────────────────────────────────────────
@@ -983,7 +986,33 @@ def build_unified_actor(
             actor._naksha_render_window = plotter.render_window
         except Exception:
             pass
- 
+
+    if actor:
+        # ── Immediate GL_PROGRAM_POINT_SIZE attempt ──────────────────────────
+        # If the GL context is already warm (file reloaded, not first-ever load),
+        # this succeeds right away and the border is visible from the first render.
+        # If the context isn't ready yet, _deferred_actor_gpu_init retries below.
+        try:
+            rw = plotter.render_window
+            if _try_enable_program_point_size(rw):
+                _install_program_point_size_observer(actor, rw)
+                actor._naksha_needs_program_point_size = False
+                print("      ✅ GL_PROGRAM_POINT_SIZE enabled immediately (warm context)")
+        except Exception:
+            pass
+
+        # ── Deferred GPU init (fallback for cold first-load) ─────────────
+        try:
+            from PySide6.QtCore import QTimer
+            _a, _c, _p = actor, ctx, plotter
+            QTimer.singleShot(
+                100,   # ← Reduced from 500ms to 100ms — closes the visibility gap
+                lambda: _deferred_actor_gpu_init(_a, _c, _p, "MainView")
+            )
+            print("      ⏱️  Deferred GPU init scheduled (100 ms)")
+        except Exception as _te:
+            print(f"      ⚠️ Could not schedule deferred init: {_te}")
+
         _ensure_opengl_polydata_mapper(actor, cloud)
         mesh   = actor.GetMapper().GetInput()
         vtk_ca = mesh.GetPointData().GetScalars()
@@ -1018,7 +1047,9 @@ def build_unified_actor(
             print("      ⏱️  Deferred GPU init scheduled (500 ms)")
         except Exception as _te:
             print(f"      ⚠️ Could not schedule deferred init: {_te}")
- 
+
+
+
     elapsed = (time.perf_counter() - t0) * 1000
     print(f"   🏗️ Unified actor built: {n_pts:,} pts in {elapsed:.1f} ms")
 
@@ -1439,15 +1470,21 @@ def fast_classify_update(app, changed_mask: np.ndarray, to_class: int, **kwargs)
     if local_changed.size == 0:
         return True
  
-    palette = kwargs.get("palette") or getattr(app, "class_palette", {})
- 
+    palette = kwargs.get("palette") or _get_slot_palette(app, 0)
+
     rgb_ptr = getattr(actor, "_naksha_rgb_ptr", None)
     if rgb_ptr is not None:
-        new_color = palette.get(to_class, {}).get("color", (128, 128, 128))
+        entry = palette.get(int(to_class), {})
+        new_color = (
+            entry.get("color", (128, 128, 128))
+            if entry.get("show", True)
+            else (0, 0, 0)
+        )
         rgb_ptr[local_changed] = new_color
         vtk_ca = getattr(actor, "_naksha_vtk_array", None)
         if vtk_ca is not None:
             vtk_ca.Modified()
+
  
     mesh = getattr(actor, '_naksha_mesh', None)
     if mesh is not None:
@@ -1756,6 +1793,35 @@ def _get_all_unified_actors(app):
                     yield (actor, view_idx + 1, gi, widget)
  
  
+# def _get_slot_palette(app, slot_idx: int) -> dict:
+#     master = getattr(app, "class_palette", {}) or {}
+    
+#     if not master:
+#         return {}
+ 
+#     overrides = {}
+#     dlg = getattr(app, "display_mode_dialog", None)
+#     if dlg and hasattr(dlg, "view_palettes"):
+#         vp = getattr(dlg, "view_palettes", None)
+#         if vp and slot_idx in vp:
+#             overrides = vp[slot_idx] or {}
+    
+#     if not overrides:
+#         vp = getattr(app, "view_palettes", {})
+#         overrides = vp.get(slot_idx, {}) or {}
+ 
+#     if slot_idx == 0:
+#         return master
+ 
+#     resolved_palette = {code: dict(info) for code, info in master.items()}
+    
+#     for code, info in overrides.items():
+#         if code in resolved_palette:
+#             resolved_palette[code].update(info)
+#         else:
+#             resolved_palette[code] = dict(info)
+ 
+#     return resolved_palette
 def _get_slot_palette(app, slot_idx: int) -> dict:
     master = getattr(app, "class_palette", {}) or {}
     
@@ -1774,8 +1840,17 @@ def _get_slot_palette(app, slot_idx: int) -> dict:
         overrides = vp.get(slot_idx, {}) or {}
  
     if slot_idx == 0:
-        return master
- 
+        # FIX: apply slot 0 Display Mode overrides (show flags) for main view.
+        # Previously returned raw master — hidden classes showed their color.
+        if not overrides:
+            return master
+        resolved_slot0 = {code: dict(info) for code, info in master.items()}
+        for code, info in overrides.items():
+            if code in resolved_slot0:
+                resolved_slot0[code].update(info)
+            else:
+                resolved_slot0[code] = dict(info)
+        return resolved_slot0
     resolved_palette = {code: dict(info) for code, info in master.items()}
     
     for code, info in overrides.items():
@@ -1783,9 +1858,7 @@ def _get_slot_palette(app, slot_idx: int) -> dict:
             resolved_palette[code].update(info)
         else:
             resolved_palette[code] = dict(info)
- 
-    return resolved_palette
- 
+    return resolved_palette 
  
 def invalidate_unified_actor(app):
     if hasattr(app, "_unified_actor"):

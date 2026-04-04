@@ -759,7 +759,6 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
     finally:
         progress.close()
 
-
 def _refresh_from_cache(app, cache, azimuth, angle, ambient):
     app.last_shade_azimuth = azimuth; app.last_shade_angle = angle
     app.shade_ambient = ambient; app.display_mode = "shaded_class"
@@ -777,7 +776,6 @@ def _refresh_from_cache(app, cache, azimuth, angle, ambient):
         cache.last_azimuth = azimuth; cache.last_angle = angle; cache.last_ambient = ambient
         cache._vtk_colors_ptr = None
     _render_mesh(app, cache, app.data.get("classification"), sc)
-
 
 def _render_mesh(app, cache, classes_raw, saved_camera):
     if cache.faces is None or len(cache.faces) == 0: return
@@ -908,7 +906,6 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
     plotter.render()
     ms = "FLAT/FACETED (single-class)" if isc else "FLAT (multi-class)"
     print(f"   🎨 Shaded Mesh [{ms}]: {nf:,} faces in {(time.time()-t0)*1000:.0f}ms")
-
 
 # ═══════════════════════════════════════════════════════════════
 # ALL REMAINING FUNCTIONS — identical behavior, compressed
@@ -1718,7 +1715,6 @@ def _fast_incremental_add_points(app, ngi):
     an = getattr(app, 'last_shade_angle', 45.)
     am = getattr(app, 'shade_ambient', .25)
     
-    # Combine all faces, then shade with global z-range
     nk = len(fo)
     cache.faces = np.vstack([fo, pf])
     cache.face_normals = pn if no is None else np.vstack([no, pn])
@@ -1736,10 +1732,13 @@ def _fast_incremental_add_points(app, ngi):
     return True
 
 def _rebuild_mesh_vtk(app, cache, cr, sc): _render_mesh(app, cache, cr, sc)
+
 def refresh_shaded_colors_fast(app):
     if getattr(app, 'display_mode', None) != "shaded_class": return
     refresh_shaded_after_classification_fast(app, None)
+
 def refresh_shaded_colors_only(app): refresh_shaded_colors_fast(app)
+
 def on_class_visibility_changed(app):
     if getattr(app, 'display_mode', None) == "shaded_class":
         clear_shading_cache("visibility changed"); update_shaded_class(app, force_rebuild=True)
@@ -1774,10 +1773,23 @@ class ShadingControlPanel(QWidget):
         btn = QPushButton("Apply"); btn.clicked.connect(self._on_apply); layout.addWidget(btn)
         rb = QPushButton("Full Rebuild"); rb.clicked.connect(self._on_full_rebuild); layout.addWidget(rb)
         self.setLayout(layout); self._restore_from_app()
+        
     def _restore_from_app(self):
         for a, s in [('last_shade_azimuth', 'az'), ('last_shade_angle', 'el'), ('shade_ambient', 'amb')]:
             v = getattr(self.app, a, None)
             if v is not None: getattr(self, s).setValue(v)
+    def refresh_from_app(self):
+        for app_attr, spin_name in [
+            ('last_shade_azimuth', 'az'),
+            ('last_shade_angle',   'el'),
+            ('shade_ambient',      'amb'),
+        ]:
+            v = getattr(self.app, app_attr, None)
+            if v is not None:
+                spin = getattr(self, spin_name)
+                spin.blockSignals(True)
+                spin.setValue(v)
+                spin.blockSignals(False)        
     def _on_apply(self):
         self.app.last_shade_azimuth = self.az.value(); self.app.last_shade_angle = self.el.value(); self.app.shade_ambient = self.amb.value()
         update_shaded_class(self.app, self.az.value(), self.el.value(), self.amb.value(), single_class_max_edge=self.max_edge.value())

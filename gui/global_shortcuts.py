@@ -1206,6 +1206,16 @@ class GlobalShortcutFilter(QObject):
                         self.app_window.last_shade_angle   = angle
                         self.app_window.shade_ambient      = ambient
 
+                        # ✅ STEP 5b: Refresh the ShadingControlPanel spinboxes so
+                        #    the panel shows the shortcut's azimuth/angle/ambient
+                        #    immediately — without this the panel stays stale.
+                        try:
+                            panel = getattr(self.app_window, 'shading_panel', None)
+                            if panel is not None and hasattr(panel, 'refresh_from_app'):
+                                panel.refresh_from_app()
+                        except Exception as _sp_err:
+                            print(f"   ⚠️ Could not refresh shading panel spinboxes: {_sp_err}")
+
                         # STEP 6: Apply shading with override STILL SET
                         from gui.shading_display import update_shaded_class
                         update_shaded_class(

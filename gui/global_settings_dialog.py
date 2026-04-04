@@ -51,7 +51,6 @@ SHORTCUT_KEYS = [f"F{i}" for i in range(1, 13)] + [chr(i) for i in range(65, 91)
 
 SHORTCUT_SIMPLE_TOOLS = set(SIMPLE_SHORTCUT_TOOLS)
 
-
 class SettingsPreviewWidget(QWidget):
     """Small reusable preview for line-based settings."""
 

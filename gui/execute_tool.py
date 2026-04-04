@@ -30,6 +30,12 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     print(f"🔧 execute_tool called: tool={tool}, from_cls={from_cls}, to_cls={to_cls}, preset={preset is not None}")
     
     tool_name = TOOL_MAP.get(tool, tool.lower())
+    
+    # ✅ NEW: If switching AWAY from cross-section while it was active, deactivate it properly
+    if tool_name != "cross_section" and getattr(app_window, "cross_section_active", False):
+        print(f"🛑 Deactivating cross-section (switching to {tool_name} via shortcut)")
+        if hasattr(app_window, "_cancel_cross_section_tool_only"):
+            app_window._cancel_cross_section_tool_only()
 
     # Handle empty list case
     if from_cls is not None and isinstance(from_cls, list) and len(from_cls) == 0:
@@ -294,7 +300,6 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
 
     if tool_name == "top_view":
         print("🔝 Activating Top View")
-        
         try:
             # ✅ Complete camera setup (matches manual method exactly)
             from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
@@ -394,26 +399,28 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
             if hasattr(app_window, 'shading_class_visibility'):
                 print(f"   🗑️ Clearing shading_class_visibility")
                 app_window.shading_class_visibility = {}
-            
-            # ✅ Clean up old actors (same as manual switch)
-            try:
-                plotter = app_window.vtk_widget
-                for actor_name in list(plotter.actors.keys()):
-                    if not any(actor_name.startswith(prefix) for prefix in ["class_", "dxf_", "__lod_overlay_", "border_"]):
-                        plotter.remove_actor(actor_name, render=False)
-                        print(f"   🧹 Removed old actor: {actor_name}")
-            except Exception as e:
-                print(f"   ⚠️ Cleanup warning: {e}")
-            
+
+            # ✅ DO NOT remove actors here — the unified GPU actor
+            # (_naksha_unified_cloud) must stay alive so set_display_mode("class")
+            # can write colors directly into its RGB buffer without a full rebuild.
+            # Removing it caused all points to become invisible (black on black).
+
             # Restore borders for classification mode if they were previously set
             if hasattr(app_window, 'display_mode_dialog') and app_window.display_mode_dialog:
                 dlg = app_window.display_mode_dialog
                 saved_border = dlg.view_borders.get(0, 0)
-                
+
                 if saved_border > 0:
                     app_window.point_border_percent = saved_border
                     app_window._main_view_borders_active = True
                     print(f"   ✅ Restored borders to {saved_border}%")
+
+            # ✅ Ensure at least one class is visible so nothing renders black
+            palette = getattr(app_window, 'class_palette', {})
+            if palette and not any(v.get('show', True) for v in palette.values()):
+                for code in palette:
+                    palette[code]['show'] = True
+                print(f"   ⚠️ All classes were hidden — reset to visible")
 
 
         try:
@@ -483,8 +490,6 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
                 preserve_cross_section=has_cross_action
             )
 
-                # ✅ DON'T clear classification parameters - they should persist.
-                # We only need the active tool state reset before switching.
             app_window.active_classify_tool = None
         
     if tool_name == "cross_section":
@@ -503,8 +508,6 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
                 mt.active = False
                 if hasattr(mt, 'is_drawing'):
                     mt.is_drawing = False
-        
-        # ... rest of cross-section code ...
 
         # ✅ CRITICAL: Use enable_cross_section_mode() to show popup dialog FIRST
         if hasattr(app_window, "enable_cross_section_mode"):

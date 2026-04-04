@@ -46,7 +46,7 @@ class MeasurementTool:
         self._render_timer = None
         self._last_z = 0.0
         self._last_preview_time = 0.0          # epoch time of last preview render
-        self._preview_interval = 0.0           # no frame cap — render every mouse event
+        self._preview_interval = 0.0            # no manual cap — Qt update() coalesces renders
         self._preview_pts = None               # reusable vtkPoints (2-pt line)
         self._preview_polydata = None          # reusable vtkPolyData for preview
         self._preview_actor_in_scene = False   # track whether actor was added
@@ -119,12 +119,12 @@ class MeasurementTool:
             pass
         
     def _render_overlay_only(self):
-        """Throttled full render — safe across all VTK backends."""
+        """Render preview — uses the same call as the draw tools."""
         try:
-            self.app.vtk_widget.GetRenderWindow().Render()
+            self.app.vtk_widget.render()
         except Exception:
             try:
-                self.app.vtk_widget.render()
+                self.app.vtk_widget.GetRenderWindow().Render()
             except Exception:
                 pass
 
@@ -230,49 +230,49 @@ class MeasurementTool:
             display_pos = self.interactor.GetEventPosition()
         x, y = display_pos
 
-        app_pick = getattr(self.app, "_pick_world_point", None)
-        if callable(app_pick):
-            try:
-                pos = app_pick(
-                    getattr(self.app, "vtk_widget", None),
-                    interactor=self.interactor,
-                    display_x=x,
-                    display_y=y,
-                )
+        # ── Fast gate: PropPicker uses bounding-boxes only (no geometry traversal).
+        # Run it FIRST.  If nothing is hit we are outside the loaded data → skip
+        # ALL expensive pickers (including app._pick_world_point which runs three
+        # O(n) pickers over the full point cloud) and return None immediately so
+        # the caller falls back to _screen_to_world_fast().  This is the dominant
+        # cause of click latency outside the data.
+        try:
+            prop_picker = vtk.vtkPropPicker()
+            prop_hit = prop_picker.Pick(float(x), float(y), 0.0, self.renderer)
+            if prop_hit and prop_picker.GetViewProp() is not None:
+                pos = prop_picker.GetPickPosition()
                 if self._is_valid_world_point(pos):
                     arr = np.asarray(pos, dtype=np.float64)
                     return (float(arr[0]), float(arr[1]), float(arr[2]))
-            except Exception:
+                # Prop was hit but pick position invalid — fall through to precise pickers
+                picker_specs = []
+                try:
+                    point_picker = vtk.vtkPointPicker()
+                    point_picker.SetTolerance(0.01)
+                    picker_specs.append((point_picker, lambda p: p.GetPointId() >= 0))
+                except Exception:
+                    pass
+                try:
+                    cell_picker = vtk.vtkCellPicker()
+                    cell_picker.SetTolerance(0.001)
+                    picker_specs.append((cell_picker, lambda p: p.GetCellId() >= 0))
+                except Exception:
+                    pass
+                for picker, is_valid in picker_specs:
+                    try:
+                        if picker.Pick(float(x), float(y), 0.0, self.renderer) and is_valid(picker):
+                            pos = picker.GetPickPosition()
+                            if self._is_valid_world_point(pos):
+                                arr = np.asarray(pos, dtype=np.float64)
+                                return (float(arr[0]), float(arr[1]), float(arr[2]))
+                    except Exception:
+                        continue
+            # No prop under cursor — return None immediately so caller uses fast fallback.
+            # Avoids O(n) point/cell traversal over the entire point cloud for empty picks.
+            else:
                 pass
-
-        picker_specs = []
-        try:
-            point_picker = vtk.vtkPointPicker()
-            point_picker.SetTolerance(0.01)
-            picker_specs.append((point_picker, lambda p: p.GetPointId() >= 0))
         except Exception:
             pass
-        try:
-            cell_picker = vtk.vtkCellPicker()
-            cell_picker.SetTolerance(0.001)
-            picker_specs.append((cell_picker, lambda p: p.GetCellId() >= 0))
-        except Exception:
-            pass
-        try:
-            prop_picker = vtk.vtkPropPicker()
-            picker_specs.append((prop_picker, lambda p: p.GetViewProp() is not None))
-        except Exception:
-            pass
-
-        for picker, is_valid in picker_specs:
-            try:
-                if picker.Pick(float(x), float(y), 0.0, self.renderer) and is_valid(picker):
-                    pos = picker.GetPickPosition()
-                    if self._is_valid_world_point(pos):
-                        arr = np.asarray(pos, dtype=np.float64)
-                        return (float(arr[0]), float(arr[1]), float(arr[2]))
-            except Exception:
-                continue
 
         if allow_focal_fallback:
             focal_pick = getattr(self.app, "_display_to_world_on_focal_plane", None)
@@ -493,6 +493,14 @@ class MeasurementTool:
         self._temp_vertex_stack = []
         self._last_cursor_pos = None
 
+        # Seed _last_z from the camera focal point so the first click outside
+        # the point cloud projects onto a sensible world plane instead of Z=0.
+        try:
+            focal = self.renderer.GetActiveCamera().GetFocalPoint()
+            self._last_z = float(focal[2])
+        except Exception:
+            pass
+
         # ✅ CRITICAL FIX: Only remove OUR specific observers, never wipe global events
         if hasattr(self, '_observer_tags') and self._observer_tags:
             for tag in self._observer_tags:
@@ -572,6 +580,13 @@ class MeasurementTool:
         self._temp_vertex_stack.append(list(self.measurement_points))
 
         pos = self._get_measurement_world_point()
+        if pos is None:
+            # Fallback: project screen position onto the cached Z plane (same math as preview).
+            # This lets the user measure in empty space outside the loaded point cloud.
+            try:
+                pos = self._screen_to_world_fast()
+            except Exception:
+                pos = None
         if pos is None:
             self.app.statusBar().showMessage("⚠️ Unable to pick a measurement point here", 2000)
             return
@@ -1030,6 +1045,7 @@ class MeasurementTool:
             actor.GetProperty().SetColor(color)
             actor.GetProperty().SetLineWidth(width)
             actor.GetProperty().SetOpacity(1.0)  # Ensure fully opaque
+            actor.GetProperty().LightingOff()  # Prevent scene lighting from blackening lines
             actor.PickableOn()  # Make pickable for deletion
             actor.GetProperty().RenderLinesAsTubesOn()
             return actor

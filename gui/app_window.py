@@ -5660,6 +5660,11 @@ class NakshaApp(QMainWindow):
             Works for: cut/cross sections and main view (fallback).
             ✅ UPDATED: ClassPicker never steals focus
             """
+            # ✅ NEW: If cross-section was active (shortcut switch), deactivate it properly
+            if getattr(self, "cross_section_active", False):
+                print("🛑 Deactivating cross-section (switching to classification)")
+                if hasattr(self, "_cancel_cross_section_tool_only"):
+                    self._cancel_cross_section_tool_only()
             if tool_name is None:
                 self.active_classify_tool = None
                 if hasattr(self, 'skip_main_view_refresh'):
@@ -10979,233 +10984,289 @@ class NakshaApp(QMainWindow):
             print(f"⚠️ Magnifier Error: {e}")
 
     def fit_view(self):
-            """
-            Fit main view to visible data INCLUDING DXF grids.
-            Camera-only operation.
-            Safe to call anytime.
-            """
-            try:
-                import numpy as np
-                
-                # Reset zoom level tracker when fitting view
-                self._current_zoom_level = 100.0
-                self._zoom_anchor_points = {}
-                if hasattr(self, 'magnifier_combo'):
-                    self.magnifier_combo.blockSignals(True)
-                    self.magnifier_combo.setCurrentText("100%")
-                    self.magnifier_combo.blockSignals(False)
-                
-                print(f"\n{'='*60}")
-                print(f"🧲 FIT VIEW (Point Cloud + DXF)")
-                print(f"{'='*60}")
-                
-                # ============================================================
-                # 1. Get point cloud bounds
-                # ============================================================
-                bounds_list = []
-                
-                if hasattr(self, 'data') and self.data is not None:
-                    xyz = self.data.get('xyz')
-                    if xyz is not None and len(xyz) > 0:
-                        # Get visible points only (based on class_palette)
-                        if hasattr(self, 'class_palette') and self.class_palette:
-                            visible_classes = [c for c, v in self.class_palette.items() if v.get('show', True)]
+        """
+        Fit main view to visible data INCLUDING DXF grids.
+        Camera-only operation. Maintains 2D lock if active.
+        Safe to call anytime.
+        """
+        try:
+            import numpy as np
+            
+            # Reset zoom level tracker when fitting view
+            self._current_zoom_level = 100.0
+            self._zoom_anchor_points = {}
+            if hasattr(self, 'magnifier_combo'):
+                self.magnifier_combo.blockSignals(True)
+                self.magnifier_combo.setCurrentText("100%")
+                self.magnifier_combo.blockSignals(False)
+            
+            print(f"\n{'='*60}")
+            print(f"🧲 FIT VIEW (Point Cloud + DXF)")
+            print(f"{'='*60}")
+            
+            # ============================================================
+            # CHECK IF 2D LOCK IS ALREADY ACTIVE
+            # ============================================================
+            is_2d_locked = getattr(self, '_2d_lock_active', False)
+            print(f"Already 2D locked: {is_2d_locked}")
+            
+            if is_2d_locked:
+                print(f"🧹 Cleared old camera observers")
+                # Remove old observer to prevent interference
+                if hasattr(self, '_camera_observer_id') and self._camera_observer_id is not None:
+                    renderer = self.vtk_widget.renderer
+                    renderer.GetRenderWindow().GetInteractor().RemoveObserver(self._camera_observer_id)
+                    self._camera_observer_id = None
+            
+            # ============================================================
+            # 1. Get point cloud bounds
+            # ============================================================
+            bounds_list = []
+            
+            if hasattr(self, 'data') and self.data is not None:
+                xyz = self.data.get('xyz')
+                if xyz is not None and len(xyz) > 0:
+                    # Get visible points only (based on class_palette)
+                    if hasattr(self, 'class_palette') and self.class_palette:
+                        visible_classes = [c for c, v in self.class_palette.items() if v.get('show', True)]
+                        
+                        if visible_classes and 'classification' in self.data:
+                            classes = self.data['classification']
+                            mask = np.isin(classes, visible_classes)
                             
-                            if visible_classes and 'classification' in self.data:
-                                classes = self.data['classification']
-                                mask = np.isin(classes, visible_classes)
-                                
-                                if np.any(mask):
-                                    visible_xyz = xyz[mask]
-                                    bounds_list.append({
-                                        'xmin': visible_xyz[:, 0].min(),
-                                        'xmax': visible_xyz[:, 0].max(),
-                                        'ymin': visible_xyz[:, 1].min(),
-                                        'ymax': visible_xyz[:, 1].max(),
-                                    })
-                                    print(f"   ✅ Point cloud bounds added")
+                            if np.any(mask):
+                                visible_xyz = xyz[mask]
+                                bounds_list.append({
+                                    'xmin': visible_xyz[:, 0].min(),
+                                    'xmax': visible_xyz[:, 0].max(),
+                                    'ymin': visible_xyz[:, 1].min(),
+                                    'ymax': visible_xyz[:, 1].max(),
+                                })
+                                print(f"   ✅ Point cloud bounds added")
+                    else:
+                        # No palette - use all points
+                        bounds_list.append({
+                            'xmin': xyz[:, 0].min(),
+                            'xmax': xyz[:, 0].max(),
+                            'ymin': xyz[:, 1].min(),
+                            'ymax': xyz[:, 1].max(),
+                        })
+                        print(f"   ✅ Point cloud bounds added (all points)")
+            
+            # ============================================================
+            # 2. Get DXF grid bounds
+            # ============================================================
+            if hasattr(self, 'dxf_actors') and self.dxf_actors:
+                print(f"   📐 Checking {len(self.dxf_actors)} DXF grids...")
+                
+                for i, dxf_data in enumerate(self.dxf_actors):
+                    try:
+                        # Check if DXF is visible
+                        actors = dxf_data.get('actors', [])
+                        if not actors:
+                            continue
+                        
+                        # Check first actor's visibility
+                        if not actors[0].GetVisibility():
+                            print(f"      ⏭️ DXF {i}: Hidden - skipping")
+                            continue
+                        
+                        # Get DXF bounds
+                        dxf_bounds = dxf_data.get('bounds')
+                        
+                        if dxf_bounds:
+                            bounds_list.append({
+                                'xmin': dxf_bounds[0],
+                                'xmax': dxf_bounds[1],
+                                'ymin': dxf_bounds[2],
+                                'ymax': dxf_bounds[3],
+                            })
+                            print(f"      ✅ DXF {i}: Bounds added")
                         else:
-                            # No palette - use all points
+                            print(f"      ⚠️ DXF {i}: No bounds data")
+                            
+                    except Exception as e:
+                        print(f"      ⚠️ DXF {i}: Error - {e}")
+
+            # ============================================================
+            # 3. Get SNT grid bounds
+            # ============================================================
+            if hasattr(self, 'snt_actors') and self.snt_actors:
+                print(f"   🗂️ Checking {len(self.snt_actors)} SNT grids...")
+
+                for i, snt_data in enumerate(self.snt_actors):
+                    try:
+                        # Check if SNT is visible
+                        actors = snt_data.get('actors', [])
+                        if not actors:
+                            continue
+
+                        # Check first actor's visibility
+                        if not actors[0].GetVisibility():
+                            print(f"      ⏭️ SNT {i}: Hidden - skipping")
+                            continue
+
+                        # Get SNT bounds
+                        snt_bounds = snt_data.get('bounds')
+
+                        if snt_bounds:
                             bounds_list.append({
-                                'xmin': xyz[:, 0].min(),
-                                'xmax': xyz[:, 0].max(),
-                                'ymin': xyz[:, 1].min(),
-                                'ymax': xyz[:, 1].max(),
+                                'xmin': snt_bounds[0],
+                                'xmax': snt_bounds[1],
+                                'ymin': snt_bounds[2],
+                                'ymax': snt_bounds[3],
                             })
-                            print(f"   ✅ Point cloud bounds added (all points)")
-                
-                # ============================================================
-                # 2. Get DXF grid bounds
-                # ============================================================
-                if hasattr(self, 'dxf_actors') and self.dxf_actors:
-                    print(f"   📐 Checking {len(self.dxf_actors)} DXF grids...")
-                    
-                    for i, dxf_data in enumerate(self.dxf_actors):
-                        try:
-                            # Check if DXF is visible
-                            actors = dxf_data.get('actors', [])
-                            if not actors:
-                                continue
-                            
-                            # Check first actor's visibility
-                            if not actors[0].GetVisibility():
-                                print(f"      ⏭️ DXF {i}: Hidden - skipping")
-                                continue
-                            
-                            # Get DXF bounds
-                            dxf_bounds = dxf_data.get('bounds')
-                            
-                            if dxf_bounds:
-                                bounds_list.append({
-                                    'xmin': dxf_bounds[0],
-                                    'xmax': dxf_bounds[1],
-                                    'ymin': dxf_bounds[2],
-                                    'ymax': dxf_bounds[3],
-                                })
-                                print(f"      ✅ DXF {i}: Bounds added")
-                            else:
-                                print(f"      ⚠️ DXF {i}: No bounds data")
-                                
-                        except Exception as e:
-                            print(f"      ⚠️ DXF {i}: Error - {e}")
+                            print(f"      ✅ SNT {i}: Bounds added")
+                        else:
+                            print(f"      ⚠️ SNT {i}: No bounds data")
 
-                # ============================================================
-                # 3. Get SNT grid bounds
-                # ============================================================
-                if hasattr(self, 'snt_actors') and self.snt_actors:
-                    print(f"   🗂️ Checking {len(self.snt_actors)} SNT grids...")
+                    except Exception as e:
+                        print(f"      ⚠️ SNT {i}: Error - {e}")
 
-                    for i, snt_data in enumerate(self.snt_actors):
-                        try:
-                            # Check if SNT is visible
-                            actors = snt_data.get('actors', [])
-                            if not actors:
-                                continue
+            # ============================================================
+            # 4. Get digitized drawing bounds
+            # ============================================================
+            digitizer = getattr(self, 'digitizer', None)
+            drawings = list(getattr(digitizer, 'drawings', []) or [])
+            if drawings:
+                print(f"   ✏️ Checking {len(drawings)} drawing(s)...")
 
-                            # Check first actor's visibility
-                            if not actors[0].GetVisibility():
-                                print(f"      ⏭️ SNT {i}: Hidden - skipping")
-                                continue
+                for i, drawing in enumerate(drawings):
+                    try:
+                        raw_coords = drawing.get('coords') or drawing.get('coordinates') or []
+                        if hasattr(raw_coords, 'tolist'):
+                            raw_coords = raw_coords.tolist()
 
-                            # Get SNT bounds
-                            snt_bounds = snt_data.get('bounds')
+                        coords_xy = []
+                        for coord in raw_coords:
+                            if hasattr(coord, 'tolist'):
+                                coord = coord.tolist()
+                            if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                                coords_xy.append((float(coord[0]), float(coord[1])))
 
-                            if snt_bounds:
-                                bounds_list.append({
-                                    'xmin': snt_bounds[0],
-                                    'xmax': snt_bounds[1],
-                                    'ymin': snt_bounds[2],
-                                    'ymax': snt_bounds[3],
-                                })
-                                print(f"      ✅ SNT {i}: Bounds added")
-                            else:
-                                print(f"      ⚠️ SNT {i}: No bounds data")
+                        if not coords_xy:
+                            continue
 
-                        except Exception as e:
-                            print(f"      ⚠️ SNT {i}: Error - {e}")
+                        xs, ys = zip(*coords_xy)
+                        bounds_list.append({
+                            'xmin': min(xs),
+                            'xmax': max(xs),
+                            'ymin': min(ys),
+                            'ymax': max(ys),
+                        })
+                    except Exception as e:
+                        print(f"      ⚠️ Drawing {i}: Error - {e}")
 
-
-                # ============================================================
-                # 4. Get digitized drawing bounds
-                # ============================================================
-                digitizer = getattr(self, 'digitizer', None)
-                drawings = list(getattr(digitizer, 'drawings', []) or [])
-                if drawings:
-                    print(f"   ✏️ Checking {len(drawings)} drawing(s)...")
-
-                    for i, drawing in enumerate(drawings):
-                        try:
-                            raw_coords = drawing.get('coords') or drawing.get('coordinates') or []
-                            if hasattr(raw_coords, 'tolist'):
-                                raw_coords = raw_coords.tolist()
-
-                            coords_xy = []
-                            for coord in raw_coords:
-                                if hasattr(coord, 'tolist'):
-                                    coord = coord.tolist()
-                                if isinstance(coord, (list, tuple)) and len(coord) >= 2:
-                                    coords_xy.append((float(coord[0]), float(coord[1])))
-
-                            if not coords_xy:
-                                continue
-
-                            xs, ys = zip(*coords_xy)
-                            bounds_list.append({
-                                'xmin': min(xs),
-                                'xmax': max(xs),
-                                'ymin': min(ys),
-                                'ymax': max(ys),
-                            })
-                        except Exception as e:
-                            print(f"      ⚠️ Drawing {i}: Error - {e}")
-
-                # ============================================================
-                # 5. Calculate combined bounds
-                # ============================================================
-                if not bounds_list:
-                    print(f"   ⚠️ No visible data to fit")
-                    print(f"{'='*60}\n")
-                    return
-                
-                # Find overall min/max
-                xmin = min(b['xmin'] for b in bounds_list)
-                xmax = max(b['xmax'] for b in bounds_list)
-                ymin = min(b['ymin'] for b in bounds_list)
-                ymax = max(b['ymax'] for b in bounds_list)
-                
-                print(f"\n   📊 Combined bounds:")
-                print(f"      X: {xmin:.2f} → {xmax:.2f} (width: {xmax-xmin:.2f})")
-                print(f"      Y: {ymin:.2f} → {ymax:.2f} (height: {ymax-ymin:.2f})")
-                
-                # ============================================================
-                # 6. Set camera to fit combined bounds
-                # ============================================================
-                if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
-                    print(f"   ⚠️ No VTK widget")
-                    return
-                
-                renderer = self.vtk_widget.renderer
-                camera = renderer.GetActiveCamera()
-                
-                # Calculate center and size
-                center_x = (xmin + xmax) / 2.0
-                center_y = (ymin + ymax) / 2.0
-                width = xmax - xmin
-                height = ymax - ymin
-
-                # Add 10% margin
-                margin = 1.1
-                max_dim = max(width, height, 1.0) * margin
-                center_z = 0.0
-                if hasattr(self, 'data') and self.data is not None:
-                    xyz = self.data.get('xyz')
-                    if xyz is not None and len(xyz) > 0:
-                        center_z = float(np.median(xyz[:, 2]))
-
-                # Set camera for top view
-                camera.SetPosition(center_x, center_y, center_z + 5000)
-                camera.SetFocalPoint(center_x, center_y, center_z)
-                camera.SetViewUp(0, 1, 0)
-                camera.ParallelProjectionOn()
-                camera.SetParallelScale(max_dim / 2.0)
-
-                # Update clipping range
-                renderer.ResetCameraClippingRange()
-                
-                # Render
-                self.vtk_widget.render()
-                
-                print(f"   ✅ Camera fitted to combined bounds")
+            # ============================================================
+            # 5. Calculate combined bounds
+            # ============================================================
+            if not bounds_list:
+                print(f"   ⚠️ No visible data to fit")
                 print(f"{'='*60}\n")
-                
-                if hasattr(self, 'statusBar'):
-                    self.statusBar().showMessage("🧲 View fitted to all visible data", 2000)
-                
-            except Exception as e:
-                print(f"⚠️ Fit view failed: {e}")
-                import traceback
-                traceback.print_exc()
-    
+                return
+            
+            # Find overall min/max
+            xmin = min(b['xmin'] for b in bounds_list)
+            xmax = max(b['xmax'] for b in bounds_list)
+            ymin = min(b['ymin'] for b in bounds_list)
+            ymax = max(b['ymax'] for b in bounds_list)
+            
+            print(f"\n   📊 Combined bounds:")
+            print(f"      X: {xmin:.2f} → {xmax:.2f} (width: {xmax-xmin:.2f})")
+            print(f"      Y: {ymin:.2f} → {ymax:.2f} (height: {ymax-ymin:.2f})")
+            
+            # ============================================================
+            # 6. Set camera to fit combined bounds
+            # ============================================================
+            if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
+                print(f"   ⚠️ No VTK widget")
+                return
+            
+            renderer = self.vtk_widget.renderer
+            camera = renderer.GetActiveCamera()
+            
+            # Calculate center and size
+            center_x = (xmin + xmax) / 2.0
+            center_y = (ymin + ymax) / 2.0
+            width = xmax - xmin
+            height = ymax - ymin
+
+            # Add 10% margin
+            margin = 1.1
+            max_dim = max(width, height, 1.0) * margin
+            center_z = 0.0
+            if hasattr(self, 'data') and self.data is not None:
+                xyz = self.data.get('xyz')
+                if xyz is not None and len(xyz) > 0:
+                    center_z = float(np.median(xyz[:, 2]))
+
+            # Set camera for top view
+            camera.SetPosition(center_x, center_y, center_z + 5000)
+            camera.SetFocalPoint(center_x, center_y, center_z)
+            camera.SetViewUp(0, 1, 0)
+            camera.ParallelProjectionOn()
+            camera.SetParallelScale(max_dim / 2.0)
+
+            # Update clipping range
+            renderer.ResetCameraClippingRange()
+            
+            # Render
+            self.vtk_widget.render()
+            
+            print(f"   ✅ Camera fitted to combined bounds")
+            
+            # ============================================================
+            # 7. REFRESH 2D LOCK IF ACTIVE
+            # ============================================================
+            if is_2d_locked:
+                print(f"ℹ️ Already 2D locked — re-fitting bounds only (no view reset)")
+                self._refresh_2d_lock()
+                print(f"🔒 Main view 2D lock REFRESHED")
+            
+            print(f"{'='*60}\n")
+            
+            if hasattr(self, 'statusBar'):
+                self.statusBar().showMessage("🧲 View fitted to all visible data", 2000)
+            
+        except Exception as e:
+            print(f"⚠️ Fit view failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+    def _refresh_2d_lock(self):
+        """
+        Recapture the current camera state as the 2D lock target.
+        Call this after any camera adjustment that should maintain 2D lock.
+        """
+        try:
+            if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
+                return
+            
+            renderer = self.vtk_widget.renderer
+            camera = renderer.GetActiveCamera()
+            
+            # Capture new lock target
+            self._lock_target_camera_state = {
+                'position': camera.GetPosition(),
+                'focal_point': camera.GetFocalPoint(),
+                'view_up': camera.GetViewUp(),
+                'parallel_scale': camera.GetParallelScale(),
+            }
+            print(f"📸 Captured new lock target")
+            
+            # Reinstall observer
+            if hasattr(self, '_camera_observer_id') and self._camera_observer_id is not None:
+                interactor = renderer.GetRenderWindow().GetInteractor()
+                interactor.RemoveObserver(self._camera_observer_id)
+                self._camera_observer_id = None
+            
+            self._install_2d_lock_observer()
+            print(f"🔒 Fresh camera lock observer installed")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to refresh 2D lock: {e}")
+        
     def _save_quick_no_dialog(self):
         from .save_pointcloud import save_pointcloud
 

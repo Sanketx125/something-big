@@ -993,7 +993,7 @@ def get_dialog_stylesheet() -> str:
         border: 1px solid {c.get('border_light')};
         border-radius: 6px;
         padding: 0px 4px;
-        font-weight: 700;
+        font-weight: normal;
     }}
     QLabel#valuePill {{
         background-color: {c.get('bg_input')};
