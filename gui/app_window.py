@@ -738,25 +738,6 @@ class NakshaApp(QMainWindow):
         except Exception:
             pass
 
-        # Drawing tool shortcuts
-        self.shortcut_line = QShortcut(QKeySequence("L"), self)
-        self.shortcut_line.activated.connect(lambda: self.digitizer.set_tool("Line"))
-        
-        self.shortcut_rect = QShortcut(QKeySequence("R"), self)
-        self.shortcut_rect.activated.connect(lambda: self.digitizer.set_tool("Rectangle"))
-        
-        self.shortcut_circle = QShortcut(QKeySequence("C"), self)
-        self.shortcut_circle.activated.connect(lambda: self.digitizer.set_tool("Circle"))
-        
-        self.shortcut_poly = QShortcut(QKeySequence("P"), self)
-        self.shortcut_poly.activated.connect(lambda: self.digitizer.set_tool("Polygon"))
-        
-        self.shortcut_freehand = QShortcut(QKeySequence("Shift+F"), self)
-        self.shortcut_freehand.activated.connect(lambda: self.digitizer.set_tool("Freehand"))
-        
-        self.shortcut_text = QShortcut(QKeySequence("T"), self)
-        self.shortcut_text.activated.connect(lambda: self.digitizer.set_tool("Text"))
-
         # Temporary test shortcut - Remove after testing
         self.shortcut_backup = QShortcut(QKeySequence("Ctrl+B"), self)
         self.shortcut_backup.activated.connect(self.open_backup_settings)
@@ -5110,6 +5091,12 @@ class NakshaApp(QMainWindow):
                                 restored += 1
 
             if restored > 0:
+                # ✅ FIX: Reset clipping range after re-adding actors so SNT actors
+                # at their Z-offset positions are not outside the view frustum.
+                try:
+                    renderer.ResetCameraClippingRange()
+                except Exception:
+                    pass
                 self.vtk_widget.render()
                 print(f"   ✅ _ensure_overlay_actors: restored {restored} missing actors")
         except Exception as e:
@@ -5665,6 +5652,7 @@ class NakshaApp(QMainWindow):
                 print("🛑 Deactivating cross-section (switching to classification)")
                 if hasattr(self, "_cancel_cross_section_tool_only"):
                     self._cancel_cross_section_tool_only()
+                    
             if tool_name is None:
                 self.active_classify_tool = None
                 if hasattr(self, 'skip_main_view_refresh'):
@@ -11522,6 +11510,16 @@ class NakshaApp(QMainWindow):
                 camera.SetParallelScale(saved_camera['parallel_scale'])
 
             renderer.ResetCameraClippingRange()
+            # ✅ FIX: After resetting clip planes, ensure all SNT/DXF overlay actors
+            # are still present in the renderer. ResetCameraClippingRange() does not
+            # evict actors, but any upstream classification pass or display-mode change
+            # that ran before this call may have stripped the renderer. Calling
+            # _ensure_overlay_actors() here guarantees SNT stays visible when a draw
+            # tool is activated (e.g. Shift+F for freehand).
+            try:
+                self._ensure_overlay_actors()
+            except Exception:
+                pass
             self.is_3d_mode = False
             self.vtk_widget.render()
 

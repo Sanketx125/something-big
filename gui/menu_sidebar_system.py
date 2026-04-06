@@ -2609,9 +2609,7 @@ class ByClassDialog(QDialog):
         # This prevents "StaysOnTop" behavior which causes the weird stacking.
         # It will now minimize nicely to the bottom like the other dialogs.
         super().__init__(None, Qt.Window)
-        
-        # Remove any self.setWindowFlags() calls that were here before!
-        
+        self.setAttribute(Qt.WA_NativeWindow, True)  # Fix: GetDC invalid window handle  
         self.setWindowModality(Qt.NonModal)
         self.app = app
         self.ribbon_parent = ribbon_parent
@@ -3051,7 +3049,7 @@ class ByClassDialog(QDialog):
         
         reply = QMessageBox.question(
             self, "Confirm Conversion", msg,
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
         )
         
         if reply != QMessageBox.Yes:
@@ -3660,8 +3658,7 @@ class ClosedByClassDialog(QDialog):
 
         super().__init__(None, Qt.Window)
         
-        # ✅ FIX 2: Use Qt.Window (Buttons + Minimize logic)
-        # self.setWindowFlags(Qt.Window)
+        self.setAttribute(Qt.WA_NativeWindow, True)  # Fix: GetDC invalid window handle
 
         self.setWindowModality(Qt.NonModal)
         self.app = app
@@ -4246,7 +4243,7 @@ class ClosedByClassDialog(QDialog):
             "Confirm Conversion",
             msg,
             QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            QMessageBox.Yes
         )
         
         if reply != QMessageBox.Yes:
@@ -4358,7 +4355,7 @@ class ClosedByClassDialog(QDialog):
                 "No Reference Points - Convert All?",
                 msg,
                 QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
+                QMessageBox.Yes
             )
             
             if reply != QMessageBox.Yes:
@@ -5117,9 +5114,8 @@ class ByClassHeightDialog(QDialog):
 
         super().__init__(None, Qt.Window)
         
-        # ✅ FIX 2: Use Qt.Window (Buttons + Minimize logic)
-        # self.setWindowFlags(Qt.Window)
-        
+        self.setAttribute(Qt.WA_NativeWindow, True)  # Fix: GetDC invalid window handle
+
         self.setWindowModality(Qt.NonModal)
         self.app = app
         self.ribbon_parent = ribbon_parent
@@ -6383,7 +6379,7 @@ class ByClassHeightDialog(QDialog):
         )
         
         reply = QMessageBox.question(self, "Confirm Conversion", msg,
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         
         if reply != QMessageBox.Yes:
             return
@@ -6424,6 +6420,14 @@ class ByClassHeightDialog(QDialog):
             if use_fence:
                 self._clear_fence_highlights()
                 self._highlight_classified_fences()
+
+                if hasattr(self.app, 'digitizer') and self.app.digitizer:
+                    try:
+                        self.app.digitizer.rebind_drawings()
+                        print("   🖊️ Drawing actors rebound to overlay after fence conversion")
+                    except Exception as _rb_err:
+                        print(f"   ⚠️ rebind_drawings failed: {_rb_err}")
+
                 if not self.permanent_fence_mode:
                     if hasattr(self.app, 'digitizer'):
                         for fence in list(self.selected_fences):
@@ -7662,7 +7666,7 @@ class InsideFenceDialog(QDialog):
             
         # Initialize with the correct parent
         super().__init__(None, Qt.Window)
-             
+        self.setAttribute(Qt.WA_NativeWindow, True)  # Fix: GetDC invalid window handle
         flags = self.windowFlags()
         print(f"\n🔍 ByClassDialog Window Flags Debug:")
         print(f"   Raw flags value: {flags}")
@@ -10330,7 +10334,14 @@ class InsideFenceDialog(QDialog):
             self._clear_fence_highlights()
             # ✅ Re-highlight fences in a distinct color (cyan) to show classified area
             self._highlight_classified_fences()
-            
+
+            if hasattr(self.app, 'digitizer') and self.app.digitizer:
+                try:
+                    self.app.digitizer.rebind_drawings()
+                    print("   🖊️ Drawing actors rebound to overlay after shading rebuild")
+                except Exception as _rb_err:
+                    print(f"   ⚠️ rebind_drawings failed: {_rb_err}")
+
             if self.ribbon_parent:
                 self.ribbon_parent.update_status(f"Converted {converted_count:,} points", "success")
 
@@ -10728,6 +10739,7 @@ class VertexInsertSettingsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
         ok_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setObjectName("cancel_btn")
@@ -10771,6 +10783,7 @@ class VertexMoveSettingsDialog(QDialog):
         # Buttons
         button_layout = QHBoxLayout()
         ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
         ok_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setObjectName("cancel_btn")

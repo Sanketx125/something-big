@@ -92,7 +92,9 @@ if HAS_NUMBA:
         has_z = z_range > 1e-5
         for i in prange(n):
             nx, ny, nz = normals[i, 0], normals[i, 1], normals[i, 2]
-            ndotl = max(0.0, nx * lx + ny * ly + nz * lz)
+            ndotl_raw = nx * lx + ny * ly + nz * lz
+            lz_safe = lz if lz > 0.08 else 0.08   # avoid div-by-zero at near-zero angles
+            ndotl = min(max(ndotl_raw / lz_safe, 0.0), 1.0) 
             ndoth = max(0.0, nx * hx + ny * hy + nz * hz)
             specular = 0.25 * (ndoth ** 64.0)
             intensity = ambient + 0.70 * ndotl + specular
@@ -253,7 +255,8 @@ def _recompute_vertex_normals_partial(cache, patch_face_start_idx):
         ar = np.radians(cache.last_azimuth); er = np.radians(cache.last_angle); amb = cache.last_ambient
         ld = np.array([np.cos(er)*np.cos(ar), np.cos(er)*np.sin(ar), np.sin(er)], dtype=np.float64)
         ld /= np.linalg.norm(ld); N = pn.astype(np.float64)
-        NdL = np.maximum((N*ld).sum(1), 0.0)
+        lz_safe = max(float(ld[2]), 0.08)
+        NdL = np.clip((N*ld).sum(1) / lz_safe, 0., 1.)
         hv = ld + np.array([0.,0.,1.]); hv /= np.linalg.norm(hv)
         NdH = np.maximum((N*hv).sum(1), 0.0)
         ni = np.clip(amb + 0.70*NdL + 0.25*(NdH**64.), 0., 1.); ni = np.power(ni, 0.85)
@@ -272,7 +275,9 @@ def _compute_shading(normals, azimuth, angle, ambient, z_values=None):
             zl = float(np.percentile(z_values, 1)); zh = float(np.percentile(z_values, 99)); zr = max(zh-zl, 1e-3)
         else: zl, zr = 0., 0.; z_values = np.empty(0, dtype=np.float64)
         return _compute_shading_fast(normals, z_values, lx, ly, lz, hx, hy, hz, ambient, zl, zr)
-    ld = np.array([lx,ly,lz], dtype=np.float64); NdL = np.maximum((normals*ld).sum(1), 0.)
+    ld = np.array([lx,ly,lz], dtype=np.float64)
+    lz_safe = max(lz, 0.08)
+    NdL = np.clip((normals*ld).sum(1) / lz_safe, 0., 1.)
     hv = np.array([hx,hy,hz], dtype=np.float64); NdH = np.maximum((normals*hv).sum(1), 0.)
     ni = np.clip(ambient + 0.70*NdL + 0.25*(NdH**64.), 0., 1.); ni = np.power(ni, 0.85)
     if z_values is not None and len(z_values) == len(normals):
@@ -906,96 +911,83 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
     plotter.render()
     ms = "FLAT/FACETED (single-class)" if isc else "FLAT (multi-class)"
     print(f"   🎨 Shaded Mesh [{ms}]: {nf:,} faces in {(time.time()-t0)*1000:.0f}ms")
-
 # ═══════════════════════════════════════════════════════════════
 # ALL REMAINING FUNCTIONS — identical behavior, compressed
 # ═══════════════════════════════════════════════════════════════
-
 def refresh_shaded_after_classification_fast(app, changed_mask=None):
+    """Optimized classification update for single-class shading."""
     cache = get_cache()
     if cache.faces is None or len(cache.faces) == 0:
         update_shaded_class(app, force_rebuild=True); return True
+    
+    # Hide point cloud actors
     if hasattr(app, 'vtk_widget'):
         for name in list(app.vtk_widget.actors.keys()):
             ns = str(name).lower()
             if ns.startswith("class_") or ns in ("main_pc", "main_pc_border"):
                 app.vtk_widget.actors[name].SetVisibility(False)
-    isc = getattr(cache, 'n_visible_classes', 0) == 1; sci = getattr(cache, 'single_class_id', None)
-    vc = _get_shading_visibility(app); va = np.array(sorted(vc), dtype=np.int32)
+    
+    isc = getattr(cache, 'n_visible_classes', 0) == 1
+    sci = getattr(cache, 'single_class_id', None)
+    vc = _get_shading_visibility(app)
+    va = np.array(sorted(vc), dtype=np.int32)
+    
     if changed_mask is None or not np.any(changed_mask):
-        if not isc or sci is None: return _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=vc)
+        if not isc or sci is None:
+            return _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=vc)
         return True
-    cls = app.data.get("classification").astype(np.int32); ci = np.where(changed_mask)[0]
-    cc = cls[ci]; nh = ~np.isin(cc, va); nvis = np.isin(cc, va)
+    
+    cls = app.data.get("classification").astype(np.int32)
+    ci = np.where(changed_mask)[0]
+    cc = cls[ci]
+    nh = ~np.isin(cc, va)  # Points now hidden (classified away from visible class)
+    nvis = np.isin(cc, va)  # Points now visible
     g2u = cache.build_global_to_unique(len(app.data["xyz"]))
     
+    # ✅ FAST PATH for single-class: blacken affected faces immediately, queue rebuild
     if isc and sci is not None:
         mesh = getattr(app, '_shaded_mesh_polydata', None)
-        if np.all(nh):
-            if mesh:
-                cellc = mesh.GetCellData().GetScalars()
-                if cellc and cache.faces is not None and cellc.GetNumberOfTuples() == len(cache.faces):
-                    try:
-                        vp = numpy_support.vtk_to_numpy(cellc)
-                        cu = g2u[ci]; cu = cu[cu >= 0]
-                        if len(cu) > 0:
-                            cs = np.zeros(len(cache.unique_indices), dtype=bool); cs[cu] = True
-                            af = cs[cache.faces[:,0]] | cs[cache.faces[:,1]] | cs[cache.faces[:,2]]
-
-                            # ✅ FIX: Recompute ALL face shading with global z-range before GPU update
-                            az_ = getattr(app, 'last_shade_azimuth', 45.)
-                            an_ = getattr(app, 'last_shade_angle', 45.)
-                            am_ = getattr(app, 'shade_ambient', .25)
-
-                            _ar = np.radians(az_); _er = np.radians(an_)
-                            _lx = np.cos(_er)*np.cos(_ar); _ly = np.cos(_er)*np.sin(_ar); _lz = np.sin(_er)
-                            _hx, _hy, _hz = _lx, _ly, _lz + 1.0
-                            _hl = np.sqrt(_hx*_hx + _hy*_hy + _hz*_hz)
-                            if _hl > 1e-10: _hx /= _hl; _hy /= _hl; _hz /= _hl
-
-                            _gz_all = cache.xyz_unique[:, 2]
-                            _zlo_g = float(np.percentile(_gz_all, 1))
-                            _zhi_g = float(np.percentile(_gz_all, 99))
-                            _zr_g  = max(_zhi_g - _zlo_g, 1e-3)
-
-                            def _shade_gpu(normals_arr, face_indices):
-                                if len(normals_arr) == 0: return np.array([], dtype=np.float32)
-                                fz = cache.xyz_unique[face_indices, 2].mean(axis=1)
-                                N = normals_arr.astype(np.float64)
-                                NdL = np.maximum(N[:,0]*_lx + N[:,1]*_ly + N[:,2]*_lz, 0.0)
-                                NdH = np.maximum(N[:,0]*_hx + N[:,1]*_hy + N[:,2]*_hz, 0.0)
-                                ni = np.clip(am_ + 0.70*NdL + 0.25*(NdH**64.), 0., 1.)
-                                ni = np.power(ni, 0.85)
-                                er = np.clip((fz - _zlo_g) / _zr_g, 0., 1.)
-                                er = 0.15 + 0.85 * er
-                                return np.clip(0.70*ni + 0.30*er, 0., 1.).astype(np.float32)
-
-                            # Apply global-z shading to ALL faces first
-                            new_shade = _shade_gpu(cache.face_normals, cache.faces) if cache.face_normals is not None else np.ones(len(cache.faces), dtype=np.float32)
-                            bc = np.array(app.class_palette.get(sci, {}).get("color", (128,128,128)), dtype=np.float32)
-                            vp[:] = np.clip(bc * new_shade[:, None], 0, 255).astype(np.uint8)
-
-                            # Now blacken only the affected faces
-                            vp[af] = [0,0,0]
-                            cellc.Modified(); mesh.Modified()
-                            a = getattr(app, '_shaded_mesh_actor', None)
-                            if a: a.GetMapper().Modified()
-                            app.vtk_widget.render()
-                    except: pass
-                _queue_incremental_patch(app, sci); return True
+        if np.all(nh) and mesh:
+            # All changed points are now hidden - fast blacken
+            cellc = mesh.GetCellData().GetScalars()
+            if cellc and cache.faces is not None and cellc.GetNumberOfTuples() == len(cache.faces):
+                try:
+                    vp = numpy_support.vtk_to_numpy(cellc)
+                    cu = g2u[ci]; cu = cu[cu >= 0]
+                    if len(cu) > 0:
+                        cs = np.zeros(len(cache.unique_indices), dtype=bool)
+                        cs[cu] = True
+                        af = cs[cache.faces[:,0]] | cs[cache.faces[:,1]] | cs[cache.faces[:,2]]
+                        vp[af] = [0,0,0]
+                        cellc.Modified()
+                        mesh.Modified()
+                        a = getattr(app, '_shaded_mesh_actor', None)
+                        if a: a.GetMapper().Modified()
+                        app.vtk_widget.render()
+                except: pass
+                _queue_incremental_patch(app, sci)
+                return True
     
+    # Handle visibility changes
     if np.all(nvis):
         if _check_previous_classes_visible(app, ci, va):
-            if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True): return True
-        nvg = ci[nvis]; mg = nvg[g2u[nvg] < 0]
+            if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
+                return True
+        nvg = ci[nvis]
+        mg = nvg[g2u[nvg] < 0]
         if len(mg) > 0:
-            if _fast_incremental_add_points(app, mg): return True
+            if _fast_incremental_add_points(app, mg):
+                return True
             _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=mg)
-            _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True); return True
-        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True): return True
+            _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True)
+            return True
+        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
+            return True
+    
     voided = None
     if np.any(nvis):
-        nvg = ci[nvis]; nim = int(np.sum(g2u[nvg] < 0))
+        nvg = ci[nvis]
+        nim = int(np.sum(g2u[nvg] < 0))
         if nim > 0:
             pwh = True
             if getattr(app, '_shading_visibility_override', None) is None:
@@ -1004,21 +996,32 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
                     if stk:
                         try:
                             old = (stk[-1].get('old_classes') or stk[-1].get('oldclasses'))
-                            if old is not None: pwh = not set(int(x) for x in np.unique(np.asarray(old))).issubset(set(int(c) for c in vc))
+                            if old is not None:
+                                pwh = not set(int(x) for x in np.unique(np.asarray(old))).issubset(set(int(c) for c in vc))
                         except: pass
                         break
-            if pwh: _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=nvg[g2u[nvg] < 0])
+            if pwh:
+                _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=nvg[g2u[nvg] < 0])
+    
     if np.any(nh):
-        voided = ci[nh]; mesh = getattr(app, '_shaded_mesh_polydata', None)
+        voided = ci[nh]
+        mesh = getattr(app, '_shaded_mesh_polydata', None)
         if mesh:
             pc = mesh.GetPointData().GetScalars()
             if pc and pc.GetNumberOfTuples() == len(cache.unique_indices):
-                hu = g2u[voided]; hu = hu[(hu >= 0) & (hu < len(cache.unique_indices))]
-                if len(hu) > 0: numpy_support.vtk_to_numpy(pc)[hu] = [0,0,0]; pc.Modified()
+                hu = g2u[voided]
+                hu = hu[(hu >= 0) & (hu < len(cache.unique_indices))]
+                if len(hu) > 0:
+                    numpy_support.vtk_to_numpy(pc)[hu] = [0,0,0]
+                    pc.Modified()
+    
     if _update_colors_gpu_fast(app, cache, changed_mask, _visible_classes=vc, _defer_render=True):
-        if voided is not None and len(voided) > 0: _queue_deferred_rebuild(app, "void cleanup")
+        if voided is not None and len(voided) > 0:
+            _queue_deferred_rebuild(app, "void cleanup")
         return True
-    update_shaded_class(app, force_rebuild=True); return True
+    
+    update_shaded_class(app, force_rebuild=True)
+    return True
 
 def _incremental_visibility_patch(app, cgi, vcs):
     cache = get_cache()
@@ -1318,30 +1321,41 @@ def _multi_class_region_undo_patch(app, changed_mask, vcs):
     return True
 
 def _rebuild_single_class(app, sci):
+    """Optimized single-class rebuild."""
     cache = get_cache()
     if cache.faces is None or len(cache.faces) == 0:
-        cache.clear("no mesh"); _do_full_rebuild(app, sci); return
+        cache.clear("no mesh")
+        _do_full_rebuild(app, sci)
+        return
+    
+    # Use cache values for shading parameters
+    az = cache.last_azimuth if cache.last_azimuth >= 0 else getattr(app, 'last_shade_azimuth', 45.)
+    an = cache.last_angle if cache.last_angle >= 0 else getattr(app, 'last_shade_angle', 45.)
+    am = cache.last_ambient if cache.last_ambient >= 0 else getattr(app, 'shade_ambient', .25)
     
     cls = app.data.get("classification").astype(np.int32)
-    cvl = cls[cache.unique_indices]; vl = cvl != sci
-    if np.sum(vl) == 0: return
+    cvl = cls[cache.unique_indices]
+    vl = cvl != sci
+    if np.sum(vl) == 0:
+        return
     
     ifm = vl[cache.faces[:,0]] | vl[cache.faces[:,1]] | vl[cache.faces[:,2]]
     vfm = ~ifm
     if np.sum(vfm) == 0:
-        cache.clear("all invalid"); _do_full_rebuild(app, sci); return
+        cache.clear("all invalid")
+        _do_full_rebuild(app, sci)
+        return
     
-    rva = np.where(vl)[0].astype(np.int32); ifa = cache.faces[ifm]
+    rva = np.where(vl)[0].astype(np.int32)
+    ifa = cache.faces[ifm]
     irf = np.zeros(len(cache.unique_indices), dtype=bool)
-    if len(rva) > 0: irf[rva] = True
+    if len(rva) > 0:
+        irf[rva] = True
     bv = np.unique(ifa.ravel()[~irf[ifa.ravel()]]).astype(np.int32)
-    
-    az = getattr(app, 'last_shade_azimuth', 45.)
-    an = getattr(app, 'last_shade_angle', 45.)
-    am = getattr(app, 'shade_ambient', .25)
     
     vf = cache.faces[vfm]
     vn = cache.face_normals[vfm] if cache.face_normals is not None else None
+    vs = cache.shade[vfm] if cache.shade is not None and len(cache.shade) == len(cache.faces) else None
     npf = np.array([], dtype=np.int32).reshape(0, 3)
     
     if len(bv) >= 3:
@@ -1364,16 +1378,15 @@ def _rebuild_single_class(app, sci):
         pn = _compute_face_normals(cache.xyz_unique, npf)
         cache.faces = np.vstack([vf, npf])
         cache.face_normals = pn if vn is None else np.vstack([vn, pn])
+        
+        # Compute shade for new patch with global z-range
+        ps = _compute_face_shade_global_z(cache.xyz_unique, npf, az, an, am, face_normals=pn)
+        cache.shade = ps if vs is None else np.concatenate([vs, ps])
     else:
         cache.faces = vf
         cache.face_normals = vn
+        cache.shade = vs
     
-    # ✅ FIX: Single shade call with global z-range for ALL faces
-    cache.shade = _compute_face_shade_global_z(
-        cache.xyz_unique, cache.faces, az, an, am,
-        face_normals=cache.face_normals)
-    
-    _recompute_vertex_normals_partial(cache, len(vf))
     cache._vtk_colors_ptr = None
     _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
 
@@ -1397,17 +1410,31 @@ def _check_previous_classes_visible(app, ci, va):
     except: return False
 
 def refresh_shaded_after_undo_fast(app, changed_mask=None):
+    """Optimized undo handling for single-class shading."""
     cache = get_cache()
-    if cache.faces is None or len(cache.faces) == 0: return False
-    isc = getattr(cache, 'n_visible_classes', 0) == 1; sci = getattr(cache, 'single_class_id', None)
+    if cache.faces is None or len(cache.faces) == 0:
+        return False
+    
+    isc = getattr(cache, 'n_visible_classes', 0) == 1
+    sci = getattr(cache, 'single_class_id', None)
     vc = getattr(cache, 'visible_classes_set', None) or _get_shading_visibility(app)
-    if changed_mask is None or not np.any(changed_mask): return _update_colors_gpu_fast(app, cache, changed_mask=None)
-    cls = app.data.get("classification"); xyz = app.data.get("xyz")
-    if cls is None or xyz is None: return False
-    cls = cls.astype(np.int32); ci = np.where(changed_mask)[0]
-    if len(ci) == 0: return True
+    
+    if changed_mask is None or not np.any(changed_mask):
+        return _update_colors_gpu_fast(app, cache, changed_mask=None)
+    
+    cls = app.data.get("classification")
+    xyz = app.data.get("xyz")
+    if cls is None or xyz is None:
+        return False
+    cls = cls.astype(np.int32)
+    ci = np.where(changed_mask)[0]
+    if len(ci) == 0:
+        return True
+    
     va = np.array(sorted(vc), dtype=np.int32) if vc else np.array([], dtype=np.int32)
     nv = np.isin(cls[ci], va) if len(va) > 0 else np.zeros(len(ci), dtype=bool)
+    
+    # Fast path: all changed points still visible
     if np.all(nv) and _check_previous_classes_visible(app, ci, va):
         if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask):
             global _rebuild_timer
@@ -1415,23 +1442,52 @@ def refresh_shaded_after_undo_fast(app, changed_mask=None):
                 try: _rebuild_timer.stop()
                 except: pass
             return True
-    g2u = cache.build_global_to_unique(len(xyz)); cu = g2u[ci]; ic = cu >= 0
+    
+    g2u = cache.build_global_to_unique(len(xyz))
+    cu = g2u[ci]
+    ic = cu >= 0
+    
+    # Check which unique vertices are actually in mesh faces
     uv = np.zeros(len(cache.unique_indices), dtype=bool)
-    if cache.faces is not None and len(cache.faces) > 0: uv[np.unique(cache.faces.ravel())] = True
-    aim = np.zeros(len(ci), dtype=bool); vp = np.where(ic)[0]
-    if len(vp) > 0: aim[vp] = uv[cu[vp]]
-    hm = aim & (~nv); vm = nv & (~aim)
-    if np.any(vm) and _check_previous_classes_visible(app, ci, va): vm[:] = False
-    pbh = ci[hm]; pbv = ci[vm]
+    if cache.faces is not None and len(cache.faces) > 0:
+        uv[np.unique(cache.faces.ravel())] = True
+    
+    aim = np.zeros(len(ci), dtype=bool)
+    vp = np.where(ic)[0]
+    if len(vp) > 0:
+        aim[vp] = uv[cu[vp]]
+    
+    hm = aim & (~nv)  # Was in mesh, now hidden
+    vm = nv & (~aim)  # Now visible, wasn't in mesh
+    
+    if np.any(vm) and _check_previous_classes_visible(app, ci, va):
+        vm[:] = False
+    
+    pbh = ci[hm]
+    pbv = ci[vm]
+    
     if len(pbh) == 0 and len(pbv) == 0:
         return _update_colors_gpu_fast(app, cache, changed_mask=changed_mask) or False
+    
+    # Multi-class path
     if not isc or sci is None:
-        if len(pbv) > 0: return _multi_class_region_undo_patch(app, changed_mask, vc)
-        if len(pbh) > 0: return _incremental_visibility_patch(app, pbh, vc)
+        if len(pbv) > 0:
+            return _multi_class_region_undo_patch(app, changed_mask, vc)
+        if len(pbh) > 0:
+            return _incremental_visibility_patch(app, pbh, vc)
         return True
-    if len(pbv) > 0 and len(pbh) > 0: return False
-    if len(pbv) > 0: _rebuild_single_class_for_undo(app, sci, changed_mask); return True
-    if len(pbh) > 0: _rebuild_single_class(app, sci); return True
+    
+    # Single-class optimized path
+    if len(pbv) > 0 and len(pbh) > 0:
+        # Both add and remove - use optimized rebuild
+        _rebuild_single_class_for_undo(app, sci, changed_mask)
+        return True
+    if len(pbv) > 0:
+        _rebuild_single_class_for_undo(app, sci, changed_mask)
+        return True
+    if len(pbh) > 0:
+        _rebuild_single_class(app, sci)
+        return True
     return True
 
 def _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=None, _defer_render=False):
@@ -1484,6 +1540,7 @@ def _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=None
     except: return False
 
 def _rebuild_single_class_for_undo(app, sci, changed_mask):
+    """Optimized single-class undo - only update affected region faces."""
     cache = get_cache()
     if cache.faces is None or cache.xyz_unique is None:
         _do_full_rebuild(app, sci); return
@@ -1495,6 +1552,11 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
     ci = np.where(changed_mask)[0]
     rgi = ci[cls[ci] == sci]
     if len(rgi) == 0: return
+
+    # ✅ FIX: Use cache values first for shading parameters
+    az_ = cache.last_azimuth if cache.last_azimuth >= 0 else getattr(app, 'last_shade_azimuth', 45.)
+    an_ = cache.last_angle if cache.last_angle >= 0 else getattr(app, 'last_shade_angle', 45.)
+    am_ = cache.last_ambient if cache.last_ambient >= 0 else getattr(app, 'shade_ambient', .25)
 
     rx = xyz[rgi]
     xn, yn = rx[:,0].min(), rx[:,1].min()
@@ -1520,7 +1582,7 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
         if np.any(stale_mask):
             stale_ui_set = region_ui[stale_mask]
 
-    # Step 2: remove faces
+    # Step 2: identify faces to remove
     all_inside = irm[cache.faces[:,0]] & irm[cache.faces[:,1]] & irm[cache.faces[:,2]]
     if len(stale_ui_set) > 0:
         has_stale = np.zeros(len(cache.unique_indices), dtype=bool)
@@ -1532,8 +1594,10 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
     else:
         fir = all_inside
 
+    n_removed = int(np.sum(fir))
     fo = cache.faces[~fir]
     no = cache.face_normals[~fir] if cache.face_normals is not None else None
+    so = cache.shade[~fir] if cache.shade is not None and len(cache.shade) == len(cache.faces) else None
 
     # Step 3: purge stale unique vertices and remap
     if len(stale_ui_set) > 0:
@@ -1547,36 +1611,54 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
                 fo_mask = (fo_flat.reshape(-1,3) >= 0).all(axis=1)
                 fo = fo_flat.reshape(-1,3)[fo_mask]
                 if no is not None: no = no[fo_mask]
+                if so is not None: so = so[fo_mask]
             else:
                 fo = fo_flat.reshape(-1, 3)
         cache.unique_indices = cache.unique_indices[keep_ui]
-        cache.xyz_unique     = cache.xyz_unique[keep_ui]
-        cache.xyz_final      = cache.xyz_final[keep_ui]
+        cache.xyz_unique = cache.xyz_unique[keep_ui]
+        cache.xyz_final = cache.xyz_final[keep_ui]
         cache._global_to_unique = None
-        if cache.vertex_normals is not None and len(cache.vertex_normals) == len(keep_ui):
-            cache.vertex_normals = cache.vertex_normals[keep_ui]
-        if cache.vertex_shade is not None and len(cache.vertex_shade) == len(keep_ui):
-            cache.vertex_shade = cache.vertex_shade[keep_ui]
 
-    # Triangulate new region
+    # Triangulate new region - use faster parameters for small regions
     lo = lx.min(axis=0); lxo = lx - lo
     ns = np.sqrt(max((lxo[:,0].max()-lxo[:,0].min())*(lxo[:,1].max()-lxo[:,1].min()), 1.) / max(len(lx), 1))
-    pr = max(ns*0.3, 0.005); pu = len(lx) / max((pr/max(ns, 1e-9))**2, 1)
-    if pu > 80000: pr = max(pr*np.sqrt(pu/80000), 0.005)
+    
+    # ✅ OPTIMIZATION: Coarser precision for faster triangulation during undo
+    pr = max(ns * 0.5, 0.01)  # Coarser than normal
+    pu = len(lx) / max((pr/max(ns, 1e-9))**2, 1)
+    if pu > 50000: pr = max(pr * np.sqrt(pu / 50000), 0.01)  # Lower threshold
+    
     xyg = np.floor(lxo[:,:2]/pr).astype(np.int64)
     si = np.lexsort((-lxo[:,2], xyg[:,1], xyg[:,0])); xys = xyg[si]
     d = np.diff(xys, axis=0); um = np.concatenate([[True], (d[:,0]!=0)|(d[:,1]!=0)])
     uli = si[um]; ulx = lxo[uli]; ulg = lgi[uli]
-    if len(ulx) < 3: return
+    if len(ulx) < 3:
+        cache.faces = fo; cache.face_normals = no; cache.shade = so
+        cache._vtk_colors_ptr = None
+        _render_mesh_fast_update(app, cache, n_removed, 0)
+        return
+        
     xy = ulx[:,:2]
     try: lf = _do_triangulate(xy)
-    except: return
-    if len(lf) == 0: return
+    except:
+        cache.faces = fo; cache.face_normals = no; cache.shade = so
+        cache._vtk_colors_ptr = None
+        _render_mesh_fast_update(app, cache, n_removed, 0)
+        return
+    if len(lf) == 0:
+        cache.faces = fo; cache.face_normals = no; cache.shade = so
+        cache._vtk_colors_ptr = None
+        _render_mesh_fast_update(app, cache, n_removed, 0)
+        return
 
     _mef = getattr(cache, 'max_edge_factor', 3.0)
     ls = np.sqrt((xy[:,0].max()-xy[:,0].min())*(xy[:,1].max()-xy[:,1].min())/len(xy)) if len(xy) > 0 else cache.spacing
     lf = _filter_edges_by_absolute(lf, xy, min(max(ls*8, cache.spacing*_mef*5), cache.spacing*_mef*20))
-    if len(lf) == 0: return
+    if len(lf) == 0:
+        cache.faces = fo; cache.face_normals = no; cache.shade = so
+        cache._vtk_colors_ptr = None
+        _render_mesh_fast_update(app, cache, n_removed, 0)
+        return
 
     g2u = cache.build_global_to_unique(len(xyz)); ltc = g2u[ulg]
     if int(np.sum(ltc < 0)) > 0:
@@ -1586,15 +1668,15 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
         cache.xyz_final = np.vstack([cache.xyz_final, nx2+cache.offset])
         cache._global_to_unique = None; g2u = cache.build_global_to_unique(len(xyz)); ltc = g2u[ulg]
     npf = ltc[lf]
-    if np.any(npf < 0): return
+    if np.any(npf < 0):
+        cache.faces = fo; cache.face_normals = no; cache.shade = so
+        cache._vtk_colors_ptr = None
+        _render_mesh_fast_update(app, cache, n_removed, 0)
+        return
 
     fn = _compute_face_normals(cache.xyz_unique, npf)
 
-    # ✅ GLOBAL Z-RANGE FIX: Compute shading for ALL faces using the SAME global z-range
-    az_ = getattr(app, 'last_shade_azimuth', 45.)
-    an_ = getattr(app, 'last_shade_angle',   45.)
-    am_ = getattr(app, 'shade_ambient',      .25)
-
+    # Compute shading for new patch faces using global z-range
     _ar = np.radians(az_); _er = np.radians(an_)
     _lx = np.cos(_er)*np.cos(_ar); _ly = np.cos(_er)*np.sin(_ar); _lz = np.sin(_er)
     _hx, _hy, _hz = _lx, _ly, _lz + 1.0
@@ -1604,31 +1686,60 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
     _gz_all = cache.xyz_unique[:, 2]
     _zlo_g = float(np.percentile(_gz_all, 1))
     _zhi_g = float(np.percentile(_gz_all, 99))
-    _zr_g  = max(_zhi_g - _zlo_g, 1e-3)
+    _zr_g = max(_zhi_g - _zlo_g, 1e-3)
 
-    def _shade_faces_global(normals_arr, face_indices):
-        if len(normals_arr) == 0: return np.array([], dtype=np.float32)
-        fz = cache.xyz_unique[face_indices, 2].mean(axis=1)
-        N = normals_arr.astype(np.float64)
-        NdL = np.maximum(N[:,0]*_lx + N[:,1]*_ly + N[:,2]*_lz, 0.0)
-        NdH = np.maximum(N[:,0]*_hx + N[:,1]*_hy + N[:,2]*_hz, 0.0)
-        ni = np.clip(am_ + 0.70*NdL + 0.25*(NdH**64.), 0., 1.)
-        ni = np.power(ni, 0.85)
-        er = np.clip((fz - _zlo_g) / _zr_g, 0., 1.)
-        er = 0.15 + 0.85 * er
-        return np.clip(0.70*ni + 0.30*er, 0., 1.).astype(np.float32)
+    # Compute new patch shade
+    fz = cache.xyz_unique[npf, 2].mean(axis=1)
+    N = fn.astype(np.float64)
+    _lz_safe = max(_lz, 0.08)
+    NdL = np.clip((N[:,0]*_lx + N[:,1]*_ly + N[:,2]*_lz) / _lz_safe, 0., 1.)
+    NdH = np.maximum(N[:,0]*_hx + N[:,1]*_hy + N[:,2]*_hz, 0.0)
+    ni = np.clip(am_ + 0.70*NdL + 0.25*(NdH**64.), 0., 1.)
+    ni = np.power(ni, 0.85)
+    er = np.clip((fz - _zlo_g) / _zr_g, 0., 1.)
+    er = 0.15 + 0.85 * er
+    nps = np.clip(0.70*ni + 0.30*er, 0., 1.).astype(np.float32)
 
-    # Recompute kept faces with global z-range
-    so = _shade_faces_global(no, fo) if (no is not None and len(no) == len(fo)) else np.array([], dtype=np.float32)
-    # Compute new patch faces with same global z-range
-    nps = _shade_faces_global(fn, npf)
-
+    # Combine
     cache.faces = np.vstack([fo, npf])
-    cache.shade = np.concatenate([so, nps])
     cache.face_normals = fn if no is None else np.vstack([no, fn])
-    _recompute_vertex_normals_partial(cache, len(fo))
+    cache.shade = nps if so is None else np.concatenate([so, nps])
     cache._vtk_colors_ptr = None
-    _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
+    
+    _render_mesh_fast_update(app, cache, n_removed, len(npf))
+
+def _render_mesh_fast_update(app, cache, n_removed, n_added):
+    """Fast mesh update - rebuild only if structure changed significantly."""
+    mesh = getattr(app, '_shaded_mesh_polydata', None)
+    actor = getattr(app, '_shaded_mesh_actor', None)
+    
+    # If mesh structure changed, we need full rebuild
+    if mesh is None or actor is None or mesh.GetNumberOfCells() != len(cache.faces):
+        _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
+        return
+    
+    # Structure same - just update colors (much faster)
+    try:
+        sci = getattr(cache, 'single_class_id', None)
+        if sci is None:
+            _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
+            return
+            
+        cc = mesh.GetCellData().GetScalars()
+        if cc is None or cc.GetNumberOfTuples() != len(cache.faces):
+            _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
+            return
+        
+        vp = numpy_support.vtk_to_numpy(cc)
+        sh = cache.shade if cache.shade is not None and len(cache.shade) == len(cache.faces) else np.ones(len(cache.faces), dtype=np.float32)
+        bc = np.array(app.class_palette.get(sci, {}).get("color", (128,128,128)), dtype=np.float32)
+        vp[:] = np.clip(bc * sh[:, None], 0, 255).astype(np.uint8)
+        cc.Modified()
+        mesh.Modified()
+        actor.GetMapper().Modified()
+        app.vtk_widget.render()
+    except:
+        _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
 
 def _fast_incremental_add_points(app, ngi):
     cache = get_cache()

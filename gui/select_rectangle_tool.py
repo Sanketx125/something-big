@@ -647,28 +647,26 @@ class SelectRectangleTool:
         self.app.vtk_widget.render()
     
     def _show_delete_confirmation(self):
-        """Show confirmation dialog for deletion"""
+        """Show delete confirmation, then optional save-deleted-part-as-LAZ dialog."""
         total_selected = self.selected_count + len(self.selected_dxf_actors)
-        
+
         if total_selected == 0:
             print("⚠️ Nothing selected")
             return
-        
-        # Build message
+
         message = f"Delete selected items?\n\n"
         message += f"• {self.selected_count:,} point cloud points\n"
         message += f"• {len(self.selected_dxf_actors)} DXF entities\n\n"
         message += "This action cannot be undone."
-        
-        # ✅ FIX: Force process events before showing dialog
+
         from PySide6.QtCore import QCoreApplication
         QCoreApplication.processEvents()
-        
-        # ✅ FIX: Store selection state before dialog
+
+        # Preserve selection through dialogs
         stored_mask = self.selected_mask.copy() if self.selected_mask is not None else None
-        stored_dxf = list(self.selected_dxf_actors)  # Copy list
+        stored_dxf = list(self.selected_dxf_actors)
         stored_count = self.selected_count
-        
+
         reply = QMessageBox.question(
             self.app,
             "Delete Selection",
@@ -676,17 +674,29 @@ class SelectRectangleTool:
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
-        
-        # ✅ FIX: Restore selection state after dialog
+
+        # Restore selection state after dialog
         self.selected_mask = stored_mask
         self.selected_dxf_actors = stored_dxf
         self.selected_count = stored_count
-        
-        if reply == QMessageBox.Yes:
-            self._delete_selection()
-        else:
+
+        if reply != QMessageBox.Yes:
             print("🚫 Deletion cancelled")
             self._cancel_selection()
+            return
+
+        # SECOND DIALOG
+        save_reply = QMessageBox.question(
+            self.app,
+            "Save Deleted Part as LAZ",
+            "Do you want to save the deleted part as a new .laz file?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+
+        save_deleted_part = (save_reply == QMessageBox.Yes)
+
+        self._delete_selection(save_deleted_part=save_deleted_part)
     
     def _cancel_selection(self):
         """Cancel selection and clear highlights"""
@@ -732,8 +742,8 @@ class SelectRectangleTool:
         
         self.app.statusBar().showMessage("🚫 Selection cancelled", 2000)
     
-    def _delete_selection(self):
-        """Delete both selected points AND DXF entities"""
+    def _delete_selection(self, save_deleted_part=False):
+        """Delete selected points/DXF and optionally save the deleted point subset as .laz."""
         progress = QProgressDialog("Deleting selection...", None, 0, 100, self.app)
         progress.setWindowTitle("Deletion Progress")
         progress.setWindowModality(Qt.WindowModal)
@@ -852,22 +862,26 @@ class SelectRectangleTool:
                 progress.setValue(70)
             
             # ========================================
-            # PART 2.5: Save deleted data to file (10%)
+            # PART 2.5: Optionally save DELETED PART as LAZ
             # ========================================
-            progress.setLabelText("Saving deleted data...")
+            saved_deleted_path = None
+            progress.setLabelText("Preparing deleted data...")
             progress.setValue(72)
-            
-            if deleted_xyz is not None or deleted_dxf > 0:
-                save_path = self._save_deleted_data(
-                    deleted_xyz if deleted_xyz is not None else np.array([]),
-                    deleted_classification,
-                    deleted_rgb,
-                    deleted_intensity,
-                    deleted_dxf
+
+            if save_deleted_part and deleted_xyz is not None and len(deleted_xyz) > 0:
+                progress.setLabelText("Saving deleted part as .laz...")
+                saved_deleted_path = self._save_deleted_data_as_laz(
+                    deleted_xyz,
+                    deleted_points_classification=deleted_classification,
+                    deleted_points_rgb=deleted_rgb,
+                    deleted_points_intensity=deleted_intensity,
+                    deleted_dxf_count=deleted_dxf
                 )
-                if save_path:
-                    print(f"💾 Deleted data saved to: {save_path}")
-            
+                if saved_deleted_path:
+                    print(f"💾 Deleted part saved to: {saved_deleted_path}")
+            elif save_deleted_part and (deleted_xyz is None or len(deleted_xyz) == 0):
+                print("⚠️ No deleted point-cloud points available to save as LAZ")
+
             progress.setValue(75)
             
             # ========================================
@@ -926,8 +940,19 @@ class SelectRectangleTool:
             # Show summary
 
             
-            # Show summary
-            message = f"✅ Deleted {deleted_points:,} points + {deleted_dxf} DXF entities (saved to *_removed.las)"
+            if save_deleted_part and saved_deleted_path:
+                message = (
+                    f"✅ Deleted {deleted_points:,} points + {deleted_dxf} DXF entities "
+                    f"(saved deleted part: {saved_deleted_path.name})"
+                )
+            elif save_deleted_part and not saved_deleted_path:
+                message = (
+                    f"⚠️ Deleted {deleted_points:,} points + {deleted_dxf} DXF entities "
+                    f"(save failed)"
+                )
+            else:
+                message = f"✅ Deleted {deleted_points:,} points + {deleted_dxf} DXF entities"
+
             self.app.statusBar().showMessage(message, 5000)
             print(f"\n{message}")
             
@@ -954,6 +979,93 @@ class SelectRectangleTool:
         
         # Show the same confirmation dialog
         self._show_delete_confirmation()
+    
+    def _save_modified_dataset_as_laz(self):
+        """
+        Save the CURRENT MODIFIED point cloud as a new .laz file
+        using filename serial numbering: file_001.laz, file_002.laz, etc.
+        """
+        try:
+            import os
+            from gui.save_pointcloud import save_pointcloud
+
+            # Use loaded file / last save path as base
+            base_path = (
+                getattr(self.app, 'last_save_path', None)
+                or getattr(self.app, 'loaded_file', None)
+                or getattr(self.app, 'current_file_path', None)
+            )
+
+            if not base_path:
+                print("⚠️ No base file path found - opening Save As dialog")
+                save_pointcloud(
+                    self.app,
+                    path=None,
+                    file_format="laz",
+                    las_version="1.4",
+                    show_dialog=True
+                )
+                return None
+
+            # Build serial filename
+            if hasattr(self.app, '_get_auto_incremented_path'):
+                output_path = self.app._get_auto_incremented_path(base_path)
+            else:
+                output_path = self._get_auto_incremented_laz_path(base_path)
+
+            # Force .laz extension
+            root, _ = os.path.splitext(output_path)
+            output_path = root + ".laz"
+
+            save_pointcloud(
+                self.app,
+                path=output_path,
+                file_format="laz",
+                las_version=getattr(self.app, 'last_save_version', "1.4"),
+                show_dialog=False
+            )
+
+            print(f"💾 Modified point cloud saved to: {output_path}")
+            return os.path.basename(output_path)
+
+        except Exception as e:
+            print(f"❌ Failed to save modified point cloud: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+    def _get_auto_incremented_laz_path(self, base_path):
+        """
+        Fallback serial generator if app._get_auto_incremented_path is unavailable.
+        """
+        import os
+        import re
+
+        directory = os.path.dirname(base_path)
+        filename = os.path.basename(base_path)
+        name, _ = os.path.splitext(filename)
+
+        match = re.search(r'_(\d{3})$', name)
+
+        if match:
+            current_num = int(match.group(1))
+            base_name = name[:match.start()]
+            next_num = current_num + 1
+            candidate = os.path.join(directory, f"{base_name}_{next_num:03d}.laz")
+        else:
+            candidate = os.path.join(directory, f"{name}_001.laz")
+
+        counter = 1
+        while os.path.exists(candidate):
+            if match:
+                candidate = os.path.join(directory, f"{base_name}_{current_num + counter:03d}.laz")
+            else:
+                candidate = os.path.join(directory, f"{name}_{counter:03d}.laz")
+            counter += 1
+            if counter > 999:
+                raise Exception("Too many serial files already exist")
+
+        return candidate
 
     def get_selection_summary(self):
         """Get summary of current selection"""
@@ -1046,114 +1158,160 @@ class SelectRectangleTool:
         
         
         
-    def _save_deleted_data(self, deleted_points_xyz, deleted_points_classification=None, 
-                       deleted_points_rgb=None, deleted_points_intensity=None,
-                       deleted_dxf_count=0):
+    def _save_deleted_data_as_laz(
+        self,
+        deleted_points_xyz,
+        deleted_points_classification=None,
+        deleted_points_rgb=None,
+        deleted_points_intensity=None,
+        deleted_dxf_count=0
+    ):
         """
-        Save deleted points to a new LAS file with '_removed' suffix.
-        Example: if original was 'data.las', saves as 'data_removed.las'
+        Save the DELETED POINT SUBSET as a serial-numbered .laz file.
+        Example:
+            123.las -> 123_deleted_001.laz
+            123.las -> 123_deleted_002.laz
         """
         try:
-            # Check if we have a loaded file path
-            if not hasattr(self.app, 'current_file_path') or not self.app.current_file_path:
-                print("⚠️ No original file path found - cannot save deleted data")
-                return None
-            
             import os
             from pathlib import Path
-            
-            # Get original file path
-            original_path = Path(self.app.current_file_path)
-            
-            # Create new filename with '_removed' suffix
-            base_name = original_path.stem  # filename without extension
-            extension = original_path.suffix  # .las or .laz
-            new_filename = f"{base_name}_removed{extension}"
-            save_path = original_path.parent / new_filename
-            
-            print(f"\n💾 Saving deleted data to: {save_path}")
-            
-            # If no points to save, just create a summary file
-            if len(deleted_points_xyz) == 0:
-                summary_path = original_path.parent / f"{base_name}_removed_summary.txt"
-                with open(summary_path, 'w') as f:
-                    f.write(f"Deletion Summary\n")
-                    f.write(f"=" * 50 + "\n")
-                    f.write(f"Original file: {original_path.name}\n")
-                    f.write(f"Points deleted: 0\n")
-                    f.write(f"DXF entities deleted: {deleted_dxf_count}\n")
-                print(f"✅ Saved summary to: {summary_path}")
-                return summary_path
-            
-            # Save deleted points to LAS/LAZ file
+            import laspy
+            import numpy as np
+
+            # Use the real app paths
+            base_path = (
+                getattr(self.app, "last_save_path", None)
+                or getattr(self.app, "loaded_file", None)
+                or getattr(self.app, "current_file_path", None)
+            )
+
+            if not base_path:
+                print("⚠️ No base file path found - cannot save deleted data")
+                return None
+
+            base_path = Path(base_path)
+            save_path = self._get_next_deleted_laz_path(base_path)
+
+            print(f"\n💾 Saving deleted part to: {save_path}")
+
+            if deleted_points_xyz is None or len(deleted_points_xyz) == 0:
+                print("⚠️ No deleted point-cloud points to save")
+                return None
+
+            xyz = np.asarray(deleted_points_xyz)
+            n = len(xyz)
+
+            # Determine RGB availability
+            has_rgb = deleted_points_rgb is not None
+            point_format = 7 if has_rgb else 6   # LAS 1.4 / RGB or no RGB
+            header = laspy.LasHeader(point_format=point_format, version="1.4")
+
+            # Better offsets/scales
+            mins = np.min(xyz, axis=0)
+            header.offsets = np.array([mins[0], mins[1], mins[2]])
+            header.scales = np.array([0.001, 0.001, 0.001])
+
+            # Embed CRS if available
             try:
-                import laspy
-                
-                # Create header
-                header = laspy.LasHeader(point_format=3, version="1.2")
-                header.offsets = np.min(deleted_points_xyz, axis=0)
-                header.scales = np.array([0.001, 0.001, 0.001])
-                
-                # Create LAS data
-                las = laspy.LasData(header)
-                
-                # Add coordinates
-                las.x = deleted_points_xyz[:, 0]
-                las.y = deleted_points_xyz[:, 1]
-                las.z = deleted_points_xyz[:, 2]
-                
-                # Add classification if available
-                if deleted_points_classification is not None:
-                    las.classification = deleted_points_classification
-                
-                # Add RGB if available
-                if deleted_points_rgb is not None and deleted_points_rgb.shape[1] >= 3:
-                    las.red = (deleted_points_rgb[:, 0] * 65535).astype(np.uint16)
-                    las.green = (deleted_points_rgb[:, 1] * 65535).astype(np.uint16)
-                    las.blue = (deleted_points_rgb[:, 2] * 65535).astype(np.uint16)
-                
-                # Add intensity if available
-                if deleted_points_intensity is not None:
-                    las.intensity = deleted_points_intensity
-                
-                # Write file
-                las.write(str(save_path))
-                
-                print(f"✅ Saved {len(deleted_points_xyz):,} deleted points to: {save_path}")
-                
-                # Also save a summary text file
-                summary_path = original_path.parent / f"{base_name}_removed_summary.txt"
-                with open(summary_path, 'w') as f:
-                    f.write(f"Deletion Summary\n")
-                    f.write(f"=" * 50 + "\n")
-                    f.write(f"Original file: {original_path.name}\n")
-                    f.write(f"Deleted file: {new_filename}\n")
-                    f.write(f"Points deleted: {len(deleted_points_xyz):,}\n")
-                    f.write(f"DXF entities deleted: {deleted_dxf_count}\n")
-                    f.write(f"\nDeleted point bounds:\n")
-                    f.write(f"  X: {np.min(deleted_points_xyz[:, 0]):.3f} to {np.max(deleted_points_xyz[:, 0]):.3f}\n")
-                    f.write(f"  Y: {np.min(deleted_points_xyz[:, 1]):.3f} to {np.max(deleted_points_xyz[:, 1]):.3f}\n")
-                    f.write(f"  Z: {np.min(deleted_points_xyz[:, 2]):.3f} to {np.max(deleted_points_xyz[:, 2]):.3f}\n")
-                
-                print(f"✅ Saved summary to: {summary_path}")
-                
-                return save_path
-                
-            except ImportError:
-                print("⚠️ laspy not available - saving as numpy array")
-                # Fallback: save as numpy array
-                np_save_path = original_path.parent / f"{base_name}_removed.npy"
-                np.save(str(np_save_path), {
-                    'xyz': deleted_points_xyz,
-                    'classification': deleted_points_classification,
-                    'rgb': deleted_points_rgb,
-                    'intensity': deleted_points_intensity
-                })
-                print(f"✅ Saved deleted points (numpy) to: {np_save_path}")
-                return np_save_path
-                
+                import pyproj
+                if getattr(self.app, "project_crs_wkt", None):
+                    crs = pyproj.CRS.from_wkt(self.app.project_crs_wkt)
+                    header.parse_crs(crs)
+                elif getattr(self.app, "project_crs_epsg", None):
+                    crs = pyproj.CRS.from_epsg(self.app.project_crs_epsg)
+                    header.parse_crs(crs)
+            except Exception as e:
+                print(f"⚠️ CRS embedding skipped: {e}")
+
+            las = laspy.LasData(header)
+            las.x = xyz[:, 0]
+            las.y = xyz[:, 1]
+            las.z = xyz[:, 2]
+
+            # Classification
+            if deleted_points_classification is not None and len(deleted_points_classification) == n:
+                las.classification = np.asarray(deleted_points_classification).astype(np.uint8, copy=False)
+            else:
+                las.classification = np.zeros(n, dtype=np.uint8)
+
+            # RGB
+            if has_rgb:
+                rgb = np.asarray(deleted_points_rgb)
+
+                if np.issubdtype(rgb.dtype, np.floating):
+                    rgb = np.clip(rgb, 0.0, 1.0)
+                    rgb16 = (rgb * 65535.0).round().astype(np.uint16)
+                else:
+                    mx = int(rgb.max()) if rgb.size else 0
+                    if mx <= 255:
+                        rgb16 = rgb.astype(np.uint16) * 256
+                    else:
+                        rgb16 = np.clip(rgb, 0, 65535).astype(np.uint16)
+
+                las.red = rgb16[:, 0]
+                las.green = rgb16[:, 1]
+                las.blue = rgb16[:, 2]
+
+            # Intensity
+            if deleted_points_intensity is not None and len(deleted_points_intensity) == n:
+                inten = np.asarray(deleted_points_intensity)
+                if np.issubdtype(inten.dtype, np.floating):
+                    mx = float(np.nanmax(inten)) if inten.size else 0.0
+                    if mx <= 1.0:
+                        inten = np.clip(inten, 0.0, 1.0) * 65535.0
+                    inten = np.clip(inten, 0.0, 65535.0)
+                    inten = inten.round().astype(np.uint16)
+                else:
+                    inten = np.clip(inten, 0, 65535).astype(np.uint16)
+
+                las.intensity = inten
+
+            las.write(str(save_path))
+            print(f"✅ Saved deleted subset: {save_path}")
+
+            # Optional PRJ sidecar
+            try:
+                prj_path = save_path.with_suffix(".prj")
+                if getattr(self.app, "project_crs_wkt", None):
+                    with open(prj_path, "w") as f:
+                        f.write(self.app.project_crs_wkt)
+                elif getattr(self.app, "project_crs_epsg", None):
+                    with open(prj_path, "w") as f:
+                        f.write(f"EPSG:{self.app.project_crs_epsg}")
+            except Exception as e:
+                print(f"⚠️ Failed writing PRJ sidecar: {e}")
+
+            return save_path
+
         except Exception as e:
-            print(f"❌ Failed to save deleted data: {e}")
+            print(f"❌ Failed to save deleted data as LAZ: {e}")
             import traceback
             traceback.print_exc()
             return None
+        
+    def _get_next_deleted_laz_path(self, base_path):
+        """
+        Return next serial-numbered deleted-subset LAZ file.
+        Example:
+            123.las -> 123_deleted_001.laz
+            123.las -> 123_deleted_002.laz
+        """
+        import re
+        from pathlib import Path
+
+        directory = base_path.parent
+        stem = base_path.stem
+
+        # If input is already something like 123_deleted_005, normalize back to 123
+        match = re.match(r"^(.*?)(_deleted_\d{3})$", stem, re.IGNORECASE)
+        if match:
+            stem = match.group(1)
+
+        counter = 1
+        while counter <= 999:
+            candidate = directory / f"{stem}_deleted_{counter:03d}.laz"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+        raise Exception("Too many deleted-part files already exist")

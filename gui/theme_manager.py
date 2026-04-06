@@ -997,6 +997,7 @@ def get_dialog_stylesheet() -> str:
     }}
     QLabel#valuePill {{
         background-color: {c.get('bg_input')};
+ 
         color: {c.get('text_primary')};
         border: 1px solid {c.get('border_light')};
         border-radius: 8px;

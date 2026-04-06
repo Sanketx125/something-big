@@ -2090,7 +2090,13 @@ class CutSectionController:
             }
            
             # Deactivate classification tool
-            if hasattr(self.app, 'deactivate_classification'):
+            # ✅ FIX: Use deactivate_classification_tool (preserve_cross_section=True) so
+            # the main view's interactor is properly restored to vtkInteractorStyleImage.
+            # The older deactivate_classification() skips the main vtk_widget restore step,
+            # leaving the main view unable to pan after a nested CutFromCut operation.
+            if hasattr(self.app, 'deactivate_classification_tool'):
+                self.app.deactivate_classification_tool(preserve_cross_section=True)
+            elif hasattr(self.app, 'deactivate_classification'):
                 self.app.deactivate_classification()
             else:
                 self.app.active_classify_tool = None
@@ -2159,6 +2165,21 @@ class CutSectionController:
            
         except Exception as e:
             print(f"   ⚠️ Restore classification warning: {e}")
+
+    def unlock_after_classification(self):
+        """
+        Restore normal interaction in the cut dock after classification is complete.
+        Called by app.deactivate_classification_tool / app.deactivate_classification.
+        Without this method those callers silently fail with a warning and leave the
+        cut dock's interactor in a stale classification style.
+        """
+        try:
+            if self.cut_vtk is not None and hasattr(self.cut_vtk, 'interactor'):
+                from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+                self.cut_vtk.interactor.SetInteractorStyle(vtkInteractorStyleImage())
+                print("   ✅ Cut section interactor unlocked")
+        except Exception as e:
+            print(f"   ⚠️ cut_section unlock_after_classification failed: {e}")
 
     def deactivate_if_waiting(self):
         """
@@ -4845,7 +4866,8 @@ class CutSectionController:
         except the currently active one.
         
         Args:
-            current_vtk: The currently active VTK widget (where preview should appear)
+           
+             current_vtk: The currently active VTK widget (where preview should appear)
         """
         if not hasattr(self.app, 'section_vtks'):
             return
@@ -4876,3 +4898,4 @@ class CutSectionController:
                     pass
             except:
                 pass
+            

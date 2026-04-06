@@ -137,11 +137,24 @@ class DigitizeManager:
         self.overlay_renderer.SetLayer(1)          # Layer 1 = always above layer 0
         self.overlay_renderer.SetInteractive(0)    # Don't intercept mouse events
         self.overlay_renderer.SetBackgroundAlpha(0.0)
+        # ✅ FIX-SNT: Do NOT erase the framebuffer before rendering Layer 1.
+        # Without this, the overlay renderer clears the entire color buffer on every
+        # render() triggered by mouse-move during drawing (even to transparent/black),
+        # wiping out Layer 0 content — which includes all SNT actors — making them
+        # invisible while a draw tool is active. SetErase(0) tells VTK to COMPOSITE
+        # Layer 1 on top of Layer 0 instead of replacing it.
+        #
+        # NOTE on depth buffer: SetErase(0) also prevents the depth buffer from being
+        # cleared, so Layer 0's point-cloud depth values persist into Layer 1.
+        # Drawing actors at point-cloud Z elevation would therefore FAIL the depth
+        # test and render "below" the point cloud.  This is solved per-actor in
+        # _add_actor_to_overlay() via SetDepthTestingEnabled(False).
+        self.overlay_renderer.SetErase(0)
         render_window.SetNumberOfLayers(2)
         render_window.AddRenderer(self.overlay_renderer)
         # Share the EXACT same camera — pan/zoom stays in sync automatically
         self.overlay_renderer.SetActiveCamera(self.renderer.GetActiveCamera())
-        print("✅ Overlay renderer created (digitize tools always on top)")
+        print("✅ Overlay renderer created (digitize tools always on top, erase=0)")
         # ───────────────────────────────────────────────────────────────────────────
 
         # ── Draw tool style settings (per-tool color/width/style) ─────────────────
@@ -3384,8 +3397,42 @@ class DigitizeManager:
     # ============================================================
 
     def _add_actor_to_overlay(self, actor):
-        """Add digitize actor to overlay renderer (always above point cloud)."""
+        """
+        Add a digitize actor to the overlay renderer (always above point cloud).
+
+        The overlay renderer uses SetErase(0) to preserve Layer 0's color buffer
+        (keeping SNT visible).  A side-effect is that Layer 0's depth buffer is also
+        preserved — point-cloud Z values are already written there, and drawing actors
+        at the same world-Z elevation would fail the depth test and appear BEHIND the
+        point cloud.
+
+        Fix: disable depth testing on every actor placed in the overlay renderer.
+        With depth-test off the actor's fragments are always written to the color
+        buffer, regardless of what the point cloud wrote to the depth buffer.
+        """
         if hasattr(self, 'overlay_renderer') and self.overlay_renderer:
+            # ── Disable depth testing so this actor always wins against the
+            #    inherited point-cloud depth buffer (SetErase=0 side-effect). ──
+            try:
+                actor.GetProperty().SetDepthTestingEnabled(False)
+            except AttributeError:
+                # VTK < 8.2 fallback: use a very aggressive polygon/line offset so
+                # the actor pushes to the very front of the depth range.  This is
+                # less reliable than disabling the test outright but better than
+                # nothing on older VTK builds.
+                try:
+                    mapper = actor.GetMapper()
+                    if mapper is not None:
+                        mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                        mapper.SetResolveCoincidentTopologyPolygonOffsetParameters(
+                            -1e5, -1e5)
+                        try:
+                            mapper.SetResolveCoincidentTopologyLineOffsetParameters(
+                                -1e5, -1e5)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             self.overlay_renderer.AddActor(actor)
         else:
             self.renderer.AddActor(actor)   # fallback
