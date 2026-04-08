@@ -221,12 +221,46 @@ def load_lidar_file(
 
         xyz = np.vstack([las.x, las.y, las.z]).T
 
+# ✅ REPLACE WITH THIS:
         rgb = None
+        # Check if RGB channels exist in the file
+        _has_rgb_fields = (
+            hasattr(las, 'red') and
+            hasattr(las, 'green') and
+            hasattr(las, 'blue')
+        )
+
         attrs = options.get("attributes", {})
-        if attrs.get("Color", False) and {"red", "green", "blue"}.issubset(
-            las.point_format.dimension_names
-        ):
-            rgb = np.vstack([las.red, las.green, las.blue]).T / 65535.0
+        if _has_rgb_fields:
+            # Load RGB if Color=True OR if forced (default True)
+            if attrs.get("Color", True):
+                r = np.asarray(las.red,   dtype=np.uint32)
+                g = np.asarray(las.green, dtype=np.uint32)
+                b = np.asarray(las.blue,  dtype=np.uint32)
+
+                raw_max = int(max(r.max(), g.max(), b.max()))
+                print(f"  🔍 RGB raw: dtype=uint16, max={raw_max}")
+
+                if raw_max > 255:
+                    # Standard LAS uint16 [0-65535] → uint8 [0-255]
+                    rgb = np.column_stack([
+                        (r // 257).astype(np.uint8),
+                        (g // 257).astype(np.uint8),
+                        (b // 257).astype(np.uint8),
+                    ])
+                else:
+                    # Already in uint8 range
+                    rgb = np.column_stack([
+                        r.astype(np.uint8),
+                        g.astype(np.uint8),
+                        b.astype(np.uint8),
+                    ])
+
+                print(f"  ✅ RGB ready: max={rgb.max()}, min={rgb.min()}, mean={rgb.mean():.1f}")
+            else:
+                print(f"  ⚠️ RGB skipped (Color=False in options)")
+        else:
+            print(f"  ⚠️ No RGB fields in file")
 
         intensity = None
         if attrs.get("Intensity", False) and "intensity" in las.point_format.dimension_names:

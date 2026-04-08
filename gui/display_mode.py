@@ -1,9 +1,8 @@
-
 import importlib as _importlib
 import sys as _sys
 import os as _os
 
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QIcon, QAction, QActionGroup
 from PySide6.QtCore import Qt, Signal, QSettings, QMutex, QMutexLocker
 import os
 from PySide6.QtWidgets import (
@@ -142,6 +141,18 @@ def restore_display_settings_for_file(app, filepath):
                 }
                 app.view_visibility_filters[view_idx] = visible_classes
 
+            # ── FIX 1: push restored palettes into app.view_palettes for ALL slots ──
+            # Without this, app.view_palettes[1..4] stays empty after a file clear,
+            # so the cross-section actor builder falls back to class_palette and
+            # ignores any per-slot visibility/weight the user had set.
+            if not hasattr(app, 'view_palettes') or app.view_palettes is None:
+                app.view_palettes = {}
+            for _vi, _pal in temp_palettes.items():
+                app.view_palettes[_vi] = {
+                    code: dict(info) for code, info in _pal.items()
+                }
+            # ────────────────────────────────────────────────────────────────────────
+
             if dialog:
                 dialog.view_palettes = {0: app.class_palette}
 
@@ -214,6 +225,16 @@ def restore_display_settings_for_file(app, filepath):
                 is_class_mode = (app.display_mode == "class")
                 app._main_view_borders_active = (app.point_border_percent > 0) and is_class_mode
 
+            # ── FIX 2: always write app.view_borders for ALL slots ───────────────
+            # The old code wrote app.view_borders only in the `else` branch (no dialog).
+            # Because a dialog is always present at load time, app.view_borders was
+            # never updated, so every new cross-section built after a file-open
+            # received border=0.0% instead of the saved value.
+            if not hasattr(app, 'view_borders') or app.view_borders is None:
+                app.view_borders = {}
+            app.view_borders.update(parsed_borders)
+            # ────────────────────────────────────────────────────────────────────
+
             if dialog:
                 dialog.view_borders = parsed_borders
                 if hasattr(dialog, 'load_view_border'):
@@ -221,8 +242,7 @@ def restore_display_settings_for_file(app, filepath):
                         dialog.load_view_border(dialog.current_slot)
                     except Exception:
                         pass
-            else:
-                app.view_borders = parsed_borders
+            # (no else needed — app.view_borders is already updated above)
 
             print(f"✅ Restored GLOBAL border values (Main View: {app.point_border_percent}%)")
 
@@ -356,6 +376,17 @@ def restore_global_display_settings(app):
         if saved_borders and isinstance(saved_borders, dict):
             dialog.view_borders = {int(k): v for k, v in saved_borders.items()}
             print(f"✅ Restored GLOBAL border values: {dialog.view_borders}")
+            restored_anything = True
+
+        saved_structured_border = settings.value("global_structured_border")
+        if saved_structured_border is not None:
+            is_structured = str(saved_structured_border).lower() == 'true'
+            if hasattr(dialog, 'border_logic_object') and hasattr(dialog, 'border_logic_point'):
+                if is_structured:
+                    dialog.border_logic_object.setChecked(True)
+                else:
+                    dialog.border_logic_point.setChecked(True)
+            print(f"✅ Restored GLOBAL structured border mode: {is_structured}")
             restored_anything = True
 
         if restored_anything:
@@ -516,7 +547,7 @@ class DisplayModeDialog(QDialog):
 
         border_container = QFrame()
         border_container.setObjectName("displayBorderStrip")
-        border_container.setFixedWidth(154)
+        border_container.setFixedWidth(190)
         border_layout    = QHBoxLayout(border_container)
         border_layout.setContentsMargins(8, 5, 8, 5)
         border_layout.setSpacing(5)
@@ -554,6 +585,46 @@ class DisplayModeDialog(QDialog):
         self.border_plus_btn.setFocusPolicy(Qt.NoFocus)
         self.border_plus_btn.clicked.connect(self.increase_border)
         border_layout.addWidget(self.border_plus_btn)
+
+        self.border_setting_btn = QPushButton()
+        self.border_setting_btn.setObjectName("displayBorderButton")
+        
+        from gui.icon_provider import get_icon
+        self.border_setting_btn.setIcon(get_icon("settings_gear", size=14))
+        from PySide6.QtCore import QSize
+        self.border_setting_btn.setIconSize(QSize(14, 14))
+        self.border_setting_btn.setFixedSize(22, 22)
+        self.border_setting_btn.setFocusPolicy(Qt.NoFocus)
+
+        self.border_setting_menu = QMenu(self)
+        self.border_logic_point = QAction("Per-Point", self.border_setting_menu)
+        self.border_logic_point.setCheckable(True)
+        self.border_logic_point.setChecked(True)
+        
+        self.border_logic_object = QAction("Structured", self.border_setting_menu)
+        self.border_logic_object.setCheckable(True)
+        
+        self.border_action_group = QActionGroup(self)
+        self.border_action_group.addAction(self.border_logic_point)
+        self.border_action_group.addAction(self.border_logic_object)
+        self.border_action_group.setExclusive(True)
+        
+        self.border_setting_menu.addAction(self.border_logic_point)
+        self.border_setting_menu.addAction(self.border_logic_object)
+        
+        self.border_logic_point.triggered.connect(self._on_border_mode_changed)
+        self.border_logic_object.triggered.connect(self._on_border_mode_changed)
+        
+        # Show menu on click to avoid the auto-indicator arrow from setMenu
+        self.border_setting_btn.clicked.connect(
+            lambda: self.border_setting_menu.exec(
+                self.border_setting_btn.mapToGlobal(
+                    self.border_setting_btn.rect().bottomLeft()
+                )
+            )
+        )
+        border_layout.addWidget(self.border_setting_btn)
+
         controls_layout.addWidget(border_container)
         controls_layout.addStretch(1)
         main_layout.addWidget(controls_card)
@@ -1602,8 +1673,9 @@ class DisplayModeDialog(QDialog):
             if self.current_ptc_path and os.path.exists(self.current_ptc_path):
                 settings.setValue("global_last_ptc_path", self.current_ptc_path)
 
-            # 6. Save color mode
+            # 6. Save color mode & structured border mode
             settings.setValue("global_color_mode", self.color_mode.currentIndex())
+            settings.setValue("global_structured_border", str(self.border_logic_object.isChecked()))
 
             settings.sync()
             print(f"✅ Global display settings saved ({len(palettes_to_save)} palette slots)")
@@ -1808,6 +1880,12 @@ class DisplayModeDialog(QDialog):
                 _uam_sync(app, slot_idx, border=float_border, render=True)
         except Exception as e:
             print(f"⚠️ _push_border_to_gpu failed (slot={slot_idx}): {e}")
+
+    def _on_border_mode_changed(self):
+        app = self.parent()
+        if app:
+            current_border = self.view_borders.get(self.current_slot, 0)
+            self._push_border_to_gpu(app, self.current_slot, current_border)
 
     def on_border_value_changed(self):
         pass

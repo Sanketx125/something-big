@@ -17,6 +17,8 @@ _BORDER_GROWTH_SCALE_PX = 4.0
 _BORDER_GROWTH_CUBIC_PX = 8.0
 _MAX_BORDER_GROWTH_PX = 3.0
 _BORDER_DEPTH_BIAS = 0.001
+# Fixed pixel-width for structured (object-edge) borders — stays constant at any zoom
+_STRUCTURED_BORDER_PX = 2.0
  
  
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,7 +29,7 @@ class ViewShaderContext:
         "slot_idx", "visibility_mask", "weight_lut", "color_lut",
         "border_ring", "_fingerprint", "_observer_id", "_generation",
         "_has_vertex_attr_cache",
-        "_vis_list_cache", "_wt_list_cache",
+        "_vis_list_cache", "_wt_list_cache", "structured_border_mode",
     )
  
     def __init__(self, slot_idx: int = 0):
@@ -42,6 +44,7 @@ class ViewShaderContext:
         self._vis_list_cache     = None
         self._wt_list_cache      = None
         self._has_vertex_attr_cache = False
+        self.structured_border_mode = 0.0
  
     def load_from_palette(self, palette: dict, border_percent: float = 0.0,
                           base_point_size: float = _BASE_POINT_SIZE) -> bool:
@@ -98,6 +101,7 @@ class ViewShaderContext:
         ctx.border_ring             = self.border_ring
         ctx._fingerprint            = self._fingerprint
         ctx._has_vertex_attr_cache  = self._has_vertex_attr_cache
+        ctx.structured_border_mode  = self.structured_border_mode
         return ctx
  
  
@@ -395,12 +399,14 @@ def _push_uniforms_direct(actor, ctx: 'ViewShaderContext') -> bool:
                 v_uni.SetUniform1fv("visibility_lut", 256, ctx.vis_as_list())
                 v_uni.SetUniform1fv("weight_lut",     256, ctx.wt_as_list())
                 v_uni.SetUniformf("border_ring_val", float(ctx.border_ring))
+                v_uni.SetUniformf("structured_border_mode", float(getattr(ctx, 'structured_border_mode', 0.0)))
                 v_uni.Modified()
                 sp.Modified()
  
         f_uni = sp.GetFragmentCustomUniforms()
         if f_uni:
             f_uni.SetUniformf("border_ring_val", float(ctx.border_ring))
+            f_uni.SetUniformf("structured_border_mode", float(getattr(ctx, 'structured_border_mode', 0.0)))
  
         actor.GetMapper().Modified()
         actor.GetProperty().Modified()
@@ -435,8 +441,12 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "class_code", "Classification",
             vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1
         )
+        raw_m.MapDataArrayToVertexAttribute(
+            "boundary_flag", "BoundaryFlag",
+            vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1
+        )
         vertex_attr_wired = True
-        print(f"      🔗 Linked 'Classification' array to shader 'class_code'")
+        print(f"      🔗 Linked 'Classification' + 'BoundaryFlag' to shader")
     except Exception as e:
         print(f"      ⚠️ Shader Attribute Mapping failed: {e}")
  
@@ -445,24 +455,27 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
  
     sp = actor.GetShaderProperty()
  
-    if not hasattr(actor, "_shaders_finalized_v23"):
+    if not hasattr(actor, "_shaders_finalized_v26"):
         sp.ClearAllVertexShaderReplacements()
         sp.ClearAllFragmentShaderReplacements()
- 
-        # ── Vertex shader (v22) ───────────────────────────────────────────────
+
         sp.AddVertexShaderReplacement(
             "//VTK::PositionVC::Dec", True,
             "//VTK::PositionVC::Dec\n"
             "in  float class_code;\n"
+            "in  float boundary_flag;\n"
             "out float v_point_size;\n"
-            "out float v_core_size;\n",
+            "out float v_core_size;\n"
+            "out float v_boundary;\n",
             False
         )
+
         sp.AddVertexShaderReplacement(
             "//VTK::PositionVC::Impl", True,
             "//VTK::PositionVC::Impl\n"
             "{\n"
             "  int c_idx = clamp(int(class_code + 0.5), 0, 255);\n"
+            "  v_boundary = boundary_flag;\n"
             "  if (visibility_lut[c_idx] <= 0.0) {\n"
             "    gl_Position  = vec4(2.0, 2.0, 2.0, 1.0);\n"
             "    gl_PointSize = 0.0;\n"
@@ -470,44 +483,80 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "    v_core_size  = 0.0;\n"
             "  } else {\n"
             "    float ps = max(1.0, weight_lut[c_idx]);\n"
-            f"    float border_growth = clamp((border_ring_val * {_BORDER_GROWTH_SCALE_PX:.1f}) + (border_ring_val * border_ring_val * border_ring_val * {_BORDER_GROWTH_CUBIC_PX:.1f}), 0.0, {_MAX_BORDER_GROWTH_PX:.1f});\n"
-            "    float total_ps = ps + border_growth;\n"
-            "    gl_PointSize = total_ps;\n"
-            "    v_point_size = total_ps;\n"
-            "    v_core_size  = ps;\n"
+            "    if (structured_border_mode > 0.5) {\n"
+            "      // Structured mode: only boundary points grow, and growth\n"
+            "      // is driven by border_ring_val so the % slider is live.\n"
+            f"      float border_growth = (boundary_flag > 0.5)\n"
+            f"        ? clamp(\n"
+            f"            (border_ring_val * {_BORDER_GROWTH_SCALE_PX:.1f})\n"
+            f"            + (border_ring_val * border_ring_val * border_ring_val * {_BORDER_GROWTH_CUBIC_PX:.1f}),\n"
+            f"            0.0, {_MAX_BORDER_GROWTH_PX:.1f}\n"
+            f"          )\n"
+            "        : 0.0;\n"
+            "      float total_ps = ps + border_growth;\n"
+            "      gl_PointSize = total_ps;\n"
+            "      v_point_size = total_ps;\n"
+            "      v_core_size  = ps;\n"
+            "    } else {\n"
+            f"      float border_growth = clamp((border_ring_val * {_BORDER_GROWTH_SCALE_PX:.1f}) + (border_ring_val * border_ring_val * border_ring_val * {_BORDER_GROWTH_CUBIC_PX:.1f}), 0.0, {_MAX_BORDER_GROWTH_PX:.1f});\n"
+            "      float total_ps = ps + border_growth;\n"
+            "      gl_PointSize = total_ps;\n"
+            "      v_point_size = total_ps;\n"
+            "      v_core_size  = ps;\n"
+            "    }\n"
             "  }\n"
             "}\n",
             False
         )
- 
+
         sp.AddFragmentShaderReplacement(
             "//VTK::Color::Dec", True,
             "//VTK::Color::Dec\n"
             "in float v_point_size;\n"
-            "in float v_core_size;\n",
+            "in float v_core_size;\n"
+            "in float v_boundary;\n",
             False
         )
         sp.AddFragmentShaderReplacement(
             "//VTK::Color::Impl", True,
             "//VTK::Color::Impl\n"
-            "// === Naksha Crisp Silhouette Border v23 ===\n"
-            "vec2 uv_v23 = gl_PointCoord.xy - vec2(0.5);\n"
-            "float dist_px_v23 = length(uv_v23) * v_point_size;\n"
-            "if (dist_px_v23 > v_point_size * 0.5) discard;\n"
+            "vec2  uv25    = gl_PointCoord.xy - vec2(0.5);\n"
+            "float dist_px = length(uv25) * v_point_size;\n"
+            "if (dist_px > v_point_size * 0.5) discard;\n"
             "\n"
-            "if (border_ring_val > 0.001 && dist_px_v23 >= v_core_size * 0.5) {\n"
+            "if (border_ring_val > 0.001) {\n"
+            "  if (structured_border_mode > 0.5) {\n"
+            "    if (v_boundary > 0.5) {\n"
+            "      // boundary point: draw black ring outside core radius\n"
+            "      if (dist_px >= v_core_size * 0.5) {\n"
             "        diffuseColor = vec3(0.0);\n"
             "        ambientColor = vec3(0.0);\n"
             f"        gl_FragDepth = clamp(gl_FragCoord.z + {_BORDER_DEPTH_BIAS:.4f}, 0.0, 1.0);\n"
-            "} else {\n"
+            "      } else {\n"
             "        gl_FragDepth = gl_FragCoord.z;\n"
+            "      }\n"
+            "    } else {\n"
+            "      // interior point: no ring at all\n"
+            "      gl_FragDepth = gl_FragCoord.z;\n"
+            "    }\n"
+            "  } else {\n"
+            "    if (dist_px >= v_core_size * 0.5) {\n"
+            "      diffuseColor = vec3(0.0);\n"
+            "      ambientColor = vec3(0.0);\n"
+            f"      gl_FragDepth = clamp(gl_FragCoord.z + {_BORDER_DEPTH_BIAS:.4f}, 0.0, 1.0);\n"
+            "    } else {\n"
+            "      gl_FragDepth = gl_FragCoord.z;\n"
+            "    }\n"
+            "  }\n"
+            "} else {\n"
+            "  gl_FragDepth = gl_FragCoord.z;\n"
             "}\n"
-            "opacity = 1.0;\n"
-            "// === End Naksha Crisp Silhouette Border v23 ===\n",
+            "opacity = 1.0;\n",
             False
         )
-        actor._shaders_finalized_v23 = True
-        print(f"      ✅ GPU Shader Pipeline v23 (crisp silhouette border) initialised: {actor_name}")
+        actor._shaders_finalized_v25 = True
+        actor._shaders_finalized_v26 = True
+        print(f"      ✅ GPU Shader v26 (structured border respects slider): {actor_name}")
  
     # Mark that GL_PROGRAM_POINT_SIZE needs to be enabled (deferred until after
     # first render when the OpenGL context is guaranteed to be initialised).
@@ -591,11 +640,23 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
         _shader_contexts[actor_name] = ctx
         _attach_view_shader_context(actor, ctx, actor_name)
  
+    # Fetch structured border mode from dialog/app (if user checked 'Structured' border)
+    structured_mode = 0.0
+    dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
+    if dialog and hasattr(dialog, 'border_logic_object'):
+        structured_mode = 1.0 if dialog.border_logic_object.isChecked() else 0.0
+    ctx.structured_border_mode = structured_mode
+
     base_point_size = float(getattr(actor, '_naksha_base_point_size', _BASE_POINT_SIZE))
  
     ctx.force_reload()
     ctx.load_from_palette(palette, float(border), base_point_size)
     _push_uniforms_direct(actor, ctx)
+
+    if slot_idx == 0:
+        # Remove legacy border actor since the unified shader now handles it natively
+        if "_naksha_unified_border" in (getattr(app, "vtk_widget", None) or {}).actors:
+            app.vtk_widget.remove_actor("_naksha_unified_border", render=False)
  
     if slot_idx == 0 and float(border) > 0.0:
         app.point_border_percent = float(border)
@@ -723,6 +784,12 @@ def refresh_section_after_weight_change(
         ctx.load_from_palette(palette, border_percent, base_point_size)
         _attach_view_shader_context(actor, ctx, actor_name)
  
+    structured_mode = 0.0
+    dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
+    if dialog and hasattr(dialog, 'border_logic_object'):
+        structured_mode = 1.0 if dialog.border_logic_object.isChecked() else 0.0
+    ctx.structured_border_mode = structured_mode
+
     sc = getattr(actor, '_naksha_section_class', None)
     if sc is not None:
         _rewrite_rgb_from_palette(rgb_ptr, sc, palette)
@@ -786,6 +853,12 @@ def fast_palette_refresh(
         ctx._has_vertex_attr_cache = hasattr(raw_mapper, 'MapDataArrayToVertexAttribute')
         actor._naksha_shader_ctx   = ctx
         _shader_contexts[UNIFIED_ACTOR_NAME] = ctx
+
+    structured_mode = 0.0
+    dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
+    if dialog and hasattr(dialog, 'border_logic_object'):
+        structured_mode = 1.0 if dialog.border_logic_object.isChecked() else 0.0
+    ctx.structured_border_mode = structured_mode
 
     gi        = getattr(app, '_main_global_indices', None)
     vis_class = classification[gi] if gi is not None else classification
@@ -957,6 +1030,14 @@ def build_unified_actor(
                                             deep=False)
     class_vtk.SetName("Classification")
     cloud.GetPointData().AddArray(class_vtk)
+
+    # ── NEW: boundary flags must be on cloud BEFORE add_points ──
+    _bf = _compute_boundary_flags(vis_xyz, vis_class)
+    _bf_vtk = numpy_support.numpy_to_vtk(_bf, deep=False)
+    _bf_vtk.SetName("BoundaryFlag")
+    cloud.GetPointData().AddArray(_bf_vtk)
+    print(f"      🔲 BoundaryFlag: {int(_bf.sum()):,}/{len(_bf):,} edge pts")
+    # ────────────────────────────────────────────────────────────
  
     if not hasattr(app, "_rgb_buffer") or len(app._rgb_buffer) != len(vis_xyz):
         app._rgb_buffer = np.zeros((len(vis_xyz), 3), dtype=np.uint8)
@@ -1001,17 +1082,17 @@ def build_unified_actor(
         except Exception:
             pass
 
-        # ── Deferred GPU init (fallback for cold first-load) ─────────────
-        try:
-            from PySide6.QtCore import QTimer
-            _a, _c, _p = actor, ctx, plotter
-            QTimer.singleShot(
-                100,   # ← Reduced from 500ms to 100ms — closes the visibility gap
-                lambda: _deferred_actor_gpu_init(_a, _c, _p, "MainView")
-            )
-            print("      ⏱️  Deferred GPU init scheduled (100 ms)")
-        except Exception as _te:
-            print(f"      ⚠️ Could not schedule deferred init: {_te}")
+        # # ── Deferred GPU init (fallback for cold first-load) ─────────────
+        # try:
+        #     from PySide6.QtCore import QTimer
+        #     _a, _c, _p = actor, ctx, plotter
+        #     QTimer.singleShot(
+        #         100,   # ← Reduced from 500ms to 100ms — closes the visibility gap
+        #         lambda: _deferred_actor_gpu_init(_a, _c, _p, "MainView")
+        #     )
+        #     print("      ⏱️  Deferred GPU init scheduled (100 ms)")
+        # except Exception as _te:
+        #     print(f"      ⚠️ Could not schedule deferred init: {_te}")
 
         _ensure_opengl_polydata_mapper(actor, cloud)
         mesh   = actor.GetMapper().GetInput()
@@ -1020,9 +1101,20 @@ def build_unified_actor(
         actor._naksha_vtk_array       = vtk_ca
         actor._naksha_mesh            = mesh
         actor._naksha_base_point_size = actual_point_size
+        # ── NEW ──
+        actor._naksha_boundary_vtk = _bf_vtk
+        # ─────────
         app._unified_actor            = actor
         ctx = ViewShaderContext(slot_idx=0)
+
         ctx.load_from_palette(palette, border_percent, actual_point_size)
+        
+        structured_mode = 0.0
+        dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
+        if dialog and hasattr(dialog, 'border_logic_object'):
+            structured_mode = 1.0 if dialog.border_logic_object.isChecked() else 0.0
+        ctx.structured_border_mode = structured_mode
+        
         _attach_view_shader_context(actor, ctx, UNIFIED_ACTOR_NAME)
         print(f"      ✅ Main view: {len(app._rgb_buffer):,} pts "
               f"(base_size={actual_point_size}, LOD_step={max(1, n_pts//target_points)})")
@@ -1386,6 +1478,13 @@ def build_section_unified_actor(
     class_vtk = numpy_support.numpy_to_vtk(cls_f32, deep=False)
     class_vtk.SetName("Classification")
     cloud.GetPointData().AddArray(class_vtk)
+
+    # ── NEW ──
+    _bf = _compute_boundary_flags(all_pts, all_cls)
+    _bf_vtk = numpy_support.numpy_to_vtk(_bf, deep=False)
+    _bf_vtk.SetName("BoundaryFlag")
+    cloud.GetPointData().AddArray(_bf_vtk)
+    # ─────────
  
     rgb_buffer = np.zeros((len(all_pts), 3), dtype=np.uint8)
     lut        = _get_lut(f"section_{view_idx}")
@@ -1427,6 +1526,9 @@ def build_section_unified_actor(
     actor._naksha_section_class   = all_cls.copy()
     actor._naksha_section_mask    = combined_global_mask
     actor._naksha_base_point_size = actual_pt_size
+    # ── NEW ──
+    actor._naksha_boundary_vtk = _bf_vtk
+    # ─────────
  
     ctx = ViewShaderContext(slot_idx=slot_idx)
     ctx.load_from_palette(palette, border_percent, actual_pt_size)
@@ -1887,6 +1989,100 @@ def _ensure_opengl_polydata_mapper(actor, cloud, use_spheres=True):
 def compute_point_size(weight: float, base: float = _BASE_POINT_SIZE) -> float:
     min_size = max(0.5, base * 0.1)
     return float(max(min_size, min(base * weight, 30.0)))
+ 
+def _compute_boundary_flags(xyz: np.ndarray, classification: np.ndarray = None,
+                             resolution: float = 0.0) -> np.ndarray:
+    """
+    Computes per-point structural boundary flags using three criteria:
+      1. Height discontinuity  — main structural edge detector (roof→ground drop)
+      2. Class-change          — only when neighbour cell is OCCUPIED + different class
+      3. Scan-edge             — point has < 4 of 8 occupied neighbours (true cloud edge)
+
+    KEY FIX vs old version: empty neighbour cells (nb == -1) are NO LONGER
+    treated as boundary. This was the root cause of dark-roof artefacts in
+    structured border mode — interior roof points with scan gaps in their
+    neighbourhood were wrongly flagged.
+    """
+    n = len(xyz)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    xy    = xyz[:, :2]
+    z_arr = xyz[:, 2].astype(np.float64)
+
+    xy_min = xy.min(axis=0)
+    xy_max = xy.max(axis=0)
+
+    if resolution <= 0.0:
+        w     = max(float(xy_max[0] - xy_min[0]), 1.0)
+        h_dim = max(float(xy_max[1] - xy_min[1]), 1.0)
+        resolution = max(0.05, np.sqrt(w * h_dim / n) * 1.5)
+
+    gc = ((xy - xy_min) / resolution).astype(np.int32) + 1
+    gx, gy   = gc[:, 0], gc[:, 1]
+    gx_max   = int(gx.max()) + 2
+    gy_max   = int(gy.max()) + 2
+
+    # ── Build Z-mean grid ────────────────────────────────────────────────────
+    z_sum   = np.zeros((gx_max, gy_max), dtype=np.float64)
+    z_count = np.zeros((gx_max, gy_max), dtype=np.int32)
+    np.add.at(z_sum,   (gx, gy), z_arr)
+    np.add.at(z_count, (gx, gy), 1)
+    # Use 0.0 for empty cells — we gate all comparisons on nb_occ anyway
+    z_mean = np.where(z_count > 0, z_sum / np.maximum(z_count, 1), 0.0)
+
+    # Mean Z of THIS point's own cell (always valid — point is in the cell)
+    my_z_cell = z_mean[gx, gy]
+
+    # Adaptive Z threshold: structural edge = height change > 3% of total
+    # Z range, minimum 0.5 m (handles both dense urban and sparse rural scenes)
+    z_global_range = max(float(z_arr.max() - z_arr.min()), 1.0)
+    z_thresh = max(0.5, z_global_range * 0.03)
+
+    # ── Class grid ───────────────────────────────────────────────────────────
+    has_class = classification is not None
+    if has_class:
+        class_grid = np.full((gx_max, gy_max), -1, dtype=np.int32)
+        class_grid[gx, gy] = classification.astype(np.int32)
+        my_class = classification.astype(np.int32)
+
+    # ── Boundary accumulation over 8 neighbours ──────────────────────────────
+    _DIRS = [(-1, -1), (-1, 0), (-1, 1),
+             ( 0, -1),          ( 0, 1),
+             ( 1, -1), ( 1, 0), ( 1, 1)]
+
+    boundary     = np.zeros(n, dtype=bool)
+    occ_nb_count = np.zeros(n, dtype=np.int32)
+
+    for dx, dy in _DIRS:
+        nx, ny = gx + dx, gy + dy
+        nb_occ = (z_count[nx, ny] > 0)          # True if neighbour cell has points
+        occ_nb_count += nb_occ.astype(np.int32)
+
+        # ── Criterion 1: height discontinuity (geometric/structural edge) ────
+        # Only compare against OCCUPIED neighbours to avoid gap-based false flags
+        nb_z   = z_mean[nx, ny]
+        z_diff = np.where(nb_occ, np.abs(my_z_cell - nb_z), 0.0)
+        boundary |= nb_occ & (z_diff > z_thresh)
+
+        # ── Criterion 2: class-change boundary ───────────────────────────────
+        # Neighbour must be OCCUPIED and a different class — empty ≠ boundary
+        if has_class:
+            nb_cls = class_grid[nx, ny]
+            boundary |= nb_occ & (nb_cls >= 0) & (nb_cls != my_class)
+
+    # ── Criterion 3: scan/cloud edge ─────────────────────────────────────────
+    # A point with < 4 occupied 8-neighbours is genuinely at the edge of the
+    # scan (not a gap — a real spatial boundary).  This replaces the old
+    # "empty neighbour = boundary" logic with a majority-vote approach that
+    # is robust against irregular point spacing on roof interiors.
+    boundary |= (occ_nb_count < 4)
+
+    pct = int(boundary.sum()) * 100 // max(n, 1)
+    print(f"      🔲 BoundaryFlag: {int(boundary.sum()):,}/{n:,} edge pts "
+          f"({pct}%, z_thresh={z_thresh:.2f}m, res={resolution:.3f}m)")
+
+    return boundary.astype(np.float32)
  
  
 def diagnose_weight_pipeline(app, slot_idx=1):

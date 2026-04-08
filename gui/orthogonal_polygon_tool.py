@@ -359,7 +359,7 @@ class OrthogonalPolygonTool:
                 try:
                     from PySide6.QtCore import QTimer
                 except ImportError:
-                    from PyQt5.QtCore import QTimer
+                    from  PySide6.QtCore import QTimer
                 QTimer.singleShot(0, self._deferred_preview_refresh)
             self.dig.app.vtk_widget.render()
             return
@@ -425,9 +425,18 @@ class OrthogonalPolygonTool:
         self._refresh_preview_colors()
         print(f"🔄 Ortho-Polygon mode → {new_mode}")
 
+    def _get_tool_style(self) -> dict:
+        """Return the configured draw style for the Ortho tool."""
+        style = self.dig._get_draw_style(self.TOOL_NAME)
+        return {
+            'color': tuple(style.get('color', (1.0, 0.0, 0.0))),
+            'width': int(style.get('width', 2) or 2),
+            'style': str(style.get('style', 'solid') or 'solid'),
+        }
+
     def _refresh_preview_colors(self):
-        """Update the VTK actor colour to match the current mode."""
-        color = _MODE_COLORS[self._mode]
+        """Update preview actors when draw settings change."""
+        color = self._get_tool_style()['color']
         for attr in (_ATTR_EDGE, _ATTR_POLY):
             actor = getattr(self.dig, attr, None)
             if actor is not None:
@@ -523,7 +532,11 @@ class OrthogonalPolygonTool:
           _ortho_edge_preview – dashed line from last vertex to live cursor
           _ortho_poly_preview – solid outline of the growing polygon ring
         """
-        color = _MODE_COLORS[self._mode]
+        style = self._get_tool_style()
+        color = style['color']
+        width = style['width']
+        line_style = style['style']
+
 
         # ── Constrained live point ────────────────────────────────────────────
         if self._mode == MODE_ORTHO and self._ortho_angle is not None:
@@ -545,11 +558,10 @@ class OrthogonalPolygonTool:
             _ATTR_EDGE,
             edge_pts,
             color=color,
-            width=2,
+            width=width,
             line_style='dashed',
         )
 
-        # ── Solid committed-ring ghost (confirmed + live) ─────────────────────
         ghost_pts = list(self.points) + [live_pt]
         if len(ghost_pts) >= 2:
             closed_ghost = ghost_pts + [ghost_pts[0]]
@@ -557,23 +569,27 @@ class OrthogonalPolygonTool:
                 _ATTR_POLY,
                 closed_ghost,
                 color=color,
-                width=2,
-                line_style='solid',
+                width=width,
+                line_style=line_style,
             )
 
     def _update_poly_actor(self):
         """Redraw the committed polygon outline after a new vertex is confirmed."""
         if len(self.points) < 2:
             return
-        color  = _MODE_COLORS[self._mode]
+        style = self._get_tool_style()
+        color = style['color']
+        width = style['width']
+        line_style = style['style']
         closed = list(self.points) + [self.points[0]]
         self.dig._update_continuous_line_world(
             _ATTR_POLY,
             closed,
             color=color,
-            width=2,
-            line_style='solid',
+            width=width,
+            line_style=line_style,
         )
+
 
     def _clear_preview(self):
         """Remove both transient preview actors from the overlay renderer."""
@@ -593,9 +609,9 @@ class OrthogonalPolygonTool:
 
     def _add_vertex_marker(self, pt: tuple):
         """Add a coloured sphere at a confirmed vertex."""
-        color    = _MODE_COLORS[self._mode]
+        color    = self._get_tool_style()['color']
         is_first = len(self._vertex_actors) == 0
-        # First vertex is green (matches digitize_tools convention), rest use mode colour
+        # First vertex is green (matches digitize_tools convention), rest use the tool color
         m_color  = (0.0, 1.0, 0.0) if is_first else color
         marker   = self.dig._add_endpoint_sphere(pt, color=m_color, radius=0.05)
         try:
@@ -655,15 +671,11 @@ class OrthogonalPolygonTool:
 
         ring.append(ring[0])   # close the ring (last == first)
 
-        # ── Build persistent VTK actor ────────────────────────────────────────
-        color  = _MODE_COLORS[self._mode]
-        # Reuse the polyline draw style for width/line-style (user-configurable)
-        style  = self.dig._get_draw_style('polyline')
+        style  = self._get_tool_style()
+        color  = style['color']
         width  = style.get('width', 2)
         lstyle = style.get('style', 'solid')
-
         self._clear_preview()   # remove transient preview before adding final actor
-
         actor = self.dig._make_polyline_actor(ring, color=color,
                                               width=width, line_style=lstyle)
         actor.PickableOn()

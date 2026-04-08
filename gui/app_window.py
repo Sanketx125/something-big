@@ -459,6 +459,32 @@ class NakshaApp(QMainWindow):
         self.cross_action = None
         self.current_saturation = 1.0   # 100% = normal
         self.current_sharpness = 1.0  # Amplifier removed — always 1.0 (no scaling)
+
+        # ── MicroStation-style display stretch defaults ─────────────────
+        self.current_saturation = 1.0
+        self.current_sharpness = 1.0
+
+        self.elevation_clip_low = 1.0
+        self.elevation_clip_high = 99.0
+        self.elevation_color_ramp = None
+
+        self._elevation_cache_key = None
+        self._elevation_cache_colors = None
+
+        self.intensity_clip_low = 0.5
+        self.intensity_clip_high = 99.8
+        self.intensity_gamma = 4.0
+
+        self.depth_clip_low = 1.0
+        self.depth_clip_high = 99.0
+
+        self.depth_color_scheme = "grayscale"
+        self.depth_gamma = 1.0
+
+        self._load_display_settings()
+
+        self.elevation_color_ramp = None
+
         self.classify_interactors = {}
  
         # ===== 2D LOCK =====
@@ -2621,7 +2647,7 @@ class NakshaApp(QMainWindow):
             if core is None:
                 core = getattr(self, "section_core_points", None)
                 buf = getattr(self, "section_buffer_points", None)
-                
+
                 # If using global, also store to source view
                 if core is not None:
                     setattr(self, f"section_{source_idx}_core_points", core)
@@ -3713,22 +3739,27 @@ class NakshaApp(QMainWindow):
             # ============================================================================
             print(f"\n📊 Phase 1: Scanning files...")
             update_progress(2, "Scanning files...", force=True)
-            
+
             from .data_loader import load_lidar_file
-            
+
             file_info = []  # Store info about each file
             total_points = 0
             first_has_rgb = False
             first_has_intensity = False
-            
+
             for i, filename in enumerate(filenames):
                 try:
-                    # Quick scan to get point count without loading full data
-                    # Most LAZ libraries can get count without full read
+                    # ✅ FIX: Force Color=True so RGB is ALWAYS loaded regardless of dialog settings
+                    forced_options = dict(batch_import_options) if batch_import_options else {}
+                    forced_attrs = dict(forced_options.get("attributes", {}))
+                    forced_attrs["Color"] = True        # ← FORCE RGB ON
+                    forced_attrs["Intensity"] = True    # ← FORCE INTENSITY ON
+                    forced_options["attributes"] = forced_attrs
+
                     tile_data = load_lidar_file(
                         filename,
                         parent=None,
-                        import_options=batch_import_options,
+                        import_options=forced_options,  # ← use forced options
                         prompt_user=False,
                     )
                     
@@ -3741,6 +3772,13 @@ class NakshaApp(QMainWindow):
                     
                     has_rgb = tile_data.get("rgb") is not None
                     has_intensity = tile_data.get("intensity") is not None
+
+                    # ✅ DEBUG: Confirm RGB actually loaded
+                    if has_rgb:
+                        rgb_check = tile_data["rgb"]
+                        print(f"   ✅ RGB loaded: dtype={rgb_check.dtype}, max={rgb_check.max()}, min={rgb_check.min()}, mean={rgb_check.mean():.1f}")
+                    else:
+                        print(f"   ⚠️ RGB is None after forced load!")
                     
                     if i == 0:
                         first_has_rgb = has_rgb
@@ -3748,7 +3786,7 @@ class NakshaApp(QMainWindow):
                     
                     file_info.append({
                         'filename': filename,
-                        'data': tile_data,  # Keep data in memory for now
+                        'data': tile_data,
                         'n_points': n_points,
                         'has_rgb': has_rgb,
                         'has_intensity': has_intensity
@@ -3758,6 +3796,8 @@ class NakshaApp(QMainWindow):
                     
                 except Exception as e:
                     print(f"   ❌ Failed to scan {os.path.basename(filename)}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     continue
             
             if not file_info:
@@ -4909,72 +4949,135 @@ class NakshaApp(QMainWindow):
             print(f"  ✅ RGB mode: direct color copy")
 
         elif mode == "intensity":
+            from gui.pointcloud_display import _microstation_intensity_rgb
+
             intensity = self.data.get("intensity")
             if intensity is not None:
                 vis_int = intensity[gi] if gi is not None else intensity
-                # Normalize intensity to 0-255 range
-                i_min = float(vis_int.min())
-                i_max = float(vis_int.max())
-                if i_max > i_min:
-                    normalized = ((vis_int - i_min) / (i_max - i_min) * 255).astype(np.uint8)
-                else:
-                    normalized = np.full(len(vis_int), 128, dtype=np.uint8)
-                # Grayscale: R=G=B=intensity
-                rgb_ptr[:, 0] = normalized[:len(rgb_ptr)]
-                rgb_ptr[:, 1] = normalized[:len(rgb_ptr)]
-                rgb_ptr[:, 2] = normalized[:len(rgb_ptr)]
+
+                colors_u8, clip_lo, clip_hi = _microstation_intensity_rgb(
+                    vis_int,
+                    low_pct=getattr(self, "intensity_clip_low", 0.5),
+                    high_pct=getattr(self, "intensity_clip_high", 99.8),
+                    gamma=getattr(self, "intensity_gamma", 1.35),
+                    return_debug=True,
+                )
+
+                rgb_ptr[:, 0] = colors_u8[:len(rgb_ptr), 0]
+                rgb_ptr[:, 1] = colors_u8[:len(rgb_ptr), 1]
+                rgb_ptr[:, 2] = colors_u8[:len(rgb_ptr), 2]
+
+                print(
+                    f"  ✅ Intensity mode: raw [{float(vis_int.min()):.1f}, {float(vis_int.max()):.1f}] "
+                    f"clip [{clip_lo:.1f}, {clip_hi:.1f}] "
+                    f"gamma={getattr(self, 'intensity_gamma', 1.35):.2f}"
+                )
             else:
                 rgb_ptr[:] = 128
                 print("  ⚠️ No intensity data — showing gray")
+
             vtk_ca.Modified()
             _mark_actor_dirty(actor)
             self.vtk_widget.render()
-            print(f"  ✅ Intensity mode: grayscale applied")
 
         elif mode == "elevation":
-            # Color by Z (elevation) using a blue→green→red gradient
-            vis_z = vis_xyz[:, 2]
-            z_min = float(vis_z.min())
-            z_max = float(vis_z.max())
-            if z_max > z_min:
-                t = ((vis_z - z_min) / (z_max - z_min)).astype(np.float32)
-                # Blue (low) → Green (mid) → Red (high)
-                r = np.clip(t * 2 - 1, 0, 1)       # 0 at low, 1 at high
-                g = 1 - np.abs(t * 2 - 1)            # peak at mid
-                b = np.clip(1 - t * 2, 0, 1)         # 1 at low, 0 at high
-                rgb_ptr[:, 0] = (r[:len(rgb_ptr)] * 255).astype(np.uint8)
-                rgb_ptr[:, 1] = (g[:len(rgb_ptr)] * 255).astype(np.uint8)
-                rgb_ptr[:, 2] = (b[:len(rgb_ptr)] * 255).astype(np.uint8)
+            from gui.pointcloud_display import _microstation_elevation_rgb
+            import time as _time
+
+            t_elev0 = _time.perf_counter()
+
+            vis_z = vis_xyz[:, 2].astype(np.float32, copy=False)
+
+            # Build cache key
+            ramp = getattr(self, "elevation_color_ramp", None)
+            if ramp:
+                ramp_key = tuple(
+                    (round(float(p), 6), int(c[0]), int(c[1]), int(c[2]))
+                    for p, c in ramp
+                )
             else:
-                rgb_ptr[:] = 128
+                ramp_key = None
+
+            if gi is None:
+                vis_key = ("all", len(vis_z))
+            else:
+                # enough to invalidate when visible subset object changes
+                vis_key = (id(gi), len(vis_z))
+
+            z_min = float(vis_z.min()) if len(vis_z) else 0.0
+            z_max = float(vis_z.max()) if len(vis_z) else 0.0
+
+            cache_key = (
+                id(self.data["xyz"]),
+                vis_key,
+                round(z_min, 4),
+                round(z_max, 4),
+                round(float(getattr(self, "elevation_clip_low", 1.0)), 3),
+                round(float(getattr(self, "elevation_clip_high", 99.0)), 3),
+                ramp_key,
+            )
+
+            if (
+                self._elevation_cache_key == cache_key
+                and self._elevation_cache_colors is not None
+                and len(self._elevation_cache_colors) == len(rgb_ptr)
+            ):
+                colors_u8 = self._elevation_cache_colors
+                print("  ⚡ Elevation cache hit")
+            else:
+                colors_u8, clip_lo, clip_hi = _microstation_elevation_rgb(
+                    vis_z,
+                    color_ramp=getattr(self, "elevation_color_ramp", None),
+                    low_pct=getattr(self, "elevation_clip_low", 1.0),
+                    high_pct=getattr(self, "elevation_clip_high", 99.0),
+                    return_debug=True,
+                )
+                self._elevation_cache_key = cache_key
+                self._elevation_cache_colors = colors_u8
+                print(
+                    f"  ✅ Elevation computed: raw Z [{z_min:.1f}, {z_max:.1f}] "
+                    f"clip [{clip_lo:.1f}, {clip_hi:.1f}]"
+                )
+
+            # Fast bulk copy instead of per-channel assignment
+            np.copyto(rgb_ptr[:len(colors_u8)], colors_u8[:len(rgb_ptr)])
+
             vtk_ca.Modified()
             _mark_actor_dirty(actor)
             self.vtk_widget.render()
-            print(f"  ✅ Elevation mode: Z range [{z_min:.1f}, {z_max:.1f}]")
+
+            t_elev_ms = (_time.perf_counter() - t_elev0) * 1000.0
+            print(f"  ⚡ Elevation mode apply: {t_elev_ms:.1f}ms")
 
         elif mode == "depth":
-            # Depth from camera — compute distance from camera position
-            try:
-                cam = self.vtk_widget.renderer.GetActiveCamera()
-                cam_pos = np.array(cam.GetPosition())
-                dist = np.sqrt(((vis_xyz - cam_pos) ** 2).sum(axis=1))
-                d_min = float(dist.min())
-                d_max = float(dist.max())
-                if d_max > d_min:
-                    t = ((dist - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-                else:
-                    t = np.full(len(dist), 128, dtype=np.uint8)
-                # White (near) → Dark (far)
-                inv_t = 255 - t
-                rgb_ptr[:, 0] = inv_t[:len(rgb_ptr)]
-                rgb_ptr[:, 1] = inv_t[:len(rgb_ptr)]
-                rgb_ptr[:, 2] = inv_t[:len(rgb_ptr)]
-            except Exception:
-                rgb_ptr[:] = 128
+            # ✅ FIX: Read custom depth settings from app attributes
+            from gui.pointcloud_display import _microstation_depth_rgb_from_camera
+            
+            # Use camera-based depth (true depth from camera perspective)
+            camera = self.vtk_widget.renderer.GetActiveCamera()
+            
+            colors_u8 = _microstation_depth_rgb_from_camera(
+                vis_xyz,
+                camera,
+                low_pct=getattr(self, "depth_clip_low", 1.0),
+                high_pct=getattr(self, "depth_clip_high", 99.0),
+                color_scheme=getattr(self, "depth_color_scheme", "grayscale"),
+                gamma=getattr(self, "depth_gamma", 1.0),
+            )
+            
+            rgb_ptr[:, 0] = colors_u8[:len(rgb_ptr), 0]
+            rgb_ptr[:, 1] = colors_u8[:len(rgb_ptr), 1]
+            rgb_ptr[:, 2] = colors_u8[:len(rgb_ptr), 2]
+            
             vtk_ca.Modified()
             _mark_actor_dirty(actor)
             self.vtk_widget.render()
-            print(f"  ✅ Depth mode applied")
+            
+            clip_lo = getattr(self, "depth_clip_low", 1.0)
+            clip_hi = getattr(self, "depth_clip_high", 99.0)
+            scheme = getattr(self, "depth_color_scheme", "grayscale")
+            gamma_val = getattr(self, "depth_gamma", 1.0)
+            print(f"  ✅ Depth mode applied: clip={clip_lo:.1f}-{clip_hi:.1f}%, scheme={scheme}, gamma={gamma_val:.2f}")
 
         else:
             # Unknown mode — fallback to pointcloud_display
@@ -4984,11 +5087,6 @@ class NakshaApp(QMainWindow):
             except Exception as e:
                 print(f"  ⚠️ Fallback display failed: {e}")
 
-        # ✅ BORDER PRESERVATION: After writing color bytes for any non-class mode,
-        # re-push the border uniform so the border ring stays visible regardless
-        # of the active display mode. The value is always read from point_border_percent
-        # (which is kept in sync by on_border_changed regardless of mode).
-        # This is a pure GPU uniform push — it does NOT touch the RGB buffer.
         if mode not in ("class", "shaded_class"):
             try:
                 from gui.unified_actor_manager import _apply_border_once, _push_uniforms_direct
@@ -5007,10 +5105,6 @@ class NakshaApp(QMainWindow):
             except Exception as _be:
                 print(f"  ⚠️ Border preservation failed: {_be}")
 
-        # Restore camera
-          # ✅ Sync Display Mode dialog combo to match the active mode
-        # So that when ribbon buttons (Depth, RGB, etc.) switch the mode,
-        # the combo in the Display Mode dialog stays up to date.
         _MODE_TO_IDX = {
             "class":        0,
             "shaded_class": 1,
@@ -5038,6 +5132,267 @@ class NakshaApp(QMainWindow):
 
         elapsed = (_time.perf_counter() - t0) * 1000
         print(f"  ⚡ Display switch complete: {elapsed:.0f}ms\n")
+
+
+    def _handle_display_mode_change(self, mode):
+        """
+        Wrapper for display mode changes from View Ribbon.
+        Intercepts Elevation and Intensity clicks to detect Shift key.
+        
+        Args:
+            mode: Display mode string ('rgb', 'depth', 'intensity', 'elevation', etc.)
+        """
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import Qt
+        
+        # ✅ Special handling for Elevation mode
+        if mode == 'elevation':
+            modifiers = QApplication.keyboardModifiers()
+            
+            if modifiers & Qt.ShiftModifier:
+                # Shift+Click → Open customization dialog
+                self._open_elevation_settings()
+                return  # Don't call set_display_mode
+            else:
+                # Normal click → Clear custom ramp and use default
+                if hasattr(self, 'elevation_color_ramp'):
+                    delattr(self, 'elevation_color_ramp')
+        
+        # ✅ NEW: Special handling for Intensity mode
+        elif mode == 'intensity':
+            modifiers = QApplication.keyboardModifiers()
+            
+            if modifiers & Qt.ShiftModifier:
+                # Shift+Click → Open intensity settings dialog
+                self._open_intensity_settings()
+                return  # Don't call set_display_mode
+            # Normal click → Just apply default intensity settings
+
+        # ✅ NEW: Special handling for Depth mode
+        elif mode == 'depth':
+            modifiers = QApplication.keyboardModifiers()
+            
+            if modifiers & Qt.ShiftModifier:
+                # Shift+Click → Open depth settings dialog
+                self._open_depth_settings()
+                return  # Don't call set_display_mode
+            # Normal click → Just apply default depth settings
+        
+        # ✅ For all modes (including elevation/intensity after settings)
+        self.set_display_mode(mode)
+
+
+    # def _open_elevation_settings(self):
+    #     """
+    #     Open elevation color ramp customization dialog (Shift+Click on Elevation button).
+    #     Allows users to customize the color gradient for elevation display.
+    #     """
+    #     if self.data is None:
+    #         from PySide6.QtWidgets import QMessageBox
+    #         QMessageBox.warning(self, "No Data", "Please load a LiDAR file first.")
+    #         return
+        
+    #     from gui.elevation_settings_dialog import ElevationSettingsDialog
+        
+    #     # Create dialog
+    #     dialog = ElevationSettingsDialog(self)
+        
+    #     # Load existing custom ramp if user already customized it
+    #     if hasattr(self, 'elevation_color_ramp') and self.elevation_color_ramp:
+    #         dialog.color_stops = list(self.elevation_color_ramp)
+    #         dialog._load_current_ramp()
+    #         dialog._update_preview()
+        
+    #     # Show dialog and wait for user
+    #     if dialog.exec() == dialog.Accepted:
+    #         # User clicked Apply - save custom ramp
+    #         self.elevation_color_ramp = dialog.get_color_ramp()
+            
+    #         # Apply immediately
+    #         self.set_display_mode('elevation')
+            
+    #         # User feedback
+    #         print(f"✅ Custom elevation ramp applied: {len(self.elevation_color_ramp)} color stops")
+    #         if hasattr(self, 'statusBar'):
+    #             self.statusBar().showMessage(
+    #                 f"✨ Custom elevation gradient applied ({len(self.elevation_color_ramp)} colors)",
+    #                 3000
+    #             )
+
+
+    def on_elevation_clicked(self):
+        """
+        Handle elevation button click.
+        - Normal click: Apply default 5-color rainbow
+        - Shift+Click: Open customization dialog
+        """
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import Qt
+        
+        modifiers = QApplication.keyboardModifiers()
+        
+        if modifiers & Qt.ShiftModifier:
+            # Shift+Click → Open customization dialog
+            self._open_elevation_settings()
+        else:
+            # Normal click → Apply default rainbow (clear any custom ramp)
+            if hasattr(self, 'elevation_color_ramp'):
+                delattr(self, 'elevation_color_ramp')
+            self.set_display_mode('elevation')
+
+    def _open_elevation_settings(self):
+        """
+        Open elevation color ramp customization dialog (Shift+Click on Elevation button).
+        ✅ FIXED: Now passes app reference so settings persist across sessions.
+        """
+        if self.data is None:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "No Data", "Please load a LiDAR file first.")
+            return
+        
+        from gui.elevation_settings_dialog import ElevationSettingsDialog
+        
+        # ✅ Pass self (app) as second parameter
+        dialog = ElevationSettingsDialog(self, app=self)
+        
+        # Settings are already loaded in __init__ via app parameter
+        
+        from PySide6.QtWidgets import QDialog
+        if dialog.exec() == QDialog.Accepted:
+            # User clicked Apply - save custom ramp
+            self.elevation_color_ramp = dialog.get_color_ramp()
+            
+            # ✅ OPTIONAL: Save to QSettings for persistence across app restarts
+            try:
+                from PySide6.QtCore import QSettings
+                settings = QSettings("NakshaAI", "LidarApp")
+                # Convert to serializable format
+                ramp_data = [(float(pos), list(color)) for pos, color in self.elevation_color_ramp]
+                settings.setValue("elevation_color_ramp", ramp_data)
+                settings.sync()
+                print(f"💾 Saved elevation ramp to settings")
+            except Exception as e:
+                print(f"⚠️ Failed to save elevation ramp: {e}")
+            
+            # Apply immediately
+            self.set_display_mode('elevation')
+            
+            print(f"✅ Custom elevation ramp applied: {len(self.elevation_color_ramp)} color stops")
+            if hasattr(self, 'statusBar'):
+                self.statusBar().showMessage(
+                    f"✨ Custom elevation gradient applied ({len(self.elevation_color_ramp)} colors)",
+                    3000
+                )
+        else:
+            print("⏭️ Elevation settings canceled")
+
+    def _open_intensity_settings(self):
+        """
+        Open intensity display customization dialog (Shift+Click on Intensity button).
+        ✅ NEW: Allows users to adjust brightness/darkness of intensity display.
+        """
+        if self.data is None or self.data.get("intensity") is None:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, 
+                "No Intensity Data", 
+                "This point cloud does not have intensity data.\n\n"
+                "Intensity settings only work with LiDAR files that include intensity values."
+            )
+            return
+        
+        from gui.intensity_settings_dialog import IntensitySettingsDialog
+        
+        # Pass self (app) as second parameter to load current settings
+        dialog = IntensitySettingsDialog(self, app=self)
+        
+        from PySide6.QtWidgets import QDialog
+        if dialog.exec() == QDialog.Accepted:
+            # User clicked Apply - save settings
+            settings = dialog.get_settings()
+            
+            self.intensity_gamma = settings['gamma']
+            self.intensity_clip_low = settings['clip_low']
+            self.intensity_clip_high = settings['clip_high']
+            
+            # ✅ Save to QSettings for persistence across app restarts
+            try:
+                from PySide6.QtCore import QSettings
+                qsettings = QSettings("NakshaAI", "LidarApp")
+                qsettings.setValue("intensity_gamma", self.intensity_gamma)
+                qsettings.setValue("intensity_clip_low", self.intensity_clip_low)
+                qsettings.setValue("intensity_clip_high", self.intensity_clip_high)
+                qsettings.sync()
+                print(f"💾 Saved intensity settings: gamma={self.intensity_gamma:.2f}")
+            except Exception as e:
+                print(f"⚠️ Failed to save intensity settings: {e}")
+            
+            # Apply immediately
+            self.set_display_mode('intensity')
+            
+            print(f"✅ Custom intensity settings applied: gamma={self.intensity_gamma:.2f}")
+            if hasattr(self, 'statusBar'):
+                self.statusBar().showMessage(
+                    f"⚡ Intensity display updated (gamma={self.intensity_gamma:.2f})",
+                    3000
+                )
+        else:
+            print("⏭️ Intensity settings canceled")
+
+
+    def _open_depth_settings(self):
+        """
+        Open depth display customization dialog (Shift+Click on Depth button).
+        ✅ NEW: Allows users to adjust depth visualization settings.
+        """
+        if self.data is None:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, 
+                "No Data", 
+                "Please load a LiDAR file first to use depth display."
+            )
+            return
+        
+        from gui.depth_settings_dialog import DepthSettingsDialog
+        
+        # Pass self (app) as second parameter to load current settings
+        dialog = DepthSettingsDialog(self, app=self)
+        
+        from PySide6.QtWidgets import QDialog
+        if dialog.exec() == QDialog.Accepted:
+            # User clicked Apply - save settings
+            settings = dialog.get_settings()
+            
+            self.depth_clip_low = settings['depth_clip_low']
+            self.depth_clip_high = settings['depth_clip_high']
+            self.depth_color_scheme = settings['depth_color_scheme']
+            self.depth_gamma = settings['depth_gamma']
+            
+            # ✅ Save to QSettings for persistence across app restarts
+            try:
+                from PySide6.QtCore import QSettings
+                qsettings = QSettings("NakshaAI", "LidarApp")
+                qsettings.setValue("depth_clip_low", self.depth_clip_low)
+                qsettings.setValue("depth_clip_high", self.depth_clip_high)
+                qsettings.setValue("depth_color_scheme", self.depth_color_scheme)
+                qsettings.setValue("depth_gamma", self.depth_gamma)
+                qsettings.sync()
+                print(f"💾 Saved depth settings: scheme={self.depth_color_scheme}, gamma={self.depth_gamma:.2f}")
+            except Exception as e:
+                print(f"⚠️ Failed to save depth settings: {e}")
+            
+            # Apply immediately
+            self.set_display_mode('depth')
+            
+            print(f"✅ Custom depth settings applied: {self.depth_color_scheme}, gamma={self.depth_gamma:.2f}")
+            if hasattr(self, 'statusBar'):
+                self.statusBar().showMessage(
+                    f"📏 Depth display updated ({self.depth_color_scheme}, gamma={self.depth_gamma:.2f})",
+                    3000
+                )
+        else:
+            print("⏭️ Depth settings canceled")
 
 
     def _restore_camera_safe(self, saved_camera):
@@ -7916,6 +8271,51 @@ class NakshaApp(QMainWindow):
         else:
             print("⏸️ Auto-backup disabled")
 
+
+    def _load_display_settings(self):
+        """
+        Load saved elevation and intensity display settings from QSettings.
+        Called during app initialization to restore user preferences.
+        """
+        try:
+            settings = QSettings("NakshaAI", "LidarApp")
+            
+            # ══════════════════════════════════════════════════════════
+            # ELEVATION SETTINGS
+            # ══════════════════════════════════════════════════════════
+            # Load custom color ramp if saved
+            saved_ramp = settings.value("elevation_color_ramp", None)
+            if saved_ramp:
+                try:
+                    # Convert back from serializable format
+                    self.elevation_color_ramp = [
+                        (float(pos), tuple(color)) 
+                        for pos, color in saved_ramp
+                    ]
+                    print(f"✅ Loaded saved elevation ramp: {len(self.elevation_color_ramp)} stops")
+                except Exception as e:
+                    print(f"⚠️ Failed to load elevation ramp: {e}")
+                    self.elevation_color_ramp = None
+            
+            # Load clip percentiles
+            self.elevation_clip_low = settings.value("elevation_clip_low", 1.0, type=float)
+            self.elevation_clip_high = settings.value("elevation_clip_high", 99.0, type=float)
+            
+            # ══════════════════════════════════════════════════════════
+            # INTENSITY SETTINGS
+            # ══════════════════════════════════════════════════════════
+            self.intensity_gamma = settings.value("intensity_gamma", 1.65, type=float)
+            self.intensity_clip_low = settings.value("intensity_clip_low", 0.5, type=float)
+            self.intensity_clip_high = settings.value("intensity_clip_high", 99.8, type=float)
+            
+            print(f"✅ Display settings loaded:")
+            print(f"   Elevation: {self.elevation_clip_low}%-{self.elevation_clip_high}%")
+            print(f"   Intensity: gamma={self.intensity_gamma:.2f}, {self.intensity_clip_low}%-{self.intensity_clip_high}%")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to load display settings: {e}")
+            # Keep defaults if load fails
+
     def open_backup_settings(self):
         """Open the backup settings dialog."""
         from gui.backup_settings_dialog import BackupSettingsDialog
@@ -8585,7 +8985,7 @@ class NakshaApp(QMainWindow):
                     view_ribbon.display_changed.disconnect()
                 except Exception:
                     pass
-                view_ribbon.display_changed.connect(self.set_display_mode)
+                view_ribbon.display_changed.connect(self._handle_display_mode_change)
         
                 try:
                     view_ribbon.shadow_toggled.disconnect()

@@ -12,24 +12,69 @@ class CrossSectionInteractor(vtk.vtkInteractorStyleTrackballCamera):
         self.app = app
         self.iren = iren
 
+        # ✅ NEW: Store original interactor style for restoration
+        self._original_style = iren.GetInteractorStyle()
+        
+        # ✅ NEW: Store observer IDs for cleanup
+        self._observer_ids = []
+
         # state machine
-        # 0 = waiting for first click
-        # 1 = dragging preview line (P1 → cursor)
-        # 2 = width adjustment after P2 fixed
         self.slice_state = 0
         self.P1 = None
         self.P2 = None
 
-        self.AddObserver("LeftButtonPressEvent", self.on_left_press)
-        self.AddObserver("MouseMoveEvent", self.on_mouse_move)
-        self.AddObserver("LeftButtonReleaseEvent", self.on_left_release)
+        # ✅ FIXED: Store observer IDs
+        self._observer_ids.append(
+            self.AddObserver("LeftButtonPressEvent", self.on_left_press)
+        )
+        self._observer_ids.append(
+            self.AddObserver("MouseMoveEvent", self.on_mouse_move)
+        )
+        self._observer_ids.append(
+            self.AddObserver("LeftButtonReleaseEvent", self.on_left_release)
+        )
 
         # keep camera navigation
-        self.AddObserver("MiddleButtonPressEvent", lambda o, e: self.OnMiddleButtonDown())
-        self.AddObserver("MiddleButtonReleaseEvent", lambda o, e: self.OnMiddleButtonUp())
-        self.AddObserver("RightButtonPressEvent", lambda o, e: self.OnRightButtonDown())
-        self.AddObserver("RightButtonReleaseEvent", lambda o, e: self.OnRightButtonUp())
-        # self.AddObserver("KeyPressEvent", self.on_key_press)
+        self._observer_ids.append(
+            self.AddObserver("MiddleButtonPressEvent", lambda o, e: self.OnMiddleButtonDown())
+        )
+        self._observer_ids.append(
+            self.AddObserver("MiddleButtonReleaseEvent", lambda o, e: self.OnMiddleButtonUp())
+        )
+        self._observer_ids.append(
+            self.AddObserver("RightButtonPressEvent", lambda o, e: self.OnRightButtonDown())
+        )
+        self._observer_ids.append(
+            self.AddObserver("RightButtonReleaseEvent", lambda o, e: self.OnRightButtonUp())
+        )
+
+    # ✅ NEW: Add cleanup method
+    def cleanup(self):
+        """Remove all observers and restore original interactor style."""
+        try:
+            # Remove all observers
+            for obs_id in self._observer_ids:
+                try:
+                    self.RemoveObserver(obs_id)
+                except Exception:
+                    pass
+            self._observer_ids.clear()
+            
+            # Restore original interactor style
+            if self._original_style is not None and self.iren is not None:
+                try:
+                    self.iren.SetInteractorStyle(self._original_style)
+                    print("✅ CrossSectionInteractor: Original style restored")
+                except Exception as e:
+                    print(f"⚠️ Failed to restore original style: {e}")
+            
+            # Clear state
+            self.P1 = None
+            self.P2 = None
+            self.slice_state = 0
+            
+        except Exception as e:
+            print(f"⚠️ CrossSectionInteractor cleanup error: {e}")
 
     # ---------------- PICKER ----------------
 

@@ -14,6 +14,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QIcon
 DEFAULT_DRAW_STYLES = {
     'smartline':  {'color': (1.0, 0.0, 0.0), 'width': 2, 'style': 'solid'},
     'line':       {'color': (1.0, 0.0, 0.0), 'width': 2, 'style': 'solid'},
+    'orthopolygon': {'color': (1.0, 0.0, 0.0), 'width': 2, 'style': 'solid'},
     'polyline':   {'color': (1.0, 0.0, 0.0), 'width': 2, 'style': 'solid'},
     'rectangle':  {'color': (1.0, 0.0, 0.0), 'width': 2, 'style': 'solid'},
     'circle':     {'color': (0.0, 1.0, 1.0), 'width': 2, 'style': 'solid'},
@@ -22,6 +23,7 @@ DEFAULT_DRAW_STYLES = {
 
 # Display names for the tool list
 TOOL_DISPLAY_NAMES = {
+    'orthopolygon': 'Ortho',
     'smartline': '🔮  Smart Line',
     'line':      '📏  Line',
     'polyline':  '⬡  Polyline',
@@ -30,7 +32,14 @@ TOOL_DISPLAY_NAMES = {
     'freehand':  '✏️  Freehand',
 }
 
-TOOL_ORDER = ['smartline', 'line', 'polyline', 'rectangle', 'circle', 'freehand']
+TOOL_ORDER = ['smartline', 'line', 'orthopolygon', 'polyline', 'rectangle', 'circle', 'freehand']
+
+
+def _plain_tool_display_name(tool_key):
+    """Return a dialog-safe tool label without any leading icon glyphs."""
+    label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+    parts = label.split("  ", 1)
+    return parts[1] if len(parts) == 2 else label
 
 
 def vtk_color_to_qcolor(vtk_color):
@@ -176,7 +185,7 @@ class DrawToolSettingsDialog(QDialog):
 
         # Add per-tool entries
         for key in TOOL_ORDER:
-            item = QListWidgetItem(TOOL_DISPLAY_NAMES[key])
+            item = QListWidgetItem(_plain_tool_display_name(key))
             item.setData(Qt.UserRole, key)
             self.tool_list.addItem(item)
 
@@ -193,12 +202,13 @@ class DrawToolSettingsDialog(QDialog):
         # ── Right: Settings panel ───────────────────────────────────────
         right_box = QVBoxLayout()
 
-        self.tool_title = QLabel(TOOL_DISPLAY_NAMES[self.selected_tool_key])
+        self.tool_title = QLabel(_plain_tool_display_name(self.selected_tool_key))
         self.tool_title.setStyleSheet("font-size: 15px; font-weight: bold; margin-bottom: 4px;")
         right_box.addWidget(self.tool_title)
 
         settings_group = QGroupBox("Appearance")
         form = QVBoxLayout()
+        form.setSpacing(10)
 
         # Color row
         color_row = QHBoxLayout()
@@ -279,7 +289,7 @@ class DrawToolSettingsDialog(QDialog):
             s = self._working_styles[TOOL_ORDER[0]]
         else:
             self.selected_tool_key = key
-            self.tool_title.setText(TOOL_DISPLAY_NAMES.get(key, key))
+            self.tool_title.setText(_plain_tool_display_name(key))
             s = self._working_styles[key]
 
         self.current_color = vtk_color_to_qcolor(s['color'])

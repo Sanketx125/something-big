@@ -4861,14 +4861,6 @@ class CutSectionController:
             traceback.print_exc()        
             
     def _clear_preview_from_other_views(self, current_vtk):
-        """
-        Clear preview actors (line, buffer bands) from all cross-section views
-        except the currently active one.
-        
-        Args:
-           
-             current_vtk: The currently active VTK widget (where preview should appear)
-        """
         if not hasattr(self.app, 'section_vtks'):
             return
         
@@ -4876,8 +4868,7 @@ class CutSectionController:
             self.line_actor,
             self.buffer_actor_upper,
             self.buffer_actor_lower
-        ]
-        
+        ]  
         for view_idx, vtk_widget in self.app.section_vtks.items():
             if vtk_widget == current_vtk:
                 continue  # Skip the active view
@@ -4898,4 +4889,3 @@ class CutSectionController:
                     pass
             except:
                 pass
-            

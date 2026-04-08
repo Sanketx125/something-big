@@ -181,6 +181,10 @@ class PointSyncTool(QObject):
         self._sync_shared_canvas_cursor(True)
 
         self._attach_main_observer()
+        
+        # ✅ NEW: Store observer IDs for cleanup
+        if not hasattr(self, '_observer_ids'):
+            self._observer_ids = {}
 
         for view_index, vtk_widget in getattr(self.app, "section_vtks", {}).items():
             self.activate_for_section(vtk_widget, view_index)
@@ -194,7 +198,9 @@ class PointSyncTool(QObject):
         self._sync_footer_button_state(True)
 
     def deactivate(self):
-        """Deactivate synced point highlighting for all views."""
+        """
+        ✅ FIXED: Complete deactivation with observer removal
+        """
         if not self.active:
             return
 
@@ -205,8 +211,22 @@ class PointSyncTool(QObject):
         self._detach_main_observer()
         self.deactivate_all_sections()
         self.deactivate_for_cut_view()
+        
+        # ✅ NEW: Remove all stored observers
+        if hasattr(self, '_observer_ids'):
+            for view_idx, obs_id in list(self._observer_ids.items()):
+                try:
+                    vtk_widget = self.app.section_vtks.get(view_idx)
+                    if vtk_widget is not None:
+                        vtk_widget.interactor.RemoveObserver(obs_id)
+                except Exception:
+                    pass
+            self._observer_ids.clear()
+        
         self.clear_highlights()
         self._sync_footer_button_state(False)
+        
+        print("✅ Point sync tool fully deactivated")
 
     def _sync_shared_canvas_cursor(self, enabled):
         try:

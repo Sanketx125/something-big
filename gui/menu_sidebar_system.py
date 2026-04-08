@@ -964,9 +964,26 @@ class ViewRibbon(QWidget):
     # 🧱 Depth Toggle
     # -----------------------------------------------------
     def toggle_depth(self):
-        self._depth_on = not self._depth_on
-        self._update_button_style(self.depth_btn, self._depth_on)
-        if self._depth_on:
+        """
+        Apply depth display mode (single click, like elevation/intensity).
+        Shift+Click opens customization dialog.
+        """
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import Qt
+        
+        modifiers = QApplication.keyboardModifiers()
+        
+        if modifiers & Qt.ShiftModifier:
+            # Shift+Click → Open depth settings dialog
+            widget = self
+            while widget:
+                if hasattr(widget, '_open_depth_settings'):
+                    widget._open_depth_settings()
+                    return
+                widget = widget.parent()
+            print("⚠️ Depth settings dialog not available")
+        else:
+            # Normal click → Apply depth mode immediately
             # ✅ Disable borders when switching to Depth
             widget = self
             while widget:
@@ -976,10 +993,10 @@ class ViewRibbon(QWidget):
                     print(f"🔳 Borders DISABLED for depth mode")
                     break
                 widget = widget.parent()
+            
+            # Emit signal to apply depth display
             self.display_changed.emit("depth")
-        else:
-            self.display_changed.emit("class")
-        print(f"🧱 Depth {'ON ✅' if self._depth_on else 'OFF ❌'}")
+            print(f"📏 Depth mode applied")
         
         
     def _switch_display_mode(self, mode):
