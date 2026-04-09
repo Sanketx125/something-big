@@ -1,4 +1,4 @@
-﻿import os
+import os
 import random
 import vtk
 import time
@@ -445,10 +445,6 @@ class NakshaApp(QMainWindow):
         
         # ✅ Load backup settings and start timer
 
-        from PySide6.QtGui import QShortcut, QKeySequence
-
-        self.shortcut_fit_view = QShortcut(QKeySequence("F"), self)
-        self.shortcut_fit_view.activated.connect(self.fit_view)
 
         # Set default view
         set_view(self, "top")
@@ -9551,6 +9547,17 @@ class NakshaApp(QMainWindow):
                     try:
                         self.vtk_widget.interactor.GetRenderWindow().GetInteractor().GetRenderWindow().Render()
                         self.vtk_widget.setFocus()
+                        
+                        # ✅ BUG FIX: Prevent stuck panning. When returning to the main view, 
+                        # force reset the mouse interaction state to clear any missed release events.
+                        style = self.vtk_widget.interactor.GetInteractorStyle()
+                        if style:
+                            try:
+                                style.OnMiddleButtonUp()
+                                style.OnLeftButtonUp()
+                            except Exception:
+                                pass
+                                
                         print(f"✅ Activated Main View")
                     except Exception as e:
                         print(f"⚠️ Error activating main view: {e}")
@@ -11894,6 +11901,17 @@ class NakshaApp(QMainWindow):
 
             style = interactor.GetInteractorStyle()
             style_name = style.GetClassName() if style is not None else "None"
+            
+            # ✅ BUG FIX: Always clear stuck interaction states (like panning) 
+            # if we are reusing the existing vtkInteractorStyleImage.
+            if style_name == "vtkInteractorStyleImage" and style is not None:
+                try:
+                    style.OnMiddleButtonUp()
+                    style.OnLeftButtonUp()
+                    style.OnRightButtonUp()
+                except Exception:
+                    pass
+
             if style_name != "vtkInteractorStyleImage":
                 style_2d = vtkInteractorStyleImage()
                 try:

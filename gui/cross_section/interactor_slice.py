@@ -161,28 +161,4 @@ class CrossSectionInteractor(vtk.vtkInteractorStyleTrackballCamera):
             self.P2 = None
             self.slice_state = 0
 
-    # def on_key_press(self, obj, ev):
-    #     key = self.iren.GetKeySym()
-    #     if key.lower() == "escape":
-    #         from vtk import vtkInteractorStyleTrackballCamera
-    #         self.app.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
-    #         self.app.section_controller.clear()
-    #         self.P1 = None
-    #         self.P2 = None
-    #         self.slice_state = 0
-    #         if self.app.cross_action.isChecked():
-    #             self.app.cross_action.setChecked(False)
-    
-    # def on_key_press(self, obj, ev):
-    #     key = self.iren.GetKeySym()
-    #     if key.lower() == "escape":
-    #         # ❌ DELETE THESE LINES (or comment them out):
-    #         # from vtk import vtkInteractorStyleTrackballCamera
-    #         # self.app.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
-    #         # self.app.section_controller.clear()
-    #         # self.P1 = None
-    #         # self.P2 = None
-    #         # self.slice_state = 0
-    #         # if self.app.cross_action.isChecked():
-    #         #     self.app.cross_action.setChecked(False)
-    #         pass  # ✅ ADD THIS - do nothing, let main app handle ESC
+  

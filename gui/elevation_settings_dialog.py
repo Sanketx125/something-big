@@ -18,7 +18,7 @@ class ElevationSettingsDialog(QDialog):
     Default: MicroStation 5-color rainbow (Blue→Cyan→Green→Yellow→Red)
     """
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, app=None):
         super().__init__(parent)
         self.setWindowTitle("Elevation Color Gradient Settings")
         self.resize(550, 650)
@@ -32,6 +32,12 @@ class ElevationSettingsDialog(QDialog):
             (0.75, (255, 255, 0)),    # Yellow
             (1.00, (255, 0, 0))       # Red
         ]
+        
+        # If app already has a custom ramp (set previously or loaded from QSettings),
+        # use it as the starting point instead of the default.
+        if app is not None and hasattr(app, 'elevation_color_ramp') \
+                and app.elevation_color_ramp:
+            self.color_stops = list(app.elevation_color_ramp)
         
         self._setup_ui()
         self._load_current_ramp()

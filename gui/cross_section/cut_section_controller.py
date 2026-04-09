@@ -1,3 +1,5 @@
+
+
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
@@ -4096,6 +4098,17 @@ class CutSectionController:
                         
                         # Trigger VTK pipeline update without rebuilding the actor
                         vtk_colors.Modified()
+                        try:
+                            # CRITICAL FIX: Ensure the entire pipeline knows data changed
+                            # This fixes intermittent classification refresh failures in cut section
+                            polydata.GetPointData().Modified()
+                            polydata.Modified()
+                            target_actor.GetMapper().Modified()
+                            target_actor.Modified()
+                            target_actor.GetProperty().Modified()
+                        except:
+                            pass
+                            
                         _safe_vtk_render(self.cut_vtk)
                         return  # 🔥 Performance Success: Exit immediately
 
@@ -4160,8 +4173,59 @@ class CutSectionController:
             layout.setContentsMargins(8, 8, 8, 8)
             layout.setSpacing(6)
 
+            # ── CRITICAL: Flush pending Qt/OpenGL events before creating a new  ──
+            # VTK render window.  After AI inference (CUDA ops) or heavy rendering,
+            # unflushed events can leave the OpenGL driver in a state where
+            # wglChoosePixelFormat fails on Windows → null render window → crash.
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+
             # Create DEDICATED VTK widget for cut section
             self.cut_vtk = QtInteractor(container)
+
+            # ── CRITICAL: Verify the render window was actually initialised ────
+            # QtInteractor.__init__ silently continues even when the underlying
+            # vtkWin32OpenGLRenderWindow fails to get a valid pixel format.
+            # If we proceed with a null/broken render window we get a
+            # 0x0000...0000 memory access violation (null-pointer deref in VTK).
+            try:
+                _rw = self.cut_vtk.GetRenderWindow()
+                if _rw is None:
+                    raise RuntimeError("VTK render window is None after QtInteractor init")
+                # Force the window to initialise its OpenGL context
+                _rw.Initialize()
+            except Exception as _vtk_init_err:
+                print(f"❌ Cut section VTK widget failed to initialise: {_vtk_init_err}")
+                print("   This usually means the GPU driver cannot create a new OpenGL")
+                print("   context right now (e.g. after heavy AI/CUDA usage).")
+                print("   → Try again in a moment, or restart the application.")
+                # Clean up the broken widget so we don't crash later
+                try:
+                    self.cut_vtk.close()
+                except Exception:
+                    pass
+                self.cut_vtk = None
+                # Tear down the half-built dock
+                if self.cut_dock is not None:
+                    try:
+                        self.cut_dock.deleteLater()
+                    except Exception:
+                        pass
+                    self.cut_dock = None
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.critical(
+                    self.app,
+                    "Cut Section Error",
+                    "Could not create the cut section view.\n\n"
+                    "The GPU driver returned an error when opening a new 3-D window.\n\n"
+                    "Possible causes:\n"
+                    "  • GPU memory exhausted after AI classification\n"
+                    "  • Too many render windows open\n\n"
+                    "Please try again in a moment.\n"
+                    "If the problem persists, save your work and restart the application."
+                )
+                return
+            # ─────────────────────────────────────────────────────────────────────
             self.cut_vtk.set_background("black")
             layout.addWidget(self.cut_vtk.interactor)
             if hasattr(self.app, "_register_canvas_cursor_widget"):

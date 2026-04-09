@@ -222,6 +222,7 @@ def load_lidar_file(
         xyz = np.vstack([las.x, las.y, las.z]).T
 
 # ✅ REPLACE WITH THIS:
+        attrs = options.get("attributes", {}) if isinstance(options, dict) else {}
         rgb = None
         # Check if RGB channels exist in the file
         _has_rgb_fields = (
@@ -230,9 +231,7 @@ def load_lidar_file(
             hasattr(las, 'blue')
         )
 
-        attrs = options.get("attributes", {})
         if _has_rgb_fields:
-            # Load RGB if Color=True OR if forced (default True)
             if attrs.get("Color", True):
                 r = np.asarray(las.red,   dtype=np.uint32)
                 g = np.asarray(las.green, dtype=np.uint32)

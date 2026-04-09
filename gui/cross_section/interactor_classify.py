@@ -17,8 +17,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QPushButton, QSlider, QWidget
 )
 from PySide6.QtCore import QTimer
-from PySide6.QtCore import Qt, QPoint
-from PySide6.QtGui import QPainter, QColor
+from PySide6.QtCore import Qt, QPoint, QPointF, QLineF
+from PySide6.QtGui import QPainter, QColor, QPen
 import pyvista as pv
 
 class PreviewOverlay(QWidget):
@@ -32,16 +32,57 @@ class PreviewOverlay(QWidget):
         self._shapes = []  # placeholder for future use
         self.hide()
 
+    def set_shapes(self, shapes):
+        self._shapes = list(shapes or [])
+        if self._shapes:
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
+        self.update()
+
+    def clear_shapes(self):
+        self.set_shapes([])
+
+    def translate_shapes(self, dx, dy):
+        if not self._shapes or (dx == 0 and dy == 0):
+            return
+
+        shifted_shapes = []
+        for shape in self._shapes:
+            shifted_segments = []
+            for p0, p1 in shape.get("segments", []):
+                shifted_segments.append((
+                    (float(p0[0]) + dx, float(p0[1]) + dy),
+                    (float(p1[0]) + dx, float(p1[1]) + dy),
+                ))
+
+            shifted_shape = dict(shape)
+            shifted_shape["segments"] = shifted_segments
+            shifted_shapes.append(shifted_shape)
+
+        self._shapes = shifted_shapes
+        self.update()
+
     def paintEvent(self, event):
-        # Minimal paint implementation (no-op by default) so the widget is valid.
-        # If future previews want to draw into this overlay, they can use QPainter here.
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        # Use a semi-transparent yellow pen as the default for overlays (optional)
-        pen_color = QColor(255, 255, 0, 180)
-        painter.setPen(pen_color)
-        painter.setBrush(Qt.NoBrush)
-        # Currently nothing is drawn; this keeps the overlay ready and prevents NameError.
+        for shape in self._shapes:
+            color = shape.get("color", (255, 255, 0, 220))
+            width = float(shape.get("width", 2.0))
+            pen = QPen(QColor(*color))
+            pen.setWidthF(max(width, 1.0))
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+
+            for p0, p1 in shape.get("segments", []):
+                painter.drawLine(
+                    QLineF(
+                        QPointF(float(p0[0]), float(p0[1])),
+                        QPointF(float(p1[0]), float(p1[1])),
+                    )
+                )
         painter.end()
 
 class ClassificationInteractor:
@@ -115,12 +156,18 @@ class ClassificationInteractor:
         self._is_panning = False
         self._last_pan_pos = (0, 0)
         self._pan_render_pending = False
+        self._preview_hidden_for_pan = False
+        self._pan_hidden_actor_names = []
+        self._deferred_left_release_timer = QTimer()
+        self._deferred_left_release_timer.setInterval(16)
+        self._deferred_left_release_timer.timeout.connect(self._check_deferred_left_release)
         self.style.AddObserver("MiddleButtonPressEvent", self._on_safe_pan_start)
         self.style.AddObserver("MiddleButtonReleaseEvent", self._on_safe_pan_stop)
 
         # state
         self.P1 = None
         self.is_dragging = False 
+        self._gesture_tool = None
         self.line_actor = None
         self.dotted_actor = None
         self.rect_actor = None
@@ -176,6 +223,343 @@ class ClassificationInteractor:
         self.is_dragging = False
         self.drawing_points = []
         self.is_drawing_freehand = False
+        self._is_panning = False  # ✅ BUG FIX: Reset panning state on cleanup
+        self._pan_render_pending = False
+        self._hide_preview_overlay_for_pan()
+        timer = getattr(self, "_deferred_left_release_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+    def _get_preview_actor_names(self):
+        return [
+            "line_actor", "dotted_actor", "rect_actor", "circle_actor",
+            "brush_actor", "polygon_actor", "freehand_actor", "poly_actor",
+            "line_actor_cut", "dotted_actor_cut", "rect_actor_cut", "circle_actor_cut",
+            "brush_actor_cut", "freehand_actor_cut", "poly_actor_cut",
+        ]
+
+    def _get_active_tool_preview_actor_names(self, tool=None):
+        tool = tool or getattr(self.app, "active_classify_tool", None)
+        vtk_widget = self._get_active_vtk_widget()
+        cut_vtk = getattr(getattr(self.app, "cut_section_controller", None), "cut_vtk", None)
+        suffix = "_cut" if (vtk_widget is not None and cut_vtk is not None and vtk_widget == cut_vtk) else ""
+        mapping = {
+            "above_line": [f"line_actor{suffix}", f"dotted_actor{suffix}"],
+            "below_line": [f"line_actor{suffix}", f"dotted_actor{suffix}"],
+            "rectangle": [f"rect_actor{suffix}"],
+            "circle": [f"circle_actor{suffix}"],
+            "freehand": [f"freehand_actor{suffix}"],
+            "polygon": [f"poly_actor{suffix}"],
+            "brush": [f"brush_actor{suffix}"],
+        }
+        return mapping.get(tool, [])
+
+    def _set_preview_visibility(self, visible, actor_names=None):
+        """Toggle preview actors without clearing the active classification state."""
+        actor_names = actor_names or self._get_preview_actor_names()
+
+        for name in actor_names:
+            actor = getattr(self, name, None)
+            if actor is None:
+                continue
+            if visible:
+                actor.VisibilityOn()
+            else:
+                actor.VisibilityOff()
+
+    def _get_visible_preview_actor_names(self, actor_names=None):
+        visible = []
+        vtk_widget = self._get_active_vtk_widget()
+        renderer = getattr(vtk_widget, "renderer", None) if vtk_widget is not None else None
+        actor_names = actor_names or self._get_preview_actor_names()
+        for name in actor_names:
+            actor = getattr(self, name, None)
+            if actor is None:
+                continue
+            try:
+                if renderer is not None and hasattr(renderer, "HasViewProp"):
+                    if not renderer.HasViewProp(actor):
+                        continue
+                if actor.GetVisibility():
+                    visible.append(name)
+            except Exception:
+                continue
+        return visible
+
+    def _collect_preview_overlay_shapes(self, actor_names=None):
+        """Capture currently visible preview actors as display-space line segments."""
+        actor_names = actor_names or self._get_preview_actor_names()
+        vtk_widget = self._get_active_vtk_widget()
+        renderer = getattr(vtk_widget, "renderer", None) if vtk_widget is not None else None
+
+        shapes = []
+        id_list = vtk.vtkIdList()
+
+        for name in actor_names:
+            actor = getattr(self, name, None)
+            if actor is None:
+                continue
+
+            try:
+                if renderer is not None and hasattr(renderer, "HasViewProp"):
+                    if not renderer.HasViewProp(actor):
+                        continue
+                if not actor.GetVisibility():
+                    continue
+            except Exception:
+                continue
+
+            try:
+                mapper = actor.GetMapper()
+                poly = mapper.GetInput() if mapper is not None else None
+                points = poly.GetPoints() if poly is not None else None
+                lines = poly.GetLines() if poly is not None else None
+            except Exception:
+                continue
+
+            if points is None or lines is None:
+                continue
+
+            try:
+                lines.InitTraversal()
+            except Exception:
+                continue
+
+            segments = []
+            while lines.GetNextCell(id_list):
+                if id_list.GetNumberOfIds() < 2:
+                    continue
+
+                prev_id = id_list.GetId(0)
+                prev_pt = points.GetPoint(prev_id)
+                for idx in range(1, id_list.GetNumberOfIds()):
+                    curr_id = id_list.GetId(idx)
+                    curr_pt = points.GetPoint(curr_id)
+
+                    # Freeze overlay in DISPLAY space so it stays visually fixed
+                    # while camera pans.
+                    prev_xy = (float(prev_pt[0]), float(prev_pt[1]))
+                    curr_xy = (float(curr_pt[0]), float(curr_pt[1]))
+                    # Most classification preview actors are vtkActor2D with
+                    # display-space points already. Only world-project non-2D actors.
+                    if renderer is not None and not isinstance(actor, vtk.vtkActor2D):
+                        try:
+                            coord = vtk.vtkCoordinate()
+                            coord.SetCoordinateSystemToWorld()
+                            coord.SetValue(float(prev_pt[0]), float(prev_pt[1]), float(prev_pt[2]))
+                            d0 = coord.GetComputedDisplayValue(renderer)
+                            coord.SetValue(float(curr_pt[0]), float(curr_pt[1]), float(curr_pt[2]))
+                            d1 = coord.GetComputedDisplayValue(renderer)
+                            prev_xy = (float(d0[0]), float(d0[1]))
+                            curr_xy = (float(d1[0]), float(d1[1]))
+                        except Exception:
+                            pass
+
+                    segments.append(
+                        (
+                            prev_xy,
+                            curr_xy,
+                        )
+                    )
+                    prev_pt = curr_pt
+
+            if not segments:
+                continue
+
+            prop = actor.GetProperty() if hasattr(actor, "GetProperty") else None
+            color = (255, 255, 0, 220)
+            width = 2.0
+            if prop is not None:
+                try:
+                    rgb = prop.GetColor()
+                    opacity = prop.GetOpacity()
+                    color = (
+                        int(max(0.0, min(1.0, rgb[0])) * 255),
+                        int(max(0.0, min(1.0, rgb[1])) * 255),
+                        int(max(0.0, min(1.0, rgb[2])) * 255),
+                        int(max(0.0, min(1.0, opacity)) * 255),
+                    )
+                    width = float(prop.GetLineWidth())
+                except Exception:
+                    pass
+
+            shapes.append({
+                "segments": segments,
+                "color": color,
+                "width": width,
+            })
+
+        return shapes
+
+    def _show_preview_overlay_for_pan(self):
+        """Freeze the current preview in a Qt overlay while the camera pans."""
+        tool = getattr(self, "_gesture_tool", None) or getattr(self.app, "active_classify_tool", None)
+        active_actor_names = self._get_active_tool_preview_actor_names(tool)
+        if active_actor_names:
+            non_active_actor_names = [
+                n for n in self._get_preview_actor_names() if n not in active_actor_names
+            ]
+            # Ensure stale previews from other tools/views are not visible during pan.
+            self._set_preview_visibility(False, non_active_actor_names)
+        self._pan_hidden_actor_names = self._get_visible_preview_actor_names(active_actor_names)
+        if not self._pan_hidden_actor_names:
+            return
+
+        shapes = self._collect_preview_overlay_shapes(self._pan_hidden_actor_names)
+        if not shapes:
+            # Keep live preview visible if overlay freeze data is unavailable.
+            self._preview_hidden_for_pan = False
+            return
+
+        if self._preview_overlay is None:
+            self._init_preview_overlay()
+        else:
+            self._update_overlay_geometry()
+
+        if self._preview_overlay is None:
+            return
+
+        self._preview_overlay.set_shapes(shapes)
+        try:
+            self._update_overlay_geometry()
+            self._preview_overlay.show()
+            self._preview_overlay.raise_()
+            self._preview_overlay.update()
+        except Exception:
+            pass
+        # Freeze mode: hide live preview actors so the visible overlay
+        # stays fixed while camera pans.
+        self._set_preview_visibility(False, self._pan_hidden_actor_names)
+        self._preview_hidden_for_pan = True
+
+    def _hide_preview_overlay_for_pan(self):
+        """Dismiss the frozen overlay preview and restore VTK preview actors."""
+        overlay = getattr(self, "_preview_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.clear_shapes()
+            except Exception:
+                try:
+                    overlay.hide()
+                except Exception:
+                    pass
+
+        if self._preview_hidden_for_pan:
+            self._set_preview_visibility(True, self._pan_hidden_actor_names)
+
+        self._pan_hidden_actor_names = []
+        self._preview_hidden_for_pan = False
+
+    def _translate_preview_actors_for_pan(self, dx, dy, actor_names=None):
+        """Shift live preview actors in display space so they stay aligned while panning."""
+        if dx == 0 and dy == 0:
+            return
+
+        actor_names = actor_names or self._get_preview_actor_names()
+
+        for name in actor_names:
+            actor = getattr(self, name, None)
+            if actor is None:
+                continue
+
+            try:
+                if not actor.GetVisibility():
+                    continue
+            except Exception:
+                continue
+
+            try:
+                mapper = actor.GetMapper()
+                poly = mapper.GetInput() if mapper is not None else None
+                points = poly.GetPoints() if poly is not None else None
+                if points is None:
+                    continue
+
+                for idx in range(points.GetNumberOfPoints()):
+                    x, y, z = points.GetPoint(idx)
+                    points.SetPoint(idx, x + dx, y + dy, z)
+
+                points.Modified()
+                if poly is not None:
+                    poly.Modified()
+            except Exception:
+                continue
+
+        overlay = getattr(self, "_preview_overlay", None)
+        if overlay is not None and getattr(self, "_preview_hidden_for_pan", False):
+            try:
+                overlay.translate_shapes(dx, dy)
+            except Exception:
+                pass
+
+    def _has_active_drag_classification(self, tool=None):
+        """Return True while a left-drag classification gesture is in progress."""
+        tool = tool or getattr(self.app, "active_classify_tool", None)
+        if tool == "freehand":
+            return bool(getattr(self, "is_drawing_freehand", False))
+        return bool(getattr(self, "is_dragging", False) and getattr(self, "P1", None) is not None)
+
+    def _stop_deferred_left_release_watch(self):
+        timer = getattr(self, "_deferred_left_release_timer", None)
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except Exception:
+            pass
+
+    def _start_deferred_left_release_watch(self):
+        """Fallback for the left-release event path during/after middle-button pan."""
+        if not self._has_active_drag_classification():
+            return
+
+        timer = getattr(self, "_deferred_left_release_timer", None)
+        if timer is None:
+            return
+
+        if not timer.isActive():
+            timer.start()
+
+    def _check_deferred_left_release(self):
+        """
+        Some middle-pan sequences do not forward a final LeftButtonReleaseEvent
+        through VTK. When that happens, finish the paused classification as soon
+        as Qt reports the left button is no longer pressed.
+        """
+        if not self._has_active_drag_classification():
+            self._stop_deferred_left_release_watch()
+            return
+
+        try:
+            from PySide6.QtWidgets import QApplication
+            buttons = QApplication.mouseButtons()
+        except Exception:
+            return
+
+        middle_pressed = bool(buttons & Qt.MiddleButton)
+        left_pressed = bool(buttons & Qt.LeftButton)
+
+        # Keep our internal pan state in sync even if VTK misses MiddleButtonReleaseEvent.
+        if getattr(self, "_is_panning", False) and not middle_pressed:
+            self._is_panning = False
+            self._last_mouse_move_time = 0.0
+            self._last_render_time = 0.0
+            self._last_pan_pos = (0, 0)
+            self._hide_preview_overlay_for_pan()
+
+        if left_pressed:
+            return
+
+        if getattr(self, "_is_panning", False):
+            self._is_panning = False
+            self._last_pan_pos = (0, 0)
+            self._hide_preview_overlay_for_pan()
+
+        self._stop_deferred_left_release_watch()
+        self.on_left_release(self.interactor, "DeferredLeftReleaseAfterPan")
 
     def _finalize_pending_main_brush_stroke(self):
         """
@@ -437,6 +821,19 @@ class ClassificationInteractor:
             
             self._is_panning = True
             self._last_pan_pos = self.interactor.GetEventPosition()
+
+            tool = getattr(self.app, "active_classify_tool", None)
+            has_preview_gesture = bool(
+                self._has_active_drag_classification(tool)
+                or getattr(self, "P1", None) is not None
+                or bool(getattr(self, "drawing_points", []))
+                or bool(getattr(self, "is_drawing_freehand", False))
+            )
+            if tool in {"rectangle", "circle", "freehand", "above_line", "below_line", "polygon", "brush"} and has_preview_gesture:
+                # Keep the live preview actors active and translate them with the pan,
+                # otherwise the preview appears frozen while the cloud moves.
+                self._hide_preview_overlay_for_pan()
+                self._start_deferred_left_release_watch()
             print("🖱️ Middle button PRESSED - starting pan")
             
         except (RuntimeError, AttributeError):
@@ -445,6 +842,20 @@ class ClassificationInteractor:
     def _on_safe_pan_stop(self, obj, event):
         """Stop custom pan (replaces style.OnMiddleButtonUp)."""
         self._is_panning = False
+        # Let the next post-pan mouse move update the preview immediately.
+        self._last_mouse_move_time = 0.0
+        self._last_render_time = 0.0
+        self._hide_preview_overlay_for_pan()
+        self._start_deferred_left_release_watch()
+
+    def _is_classification_paused_for_pan(self, tool=None):
+        """
+        Return True while a drag-style classification gesture should be frozen
+        so middle-button pan can run without changing the active selection.
+        """
+        if not getattr(self, "_is_panning", False):
+            return False
+        return self._has_active_drag_classification(tool)
 
     def _do_safe_pan(self):
         """
@@ -548,6 +959,25 @@ class ClassificationInteractor:
             camera.SetFocalPoint(*[fp[i] + pan[i] for i in range(3)])
             
             self._last_pan_pos = current_pos
+
+            tool = getattr(self, "_gesture_tool", None) or getattr(self.app, "active_classify_tool", None)
+            if self._has_active_drag_classification(tool):
+                if tool == "freehand" and hasattr(self, "drawing_points_display_cut"):
+                    self.drawing_points_display_cut = [
+                        (float(px) + dx, float(py) + dy)
+                        for px, py in self.drawing_points_display_cut
+                    ]
+                elif tool == "rectangle" and getattr(self, "P1_display_cut", None) is not None:
+                    self.P1_display_cut = (
+                        float(self.P1_display_cut[0]) + dx,
+                        float(self.P1_display_cut[1]) + dy,
+                    )
+
+                self._translate_preview_actors_for_pan(
+                    dx,
+                    dy,
+                    self._get_active_tool_preview_actor_names(tool),
+                )
             
             # Deferred render
             if not getattr(self, '_pan_render_pending', False):
@@ -570,6 +1000,15 @@ class ClassificationInteractor:
                 if hasattr(vtk_widget, 'isVisible') and not vtk_widget.isVisible():
                     return
                 vtk_widget.render()
+                overlay = getattr(self, "_preview_overlay", None)
+                if overlay is not None and getattr(self, "_preview_hidden_for_pan", False):
+                    try:
+                        self._update_overlay_geometry()
+                        overlay.show()
+                        overlay.raise_()
+                        overlay.update()
+                    except Exception:
+                        pass
         except (RuntimeError, AttributeError, OSError, ReferenceError):
             pass
         except Exception:
@@ -1709,6 +2148,7 @@ class ClassificationInteractor:
             actor = getattr(self, name, None)
             if actor:
                 actor.VisibilityOff()
+        self._hide_preview_overlay_for_pan()
     
         # 3. Reset state variables
         self.P1 = None
@@ -1778,6 +2218,10 @@ class ClassificationInteractor:
                 return
 
             tool = getattr(self.app, "active_classify_tool", None)
+
+            if self._is_classification_paused_for_pan(tool):
+                self._do_safe_pan()
+                return
 
             # Try to pick world point (fast, non-snapping)
             try:
@@ -2162,6 +2606,8 @@ class ClassificationInteractor:
             return
         if not hasattr(self, 'interactor') or self.interactor is None:
             return
+        self._stop_deferred_left_release_watch()
+        self._hide_preview_overlay_for_pan()
 
         # ════════════════════════════════════════════════════════════════
         # ✅ CRITICAL: Cancel any pending deferred rebuild immediately
@@ -2216,6 +2662,7 @@ class ClassificationInteractor:
                     pass
 
         tool = getattr(self.app, "active_classify_tool", None)
+        self._gesture_tool = tool
         print(f"🔍 DEBUG: is_main={self._is_main_view()}, target='{getattr(self.app, 'active_classify_target', 'NONE')}', tool={tool}")
 
         # ❌ BLOCK Above/Below Line in MAIN VIEW ONLY
@@ -2805,6 +3252,8 @@ class ClassificationInteractor:
             traceback.print_exc()
 
         finally:
+            self._stop_deferred_left_release_watch()
+            self._gesture_tool = None
             # 1. CLEANUP STATE
             self.is_dragging = False
             self.P1 = None
@@ -2812,6 +3261,7 @@ class ClassificationInteractor:
             self.is_drawing_freehand = False
             self._last_brush_center = None
             self._is_panning = False
+            self._hide_preview_overlay_for_pan()
             self._last_pan_pos = (0, 0) 
             # Clear previews
             self._last_rectangle_preview_P2 = None
