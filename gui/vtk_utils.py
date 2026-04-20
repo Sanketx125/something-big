@@ -16,7 +16,6 @@ Author: Enhanced fix for border rendering glitch
 Date: 2026-01-05
 """
 
-import numpy as np
 
 
 def force_vtk_pipeline_update_with_borders(app):

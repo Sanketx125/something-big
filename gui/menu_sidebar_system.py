@@ -5,11 +5,11 @@ Displays all menu options horizontally in a ribbon layout
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-    QLabel, QFrame, QScrollArea, QGroupBox, QSlider, QListWidget, QListWidgetItem,
-    QCheckBox, QSpinBox, QDoubleSpinBox, QSizePolicy, QDialog, QDialogButtonBox,
+    QLabel, QFrame, QScrollArea, QGroupBox, QListWidget, QListWidgetItem,
+    QCheckBox, QDoubleSpinBox, QSizePolicy, QDialog, QDialogButtonBox,
     QComboBox, QMessageBox, QAbstractItemView, QApplication, QRadioButton  # ✅ ADD THIS
 )
-from PySide6.QtCore import Qt, Signal, QPropertyAnimation, QEasingCurve, QEvent, QSize, QSettings
+from PySide6.QtCore import Qt, Signal, QEvent, QSize, QSettings
 from PySide6.QtGui import QFont, QPixmap, QIcon, QColor
 from html import escape
 import json
@@ -18,7 +18,6 @@ from scipy.spatial import cKDTree
 from gui.prj_block_identifier import show_block_identifier_dialog
 from .digitize_tools import PolylineSettingsDialog
 from .curve_ribbon import CurveRibbon
-from .curve_tools import CurveTool
 from .digitize_tools import LineArrowSettingsDialog, PolylineSettingsDialog
 from .draw_settings_dialog import DrawToolSettingsDialog
 from .icon_provider import get_button_icon
@@ -5504,7 +5503,30 @@ class ByClassHeightDialog(QDialog):
         height_label = QLabel("📐 SET HEIGHT RANGE")
         height_label.setObjectName("header_label") # Applies Teal color
         layout.addWidget(height_label)
-        
+
+        # ── Reference Class ──────────────────────────────────────────────────
+        ref_row = QHBoxLayout()
+        ref_label = QLabel("Reference class (heights measured from):")
+        ref_label.setStyleSheet("color: #888888; font-size: 10px;")
+        layout.addWidget(ref_label)
+
+        self.ref_class_combo = QComboBox()
+        self.ref_class_combo.setToolTip(
+            "Heights are measured from the nearest point of this class.\n"
+            "Default: Class 1 (Ground). Change to use a different class\n"
+            "as the zero-height baseline (e.g. Low Vegetation)."
+        )
+        # When reference class changes, force re-analysis before convert
+        self.ref_class_combo.currentIndexChanged.connect(self.on_ref_class_changed)
+        layout.addWidget(self.ref_class_combo)
+
+        ref_info = QLabel("ℹ️ Min = 0 m means 'at reference class level'. "
+                          "Heights are relative to nearest reference-class point.")
+        ref_info.setStyleSheet("color: #607d8b; font-size: 9px; font-style: italic;")
+        ref_info.setWordWrap(True)
+        layout.addWidget(ref_info)
+        # ────────────────────────────────────────────────────────────────────
+
         # Analysis button - uses a muted purple or keep standard dark
         analyze_btn = QPushButton("🔍 Analyze Heights")
         analyze_btn.setStyleSheet("color: #00c8aa; font-weight: bold; background-color: #1a1a1a;")
@@ -5520,13 +5542,13 @@ class ByClassHeightDialog(QDialog):
         min_height_row = QHBoxLayout()
         min_height_row.addWidget(QLabel("Min:"))
         self.min_height_spin = QDoubleSpinBox()
-        self.min_height_spin.setRange(-100.0, 1000.0)
+        self.min_height_spin.setRange(-999999.0, 999999.0)
         self.min_height_spin.setSuffix(" m")
         min_height_row.addWidget(self.min_height_spin)
         
         min_height_row.addWidget(QLabel("Max:"))
         self.max_height_spin = QDoubleSpinBox()
-        self.max_height_spin.setRange(-100.0, 1000.0)
+        self.max_height_spin.setRange(-999999.0, 999999.0)
         self.max_height_spin.setSuffix(" m")
         min_height_row.addWidget(self.max_height_spin)
         layout.addLayout(min_height_row)
@@ -6069,7 +6091,30 @@ class ByClassHeightDialog(QDialog):
             self.from_list.addItem(item)
             
             self.to_combo.addItem(icon, text, code)
-        
+
+        # ── Populate Reference Class combo ───────────────────────────────────
+        # Keep current selection if possible
+        old_ref = self.ref_class_combo.currentData() if self.ref_class_combo.count() > 0 else 1
+        self.ref_class_combo.clear()
+        for cls in class_list:
+            code = cls['code']
+            lvl  = cls['lvl']
+            desc = cls['desc']
+            color = cls['color']
+            text = f"{code} - {lvl}" if lvl and lvl.strip() else f"{code}"
+            if desc:
+                text += f" ({desc})"
+            icon = make_color_icon(color)
+            self.ref_class_combo.addItem(icon, text, code)
+
+        # Default to Class 1 (Ground) if available, else restore old selection
+        restore_idx = self.ref_class_combo.findData(old_ref if old_ref is not None else 1)
+        if restore_idx < 0:
+            restore_idx = self.ref_class_combo.findData(1)   # fallback: Ground
+        if restore_idx >= 0:
+            self.ref_class_combo.setCurrentIndex(restore_idx)
+        # ─────────────────────────────────────────────────────────────────────
+
         print(f"✅ Populated ByClassHeightDialog with {len(class_list)} classes")
     
     def on_classes_changed(self):
@@ -6082,6 +6127,7 @@ class ByClassHeightDialog(QDialog):
         selected_items = self.from_list.selectedItems()
         old_from_codes = [item.data(Qt.UserRole) for item in selected_items]
         old_to = self.to_combo.currentData()
+        old_ref = self.ref_class_combo.currentData()
         old_min_height = self.min_height_spin.value()
         old_max_height = self.max_height_spin.value()
         
@@ -6098,6 +6144,12 @@ class ByClassHeightDialog(QDialog):
             idx = self.to_combo.findData(old_to)
             if idx >= 0:
                 self.to_combo.setCurrentIndex(idx)
+
+        # Restore reference class selection
+        if old_ref is not None:
+            ref_idx = self.ref_class_combo.findData(old_ref)
+            if ref_idx >= 0:
+                self.ref_class_combo.setCurrentIndex(ref_idx)
         
         self.min_height_spin.setValue(old_min_height)
         self.max_height_spin.setValue(old_max_height)
@@ -6131,6 +6183,17 @@ class ByClassHeightDialog(QDialog):
         self.height_combo.addItem("Click 'Analyze Heights' to see options", None)
         self.height_info_label.setText("💡 Class changed. Click 'Analyze Heights' to recalculate.")
         self.height_info_label.setStyleSheet("color: #ff9800; font-size: 9px; font-style: italic;")
+
+    def on_ref_class_changed(self, index):
+        """Called when the Reference Class combo changes — force re-analysis."""
+        self.height_combo.clear()
+        self.height_combo.addItem("Click 'Analyze Heights' to see options", None)
+        ref_text = self.ref_class_combo.currentText() if self.ref_class_combo.count() > 0 else "?"
+        self.height_info_label.setText(
+            f"⚠️ Reference class changed to [{ref_text}]. "
+            "Click 'Analyze Heights' to recalculate heights."
+        )
+        self.height_info_label.setStyleSheet("color: #ff9800; font-size: 9px; font-style: italic;")
     
     def on_height_combo_changed(self, index):
         """Update spin boxes when dropdown selection changes"""
@@ -6152,13 +6215,29 @@ class ByClassHeightDialog(QDialog):
             return
         
         from_class = selected_items[0].data(Qt.UserRole)
-        ground_class = 1
-        
+
+        # ── Reference class (replaces the hardcoded ground_class = 1) ────────
+        ground_class = self.ref_class_combo.currentData()
+        if ground_class is None:
+            ground_class = 1   # safety fallback
+        ref_class_text = self.ref_class_combo.currentText()
+        print(f"   📐 Reference class: {ground_class} ({ref_class_text})")
+        # ─────────────────────────────────────────────────────────────────────
+
         classification = self.app.data.get("classification")
         xyz = self.app.data.get("xyz")
         if classification is None or xyz is None:
             return
-        
+
+        # Validate: reference class must differ from the From class
+        if ground_class == from_class:
+            QMessageBox.warning(
+                self, "Invalid Reference Class",
+                f"Reference class ({ground_class}) cannot be the same as the From class.\n"
+                "Please choose a different reference class."
+            )
+            return
+
         # ✅ CHECK FENCE FILTER
         use_fence = self.fence_filter_enabled.isChecked() and len(self.selected_fences) > 0
         if self.fence_filter_enabled.isChecked() and not self.selected_fences:
@@ -6171,11 +6250,15 @@ class ByClassHeightDialog(QDialog):
         print(f"📊 ANALYZING HEIGHT DISTRIBUTION {'(FENCE-RESTRICTED)' if use_fence else ''}")
         print(f"{'='*60}")
         
-        # Get ground points
+        # Get reference-class points (user-selected, no longer hardcoded to Class 1)
         ground_mask = (classification == ground_class)
         ground_count = np.sum(ground_mask)
         if ground_count == 0:
-            QMessageBox.warning(self, "No Ground Points", "No Ground (Class 1) points found")
+            QMessageBox.warning(
+                self, "No Reference Points",
+                f"No points found for reference class {ground_class} ({ref_class_text}).\n"
+                "Please choose a different reference class."
+            )
             return
         
         # Get From class points
@@ -6240,15 +6323,19 @@ class ByClassHeightDialog(QDialog):
         mean_h = np.mean(heights)
         median_h = np.median(heights)
         
-        # Create height options
+        # Create height options — use actual min_h so ranges reflect real data
         percentiles = [25, 50, 75, 90, 95, 99]
         height_options = []
         for p in percentiles:
             threshold = np.percentile(heights, p)
-            count = np.sum((heights >= 0) & (heights <= threshold))
+            lower     = np.percentile(heights, 100 - p)   # symmetric lower bound
+            actual_min = float(min_h)
+            count = np.sum((heights >= actual_min) & (heights <= threshold))
             percentage = (count / len(heights)) * 100
             height_options.append({
-                'percentile': p, 'min': 0.0, 'max': threshold,
+                'percentile': p,
+                'min': round(actual_min, 3),
+                'max': round(float(threshold), 3),
                 'count': count, 'percentage': percentage
             })
         
@@ -6256,34 +6343,58 @@ class ByClassHeightDialog(QDialog):
         print(f"   Min: {min_h:.3f}m, Max: {max_h:.3f}m, Mean: {mean_h:.3f}m")
         print(f"{'='*60}\n")
         
-        # Populate dropdown
+        # Populate dropdown — labels now show the real min, not a hardcoded 0
         self.height_combo.clear()
         for opt in height_options:
-            label = f"0m - {opt['max']:.2f}m — {opt['percentile']}% coverage ({opt['count']:,} pts)"
+            label = (f"{opt['min']:.2f}m → {opt['max']:.2f}m  "
+                     f"— {opt['percentile']}th pct  ({opt['count']:,} pts, {opt['percentage']:.0f}%)")
             self.height_combo.addItem(label, opt)
         
         self.height_combo.insertSeparator(self.height_combo.count())
         
-        common_ranges = [(0, 0.5), (0, 1.0), (0, 2.0), (0, 5.0), (0, 10.0), (0.2, 2.0), (2.0, 10.0)]
+        # Common relative ranges — only add if they fall within actual data range
+        common_ranges = [
+            (min_h, max_h),          # full range
+            (min_h, np.percentile(heights, 50)),   # lower half
+            (0.0, 0.5), (0.0, 1.0), (0.0, 2.0),
+            (0.0, 5.0), (0.0, 10.0),
+            (0.2, 2.0), (2.0, 10.0),
+        ]
+        seen_ranges = set()
         for min_r, max_r in common_ranges:
-            if max_r <= max_h:
-                count = np.sum((heights >= min_r) & (heights <= max_r))
-                percentage = (count / len(heights)) * 100
-                label = f"{min_r:.1f}m - {max_r:.1f}m — {count:,} pts ({percentage:.1f}%)"
-                self.height_combo.addItem(label, {'min': min_r, 'max': max_r})
+            min_r = round(float(min_r), 3)
+            max_r = round(float(max_r), 3)
+            key = (min_r, max_r)
+            if key in seen_ranges:
+                continue
+            seen_ranges.add(key)
+            if min_r >= max_r:
+                continue
+            if max_r > max_h + 0.01:   # skip ranges beyond actual data
+                continue
+            count = np.sum((heights >= min_r) & (heights <= max_r))
+            percentage = (count / len(heights)) * 100
+            label = f"{min_r:.2f}m → {max_r:.2f}m  — {count:,} pts ({percentage:.0f}%)"
+            self.height_combo.addItem(label, {'min': min_r, 'max': max_r})
         
+        # Default selection: 75th percentile (index 2)
         if len(height_options) > 2:
             self.height_combo.setCurrentIndex(2)
         
+        # ✅ Auto-fill spinboxes with the actual analyzed min/max
+        self.min_height_spin.setValue(round(float(min_h), 3))
+        self.max_height_spin.setValue(round(float(max_h), 3))
+        
         self.height_info_label.setText(
             f"✅ Analyzed {len(from_class_xyz):,} points{fence_label_text} | "
-            f"Min: {min_h:.3f}m | Max: {max_h:.3f}m"
+            f"Ref: [{ref_class_text}] | Min: {min_h:.3f}m | Max: {max_h:.3f}m"
         )
         self.height_info_label.setStyleSheet("color: #4caf50; font-size: 9px; font-weight: bold;")
         
         QMessageBox.information(self, "Height Analysis Complete", 
             f"Analyzed {len(from_class_xyz):,} points{fence_label_text}\n"
-            f"Min: {min_h:.3f}m, Max: {max_h:.3f}m\n"
+            f"Reference class: {ref_class_text}\n"
+            f"Min: {min_h:.3f}m, Max: {max_h:.3f}m above reference\n"
             f"Select a height range from dropdown")
         
     def preview_conversion(self):
@@ -6303,7 +6414,8 @@ class ByClassHeightDialog(QDialog):
             from_display = ", ".join(str(c) for c in from_classes)
 
         to_class = self.to_combo.currentData()
-        ground_class = 1
+        ground_class = self.ref_class_combo.currentData() or 1
+        ref_class_text = self.ref_class_combo.currentText()
         min_height = self.min_height_spin.value()
         max_height = self.max_height_spin.value()
         
@@ -6315,10 +6427,6 @@ class ByClassHeightDialog(QDialog):
             QMessageBox.warning(self, "Invalid Selection", f"Cannot convert class {to_class} to itself")
             return
                 
-        if min_height >= max_height:
-            QMessageBox.warning(self, "Invalid Range", "Min height must be less than Max height")
-            return
-        
         try:
             affected_count = self._calculate_conversion(
                 from_classes, to_class, ground_class, min_height, max_height, preview=True
@@ -6330,7 +6438,7 @@ class ByClassHeightDialog(QDialog):
             self.preview_label.setText(
                 f"📊 Preview: {affected_count:,} points would be converted\n"
                 f"From: {from_display} → To: Class {to_class}\n"
-                f"Height: {min_height}m - {max_height}m"
+                f"Height: {min_height}m - {max_height}m above [{ref_class_text}]"
             )
             self.preview_label.setStyleSheet("""
                 QLabel {
@@ -6363,7 +6471,8 @@ class ByClassHeightDialog(QDialog):
             from_display = ", ".join(str(c) for c in from_classes)
 
         to_class = self.to_combo.currentData()
-        ground_class = 1
+        ground_class = self.ref_class_combo.currentData() or 1
+        ref_class_text = self.ref_class_combo.currentText()
         min_height = self.min_height_spin.value()
         max_height = self.max_height_spin.value()
         
@@ -6374,9 +6483,14 @@ class ByClassHeightDialog(QDialog):
         if from_classes and to_class in from_classes:
             QMessageBox.warning(self, "Invalid Selection", f"Cannot convert class {to_class} to itself")
             return
-                
-        if min_height >= max_height:
-            QMessageBox.warning(self, "Invalid Range", "Min height must be less than Max height")
+
+        # Guard: reference class must not be the same as a From class
+        if from_classes and ground_class in from_classes:
+            QMessageBox.warning(
+                self, "Invalid Reference Class",
+                f"Reference class ({ground_class}) cannot be one of the From classes.\n"
+                "Please select a different reference class."
+            )
             return
         
         # ✅ CHECK FENCE
@@ -6392,7 +6506,7 @@ class ByClassHeightDialog(QDialog):
         
         msg = (
             f"Convert {from_display} → class {to_class}\n"
-            f"Height: {min_height}m - {max_height}m above Ground?{fence_text}"
+            f"Height: {min_height}m - {max_height}m above [{ref_class_text}]{fence_text}"
         )
         
         reply = QMessageBox.question(self, "Confirm Conversion", msg,
@@ -6483,14 +6597,19 @@ class ByClassHeightDialog(QDialog):
         
         print(f"\n{'='*60}")
         print(f"📏 HEIGHT-BASED CONVERSION")
+        print(f"   Reference class (baseline): {ground_class}")
         print(f"{'='*60}")
         
-        # Get ground points
+        # Get reference-class points (previously always Class 1 / Ground)
         ground_mask = (classification == ground_class)
         ground_count = np.sum(ground_mask)
         
         if ground_count == 0:
-            QMessageBox.warning(self, "No Ground Points", "No Ground (Class 1) points found")
+            QMessageBox.warning(
+                self, "No Reference Points",
+                f"No points found for reference class {ground_class}.\n"
+                "Please select a different reference class or load more data."
+            )
             return None
         
         # Get From class points
@@ -6625,8 +6744,10 @@ class ByClassHeightDialog(QDialog):
         current_display_mode = getattr(self.app, 'display_mode', 'class')
         print(f"   🔄 Post-conversion refresh (display_mode='{current_display_mode}')...")
 
-        # Only wipe actors in class/other modes — in shaded_class the mesh actor must survive
-        if current_display_mode != "shaded_class":
+        # ⚡ For class mode, keep the existing actor alive so _fast_classification_inject
+        #    can patch it in-place (O(changed) instead of O(all)).
+        #    Only wipe for shaded_class/other modes where a full rebuild is needed anyway.
+        if current_display_mode not in ("shaded_class", "class"):
             if hasattr(self.app, 'vtk_widget'):
                 if hasattr(self.app.vtk_widget, 'actors'):
                     old_actors = self.app.vtk_widget.actors
@@ -6667,6 +6788,63 @@ class ByClassHeightDialog(QDialog):
             self.app.point_count_widget.schedule_update()
      
         return in_range_count
+
+    def _fast_classification_inject(self):
+        """
+        Fast classification refresh using the same pipeline as interactive classify.
+        This avoids stale actor-array indexing after undo/redo.
+        """
+        import time
+        import numpy as np
+
+        t0 = time.perf_counter()
+
+        info = getattr(self, '_last_conversion_info', None)
+        convert_indices = info.get('converted_indices') if info else None
+        to_class = info.get('to_class') if info else None
+
+        try:
+            if convert_indices is None or to_class is None:
+                return False
+            if not hasattr(self.app, 'data') or self.app.data is None:
+                return False
+
+            classification = self.app.data.get('classification')
+            if classification is None:
+                return False
+
+            total_pts = len(classification)
+            if total_pts == 0:
+                return False
+
+            convert_indices = np.asarray(convert_indices, dtype=np.int64)
+            valid = (convert_indices >= 0) & (convert_indices < total_pts)
+            if not np.any(valid):
+                return False
+
+            changed_mask = np.zeros(total_pts, dtype=bool)
+            changed_mask[convert_indices[valid]] = True
+
+            from gui.unified_actor_manager import fast_classify_update
+            ok = fast_classify_update(self.app, changed_mask, int(to_class))
+            if not ok:
+                return False
+
+            # Keep section mirrors and statistics in sync through app signal bus.
+            try:
+                self.app.classification_finished.emit(changed_mask)
+            except Exception:
+                pass
+
+            elapsed = (time.perf_counter() - t0) * 1000
+            print(f"   fast_inject unified update: {int(np.count_nonzero(changed_mask)):,} pts [{elapsed:.1f} ms]")
+            return True
+
+        except Exception as e:
+            print(f"   _fast_classification_inject failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def _refresh_after_classification(self):
         """
@@ -6761,8 +6939,12 @@ class ByClassHeightDialog(QDialog):
                 print(f"   ✅ Refreshed in shaded_class mode")
                 
             elif display_mode == "class":
-                from gui.class_display import update_class_mode
-                update_class_mode(self.app, force_refresh=True)
+                # ⚡ FAST PATH — patch only the converted points, same strategy as undo's fast_undo_update
+                fast_ok = self._fast_classification_inject()
+                if not fast_ok:
+                    # Fallback: full rebuild (slow, only if fast path is unavailable)
+                    from gui.class_display import update_class_mode
+                    update_class_mode(self.app, force_refresh=True)
                 print("   ✅ Refreshed in class mode")
             else:
                 from gui.pointcloud_display import update_pointcloud
@@ -9690,7 +9872,6 @@ class InsideFenceDialog(QDialog):
                     pass
             
             # Create temporary yellow highlight
-            from gui.digitize_tools import DigitizeManager
             
             # Use digitizer's method if available, otherwise create inline
             if hasattr(self.app, 'digitizer'):

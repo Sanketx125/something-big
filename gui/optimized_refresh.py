@@ -331,7 +331,6 @@ class OptimizedRefreshPipeline:
         Optimized single cross-section refresh.
         ✅ FIXED: Detects view mode changes and delegates to _plot_section for full rebuild
         """
-        import pyvista as pv
         import numpy as np
 
         if not hasattr(self.app, 'section_vtks') or view_idx not in self.app.section_vtks:
@@ -644,7 +643,6 @@ class OptimizedRefreshPipeline:
         ✅ FIXED: Properly refresh main view with GUARANTEED border preservation
         🚀 OPTIMIZED: Uses Direct GPU Pointer injection with LOD and Visibility mapping.
         """
-        import pyvista as pv
         import numpy as np
         from vtkmodules.util import numpy_support
         app = self.app
@@ -706,7 +704,7 @@ class OptimizedRefreshPipeline:
             # Cache it
             if not hasattr(self, '_cached_dirty_classes'):
                 self._cached_dirty_classes = {}
-            self._cached_dirty_classes = {'key': cache_key, 'value': dirty_classes}
+            self._cached_dirty_classes = {'value': dirty_classes}
             if ENABLE_PERFORMANCE_LOGGING:
                 print(f"      ⚡ Calculated and cached dirty_classes")
 
@@ -917,12 +915,6 @@ class OptimizedRefreshPipeline:
                 get_cache,
                 clear_shading_cache,
                 update_shaded_class,
-                _do_triangulate,
-                _filter_edges_by_absolute,
-                _compute_face_normals,
-                _compute_shading,
-                _render_mesh,
-                _save_camera,
             )
 
             cache = get_cache()

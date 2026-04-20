@@ -6,7 +6,7 @@ MicroStation-style point-by-point curve drawing with real-time preview
 import numpy as np
 import vtk
 from PySide6.QtCore import Qt, QEvent, QObject # ✅ ADD QObject
-from PySide6.QtGui import QFont, QPixmap, QIcon, QColor
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QColorDialog
 
 class CurveTool(QObject):  # ✅ INHERIT FROM QObject

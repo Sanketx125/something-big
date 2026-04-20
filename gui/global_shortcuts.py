@@ -58,1331 +58,1431 @@ class GlobalShortcutFilter(QObject):
         self._shortcut_guard = ShortcutExecutionGuard()  # ✅ ADD THIS
 
     def eventFilter(self, obj, event):
-            _QTimer = QTimer  # noqa — intentional alias
+        _QTimer = QTimer  # noqa — intentional alias
 
-            if event.type() == QEvent.KeyPress:
-                
-                # ====================================================================
-                # BYPASS SHORTCUTS IF USER IS TYPING IN AN INPUT FIELD
-                # ====================================================================
-                try:
-                    from PySide6.QtWidgets import QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox
-                    focus_widget = QApplication.focusWidget()
-                    if isinstance(focus_widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)):
-                        # If the user is typing, let the widget handle its own key presses!
-                        # Only bypass if they are NOT holding Ctrl/Alt/Shift (unless it's just Shift for capitals)
-                        if not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)):
-                            return False
-                        # Even if holding Ctrl, let standard text shortcuts (Ctrl+C, Ctrl+V, Ctrl+Z, Ctrl+Y) pass
-                        if event.modifiers() & Qt.ControlModifier and event.key() in (Qt.Key_C, Qt.Key_V, Qt.Key_X, Qt.Key_Z, Qt.Key_Y, Qt.Key_A):
-                            return False
-                except Exception:
-                    pass
-
-                # ====================================================================
-                # PRIORITY -2: Shift+ESC - Exit active digitize tool, keep drawings
-                # ====================================================================
-                if event.key() == Qt.Key_Escape and (event.modifiers() & Qt.ShiftModifier):
-                    digitizer = getattr(self.app_window, 'digitizer', None)
-                    if digitizer and getattr(digitizer, 'active_tool', None):
-                        print("🛑 Shift+ESC - deactivating digitizer tool")
-                        try:
-                            if hasattr(digitizer, '_deactivate_active_tool_keep_drawings') and \
-                               digitizer._deactivate_active_tool_keep_drawings():
-                                return True
-                        except Exception as e:
-                            print(f"⚠️ Shift+ESC digitizer deactivation failed: {e}")
-
-                # ====================================================================
-                # PRIORITY -1: Curve Tool Shortcuts (highest priority)
-                # ====================================================================
-                if hasattr(self.app_window, 'curve_tool'):
-                    curve_tool = self.app_window.curve_tool
-                    
-                    # Shift+E - Edit curve color (when curve tool has selection)
-                    if event.key() == Qt.Key_E and (event.modifiers() & Qt.ShiftModifier):
-                        if curve_tool.selected_curve_data:
-                            print("🎨 Shift+E → Edit Curve Color (curve tool)")
-                            try:
-                                curve_tool._edit_selected_curve_color()
-                            except Exception as e:
-                                print(f"⚠️ Curve color edit failed: {e}")
-                            return True
-                    
-                    # Delete - Delete curve (when curve tool has selection)
-                    if (event.key() == Qt.Key_Delete or event.key() == Qt.Key_Backspace):
-                        if curve_tool.selected_curve_data and not curve_tool.active:
-                            print("🗑️ Delete → Delete Curve (curve tool)")
-                            try:
-                                curve_tool._delete_selected_curve()
-                            except Exception as e:
-                                print(f"⚠️ Curve delete failed: {e}")
-                            return True
-                
-                # ====================================================================
-                # PRIORITY 0: ESC key - Cancel active modes
-                # ====================================================================
-                if event.key() == Qt.Key_Escape:
-                    # Priority 1: Cross-section mode (top-most tool)
-                    # if hasattr(self.app_window, 'cross_action') and self.app_window.cross_action.isChecked():
-                    if getattr(self.app_window, 'cross_action', None) is not None and self.app_window.cross_action.isChecked():
-                        print("🛑 ESC - deactivating cross-section")
-                        
-                        # Uncheck the button
-                        if getattr(self.app_window, 'cross_action', None) is not None:
-                                self.app_window.cross_action.setChecked(False)
-                        
-                        # ✅ DEACTIVATE MODE BUT KEEP EXISTING SECTIONS
-                        try:
-                            # Clear ONLY the preview/rubber band (not finalized sections)
-                            if hasattr(self.app_window, 'section_controller'):
-                                sc = self.app_window.section_controller
-                                
-                                # Clear only preview actors (rubber band, centerline)
-                                renderer = self.app_window.vtk_widget.renderer
-                                
-                                # Remove 2D preview centerline
-                                if hasattr(sc, '_centerline_actor_2d') and sc._centerline_actor_2d:
-                                    renderer.RemoveActor2D(sc._centerline_actor_2d)
-                                    sc._centerline_actor_2d = None
-                                
-                                # Remove 2D preview rectangle
-                                if hasattr(sc, '_rubber_actor_2d') and sc._rubber_actor_2d:
-                                    renderer.RemoveActor2D(sc._rubber_actor_2d)
-                                    sc._rubber_actor_2d = None
-                                
-                                # Remove 3D rubber band (in-progress selection)
-                                if hasattr(sc, 'rubber_actor') and sc.rubber_actor:
-                                    renderer.RemoveActor(sc.rubber_actor)
-                                    sc.rubber_actor = None
-                                
-                                # Reset interactor state (P1, P2)
-                                if hasattr(self.app_window, 'cross_interactor'):
-                                    ci = self.app_window.cross_interactor
-                                    if hasattr(ci, 'P1'):
-                                        ci.P1 = None
-                                    if hasattr(ci, 'P2'):
-                                        ci.P2 = None
-                                    if hasattr(ci, 'slice_state'):
-                                        ci.slice_state = 0
-                            
-                            # Clear interactor reference
-                            if hasattr(self.app_window, 'cross_interactor'):
-                                self.app_window.cross_interactor = None
-                            
-                            # Restore default interactor
-                            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
-                            self.app_window.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
-                            
-                            # Clear state flags
-                            if hasattr(self.app_window, 'cross_section_active'):
-                                self.app_window.cross_section_active = False
-                            
-                            self.app_window.vtk_widget.render()
-                            
-                            print("✅ Cross-section mode deactivated (existing sections preserved)")
-                            
-                        except Exception as e:
-                            print(f"⚠️ Error deactivating cross-section: {e}")
-                        
-                        return True
-                    
-                    # Priority 2: Classification tool
-                    if hasattr(self.app_window, 'active_classify_tool') and self.app_window.active_classify_tool:
-                        print("🛑 ESC - deactivating classification")
-                        self.app_window.deactivate_classification_tool()
-                        return True
-                    
-                    # If neither is active, let ESC pass through
-                    return False
-                
+        if event.type() == QEvent.KeyPress:
             
-                # ====================================================================
-                # PRIORITY 1: Undo/Redo (Ctrl+Z/Y)
-                # ====================================================================
-                if event.modifiers() & Qt.ControlModifier:
+            # ====================================================================
+            # BYPASS SHORTCUTS IF USER IS TYPING IN AN INPUT FIELD
+            # ====================================================================
+            try:
+                from PySide6.QtWidgets import QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox
+                focus_widget = QApplication.focusWidget()
+                if isinstance(focus_widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)):
+                    if not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)):
+                        return False
+                    if event.modifiers() & Qt.ControlModifier and event.key() in (Qt.Key_C, Qt.Key_V, Qt.Key_X, Qt.Key_Z, Qt.Key_Y, Qt.Key_A):
+                        return False
+            except Exception:
+                pass
 
-                    # ✅ Curve tool undo/redo (if curve tool is active)
-                    if hasattr(self.app_window, 'curve_tool') and \
-                       hasattr(self.app_window.curve_tool, 'active') and \
-                       self.app_window.curve_tool.active:
-                        
-                        if event.key() == Qt.Key_Z:
-                            print("🎨 Ctrl+Z → Curve Tool Undo Point")
-                            try:
-                                self.app_window.curve_tool._undo_last_point()
-                            except Exception as e:
-                                print(f"⚠️ Curve undo failed: {e}")
+            # ====================================================================
+            # PRIORITY -2: Shift+ESC - Exit active digitize tool, keep drawings
+            # ====================================================================
+            if event.key() == Qt.Key_Escape and (event.modifiers() & Qt.ShiftModifier):
+                digitizer = getattr(self.app_window, 'digitizer', None)
+                if digitizer and getattr(digitizer, 'active_tool', None):
+                    print("🛑 Shift+ESC - deactivating digitizer tool")
+                    try:
+                        if hasattr(digitizer, '_deactivate_active_tool_keep_drawings') and \
+                        digitizer._deactivate_active_tool_keep_drawings():
                             return True
-                        
-                        elif event.key() == Qt.Key_Y:
-                            print("🎨 Ctrl+Y → Curve Tool Redo Point")
-                            try:
-                                self.app_window.curve_tool._redo_last_point()
-                            except Exception as e:
-                                print(f"⚠️ Curve redo failed: {e}")
-                            return True
+                    except Exception as e:
+                        print(f"⚠️ Shift+ESC digitizer deactivation failed: {e}")
 
-                    # ✅ Curve tool completed-operation undo/redo (when tool is inactive but has history)
-                    elif hasattr(self.app_window, 'curve_tool') and \
-                         not getattr(self.app_window.curve_tool, 'active', False) and \
-                         (getattr(self.app_window.curve_tool, 'history_stack', []) or
-                          getattr(self.app_window.curve_tool, 'history_redo_stack', [])):
-
-                        if event.key() == Qt.Key_Z:
-                            print("🎨 Ctrl+Z → Curve Tool Undo Completed Curve")
-                            try:
-                                self.app_window.curve_tool.undo_curve()
-                            except Exception as e:
-                                print(f"⚠️ Curve undo failed: {e}")
-                            return True
-
-                        elif event.key() == Qt.Key_Y:
-                            print("🎨 Ctrl+Y → Curve Tool Redo Completed Curve")
-                            try:
-                                self.app_window.curve_tool.redo_curve()
-                            except Exception as e:
-                                print(f"⚠️ Curve redo failed: {e}")
-                            return True
-
-                    # ✅ Measurement undo/redo — when measurement tool is active
-                    # ✅ Measurement undo/redo — ONLY when measurement tool is active
-                    #    AND no classification tool has taken over via shortcut
-                    elif hasattr(self.app_window, 'measurement_tool') and \
-                         hasattr(self.app_window.measurement_tool, 'active') and \
-                         self.app_window.measurement_tool.active and \
-                         not getattr(self.app_window, 'active_classify_tool', None) and \
-                         not getattr(self.app_window, 'classify_interactor', None) and \
-                         not getattr(self.app_window, 'classify_interactors', None):
-
-                        measurement_tool = self.app_window.measurement_tool
-
-                        if event.key() == Qt.Key_Z:
-                            print("📏 Ctrl+Z → Measurement Undo")
-                            try:
-                                measurement_tool.undo()
-                            except Exception as e:
-                                print(f"⚠️ Measurement undo failed: {e}")
-                            return True
-
-                        elif event.key() == Qt.Key_Y:
-                            print("📏 Ctrl+Y → Measurement Redo")
-                            try:
-                                measurement_tool.redo()
-                            except Exception as e:
-                                print(f"⚠️ Measurement redo failed: {e}")
-                            return True
+            # ====================================================================
+            # PRIORITY -1: Curve Tool Shortcuts (highest priority)
+            # ====================================================================
+            if hasattr(self.app_window, 'curve_tool'):
+                curve_tool = self.app_window.curve_tool
+                
+                if event.key() == Qt.Key_E and (event.modifiers() & Qt.ShiftModifier):
+                    if curve_tool.selected_curve_data:
+                        print("🎨 Shift+E → Edit Curve Color (curve tool)")
+                        try:
+                            curve_tool._edit_selected_curve_color()
+                        except Exception as e:
+                            print(f"⚠️ Curve color edit failed: {e}")
+                        return True
+                
+                if (event.key() == Qt.Key_Delete or event.key() == Qt.Key_Backspace):
+                    if curve_tool.selected_curve_data and not curve_tool.active:
+                        print("🗑️ Delete → Delete Curve (curve tool)")
+                        try:
+                            curve_tool._delete_selected_curve()
+                        except Exception as e:
+                            print(f"⚠️ Curve delete failed: {e}")
+                        return True
+            
+            # ====================================================================
+            # PRIORITY 0: ESC key - Cancel active modes
+            # ====================================================================
+            if event.key() == Qt.Key_Escape:
+                if getattr(self.app_window, 'cross_action', None) is not None and self.app_window.cross_action.isChecked():
+                    print("🛑 ESC - deactivating cross-section")
                     
-                    # ✅ Curve tool completed-operation undo/redo (when tool is inactive but has history)
-                    elif hasattr(self.app_window, 'curve_tool') and \
-                         not getattr(self.app_window.curve_tool, 'active', False) and \
-                         getattr(getattr(self.app_window, 'ribbon_manager', None), 'current_ribbon', None) == 'curve' and \
-                         (getattr(self.app_window.curve_tool, 'history_stack', []) or
-                          getattr(self.app_window.curve_tool, 'history_redo_stack', [])):
-
-                        if event.key() == Qt.Key_Z:
-                            print("🎨 Ctrl+Z → Curve Tool Undo Completed Curve")
-                            try:
-                                self.app_window.curve_tool.undo_curve()
-                            except Exception as e:
-                                print(f"⚠️ Curve undo failed: {e}")
-                            return True
-
-                        elif event.key() == Qt.Key_Y:
-                            print("🎨 Ctrl+Y → Curve Tool Redo Completed Curve")
-                            try:
-                                self.app_window.curve_tool.redo_curve()
-                            except Exception as e:
-                                print(f"⚠️ Curve redo failed: {e}")
-                            return True
-
-                    # ✅ DIGITIZER undo/redo — if digitizer is enabled, it gets priority
-                    elif hasattr(self.app_window, 'digitizer') and \
-                         self.app_window.digitizer.enabled and \
-                         (getattr(self.app_window.digitizer, 'active_tool', None) or
-                          getattr(getattr(self.app_window, 'ribbon_manager', None), 'current_ribbon', None) == 'draw'):
-                        digitizer = self.app_window.digitizer
-                        
-                        if event.key() == Qt.Key_Z:
-                            print("🎨 Ctrl+Z → Digitizer Undo")
-                            try:
-                                digitizer.undo()
-                            except Exception as e:
-                                print(f"⚠️ Digitizer undo failed: {e}")
-                            return True
-
-                        elif event.key() == Qt.Key_Y:
-                            print("🎨 Ctrl+Y → Digitizer Redo")
-                            try:
-                                digitizer.redo()
-                            except Exception as e:
-                                print(f"⚠️ Digitizer redo failed: {e}")
-                            return True
+                    if getattr(self.app_window, 'cross_action', None) is not None:
+                        self.app_window.cross_action.setChecked(False)
                     
-                    # ✅ CLASSIFICATION undo/redo — only if digitizer is NOT enabled
-                    else:
-                        if event.key() == Qt.Key_Z:
-                            print("🟢 Ctrl+Z → Undo Classification")
-                            try:
-                                self.app_window.undo_classification()
-                            except Exception as e:
-                                print(f"⚠️ Undo failed: {e}")
+                    try:
+                        if hasattr(self.app_window, 'section_controller'):
+                            sc = self.app_window.section_controller
+                            renderer = self.app_window.vtk_widget.renderer
+                            
+                            if hasattr(sc, '_centerline_actor_2d') and sc._centerline_actor_2d:
+                                renderer.RemoveActor2D(sc._centerline_actor_2d)
+                                sc._centerline_actor_2d = None
+                            
+                            if hasattr(sc, '_rubber_actor_2d') and sc._rubber_actor_2d:
+                                renderer.RemoveActor2D(sc._rubber_actor_2d)
+                                sc._rubber_actor_2d = None
+                            
+                            if hasattr(sc, 'rubber_actor') and sc.rubber_actor:
+                                renderer.RemoveActor(sc.rubber_actor)
+                                sc.rubber_actor = None
+                            
+                            if hasattr(self.app_window, 'cross_interactor'):
+                                ci = self.app_window.cross_interactor
+                                if hasattr(ci, 'P1'):
+                                    ci.P1 = None
+                                if hasattr(ci, 'P2'):
+                                    ci.P2 = None
+                                if hasattr(ci, 'slice_state'):
+                                    ci.slice_state = 0
+                        
+                        if hasattr(self.app_window, 'cross_interactor'):
+                            self.app_window.cross_interactor = None
+                        
+                        from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+                        self.app_window.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
+                        
+                        if hasattr(self.app_window, 'cross_section_active'):
+                            self.app_window.cross_section_active = False
+                        
+                        self.app_window.vtk_widget.render()
+                        print("✅ Cross-section mode deactivated (existing sections preserved)")
+                        
+                    except Exception as e:
+                        print(f"⚠️ Error deactivating cross-section: {e}")
+                    
+                    return True
+                
+                if hasattr(self.app_window, 'active_classify_tool') and self.app_window.active_classify_tool:
+                    print("🛑 ESC - deactivating classification")
+                    self.app_window.deactivate_classification_tool()
+                    return True
+                
+                return False
+            
+
+            # ====================================================================
+            # PRIORITY 1: Undo/Redo (Ctrl+Z/Y)
+            # ====================================================================
+            if event.modifiers() & Qt.ControlModifier:
+
+                if hasattr(self.app_window, 'curve_tool') and \
+                hasattr(self.app_window.curve_tool, 'active') and \
+                self.app_window.curve_tool.active:
+                    
+                    if event.key() == Qt.Key_Z:
+                        print("🎨 Ctrl+Z → Curve Tool Undo Point")
+                        try:
+                            self.app_window.curve_tool._undo_last_point()
+                        except Exception as e:
+                            print(f"⚠️ Curve undo failed: {e}")
+                        return True
+                    
+                    elif event.key() == Qt.Key_Y:
+                        print("🎨 Ctrl+Y → Curve Tool Redo Point")
+                        try:
+                            self.app_window.curve_tool._redo_last_point()
+                        except Exception as e:
+                            print(f"⚠️ Curve redo failed: {e}")
+                        return True
+
+                elif hasattr(self.app_window, 'curve_tool') and \
+                    not getattr(self.app_window.curve_tool, 'active', False) and \
+                    (getattr(self.app_window.curve_tool, 'history_stack', []) or
+                    getattr(self.app_window.curve_tool, 'history_redo_stack', [])):
+
+                    if event.key() == Qt.Key_Z:
+                        print("🎨 Ctrl+Z → Curve Tool Undo Completed Curve")
+                        try:
+                            self.app_window.curve_tool.undo_curve()
+                        except Exception as e:
+                            print(f"⚠️ Curve undo failed: {e}")
+                        return True
+
+                    elif event.key() == Qt.Key_Y:
+                        print("🎨 Ctrl+Y → Curve Tool Redo Completed Curve")
+                        try:
+                            self.app_window.curve_tool.redo_curve()
+                        except Exception as e:
+                            print(f"⚠️ Curve redo failed: {e}")
+                        return True
+
+                elif hasattr(self.app_window, 'measurement_tool') and \
+                    hasattr(self.app_window.measurement_tool, 'active') and \
+                    self.app_window.measurement_tool.active and \
+                    not getattr(self.app_window, 'active_classify_tool', None) and \
+                    not getattr(self.app_window, 'classify_interactor', None) and \
+                    not getattr(self.app_window, 'classify_interactors', None):
+
+                    measurement_tool = self.app_window.measurement_tool
+
+                    if event.key() == Qt.Key_Z:
+                        print("📏 Ctrl+Z → Measurement Undo")
+                        try:
+                            measurement_tool.undo()
+                        except Exception as e:
+                            print(f"⚠️ Measurement undo failed: {e}")
+                        return True
+
+                    elif event.key() == Qt.Key_Y:
+                        print("📏 Ctrl+Y → Measurement Redo")
+                        try:
+                            measurement_tool.redo()
+                        except Exception as e:
+                            print(f"⚠️ Measurement redo failed: {e}")
+                        return True
+                
+                elif hasattr(self.app_window, 'curve_tool') and \
+                    not getattr(self.app_window.curve_tool, 'active', False) and \
+                    getattr(getattr(self.app_window, 'ribbon_manager', None), 'current_ribbon', None) == 'curve' and \
+                    (getattr(self.app_window.curve_tool, 'history_stack', []) or
+                    getattr(self.app_window.curve_tool, 'history_redo_stack', [])):
+
+                    if event.key() == Qt.Key_Z:
+                        print("🎨 Ctrl+Z → Curve Tool Undo Completed Curve")
+                        try:
+                            self.app_window.curve_tool.undo_curve()
+                        except Exception as e:
+                            print(f"⚠️ Curve undo failed: {e}")
+                        return True
+
+                    elif event.key() == Qt.Key_Y:
+                        print("🎨 Ctrl+Y → Curve Tool Redo Completed Curve")
+                        try:
+                            self.app_window.curve_tool.redo_curve()
+                        except Exception as e:
+                            print(f"⚠️ Curve redo failed: {e}")
+                        return True
+
+                elif hasattr(self.app_window, 'digitizer') and \
+                    self.app_window.digitizer.enabled and \
+                    (getattr(self.app_window.digitizer, 'active_tool', None) or
+                    getattr(getattr(self.app_window, 'ribbon_manager', None), 'current_ribbon', None) == 'draw'):
+                    digitizer = self.app_window.digitizer
+                    
+                    if event.key() == Qt.Key_Z:
+                        print("🎨 Ctrl+Z → Digitizer Undo")
+                        try:
+                            digitizer.undo()
+                        except Exception as e:
+                            print(f"⚠️ Digitizer undo failed: {e}")
+                        return True
+
+                    elif event.key() == Qt.Key_Y:
+                        print("🎨 Ctrl+Y → Digitizer Redo")
+                        try:
+                            digitizer.redo()
+                        except Exception as e:
+                            print(f"⚠️ Digitizer redo failed: {e}")
+                        return True
+                
+                else:
+                    if event.key() == Qt.Key_Z:
+                        print("🟢 Ctrl+Z → Undo Classification")
+                        try:
+                            self.app_window.undo_classification()
+                        except Exception as e:
+                            print(f"⚠️ Undo failed: {e}")
+                        return True
+
+                    elif event.key() == Qt.Key_Y:
+                        print("🟢 Ctrl+Y → Redo Classification")
+                        try:
+                            self.app_window.redo_classification()
+                        except Exception as e:
+                            print(f"⚠️ Redo failed: {e}")
+                        return True
+
+                if (event.modifiers() & Qt.ShiftModifier):
+                    if event.key() == Qt.Key_D:
+                        if not self._shortcut_guard.try_acquire("Ctrl+Shift+D"):
                             return True
-
-                        elif event.key() == Qt.Key_Y:
-                            print("🟢 Ctrl+Y → Redo Classification")
-                            try:
-                                self.app_window.redo_classification()
-                            except Exception as e:
-                                print(f"⚠️ Redo failed: {e}")
-                            return True
-                    if (event.modifiers() & Qt.ShiftModifier):
-                        if event.key() == Qt.Key_D:
-                            # ✅ GUARD
-                            if not self._shortcut_guard.try_acquire("Ctrl+Shift+D"):
-                                return True
-                            print("🎛️ Ctrl+Shift+D → Apply Display Settings")
-                            try:
-                                # Check if point cloud data is loaded
-                                if not (hasattr(self.app_window, 'data') and self.app_window.data is not None):
-                                    print("   ⚠️ No point cloud data loaded")
-                                    if hasattr(self.app_window, 'statusBar'):
-                                        self.app_window.statusBar().showMessage(
-                                            "⚠️ Please load a point cloud file first (File → Open)",
-                                            3000
-                                        )
-                                    return True
-                                
-                                # ✅ SAVE: Current view selection
-                                saved_slot = None
-                                if hasattr(self.app_window, 'display_mode_dialog') and \
-                                self.app_window.display_mode_dialog is not None:
-                                    saved_slot = self.app_window.display_mode_dialog.current_slot
-                                    print(f"   💾 Current view: {saved_slot}")
-                                
-                                # ── Ensure dialog exists ──────────────────────────────
-                                if not (hasattr(self.app_window, 'display_mode_dialog') and
-                                        self.app_window.display_mode_dialog is not None):
-                                    print("   🔧 Creating Display Mode dialog silently...")
-                                    from gui.display_mode import DisplayModeDialog
-                                    self.app_window.display_mode_dialog = DisplayModeDialog(self.app_window)
-
-                                if hasattr(self.app_window, 'ensure_display_mode_dialog'):
-                                    if not self.app_window.ensure_display_mode_dialog():
-                                        return True
-                                dialog = self.app_window.display_mode_dialog
-
-                                # ── MicroStation Ctrl+Shift+D: push CURRENT PTC palette ──
-                                # to EVERY active view via GPU uniform poke ONLY.
-                                # Zero actor rebuild / remove / create.
-                                # Each view keeps its OWN weight LUT — main-view weights
-                                # are NOT forced onto cross-section views.
-                                print("   📋 Ctrl+Shift+D: GPU-poke all active views with current PTC...")
-
-                                from gui.unified_actor_manager import sync_palette_to_gpu
-
-                                app = self.app_window
-                                views_synced = []
-
-                                # ── Slot 0: Main View ─────────────────────────────────
-                                main_palette = getattr(app, 'class_palette', {})
-                                border0 = float(getattr(app, 'point_border_percent', 0) or 0.0)
-                                if sync_palette_to_gpu(app, 0, main_palette, border0, render=False):
-                                    views_synced.append("Main")
-
-                                # ── Slots 1-4: Cross-section views ───────────────────
-                                if hasattr(app, 'section_vtks'):
-                                    for view_idx, vtk_w in app.section_vtks.items():
-                                        if vtk_w is None:
-                                            continue
-                                        slot_idx = view_idx + 1
-                                        # Use this view's own palette (preserves per-view weights)
-                                        from gui.unified_actor_manager import _get_slot_palette
-                                        sec_palette = _get_slot_palette(app, slot_idx)
-                                        if not sec_palette:
-                                            sec_palette = main_palette
-                                        border_s = float(
-                                            getattr(dialog, 'view_borders', {}).get(slot_idx, 0) or 0
-                                        )
-                                        if sync_palette_to_gpu(app, slot_idx, sec_palette, border_s, render=False):
-                                            views_synced.append(f"V{slot_idx}")
-
-                                # ── Single batched render pass ────────────────────────
-                                try:
-                                    app.vtk_widget.render()
-                                except Exception:
-                                    pass
-                                if hasattr(app, 'section_vtks'):
-                                    for vtk_w in app.section_vtks.values():
-                                        if vtk_w:
-                                            try:
-                                                vtk_w.render()
-                                            except Exception:
-                                                pass
-
-                                msg = f"✅ Ctrl+Shift+D applied to: {', '.join(views_synced)}" \
-                                      if views_synced else "⚠️ No active views to sync"
-                                if hasattr(app, 'statusBar'):
-                                    app.statusBar().showMessage(msg, 2500)
-                                print(f"   {msg}")
-                                
-                            except Exception as e:
-                                print(f"⚠️ Display shortcut failed: {e}")
-                                import traceback
-                                traceback.print_exc()
+                        print("🎛️ Ctrl+Shift+D → Apply Display Settings")
+                        try:
+                            if not (hasattr(self.app_window, 'data') and self.app_window.data is not None):
+                                print("   ⚠️ No point cloud data loaded")
                                 if hasattr(self.app_window, 'statusBar'):
                                     self.app_window.statusBar().showMessage(
-                                        f"❌ Failed to apply display settings: {e}",
+                                        "⚠️ Please load a point cloud file first (File → Open)",
                                         3000
                                     )
-                            finally:
-                                # ✅ Always release guard — even on crash
-                                self._shortcut_guard.force_unlock()
-                            return True
-                        
-                        
-                # ✅ NEW: Apply Shortcuts shortcut (Ctrl+Shift+S)
-                # ====================================================================
-                if event.key() == Qt.Key_S:
-                    print("⚡ Ctrl+Shift+S → Apply Shortcuts from Settings")
-                    try:
-                        # ✅ Import and call the static method
-                        from gui.shortcut_manager import ShortcutManager
-                        ShortcutManager.apply_shortcuts_from_settings(self.app_window)
-                        
-                    except Exception as e:
-                        print(f"⚠️ Apply shortcuts failed: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        if hasattr(self.app_window, 'statusBar'):
-                            self.app_window.statusBar().showMessage(
-                                f"❌ Failed to apply shortcuts: {e}",
-                                3000
-                            )
-                    return True
-                # ====================================================================
-                # Unlock views shortcut (Shift+P) - Context-aware (focused view only)
-                # ====================================================================
-                if (event.modifiers() & Qt.ShiftModifier) and event.key() == Qt.Key_P:
-                    print("🔓 Shift+P → Unlock Focused View")
-                    try:
-                        # Get the currently focused widget
-                        from PySide6.QtWidgets import QApplication
-                        focused = QApplication.focusWidget()
-                        
-                        print(f"   🔍 Focused widget: {type(focused).__name__}")
-                        
-                        # Check if a cross-section view is focused
-                        unlocked_view = None
-                        if hasattr(self.app_window, 'section_vtks') and self.app_window.section_vtks:
-                            for view_idx, vtk_widget in self.app_window.section_vtks.items():
-                                try:
-                                    if (focused == vtk_widget.interactor or
-                                        vtk_widget.interactor.isAncestorOf(focused)):
-                                        # Unlock THIS cross-section view only
-                                        self._unlock_cross_section_view(view_idx, vtk_widget)
-                                        unlocked_view = f"Cross-Section {view_idx + 1}"
-                                        break
-                                except Exception as e:
-                                    print(f"   ⚠️ Error checking view {view_idx}: {e}")
-                        
-                        # If no cross-section focused, unlock main view
-                        if unlocked_view is None:
-                            self._unlock_main_view()
-                            unlocked_view = "Main View"
-                        
-                        if hasattr(self.app_window, 'statusBar'):
-                            self.app_window.statusBar().showMessage(
-                                f"🔓 {unlocked_view} unlocked - 3D rotation enabled",
-                                1500
-                            )
-                    except Exception as e:
-                        print(f"⚠️ Unlock failed: {e}")
-                    return True
-        
-                # ====================================================================
-                # Fit View shortcut (Shift+F) - ONLY Shift, NO Ctrl
-                # ====================================================================
-                # if event.key() == Qt.Key_F:
-                #             print("🧲 Shift+F → Context-Aware Fit View")
-                #             try:
-                #                 self._handle_context_fit_view()
-                #             except Exception as e:
-                #                 print(f"⚠️ Fit view failed: {e}")
-                #             return True
-
-                if (event.modifiers() & Qt.ShiftModifier) and event.key() == Qt.Key_F:
-                    print("🧲 Shift+F → Context-Aware Fit View")
-                    try:
-                        self._handle_context_fit_view()
-                    except Exception as e:
-                        print(f"⚠️ Fit view failed: {e}")
-                    return True           
-                # =====================================
-                # PRIORITY 2: Tool Shortcuts (F1–F12, digits, etc.)
-                # ====================================================================
-
-                # ── Ortho-polygon tool owns Space/Shift+Space ──────────────────────
-                # Space is mapped to TopView in the shortcut table, but when the
-                # ortho-polygon tool is active those keys must reach VTK so the tool
-                # can toggle ORTHO↔FREEHAND (Space) or CURVE mode (Shift+Space).
-                _digitizer = getattr(self.app_window, 'digitizer', None)
-                if (_digitizer and
-                        getattr(_digitizer, 'active_tool', None) == 'orthopolygon' and
-                        event.key() == Qt.Key_Space):
-                    return False   # let it through to VTK
-                # ──────────────────────────────────────────────────────────────────
-
-                key = event.key()
-    
-                # Build modifier string
-                mod_parts = []
-                if event.modifiers() & Qt.ControlModifier:
-                    mod_parts.append("ctrl")
-                if event.modifiers() & Qt.AltModifier:
-                    mod_parts.append("alt")
-                if event.modifiers() & Qt.ShiftModifier:
-                    mod_parts.append("shift")
-                mod = "+".join(mod_parts) if mod_parts else "none"
-    
-                # Robust key normalization (F-keys + digits + others)
-                if Qt.Key_F1 <= key <= Qt.Key_F12:
-                    keyname = f"F{key - Qt.Key_F1 + 1}"
-                elif Qt.Key_0 <= key <= Qt.Key_9:
-                    keyname = chr(ord('0') + (key - Qt.Key_0))
-                else:
-                    keyname = QKeySequence(key).toString().upper() or event.text().upper()
-    
-                combo = (mod.lower(), keyname.upper())
-    
-                print(f"KEY DEBUG → combo={combo}")
-                print("ALL SHORTCUTS NOW:", list(getattr(self.app_window, 'shortcuts', {}).keys()))
-    
-                # Look up in shortcut table
-                # Look up in shortcut table
-                shortcuts = getattr(self.app_window, 'shortcuts', {})
-                shortcut = shortcuts.get(combo)
-
-                tool = None
-                if shortcut:
-                    tool = shortcut.get("tool")  # ✅ ASSIGN TOOL FIRST
-
-                if tool == "DisplayMode":
-                    preset = shortcut.get("preset")
-                    print(f"✅ SHORTCUT MATCH: {combo} → DisplayMode")
-
-                    if not preset:
-                        print("⚠️ DisplayMode shortcut has no preset")
-                        return True
-
-                    # ✅ GUARD: Block if another shortcut is still executing
-                    if not self._shortcut_guard.try_acquire("DisplayMode"):
-                        if hasattr(self.app_window, 'statusBar'):
-                            self.app_window.statusBar().showMessage(
-                                "⚠️ Please wait — previous shortcut still processing", 1500
-                            )
-                        return True
-
-                    try:
-                        print(f"\n{'='*60}")
-                        print(f"🎨 APPLYING DISPLAYMODE PRESET FROM SHORTCUT")
-                        print(f"{'='*60}")
-                        
-                        # ✅ CRITICAL: Extract target_view FIRST before any other operations
-                        views = preset.get("views", {})
-                        border_percent = preset.get("border_percent", 0.0)
-                        
-                        # ✅ Get the TARGET VIEW from the preset (MUST be done first!)
-                        target_view = int(list(views.keys())[0]) if views else 0
-                        print(f"   🎯 TARGET VIEW FROM SHORTCUT: {target_view}")
-
-                        # ====================================================================
-                        # ✅ STEP 0: CHECK IF SAME SHORTCUT ALREADY APPLIED — skip rebuild
-                        # Only skips when the EXACT SAME shortcut key is pressed consecutively.
-                        # Pressing a different shortcut (alt+F2) then back (alt+F1) will
-                        # correctly re-apply because the shortcut ID differs.
-                        # ====================================================================
-                        _current_shortcut_id = combo  # e.g. ('alt', 'F1')
-                        _last_applied_id = getattr(self.app_window, '_last_display_shortcut_id', None)
-
-                        if _last_applied_id == _current_shortcut_id:
-                            # Same key pressed again — verify GPU state actually matches
-                            _state_ok = True
-                            try:
-                                if target_view == 0 and getattr(self.app_window, 'display_mode', None) != 'class':
-                                    _state_ok = False
-                                if _state_ok and target_view == 0:
-                                    _cp = getattr(self.app_window, 'class_palette', None)
-                                    if _cp:
-                                        view_key = str(target_view) if str(target_view) in views else target_view
-                                        _pclasses = views.get(view_key, views.get(str(view_key), {}))
-                                        for _pc, _pi in _pclasses.items():
-                                            _ci = _cp.get(int(_pc))
-                                            if _ci is None or _ci.get('show', True) != _pi.get('show', False):
-                                                _state_ok = False
-                                                break
-                                            if abs(float(_ci.get('weight', 1.0)) - float(_pi.get('weight', 1.0))) > 0.001:
-                                                _state_ok = False
-                                                break
-                            except Exception:
-                                _state_ok = False
-
-                            if _state_ok:
-                                print(f"   ⏭️  SKIPPING — same shortcut {_current_shortcut_id} already applied (no-op)")
-                                print(f"{'='*60}\n")
-                                if hasattr(self.app_window, 'statusBar'):
-                                    self.app_window.statusBar().showMessage(
-                                        "✅ DisplayMode already applied (no rebuild needed)", 2000)
-                                self._shortcut_guard.force_unlock()
                                 return True
+                            
+                            saved_slot = None
+                            if hasattr(self.app_window, 'display_mode_dialog') and \
+                            self.app_window.display_mode_dialog is not None:
+                                saved_slot = self.app_window.display_mode_dialog.current_slot
+                                print(f"   💾 Current view: {saved_slot}")
+                            
+                            if not (hasattr(self.app_window, 'display_mode_dialog') and
+                                    self.app_window.display_mode_dialog is not None):
+                                print("   🔧 Creating Display Mode dialog silently...")
+                                from gui.display_mode import DisplayModeDialog
+                                self.app_window.display_mode_dialog = DisplayModeDialog(self.app_window)
 
-                        print(f"   🔄 Applying preset (last={_last_applied_id}, current={_current_shortcut_id})...")
+                            if hasattr(self.app_window, 'ensure_display_mode_dialog'):
+                                if not self.app_window.ensure_display_mode_dialog():
+                                    return True
+                            dialog = self.app_window.display_mode_dialog
 
-                        # ============================================================================
-                        # ✅ STEP 0A: RESET class_palette VISIBILITY FROM PRESET
-                        # ✅ CRITICAL FIX: ONLY if target is Main View (0)
-                        # ============================================================================
-                        print(f"   🔄 Checking if class_palette reset needed (target={target_view})...")
-                        
-                        if target_view == 0:
-                            # Main View - reset class_palette visibility
-                            print(f"   🔄 Resetting class_palette visibility from preset...")
-                            
-                            # First, set ALL classes to hidden
-                            if hasattr(self.app_window, 'class_palette'):
-                                for code in self.app_window.class_palette:
-                                    self.app_window.class_palette[code]["show"] = False
-                            
-                            # Then, apply visibility from the preset's main view
-                            view_key = str(target_view) if str(target_view) in views else target_view
-                            preset_classes = views.get(view_key, views.get(str(view_key), {}))
-                            
-                            for code, info in preset_classes.items():
-                                code_int = int(code)
-                                if code_int in self.app_window.class_palette:
-                                    self.app_window.class_palette[code_int]["show"] = info.get("show", False)
-                                    self.app_window.class_palette[code_int]["weight"] = info.get("weight", 1.0)
-                                    print(f"      Class {code_int}: show={info.get('show', False)}")
-                            
-                            print(f"   ✅ class_palette reset complete (Main View)")
-                        else:
-                            # Cross-section or Cut View - DO NOT touch class_palette at all
-                            print(f"   ⏭️  Skipped class_palette reset (target is View {target_view}, not Main View)")
-                            print(f"   ✅ Main View class_palette remains COMPLETELY UNCHANGED")
-                    
+                            print("   📋 Ctrl+Shift+D: GPU-poke all active views with current PTC...")
 
-                        if target_view == 0:
-                            # ✅ Target is Main View - safe to clear shading
-                            print(f"   🧹 Clearing Main View shading mode actors...")
-                            if hasattr(self.app_window, '_shaded_mesh_actor') and self.app_window._shaded_mesh_actor:
-                                try:
-                                    self.app_window.vtk_widget.remove_actor('shaded_mesh', render=False)
-                                    self.app_window._shaded_mesh_actor = None
-                                    print(f"      ✅ Removed Main View shading mesh actor")
-                                except Exception as e:
-                                    print(f"      ⚠️ Could not remove shading actor: {e}")
- 
-                            if hasattr(self.app_window, '_shaded_mesh_polydata'):
-                                self.app_window._shaded_mesh_polydata = None
- 
-                            # Clear shading cache for Main View
-                            try:
-                                from gui.shading_display import clear_shading_cache
-                                clear_shading_cache("Main View switching to DisplayMode")
-                                print(f"      ✅ Cleared Main View shading cache")
-                            except Exception as e:
-                                print(f"      ⚠️ Could not clear shading cache: {e}")
- 
-                            # Set Main View display mode back to classification
-                            self.app_window.display_mode = 'class'
-                            if hasattr(self.app_window, 'current_display_mode'):
-                                self.app_window.current_display_mode = 'class'
-                            print(f"      ✅ Set Main View display mode to 'class'")
- 
-                            # ✅ FAST PATH: Use GPU sync if actor exists, full rebuild only if needed
-                            try:
-                                from gui.unified_actor_manager import sync_palette_to_gpu, _get_unified_actor
-                                _actor = _get_unified_actor(self.app_window)
-                                if _actor is not None:
-                                    # Actor exists — GPU uniform poke only (~300ms)
-                                    sync_palette_to_gpu(
-                                        self.app_window, 0,
-                                        self.app_window.class_palette,
-                                        border_percent, render=True
+                            from gui.unified_actor_manager import sync_palette_to_gpu
+
+                            app = self.app_window
+                            views_synced = []
+
+                            main_palette = getattr(app, 'class_palette', {})
+                            border0 = float(getattr(app, 'point_border_percent', 0) or 0.0)
+                            if sync_palette_to_gpu(app, 0, main_palette, border0, render=False):
+                                views_synced.append("Main")
+
+                            if hasattr(app, 'section_vtks'):
+                                for view_idx, vtk_w in app.section_vtks.items():
+                                    if vtk_w is None:
+                                        continue
+                                    slot_idx = view_idx + 1
+                                    from gui.unified_actor_manager import _get_slot_palette
+                                    sec_palette = _get_slot_palette(app, slot_idx)
+                                    if not sec_palette:
+                                        sec_palette = main_palette
+                                    border_s = float(
+                                        getattr(dialog, 'view_borders', {}).get(slot_idx, 0) or 0
                                     )
-                                    print(f"      ⚡ Fast GPU sync (actor exists)")
-                                else:
-                                    # No actor — need full build (first time / after mode switch)
-                                    from gui.class_display import update_class_mode
-                                    update_class_mode(self.app_window, force_refresh=True)
-                                    print(f"      ✅ Full classification render (no actor)")
-                            except Exception as e:
-                                print(f"      ⚠️ Fast path failed, falling back: {e}")
-                                from gui.class_display import update_class_mode
-                                update_class_mode(self.app_window, force_refresh=True)
-                        else:
-                            # ✅ Target is Cross Section or Cut View - DO NOT TOUCH MAIN VIEW!
-                            print(f"   ⏭️  Target is View {target_view}, NOT Main View")
-                            print(f"   ✅ Skipping shading actor clear - Main View UNCHANGED")
-                            print(f"   ✅ Skipping display_mode reset - Main View UNCHANGED")
-                            print(f"   ✅ Main View shading state PRESERVED")
-                            print(f"   🎯 Only updating Cross Section View {target_view}")
-                        
-                        view_names = ["Main View", "View 1", "View 2", "View 3", "View 4", "Cut Section"]
-                        
-                        print(f"   📋 Border: {border_percent}%")
-                        print(f"   📋 Views configured: {list(views.keys())}")
-                        
-                        # ✅ Initialize display_mode_dialog if needed
-                        if not hasattr(self.app_window, 'display_mode_dialog') or self.app_window.display_mode_dialog is None:
-                            from gui.display_mode import DisplayModeDialog
-                            self.app_window.display_mode_dialog = DisplayModeDialog(self.app_window)
-                            print("   🔧 Created DisplayModeDialog")
-                        
-                        dlg = self.app_window.display_mode_dialog
-                        
-                        # Initialize structures if needed
-                        if not hasattr(dlg, 'view_palettes'):
-                            dlg.view_palettes = {}
-                        if not hasattr(dlg, 'view_borders'):
-                            dlg.view_borders = {}
-                        if not hasattr(dlg, 'slot_shows'):
-                            dlg.slot_shows = {}
-                        
-                        # ============================================================================
-                        # ✅ STEP 1: UPDATE THE SLOT DROPDOWN TO SHOW THE TARGET VIEW
-                        # ============================================================================
-                        print(f"\n   🔄 SWITCHING DISPLAY MODE DIALOG TO VIEW {target_view}")
-                        
-                        # Update current_slot
-                        dlg.current_slot = target_view
-                        
-                        # ✅ Update the slot dropdown widget
-                        slot_widget = None
-                        for attr_name in ['slot_box', 'slot_combo', 'view_combo', 'view_selector']:
-                            if hasattr(dlg, attr_name):
-                                slot_widget = getattr(dlg, attr_name)
-                                if slot_widget is not None:
-                                    slot_widget.blockSignals(True)
-                                    slot_widget.setCurrentIndex(target_view)
-                                    slot_widget.blockSignals(False)
-                                    print(f"   ✅ Updated {attr_name} to index {target_view}")
-                                    break
-                        
-                        if slot_widget is None:
-                            print(f"   ⚠️ Could not find slot dropdown widget")
-                        
-                        # ============================================================================
-                        # ✅ STEP 2: PROCESS PRESET DATA INTO DIALOG STATE
-                        # ============================================================================
-                        for view_idx_str, classes in views.items():
-                            view_idx = int(view_idx_str)
-                            
-                            print(f"   🔍 Processing View {view_idx} with {len(classes)} classes")
-                            
-                            # Deep copy to view_palettes
-                            dlg.view_palettes[view_idx] = {}
-                            if view_idx not in dlg.slot_shows:
-                                dlg.slot_shows[view_idx] = {}
-                            
-                            for code, info in classes.items():
-                                code_int = int(code)
-                                dlg.view_palettes[view_idx][code_int] = {
-                                    "show": info.get("show", False),
-                                    "description": info.get("description", ""),
-                                    "color": tuple(info.get("color", (128, 128, 128))),
-                                    "weight": float(info.get("weight", 1.0)),
-                                    "draw": info.get("draw", ""),
-                                    "lvl": info.get("lvl", "")
-                                }
-                                dlg.slot_shows[view_idx][code_int] = info.get("show", False)
-                            
-                            dlg.view_borders[view_idx] = border_percent
-                            
-                            visible = [c for c, i in dlg.view_palettes[view_idx].items() if i.get("show")]
-                            print(f"   ✅ View {view_idx}: {len(visible)} visible classes")
+                                    if sync_palette_to_gpu(app, slot_idx, sec_palette, border_s, render=False):
+                                        views_synced.append(f"V{slot_idx}")
 
-                        # ============================================================================
-                        # ✅ STEP 3: SYNC TO APP_WINDOW - ONLY the target view
-                        # ============================================================================
-                        if not hasattr(self.app_window, 'view_palettes'):
-                            self.app_window.view_palettes = {}
-                        
-                        for view_idx_str, classes in views.items():
-                            view_idx = int(view_idx_str)
-                            self.app_window.view_palettes[view_idx] = {}
-                            
-                            for code, info in classes.items():
-                                code_int = int(code)
-                                preset_weight = info.get("weight", 1.0)
-                                
-                                self.app_window.view_palettes[view_idx][code_int] = {
-                                    "show": info.get("show", False),
-                                    "description": info.get("description", ""),
-                                    "color": tuple(info.get("color", (128, 128, 128))),
-                                    "weight": preset_weight,
-                                    "draw": info.get("draw", ""),
-                                    "lvl": info.get("lvl", "")
-                                }
-                                
-                                # ✅ CRITICAL FIX: ONLY sync to class_palette if this is Main View (0)
-                                if view_idx == 0 and code_int in self.app_window.class_palette:
-                                    self.app_window.class_palette[code_int]["show"] = info.get("show", False)
-                                    self.app_window.class_palette[code_int]["weight"] = preset_weight
-
-                        # ✅ Log what was synced
-                        for view_idx in views.keys():
-                            view_idx = int(view_idx)
-                            if view_idx == 0:
-                                print(f"   ✅ Synced to app.view_palettes[{view_idx}] AND app.class_palette")
-                            else:
-                                print(f"   ✅ Synced to app.view_palettes[{view_idx}] ONLY (Main View untouched)")
-
-                        # ============================================================================
-                        # ✅ STEP 4: REFRESH DIALOG UI FOR TARGET VIEW
-                        # ============================================================================
-                        if dlg.isVisible():
-                            print(f"\n   🔄 REFRESHING DIALOG UI FOR TARGET VIEW {target_view}")
-                            
-                            dlg.blockSignals(True)
                             try:
-                                # Reload checkboxes
-                                if hasattr(dlg, '_load_slot_checkboxes'):
-                                    dlg._load_slot_checkboxes(target_view)
-                                    print(f"   ✅ Checkboxes reloaded")
-                                
-                                # Reload weights
-                                if hasattr(dlg, '_load_slot_weights'):
-                                    dlg._load_slot_weights(target_view)
-                                    print(f"   ✅ Weights reloaded")
-                                
-                                # Update border display
-                                if hasattr(dlg, 'load_view_border'):
-                                    dlg.load_view_border(target_view)
-                                
-                                if hasattr(dlg, 'border_label'):
-                                    dlg.border_label.setText(f"🔳 Border: {border_percent}%")
-                                if hasattr(dlg, 'border_value_display'):
-                                    dlg.border_value_display.setText(f"{border_percent}%")
-                                if hasattr(dlg, 'border_slider'):
-                                    dlg.border_slider.blockSignals(True)
-                                    dlg.border_slider.setValue(int(border_percent))
-                                    dlg.border_slider.blockSignals(False)
-                                
-                                # Update window title
-                                view_name = view_names[target_view] if target_view < len(view_names) else f"View {target_view}"
-                                dlg.setWindowTitle(f"Display Mode - {view_name} ✓")
-                                print(f"   ✅ Title updated to: {view_name}")
-                                
-                            finally:
-                                dlg.blockSignals(False)
-                        
-                        # ============================================================================
-                        # ✅ STEP 4B: SYNC class_palette - ONLY if target is Main View
-                        # ============================================================================
-                        print(f"\n   🔄 CHECKING IF MAIN VIEW SYNC NEEDED (target={target_view})")
-                        
-                        if target_view == 0:
-                            # Main View - sync to class_palette
-                            if target_view in self.app_window.view_palettes:
-                                for code, info in self.app_window.view_palettes[target_view].items():
-                                    if code in self.app_window.class_palette:
-                                        self.app_window.class_palette[code]["show"] = info.get("show", False)
-                                        self.app_window.class_palette[code]["weight"] = info.get("weight", 1.0)
-                                print(f"   ✅ class_palette synced from view_palettes[0]")
-                        else:
-                            # Cross-section or Cut View - DO NOT touch class_palette
-                            print(f"   ⏭️  Skipped class_palette sync (View {target_view}, not Main View)")
-                            print(f"   ✅ Main View class_palette UNCHANGED")
-
-                        # ============================================================================
-                        # ✅ STEP 5: CHECK CURRENT DISPLAY MODE AND ADJUST BORDERS
-                        # ============================================================================
-                        current_display_mode = getattr(self.app_window, 'display_mode', 'class')
-                        print(f"\n   🎨 CURRENT DISPLAY MODE: {current_display_mode}")
-
-                        if current_display_mode in ['depth', 'rgb', 'intensity']:
-                            print(f"   🔳 Forcing borders to 0 for {current_display_mode} mode")
-                            border_percent = 0
-                            self.app_window.point_border_percent = 0
-                            self.app_window._main_view_borders_active = False
-                            dlg.view_borders[target_view] = 0
-                            
-                            if dlg.isVisible():
-                                if hasattr(dlg, 'border_label'):
-                                    dlg.border_label.setText(f"🔳 Border: 0%")
-                                if hasattr(dlg, 'border_value_display'):
-                                    dlg.border_value_display.setText("0%")
-                                if hasattr(dlg, 'border_slider'):
-                                    dlg.border_slider.blockSignals(True)
-                                    dlg.border_slider.setValue(0)
-                                    dlg.border_slider.blockSignals(False)
-                        else:
-                            print(f"   🔳 Using preset border {border_percent}% for classification mode")
-                            if target_view == 0:  # Only set border for Main View
-                                self.app_window.point_border_percent = border_percent
-                                self.app_window._main_view_borders_active = (border_percent > 0)
-
-                        # ============================================================================
-                        # ✅ STEP 6: REFRESH VIEWS
-                        # ============================================================================
-                        self.app_window._preserve_shortcut_visibility = True
-
-                        # Main View refresh - ONLY if target is Main View (0)
-                        if target_view == 0 and 0 in views:
-                            dlg.view_borders[0] = border_percent
-                            
-                            # ✅ FAST PATH: GPU sync only (actor already built in STEP 0A)
-                            try:
-                                from gui.unified_actor_manager import sync_palette_to_gpu, _get_unified_actor
-                                _actor = _get_unified_actor(self.app_window)
-                                if _actor is not None:
-                                    self.app_window._preserve_view = True
-                                    sync_palette_to_gpu(
-                                        self.app_window, 0,
-                                        self.app_window.class_palette,
-                                        border_percent, render=True
-                                    )
-                                    print(f"   ⚡ Main view GPU sync with border={border_percent}%")
-                                else:
-                                    from gui.class_display import update_class_mode
-                                    self.app_window._preserve_view = True
-                                    update_class_mode(self.app_window, force_refresh=True)
-                                    print(f"   ✅ Main view rebuilt (no actor)")
-                            except Exception as _sync_err:
-                                print(f"   ⚠️ GPU sync failed, falling back: {_sync_err}")
-                                from gui.class_display import update_class_mode
-                                self.app_window._preserve_view = True
-                                update_class_mode(self.app_window, force_refresh=True)
-
-                        # Cross-section views refresh
-                        all_section_views = [v for v in views.keys() if 1 <= int(v) <= 5]
-                        if all_section_views:
-                            print(f"\n   🔄 SYNCING SECTION VIEWS: {all_section_views}")
-                            for view_idx_str in all_section_views:
-                                view_idx = int(view_idx_str)
-
-                                # Handle Cut Section (View 5) separately
-                                if view_idx == 5:
-                                    if hasattr(self.app_window, 'cut_vtk') and self.app_window.cut_vtk is not None:
+                                app.vtk_widget.render()
+                            except Exception:
+                                pass
+                            if hasattr(app, 'section_vtks'):
+                                for vtk_w in app.section_vtks.values():
+                                    if vtk_w:
                                         try:
-                                            print(f"\n      🔪 REFRESHING CUT SECTION (View 5)")
-                                            self._refresh_cut_section(view_idx)
-                                            print(f"      ✅ Cut Section refreshed")
-                                        except Exception as e:
-                                            print(f"      ⚠️ Cut Section refresh failed: {e}")
-                                            import traceback
-                                            traceback.print_exc()
-                                    continue
+                                            vtk_w.render()
+                                        except Exception:
+                                            pass
 
-                                # Cross-Sections (Views 1-4) — use unified actor
-                                view_index = view_idx - 1
-
-                                if not (hasattr(self.app_window, 'section_vtks') and view_index in self.app_window.section_vtks):
-                                    continue
-
-                                try:
-                                    from gui.unified_actor_manager import build_section_unified_actor
-
-                                    # ── palette is already written into dlg.view_palettes[view_idx]
-                                    # ── and app.view_palettes[view_idx] by STEP 2/3 above.
-                                    # ── build_section_unified_actor() reads _get_slot_palette(app, slot_idx)
-                                    # ── where slot_idx = view_idx (== view_index + 1), so it will pick
-                                    # ── up the new palette automatically.
-                                    # ── It also removes the existing unified actor + any stale class_*
-                                    # ── actors internally, so no manual actor cleanup is needed here.
-
-                                    actor = build_section_unified_actor(
-                                        self.app_window,
-                                        view_index,          # 0-based
-                                        border_percent=border_percent,
-                                    )
-
-                                    if actor is not None:
-                                        slot_idx = view_idx          # slot_idx == view_idx for sections
-                                        visible = [
-                                            c for c, info in
-                                            self.app_window.view_palettes.get(view_idx, {}).items()
-                                            if info.get("show", False)
-                                        ]
-                                        print(f"      👁️ Visible in View {view_idx}: {sorted(visible)}")
-                                        print(f"      ✅ Synced View {view_idx}: unified actor rebuilt "
-                                              f"({len(visible)} classes visible)")
-                                    else:
-                                        print(f"      ⚠️ View {view_idx}: no data yet — skipped")
-
-                                except Exception as e:
-                                    print(f"      ⚠️ View {view_idx} sync failed: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                        
-                        # ✅ Track which shortcut was last applied (for skip-if-same guard)
-                        self.app_window._last_display_shortcut_id = _current_shortcut_id
-
-                        # Status message
-                        total_visible = sum(
-                            sum(1 for c in classes.values() if c.get("show"))
-                            for classes in views.values()
-                        )
-                        
-                        if hasattr(self.app_window, 'statusBar'):
-                            view_names_short = []
-                            for v in sorted([int(x) for x in views.keys()]):
-                                if v == 0: view_names_short.append("Main")
-                                elif v == 5: view_names_short.append("Cut")
-                                else: view_names_short.append(f"V{v}")
+                            msg = f"✅ Ctrl+Shift+D applied to: {', '.join(views_synced)}" \
+                                if views_synced else "⚠️ No active views to sync"
+                            if hasattr(app, 'statusBar'):
+                                app.statusBar().showMessage(msg, 2500)
+                            print(f"   {msg}")
                             
-                            self.app_window.statusBar().showMessage(
-                                f"✅ DisplayMode: {view_names_short[0]} active, {total_visible} classes visible",
-                                2500
-                            )
-                        
-                        print(f"   ✅ DisplayMode shortcut complete - {view_names[target_view]} now active")
-                        print(f"{'='*60}\n")
-                        
-                    except Exception as e:
-                        print(f"⚠️ Failed to apply DisplayMode preset: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    
-                    finally:
-                        # ✅ NO import here — use module-level QTimer via _QTimer alias
-                        _QTimer.singleShot(
-                            1000,
-                            lambda: setattr(
-                                self.app_window,
-                                '_preserve_shortcut_visibility',
-                                False
-                            )
-                        )
-                        _QTimer.singleShot(
-                            ShortcutExecutionGuard.COOLDOWN_DISPLAY,
-                            self._shortcut_guard.force_unlock
-                        )
-
-                    return True
-                    
-                if tool == "ShadingMode":
-                    preset = shortcut.get("preset")
-                    print(f"✅ SHORTCUT MATCH: {combo} → ShadingMode")
-
-                    if not preset:
-                        print("⚠️ ShadingMode shortcut has no preset")
+                        except Exception as e:
+                            print(f"⚠️ Display shortcut failed: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            if hasattr(self.app_window, 'statusBar'):
+                                self.app_window.statusBar().showMessage(
+                                    f"❌ Failed to apply display settings: {e}",
+                                    3000
+                                )
+                        finally:
+                            self._shortcut_guard.force_unlock()
                         return True
-
-                    # ✅ GUARD: Block if another shortcut is still executing
-                    if not self._shortcut_guard.try_acquire("ShadingMode"):
-                        if hasattr(self.app_window, 'statusBar'):
-                            self.app_window.statusBar().showMessage(
-                                "⚠️ Please wait — previous shortcut still processing", 1500
-                            )
-                        return True
-
-                    try:
-                        print(f"\n{'='*60}")
-                        print(f"🌗 APPLYING SHADINGMODE PRESET FROM SHORTCUT")
-                        print(f"{'='*60}")
-
-                        # ====================================================================
-                        # ✅ GUARD: Skip if this exact shading is already active
-                        # ====================================================================
-                        _skip_shading = False
+                    
+                    if event.key() == Qt.Key_S:
+                        print("⚡ Ctrl+Shift+S → Apply Shortcuts from Settings")
                         try:
-                            if getattr(self.app_window, 'display_mode', None) == 'shaded_class' \
-                                    and hasattr(self.app_window, '_shaded_mesh_actor') \
-                                    and self.app_window._shaded_mesh_actor is not None:
-                                # Check params match
-                                _az_match = abs(getattr(self.app_window, 'last_shade_azimuth', -1) - preset.get('azimuth', 45.0)) < 0.01
-                                _an_match = abs(getattr(self.app_window, 'last_shade_angle', -1) - preset.get('angle', 45.0)) < 0.01
-                                _am_match = abs(getattr(self.app_window, 'shade_ambient', -1) - preset.get('ambient', 0.2)) < 0.01
-                                if _az_match and _an_match and _am_match:
-                                        # Check visibility match
-                                        _p_vis = set(int(c) for c, i in preset.get("classes", {}).items() if i.get("show", False))
-                                        _c_vis = getattr(self.app_window, '_shading_visibility_override', None)
-                                        if _c_vis is None:
-                                            # Override is cleared 200ms after shortcut completes,
-                                            # fall back to the persisted visible-classes set
-                                            # (written by update_shaded_class and never cleared)
-                                            _c_vis = getattr(self.app_window, '_shading_visible_classes', None)
-                                        if _c_vis is not None and isinstance(_c_vis, set) and _c_vis == _p_vis:
-                                            _skip_shading = True
-                        except Exception:
-                            _skip_shading = False
+                            from gui.shortcut_manager import ShortcutManager
+                            ShortcutManager.apply_shortcuts_from_settings(self.app_window)
+                            
+                        except Exception as e:
+                            print(f"⚠️ Apply shortcuts failed: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            if hasattr(self.app_window, 'statusBar'):
+                                self.app_window.statusBar().showMessage(
+                                    f"❌ Failed to apply shortcuts: {e}",
+                                    3000
+                                )
+                        return True
 
-                        if _skip_shading:
-                            print(f"   ⏭️  SKIPPING — same shading already active (no-op)")
+            # ====================================================================
+            # Unlock views shortcut (Shift+P)
+            # ====================================================================
+            if (event.modifiers() & Qt.ShiftModifier) and event.key() == Qt.Key_P:
+                print("🔓 Shift+P → Unlock Focused View")
+                try:
+                    from PySide6.QtWidgets import QApplication
+                    focused = QApplication.focusWidget()
+                    print(f"   🔍 Focused widget: {type(focused).__name__}")
+                    
+                    unlocked_view = None
+                    if hasattr(self.app_window, 'section_vtks') and self.app_window.section_vtks:
+                        for view_idx, vtk_widget in self.app_window.section_vtks.items():
+                            try:
+                                if (focused == vtk_widget.interactor or
+                                    vtk_widget.interactor.isAncestorOf(focused)):
+                                    self._unlock_cross_section_view(view_idx, vtk_widget)
+                                    unlocked_view = f"Cross-Section {view_idx + 1}"
+                                    break
+                            except Exception as e:
+                                print(f"   ⚠️ Error checking view {view_idx}: {e}")
+                    
+                    if unlocked_view is None:
+                        self._unlock_main_view()
+                        unlocked_view = "Main View"
+                    
+                    if hasattr(self.app_window, 'statusBar'):
+                        self.app_window.statusBar().showMessage(
+                            f"🔓 {unlocked_view} unlocked - 3D rotation enabled",
+                            1500
+                        )
+                except Exception as e:
+                    print(f"⚠️ Unlock failed: {e}")
+                return True
+
+            # ====================================================================
+            # Fit View shortcut (Shift+F)
+            # ====================================================================
+            if (event.modifiers() & Qt.ShiftModifier) and event.key() == Qt.Key_F:
+                print("🧲 Shift+F → Context-Aware Fit View")
+                try:
+                    self._handle_context_fit_view()
+                except Exception as e:
+                    print(f"⚠️ Fit view failed: {e}")
+                return True
+
+            # ====================================================================
+            # PRIORITY 2: Tool Shortcuts (F1–F12, digits, etc.)
+            # ====================================================================
+
+            _digitizer = getattr(self.app_window, 'digitizer', None)
+            if (_digitizer and
+                    getattr(_digitizer, 'active_tool', None) == 'orthopolygon' and
+                    event.key() == Qt.Key_Space):
+                return False
+
+            key = event.key()
+
+            mod_parts = []
+            if event.modifiers() & Qt.ControlModifier:
+                mod_parts.append("ctrl")
+            if event.modifiers() & Qt.AltModifier:
+                mod_parts.append("alt")
+            if event.modifiers() & Qt.ShiftModifier:
+                mod_parts.append("shift")
+            mod = "+".join(mod_parts) if mod_parts else "none"
+
+            if Qt.Key_F1 <= key <= Qt.Key_F12:
+                keyname = f"F{key - Qt.Key_F1 + 1}"
+            elif Qt.Key_0 <= key <= Qt.Key_9:
+                keyname = chr(ord('0') + (key - Qt.Key_0))
+            else:
+                keyname = QKeySequence(key).toString().upper() or event.text().upper()
+
+            combo = (mod.lower(), keyname.upper())
+
+            print(f"KEY DEBUG → combo={combo}")
+            print("ALL SHORTCUTS NOW:", list(getattr(self.app_window, 'shortcuts', {}).keys()))
+
+            shortcuts = getattr(self.app_window, 'shortcuts', {})
+            shortcut = shortcuts.get(combo)
+
+            tool = None
+            if shortcut:
+                tool = shortcut.get("tool")
+
+            # ====================================================================
+            # DisplayMode shortcut handler
+            # ====================================================================
+            if tool == "DisplayMode":
+                preset = shortcut.get("preset")
+                print(f"✅ SHORTCUT MATCH: {combo} → DisplayMode")
+
+                if not preset:
+                    print("⚠️ DisplayMode shortcut has no preset")
+                    return True
+
+                if not self._shortcut_guard.try_acquire("DisplayMode"):
+                    if hasattr(self.app_window, 'statusBar'):
+                        self.app_window.statusBar().showMessage(
+                            "⚠️ Please wait — previous shortcut still processing", 1500
+                        )
+                    return True
+
+                try:
+                    print(f"\n{'='*60}")
+                    print(f"🎨 APPLYING DISPLAYMODE PRESET FROM SHORTCUT")
+                    print(f"{'='*60}")
+                    
+                    views = preset.get("views", {})
+                    border_percent = preset.get("border_percent", 0.0)
+                    
+                    target_view = int(list(views.keys())[0]) if views else 0
+                    print(f"   🎯 TARGET VIEW FROM SHORTCUT: {target_view}")
+
+                    # ============================================================
+                    # STEP 0: CHECK IF SAME SHORTCUT ALREADY APPLIED — skip rebuild
+                    # ============================================================
+                    _current_shortcut_id = combo
+                    _last_applied_id = getattr(
+                        self.app_window, '_last_display_shortcut_id', None
+                    )
+
+                    # lines 540–565 — REPLACE the entire if block with this:
+                    
+                    if _last_applied_id == _current_shortcut_id:
+                        _state_ok = True
+                        try:
+                            if target_view == 0 and \
+                                    getattr(self.app_window, 'display_mode', None) != 'class':
+                                _state_ok = False
+                            if _state_ok and target_view == 0:
+                                _cp = getattr(self.app_window, 'class_palette', None)
+                                if _cp:
+                                    view_key = str(target_view) if str(target_view) in views \
+                                        else target_view
+                                    _pclasses = views.get(
+                                        view_key, views.get(str(view_key), {})
+                                    )
+                                    for _pc, _pi in _pclasses.items():
+                                        _ci = _cp.get(int(_pc))
+                                        if _ci is None or \
+                                                _ci.get('show', True) != _pi.get('show', False):
+                                            _state_ok = False
+                                            break
+                                        if abs(float(_ci.get('weight', 1.0)) -
+                                            float(_pi.get('weight', 1.0))) > 0.001:
+                                            _state_ok = False
+                                            break
+                            elif _state_ok and target_view != 0:
+                                _vp = getattr(self.app_window, 'view_palettes', {}).get(target_view)
+                                if not _vp:
+                                    _state_ok = False
+                                else:
+                                    view_key = str(target_view) if str(target_view) in views \
+                                        else target_view
+                                    _pclasses = views.get(
+                                        view_key, views.get(str(view_key), {})
+                                    )
+                                    for _pc, _pi in _pclasses.items():
+                                        _ci = _vp.get(int(_pc))
+                                        if _ci is None or \
+                                                _ci.get('show', True) != _pi.get('show', False):
+                                            _state_ok = False
+                                            break
+                                        if abs(float(_ci.get('weight', 1.0)) -
+                                            float(_pi.get('weight', 1.0))) > 0.001:
+                                            _state_ok = False
+                                            break
+                        except Exception:
+                            _state_ok = False
+
+                        if _state_ok:
+                            print(f"   ⏭️  SKIPPING — same shortcut already applied (no-op)")
                             print(f"{'='*60}\n")
                             if hasattr(self.app_window, 'statusBar'):
                                 self.app_window.statusBar().showMessage(
-                                    "✅ ShadingMode already applied (no rebuild needed)", 2000)
+                                    "✅ DisplayMode already applied (no rebuild needed)", 2000
+                                )
                             self._shortcut_guard.force_unlock()
                             return True
 
-                        # STEP 1: Hide classification point actors
-                        if hasattr(self.app_window, 'vtk_widget'):
-                            for name in list(self.app_window.vtk_widget.actors.keys()):
-                                if str(name).startswith("class_"):
-                                    self.app_window.vtk_widget.actors[name].SetVisibility(False)
+                    print(f"   🔄 Applying preset "
+                        f"(last={_last_applied_id}, current={_current_shortcut_id})...")
 
-                        # STEP 2: Set display mode
-                        self.app_window.display_mode = "shaded_class"
-                        if hasattr(self.app_window, 'current_display_mode'):
-                            self.app_window.current_display_mode = "shaded_class"
+                    # ============================================================
+                    # STEP 0A: Reset class_palette visibility + clear shading
+                    # ✅ FIX: Properly transition from shading to classification
+                    # ============================================================
+                    print(f"   🔄 Checking display state (target={target_view})...")
 
-                        # STEP 3: Reset ALL classes hidden, apply preset visibility
-                        classes = preset.get("classes", {})
+                    if target_view == 0:
 
+                        # ✅ FIX STEP 1: Record previous display mode BEFORE changing
+                        previous_display_mode = getattr(
+                            self.app_window, 'display_mode', 'class'
+                        )
+                        was_shading = previous_display_mode in (
+                            'shaded_class', 'shading', 'hillshade'
+                        )
+                        print(f"   🔍 Previous display mode: '{previous_display_mode}' "
+                            f"| was_shading={was_shading}")
+
+                        # ✅ FIX STEP 2: Reset class_palette visibility from preset
+                        print(f"   🔄 Resetting class_palette visibility from preset...")
                         if hasattr(self.app_window, 'class_palette'):
                             for code in self.app_window.class_palette:
                                 self.app_window.class_palette[code]["show"] = False
 
-                        visible_set = set()
-                        if classes:
-                            for code, info in classes.items():
-                                code_int = int(code)
-                                if code_int in self.app_window.class_palette:
-                                    is_visible = info.get("show", False)
-                                    self.app_window.class_palette[code_int]["show"] = is_visible
-                                    if is_visible:
-                                        visible_set.add(code_int)
-                        else:
-                            if hasattr(self.app_window, 'class_palette'):
-                                for code in self.app_window.class_palette:
-                                    self.app_window.class_palette[code]["show"] = True
-                                    visible_set.add(int(code))
-
-                        visible_count = len(visible_set)
-                        print(f"   ✅ Visible classes: {sorted(visible_set)}")
-
-                        # ✅ Set override BEFORE calling update_shaded_class
-                        self.app_window._shading_visibility_override = visible_set
-
-                        # STEP 4: Sync to display_mode_dialog AND UPDATE CHECKBOXES
-                        if hasattr(self.app_window, 'display_mode_dialog') and \
-                                self.app_window.display_mode_dialog is not None:
-                            dlg = self.app_window.display_mode_dialog
-
-                            if not hasattr(dlg, 'view_palettes'):
-                                dlg.view_palettes = {}
-                            if 0 not in dlg.view_palettes:
-                                dlg.view_palettes[0] = {}
-
-                            for code, entry in self.app_window.class_palette.items():
-                                dlg.view_palettes[0][int(code)] = {
-                                    "show": entry.get("show", False),
-                                    "color": entry.get("color", (128, 128, 128)),
-                                    "weight": entry.get("weight", 1.0),
-                                }
-
-                            if hasattr(dlg, 'table') and dlg.table is not None:
-                                for row in range(dlg.table.rowCount()):
-                                    try:
-                                        code_item = dlg.table.item(row, 1)
-                                        if not code_item:
-                                            continue
-                                        code = int(code_item.text())
-                                        chk = dlg.table.cellWidget(row, 0)
-                                        if chk:
-                                            chk.blockSignals(True)
-                                            chk.setChecked(code in visible_set)
-                                            chk.blockSignals(False)
-                                    except Exception:
-                                        continue
-
-                            if not hasattr(dlg, 'slot_shows'):
-                                dlg.slot_shows = {}
-                            if 0 not in dlg.slot_shows:
-                                dlg.slot_shows[0] = {}
-
-                            for code in self.app_window.class_palette:
-                                dlg.slot_shows[0][int(code)] = (int(code) in visible_set)
-
-                        # STEP 5: Store params
-                        azimuth = preset.get("azimuth", 45.0)
-                        angle   = preset.get("angle",   45.0)
-                        ambient = preset.get("ambient",  0.2)
-
-                        self.app_window.last_shade_azimuth = azimuth
-                        self.app_window.last_shade_angle   = angle
-                        self.app_window.shade_ambient      = ambient
-
-                        # ✅ STEP 5b: Refresh the ShadingControlPanel spinboxes so
-                        #    the panel shows the shortcut's azimuth/angle/ambient
-                        #    immediately — without this the panel stays stale.
-                        try:
-                            panel = getattr(self.app_window, 'shading_panel', None)
-                            if panel is not None and hasattr(panel, 'refresh_from_app'):
-                                panel.refresh_from_app()
-                        except Exception as _sp_err:
-                            print(f"   ⚠️ Could not refresh shading panel spinboxes: {_sp_err}")
-
-                        # STEP 6: Apply shading with override STILL SET
-                        from gui.shading_display import update_shaded_class
-                        update_shaded_class(
-                            self.app_window,
-                            azimuth=azimuth,
-                            angle=angle,
-                            ambient=ambient,
-                            force_rebuild=False
+                        view_key = str(target_view) if str(target_view) in views \
+                            else target_view
+                        preset_classes = views.get(
+                            view_key, views.get(str(view_key), {})
                         )
+                        for code, info in preset_classes.items():
+                            code_int = int(code)
+                            if code_int in self.app_window.class_palette:
+                                self.app_window.class_palette[code_int]["show"] = \
+                                    info.get("show", False)
+                                self.app_window.class_palette[code_int]["weight"] = \
+                                    info.get("weight", 1.0)
+                                print(f"      Class {code_int}: "
+                                    f"show={info.get('show', False)}")
+                        print(f"   ✅ class_palette reset complete")
 
-                        # ✅ Clear override AFTER shading — use pre-captured _QTimer
-                        _QTimer.singleShot(
-                            200,
-                            lambda: setattr(
-                                self.app_window,
-                                '_shading_visibility_override',
-                                None
-                            )
-                        )
-
-                        print(f"   ✅ Shading done: az={azimuth}° angle={angle}° "
-                              f"| {visible_count} classes")
-                        print(f"{'='*60}\n")
-
-                        if hasattr(self.app_window, 'statusBar'):
-                            self.app_window.statusBar().showMessage(
-                                f"🌗 ShadingMode: {azimuth}°/{angle}°, "
-                                f"{visible_count} classes visible",
-                                2500
-                            )
-
-                    except Exception as e:
-                        # ✅ Always clear override on any exception
-                        try:
-                            self.app_window._shading_visibility_override = None
-                        except Exception:
-                            pass
-                        print(f"⚠️ Failed to apply ShadingMode preset: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                    finally:
-                        # ✅ Use pre-captured _QTimer — never unbound here
-                        _QTimer.singleShot(
-                            ShortcutExecutionGuard.COOLDOWN_SHADING,
-                            self._shortcut_guard.force_unlock
-                        )
-
-                    return True
-                
-                if tool == "DrawSettings":
-                    preset = shortcut.get("preset")
-                    print(f"✅ SHORTCUT MATCH: {combo} → DrawSettings")
-
-                    if not preset:
-                        print("⚠️ DrawSettings shortcut has no preset")
-                        return True
-
-                    try:
-                        print(f"\n{'='*60}")
-                        print(f"🎨 APPLYING DRAW SETTINGS PRESET FROM SHORTCUT")
-                        print(f"{'='*60}")
-
-                        tools = preset.get("tools", {})
-
-                        # Apply to digitizer
-                        if hasattr(self.app_window, 'digitizer') and \
-                                hasattr(self.app_window.digitizer, 'draw_tool_styles'):
-                            for tool_key, style in tools.items():
-                                self.app_window.digitizer.draw_tool_styles[tool_key] = dict(style)
-                            print(f"   ✅ Applied {len(tools)} tool styles to digitizer")
-                        else:
-                            print("   ⚠️ Digitizer not available, styles saved to QSettings only")
-
-                        # Persist to QSettings
-                        from gui.draw_settings_dialog import save_draw_settings
-                        save_draw_settings(tools)
-                        print(f"   ✅ Saved to QSettings")
-
-                        # ✅ Activate the digitizer and set the chosen tool
-                        active_tool = preset.get("active_tool", "smartline")
-                        if hasattr(self.app_window, 'digitizer') and self.app_window.digitizer:
-                            digi = self.app_window.digitizer
-                            # Enable digitizer if not already enabled
-                            if hasattr(digi, 'enable'):
-                                digi.enable(True)
-                            elif hasattr(digi, 'enabled'):
-                                digi.enabled = True
-
-                            # Activate the user's chosen tool
-                            if hasattr(digi, 'set_tool'):
-                                digi.set_tool(active_tool)
-                                print(f"   ✅ Activated digitizer with tool: {active_tool}")
-                            elif hasattr(digi, 'active_tool'):
-                                digi.active_tool = active_tool
-                                print(f"   ✅ Set digitizer active_tool: {active_tool}")
-                            else:
-                                print(f"   ✅ Digitizer enabled (set_tool not available)")
-                        else:
-                            print("   ⚠️ Digitizer not found, only styles saved")
-
-                        # Refresh DrawToolSettingsDialog if open
-                        if hasattr(self.app_window, 'draw_settings_dialog') and \
-                                self.app_window.draw_settings_dialog is not None and \
-                                self.app_window.draw_settings_dialog.isVisible():
+                        # ✅ FIX STEP 3: Remove shading mesh actor
+                        print(f"   🧹 Clearing shading actors...")
+                        if hasattr(self.app_window, '_shaded_mesh_actor') and \
+                                self.app_window._shaded_mesh_actor:
                             try:
-                                self.app_window.draw_settings_dialog._load_styles()
-                                print(f"   ✅ Refreshed Draw Settings dialog")
-                            except Exception:
-                                pass
+                                self.app_window.vtk_widget.remove_actor(
+                                    'shaded_mesh', render=False
+                                )
+                                self.app_window._shaded_mesh_actor = None
+                                print(f"      ✅ Removed shading mesh actor")
+                            except Exception as e:
+                                print(f"      ⚠️ Could not remove shading actor: {e}")
 
-                        if hasattr(self.app_window, 'statusBar'):
-                            self.app_window.statusBar().showMessage(
-                                f"🎨 DrawSettings applied + {active_tool} activated ({len(tools)} tools updated)",
-                                2500
+                        if hasattr(self.app_window, '_shaded_mesh_polydata'):
+                            self.app_window._shaded_mesh_polydata = None
+
+                        try:
+                            from gui.shading_display import clear_shading_cache
+                            clear_shading_cache("Main View switching to DisplayMode")
+                            print(f"      ✅ Cleared shading cache")
+                        except Exception as e:
+                            print(f"      ⚠️ Could not clear shading cache: {e}")
+
+                        # ✅ FIX STEP 4: Clear shading override flag
+                        self.app_window._shading_visibility_override = None
+
+                        # ✅ FIX STEP 5: Set display mode to classification
+                        self.app_window.display_mode = 'class'
+                        if hasattr(self.app_window, 'current_display_mode'):
+                            self.app_window.current_display_mode = 'class'
+                        print(f"      ✅ display_mode set to 'class'")
+
+                        # ✅ FIX STEP 6: Restore class_ actor visibility
+                        # CRITICAL — ShadingMode hides all class_ actors via
+                        # SetVisibility(False). Without this restore, the view
+                        # stays blank even after GPU sync rebuilds the palette.
+                        if was_shading:
+                            print(f"      🔧 Restoring class_ actors hidden by shading...")
+                            _hidden_actors = getattr(
+                                self.app_window, '_actors_hidden_by_shading', None
                             )
+                            if _hidden_actors:
+                                # Precise restore — only actors we specifically hid
+                                _restored = 0
+                                for name in _hidden_actors:
+                                    actor = self.app_window.vtk_widget.actors.get(name)
+                                    if actor:
+                                        actor.SetVisibility(True)
+                                        _restored += 1
+                                print(f"      ✅ Precisely restored {_restored}/"
+                                    f"{len(_hidden_actors)} hidden actors")
+                                self.app_window._actors_hidden_by_shading = []
+                            else:
+                                # Broad fallback — restore all class_ actors
+                                _restored = 0
+                                for name, actor in \
+                                        self.app_window.vtk_widget.actors.items():
+                                    if str(name).startswith("class_"):
+                                        actor.SetVisibility(True)
+                                        _restored += 1
+                                print(f"      ✅ Broad restore: {_restored} class_ actors")
+                        else:
+                            print(f"      ℹ️ No shading transition — skip actor restore")
 
-                        print(f"   ✅ DrawSettings shortcut complete")
-                        print(f"{'='*60}\n")
+                        # ✅ FIX STEP 7: Ensure unified actor is visible
+                        try:
+                            from gui.unified_actor_manager import _get_unified_actor
+                            _ua = _get_unified_actor(self.app_window)
+                            if _ua is not None:
+                                _ua.SetVisibility(True)
+                                print(f"      ✅ Unified actor made visible")
+                            else:
+                                print(f"      ℹ️ No unified actor yet — will be built below")
+                        except Exception as e:
+                            print(f"      ⚠️ Could not check unified actor: {e}")
 
-                    except Exception as e:
-                        print(f"⚠️ Failed to apply DrawSettings preset: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    finally:
-                        _QTimer.singleShot(
-                            ShortcutExecutionGuard.COOLDOWN_DRAW,
-                            self._shortcut_guard.force_unlock
+                        # ✅ FIX STEP 8: GPU sync / full rebuild
+                        try:
+                            from gui.unified_actor_manager import (
+                                sync_palette_to_gpu, _get_unified_actor
+                            )
+                            _actor = _get_unified_actor(self.app_window)
+                            print(f"      🔍 Unified actor for GPU sync: "
+                                f"{'exists' if _actor else 'None — full rebuild'}")
+                            if _actor is not None:
+                                _actor.SetVisibility(True)  # ensure visible before sync
+                                sync_palette_to_gpu(
+                                    self.app_window, 0,
+                                    self.app_window.class_palette,
+                                    border_percent, render=True
+                                )
+                                print(f"      ⚡ Fast GPU sync complete")
+                            else:
+                                from gui.class_display import update_class_mode
+                                update_class_mode(self.app_window, force_refresh=True)
+                                print(f"      ✅ Full classification rebuild complete")
+                        except Exception as e:
+                            print(f"      ⚠️ GPU sync failed, falling back: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            try:
+                                from gui.class_display import update_class_mode
+                                self.app_window._preserve_view = True
+                                update_class_mode(self.app_window, force_refresh=True)
+                            except Exception as _fb_err:
+                                print(f"      ❌ Fallback rebuild also failed: {_fb_err}")
+
+                    else:
+                        print(f"   ⏭️  Target is View {target_view}, NOT Main View")
+                        print(f"   ✅ Main View shading/class state COMPLETELY PRESERVED")
+
+                    view_names = [
+                        "Main View", "View 1", "View 2",
+                        "View 3", "View 4", "Cut Section"
+                    ]
+                    print(f"   📋 Border: {border_percent}%")
+                    print(f"   📋 Views configured: {list(views.keys())}")
+
+                    # ============================================================
+                    # PRE-STEP: Write preset to app.view_palettes
+                    # ============================================================
+                    if not hasattr(self.app_window, 'view_palettes'):
+                        self.app_window.view_palettes = {}
+
+                    for view_idx_str, classes in views.items():
+                        view_idx = int(view_idx_str)
+                        self.app_window.view_palettes[view_idx] = {}
+                        for code, info in classes.items():
+                            code_int = int(code)
+                            self.app_window.view_palettes[view_idx][code_int] = {
+                                "show":        bool(info.get("show", False)),
+                                "description": str(info.get("description", "")),
+                                "color":       tuple(info.get("color", (128, 128, 128))),
+                                "weight":      float(info.get("weight", 1.0)),
+                                "draw":        info.get("draw", ""),
+                                "lvl":         info.get("lvl", "")
+                            }
+                    print(f"   ✅ PRE-STEP: app.view_palettes seeded "
+                        f"({len(views)} views)")
+
+                    if not hasattr(self.app_window, 'view_borders'):
+                        self.app_window.view_borders = {}
+                    self.app_window.view_borders[target_view] = border_percent
+
+                    # ============================================================
+                    # Initialize display_mode_dialog if needed
+                    # ============================================================
+                    if not hasattr(self.app_window, 'display_mode_dialog') or \
+                            self.app_window.display_mode_dialog is None:
+                        self.app_window._block_ptc_autoload = True
+                        try:
+                            from gui.display_mode import DisplayModeDialog
+                            self.app_window.display_mode_dialog = \
+                                DisplayModeDialog(self.app_window)
+                            print("   🔧 Created DisplayModeDialog")
+                        finally:
+                            self.app_window._block_ptc_autoload = False
+
+                    dlg = self.app_window.display_mode_dialog
+
+                    if not hasattr(dlg, 'view_palettes'):
+                        dlg.view_palettes = {}
+                    if not hasattr(dlg, 'view_borders'):
+                        dlg.view_borders = {}
+                    if not hasattr(dlg, 'slot_shows'):
+                        dlg.slot_shows = {}
+
+                    # ============================================================
+                    # STEP 1: Update slot dropdown to target view
+                    # ============================================================
+                    print(f"\n   🔄 SWITCHING DIALOG TO VIEW {target_view}")
+                    dlg.current_slot = target_view
+
+                    slot_widget = None
+                    for attr_name in ['slot_box', 'slot_combo',
+                                    'view_combo', 'view_selector']:
+                        if hasattr(dlg, attr_name):
+                            slot_widget = getattr(dlg, attr_name)
+                            if slot_widget is not None:
+                                slot_widget.blockSignals(True)
+                                slot_widget.setCurrentIndex(target_view)
+                                slot_widget.blockSignals(False)
+                                print(f"   ✅ Updated {attr_name} → index {target_view}")
+                                break
+
+                    if slot_widget is None:
+                        print(f"   ⚠️ Could not find slot dropdown widget")
+
+                    # ============================================================
+                    # STEP 2: Process preset data into dialog state
+                    # ============================================================
+                    for view_idx_str, classes in views.items():
+                        view_idx = int(view_idx_str)
+                        print(f"   🔍 Processing View {view_idx} "
+                            f"({len(classes)} classes)")
+
+                        dlg.view_palettes[view_idx] = {}
+                        if view_idx not in dlg.slot_shows:
+                            dlg.slot_shows[view_idx] = {}
+
+                        for code, info in classes.items():
+                            code_int = int(code)
+                            dlg.view_palettes[view_idx][code_int] = {
+                                "show":        info.get("show", False),
+                                "description": info.get("description", ""),
+                                "color":       tuple(info.get("color", (128, 128, 128))),
+                                "weight":      float(info.get("weight", 1.0)),
+                                "draw":        info.get("draw", ""),
+                                "lvl":         info.get("lvl", "")
+                            }
+                            dlg.slot_shows[view_idx][code_int] = \
+                                info.get("show", False)
+
+                        dlg.view_borders[view_idx] = border_percent
+
+                        visible = [
+                            c for c, i in dlg.view_palettes[view_idx].items()
+                            if i.get("show")
+                        ]
+                        print(f"   ✅ View {view_idx}: {len(visible)} visible classes")
+
+                    # ============================================================
+                    # STEP 3: Sync class_palette for Main View
+                    # ============================================================
+                    for view_idx_str, classes in views.items():
+                        view_idx = int(view_idx_str)
+                        for code, info in classes.items():
+                            code_int = int(code)
+                            preset_weight = float(info.get("weight", 1.0))
+                            if view_idx == 0 and \
+                                    hasattr(self.app_window, 'class_palette') and \
+                                    code_int in self.app_window.class_palette:
+                                self.app_window.class_palette[code_int]["show"] = \
+                                    bool(info.get("show", False))
+                                self.app_window.class_palette[code_int]["weight"] = \
+                                    preset_weight
+
+                    for view_idx in views.keys():
+                        view_idx = int(view_idx)
+                        if view_idx == 0:
+                            print(f"   ✅ Synced view_palettes[0] AND class_palette")
+                        else:
+                            print(f"   ✅ Synced view_palettes[{view_idx}] "
+                                f"(Main View untouched)")
+
+                    # ============================================================
+                    # STEP 4: Refresh dialog UI for target view
+                    # ============================================================
+                    if dlg.isVisible():
+                        print(f"\n   🔄 REFRESHING DIALOG UI → VIEW {target_view}")
+                        dlg.blockSignals(True)
+                        try:
+                            if hasattr(dlg, '_load_slot_checkboxes'):
+                                dlg._load_slot_checkboxes(target_view)
+                                print(f"   ✅ Checkboxes reloaded")
+
+                            if hasattr(dlg, '_load_slot_weights'):
+                                dlg._load_slot_weights(target_view)
+                                print(f"   ✅ Weights reloaded")
+
+                            if hasattr(dlg, 'load_view_border'):
+                                dlg.load_view_border(target_view)
+
+                            if hasattr(dlg, 'border_label'):
+                                dlg.border_label.setText(
+                                    f"🔳 Border: {border_percent}%"
+                                )
+                            if hasattr(dlg, 'border_value_display'):
+                                dlg.border_value_display.setText(
+                                    f"{border_percent}%"
+                                )
+                            if hasattr(dlg, 'border_slider'):
+                                dlg.border_slider.blockSignals(True)
+                                dlg.border_slider.setValue(int(border_percent))
+                                dlg.border_slider.blockSignals(False)
+
+                            view_name = view_names[target_view] \
+                                if target_view < len(view_names) \
+                                else f"View {target_view}"
+                            dlg.setWindowTitle(f"Display Mode - {view_name} ✓")
+                            print(f"   ✅ Title → {view_name}")
+
+                        finally:
+                            dlg.blockSignals(False)
+
+                    # ============================================================
+                    # STEP 4B: Sync class_palette — Main View only
+                    # ============================================================
+                    print(f"\n   🔄 CLASS_PALETTE SYNC CHECK (target={target_view})")
+                    if target_view == 0:
+                        if target_view in self.app_window.view_palettes:
+                            for code, info in \
+                                    self.app_window.view_palettes[target_view].items():
+                                if code in self.app_window.class_palette:
+                                    self.app_window.class_palette[code]["show"] = \
+                                        info.get("show", False)
+                                    self.app_window.class_palette[code]["weight"] = \
+                                        info.get("weight", 1.0)
+                            print(f"   ✅ class_palette synced from view_palettes[0]")
+                    else:
+                        print(f"   ⏭️  Skipped (View {target_view}, not Main View)")
+
+                    # ============================================================
+                    # STEP 5: Check current display mode / adjust borders
+                    # ============================================================
+                    current_display_mode = getattr(
+                        self.app_window, 'display_mode', 'class'
+                    )
+                    print(f"\n   🎨 DISPLAY MODE NOW: {current_display_mode}")
+
+                    if current_display_mode in ['depth', 'rgb', 'intensity']:
+                        print(f"   🔳 Forcing border=0 for {current_display_mode}")
+                        border_percent = 0
+                        self.app_window.point_border_percent = 0
+                        self.app_window._main_view_borders_active = False
+                        dlg.view_borders[target_view] = 0
+
+                        if dlg.isVisible():
+                            if hasattr(dlg, 'border_label'):
+                                dlg.border_label.setText("🔳 Border: 0%")
+                            if hasattr(dlg, 'border_value_display'):
+                                dlg.border_value_display.setText("0%")
+                            if hasattr(dlg, 'border_slider'):
+                                dlg.border_slider.blockSignals(True)
+                                dlg.border_slider.setValue(0)
+                                dlg.border_slider.blockSignals(False)
+                    else:
+                        print(f"   🔳 Using preset border {border_percent}%")
+                        if target_view == 0:
+                            self.app_window.point_border_percent = border_percent
+                            self.app_window._main_view_borders_active = \
+                                (border_percent > 0)
+
+                    # ============================================================
+                    # STEP 6: Refresh views
+                    # ============================================================
+                    self.app_window._preserve_shortcut_visibility = True
+
+                    if target_view == 0 and 0 in views:
+                        dlg.view_borders[0] = border_percent
+                        try:
+                            from gui.unified_actor_manager import (
+                                sync_palette_to_gpu, _get_unified_actor
+                            )
+                            _actor = _get_unified_actor(self.app_window)
+                            if _actor is not None:
+                                # ✅ FIX: Always ensure actor visible before sync
+                                _actor.SetVisibility(True)
+                                self.app_window._preserve_view = True
+                                sync_palette_to_gpu(
+                                    self.app_window, 0,
+                                    self.app_window.class_palette,
+                                    border_percent, render=True
+                                )
+                                print(f"   ⚡ STEP 6: Main view GPU sync "
+                                    f"(border={border_percent}%)")
+                            else:
+                                from gui.class_display import update_class_mode
+                                self.app_window._preserve_view = True
+                                update_class_mode(self.app_window, force_refresh=True)
+                                print(f"   ✅ STEP 6: Main view rebuilt (no actor)")
+                        except Exception as _sync_err:
+                            print(f"   ⚠️ STEP 6 GPU sync failed: {_sync_err}")
+                            import traceback
+                            traceback.print_exc()
+                            try:
+                                from gui.class_display import update_class_mode
+                                self.app_window._preserve_view = True
+                                update_class_mode(self.app_window, force_refresh=True)
+                            except Exception as _fb_err:
+                                print(f"   ❌ STEP 6 fallback failed: {_fb_err}")
+
+                    # Cross-section views
+                    all_section_views = [v for v in views.keys() if 1 <= int(v) <= 5]
+                    if all_section_views:
+                        print(f"\n   🔄 SYNCING SECTION VIEWS: {all_section_views}")
+                        for view_idx_str in all_section_views:
+                            view_idx = int(view_idx_str)
+
+                            if view_idx == 5:
+                                if hasattr(self.app_window, 'cut_vtk') and \
+                                        self.app_window.cut_vtk is not None:
+                                    try:
+                                        print(f"\n      🔪 REFRESHING CUT SECTION")
+                                        self._refresh_cut_section(view_idx)
+                                        print(f"      ✅ Cut Section refreshed")
+                                    except Exception as e:
+                                        print(f"      ⚠️ Cut Section failed: {e}")
+                                        import traceback
+                                        traceback.print_exc()
+                                else:
+                                    print(f"      ℹ️ Cut Section not open — "
+                                        f"preset stored, applies on open")
+                                continue
+
+                            view_index = view_idx - 1
+
+                            section_vtks = getattr(
+                                self.app_window, 'section_vtks', {}
+                            )
+                            if view_index not in section_vtks:
+                                print(f"      ℹ️ View {view_idx} not open — "
+                                    f"preset in view_palettes[{view_idx}]")
+                                continue
+
+                            try:
+                                from gui.unified_actor_manager import \
+                                    build_section_unified_actor
+
+                                if view_idx not in dlg.view_palettes or \
+                                        not dlg.view_palettes[view_idx]:
+                                    dlg.view_palettes[view_idx] = dict(
+                                        self.app_window.view_palettes.get(
+                                            view_idx, {}
+                                        )
+                                    )
+                                    print(f"      🔄 dlg.view_palettes[{view_idx}] "
+                                        f"synced from app (fallback)")
+
+                                actor = build_section_unified_actor(
+                                    self.app_window,
+                                    view_index,
+                                    border_percent=border_percent,
+                                )
+
+                                if actor is not None:
+                                    visible = [
+                                        c for c, info in
+                                        self.app_window.view_palettes.get(
+                                            view_idx, {}
+                                        ).items()
+                                        if info.get("show", False)
+                                    ]
+                                    print(f"      ✅ View {view_idx}: "
+                                        f"{len(visible)} classes visible")
+                                else:
+                                    print(f"      ⚠️ View {view_idx}: "
+                                        f"build returned None")
+
+                            except Exception as e:
+                                print(f"      ⚠️ View {view_idx} sync failed: {e}")
+                                import traceback
+                                traceback.print_exc()
+
+                    # Track last applied shortcut
+                    self.app_window._last_display_shortcut_id = _current_shortcut_id
+
+                    total_visible = sum(
+                        sum(1 for c in classes.values() if c.get("show"))
+                        for classes in views.values()
+                    )
+
+                    if hasattr(self.app_window, 'statusBar'):
+                        view_names_short = []
+                        for v in sorted([int(x) for x in views.keys()]):
+                            if v == 0:
+                                view_names_short.append("Main")
+                            elif v == 5:
+                                view_names_short.append("Cut")
+                            else:
+                                view_names_short.append(f"V{v}")
+
+                        self.app_window.statusBar().showMessage(
+                            f"✅ DisplayMode: {view_names_short[0]} active, "
+                            f"{total_visible} classes visible",
+                            2500
                         )
 
+                    print(f"   ✅ DisplayMode shortcut complete — "
+                        f"{view_names[target_view]}")
+                    print(f"{'='*60}\n")
+
+                except Exception as e:
+                    print(f"⚠️ Failed to apply DisplayMode preset: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                finally:
+                    _QTimer.singleShot(
+                        1000,
+                        lambda: setattr(
+                            self.app_window,
+                            '_preserve_shortcut_visibility',
+                            False
+                        )
+                    )
+                    _QTimer.singleShot(
+                        ShortcutExecutionGuard.COOLDOWN_DISPLAY,
+                        self._shortcut_guard.force_unlock
+                    )
+
+                return True
+
+            # ====================================================================
+            # ShadingMode shortcut handler
+            # ====================================================================
+            if tool == "ShadingMode":
+                preset = shortcut.get("preset")
+                print(f"✅ SHORTCUT MATCH: {combo} → ShadingMode")
+
+                if not preset:
+                    print("⚠️ ShadingMode shortcut has no preset")
                     return True
 
-                if not shortcut:
-                    return False
-
-                # ✅ ShadingMode/DisplayMode/DrawSettings handled inline above
-                if tool in ("ShadingMode", "DisplayMode", "DrawSettings"):
-                    print(f"⚠️ {tool} reached fallback — already handled inline")
-                    return True
-
-                # ✅ Classification tools — guard prevents concurrent execution
-                if not self._shortcut_guard.try_acquire(tool or "tool"):
+                if not self._shortcut_guard.try_acquire("ShadingMode"):
                     if hasattr(self.app_window, 'statusBar'):
                         self.app_window.statusBar().showMessage(
-                            "⚠️ Please wait — previous shortcut still processing",
-                            1500
+                            "⚠️ Please wait — previous shortcut still processing", 1500
                         )
                     return True
 
-                from_cls = shortcut.get("from")
-                to_cls = shortcut.get("to")
-
-                print(f"✅ SHORTCUT MATCH: {combo} → {tool}, "
-                      f"from={from_cls}, to={to_cls}")
                 try:
-                    execute_tool(self.app_window, tool, from_cls, to_cls)
+                    print(f"\n{'='*60}")
+                    print(f"🌗 APPLYING SHADINGMODE PRESET FROM SHORTCUT")
+                    print(f"{'='*60}")
+
+                    # ============================================================
+                    # GUARD: Skip if same shading already active
+                    # ============================================================
+                    _skip_shading = False
+                    try:
+                        if getattr(self.app_window, 'display_mode', None) == \
+                                'shaded_class' and \
+                                hasattr(self.app_window, '_shaded_mesh_actor') and \
+                                self.app_window._shaded_mesh_actor is not None:
+                            _az_match = abs(
+                                getattr(self.app_window, 'last_shade_azimuth', -1) -
+                                preset.get('azimuth', 45.0)
+                            ) < 0.01
+                            _an_match = abs(
+                                getattr(self.app_window, 'last_shade_angle', -1) -
+                                preset.get('angle', 45.0)
+                            ) < 0.01
+                            _am_match = abs(
+                                getattr(self.app_window, 'shade_ambient', -1) -
+                                preset.get('ambient', 0.2)
+                            ) < 0.01
+                            if _az_match and _an_match and _am_match:
+                                _p_vis = set(
+                                    int(c) for c, i in
+                                    preset.get("classes", {}).items()
+                                    if i.get("show", False)
+                                )
+                                _c_vis = getattr(
+                                    self.app_window,
+                                    '_shading_visibility_override',
+                                    None
+                                )
+                                if _c_vis is None:
+                                    _c_vis = getattr(
+                                        self.app_window,
+                                        '_shading_visible_classes',
+                                        None
+                                    )
+                                if _c_vis is not None and \
+                                        isinstance(_c_vis, set) and \
+                                        _c_vis == _p_vis:
+                                    _skip_shading = True
+                    except Exception:
+                        _skip_shading = False
+
+                    if _skip_shading:
+                        print(f"   ⏭️  SKIPPING — same shading already active (no-op)")
+                        print(f"{'='*60}\n")
+                        if hasattr(self.app_window, 'statusBar'):
+                            self.app_window.statusBar().showMessage(
+                                "✅ ShadingMode already applied (no rebuild needed)",
+                                2000
+                            )
+                        self._shortcut_guard.force_unlock()
+                        return True
+
+                    # ============================================================
+                    # STEP 1: Hide classification actors + SAVE which ones we hide
+                    # ✅ FIX: Track hidden actors so DisplayMode can restore them
+                    # ============================================================
+                    if hasattr(self.app_window, 'vtk_widget'):
+                        _hidden_by_shading = []
+                        for name in list(self.app_window.vtk_widget.actors.keys()):
+                            if str(name).startswith("class_"):
+                                self.app_window.vtk_widget.actors[name]\
+                                    .SetVisibility(False)
+                                _hidden_by_shading.append(name)
+                        # ✅ FIX: Persist the list for DisplayMode to restore
+                        self.app_window._actors_hidden_by_shading = _hidden_by_shading
+                        print(f"   🙈 Hidden {len(_hidden_by_shading)} class_ actors "
+                            f"(saved for restore)")
+
+                    # STEP 2: Set display mode
+                    self.app_window.display_mode = "shaded_class"
+                    if hasattr(self.app_window, 'current_display_mode'):
+                        self.app_window.current_display_mode = "shaded_class"
+
+                    # STEP 3: Reset ALL classes hidden, apply preset visibility
+                    classes = preset.get("classes", {})
+
+                    if hasattr(self.app_window, 'class_palette'):
+                        for code in self.app_window.class_palette:
+                            self.app_window.class_palette[code]["show"] = False
+
+                    visible_set = set()
+                    if classes:
+                        for code, info in classes.items():
+                            code_int = int(code)
+                            if code_int in self.app_window.class_palette:
+                                is_visible = info.get("show", False)
+                                self.app_window.class_palette[code_int]["show"] = \
+                                    is_visible
+                                if is_visible:
+                                    visible_set.add(code_int)
+                    else:
+                        if hasattr(self.app_window, 'class_palette'):
+                            for code in self.app_window.class_palette:
+                                self.app_window.class_palette[code]["show"] = True
+                                visible_set.add(int(code))
+
+                    visible_count = len(visible_set)
+                    print(f"   ✅ Visible classes: {sorted(visible_set)}")
+
+                    self.app_window._shading_visibility_override = visible_set
+
+                    # STEP 4: Sync to display_mode_dialog
+                    if hasattr(self.app_window, 'display_mode_dialog') and \
+                            self.app_window.display_mode_dialog is not None:
+                        dlg = self.app_window.display_mode_dialog
+
+                        if not hasattr(dlg, 'view_palettes'):
+                            dlg.view_palettes = {}
+                        if 0 not in dlg.view_palettes:
+                            dlg.view_palettes[0] = {}
+
+                        for code, entry in self.app_window.class_palette.items():
+                            dlg.view_palettes[0][int(code)] = {
+                                "show":   entry.get("show", False),
+                                "color":  entry.get("color", (128, 128, 128)),
+                                "weight": entry.get("weight", 1.0),
+                            }
+
+                        if hasattr(dlg, 'table') and dlg.table is not None:
+                            for row in range(dlg.table.rowCount()):
+                                try:
+                                    code_item = dlg.table.item(row, 1)
+                                    if not code_item:
+                                        continue
+                                    code = int(code_item.text())
+                                    chk = dlg.table.cellWidget(row, 0)
+                                    if chk:
+                                        chk.blockSignals(True)
+                                        chk.setChecked(code in visible_set)
+                                        chk.blockSignals(False)
+                                except Exception:
+                                    continue
+
+                        if not hasattr(dlg, 'slot_shows'):
+                            dlg.slot_shows = {}
+                        if 0 not in dlg.slot_shows:
+                            dlg.slot_shows[0] = {}
+
+                        for code in self.app_window.class_palette:
+                            dlg.slot_shows[0][int(code)] = (int(code) in visible_set)
+
+                    # STEP 5: Store shading params
+                    azimuth = preset.get("azimuth", 45.0)
+                    angle   = preset.get("angle",   45.0)
+                    ambient = preset.get("ambient",  0.2)
+
+                    self.app_window.last_shade_azimuth = azimuth
+                    self.app_window.last_shade_angle   = angle
+                    self.app_window.shade_ambient      = ambient
+
+                    try:
+                        panel = getattr(self.app_window, 'shading_panel', None)
+                        if panel is not None and hasattr(panel, 'refresh_from_app'):
+                            panel.refresh_from_app()
+                    except Exception as _sp_err:
+                        print(f"   ⚠️ Could not refresh shading panel: {_sp_err}")
+
+                    # STEP 6: Apply shading
+                    from gui.shading_display import update_shaded_class
+                    update_shaded_class(
+                        self.app_window,
+                        azimuth=azimuth,
+                        angle=angle,
+                        ambient=ambient,
+                        force_rebuild=False
+                    )
+
+                    _QTimer.singleShot(
+                        200,
+                        lambda: setattr(
+                            self.app_window,
+                            '_shading_visibility_override',
+                            None
+                        )
+                    )
+
+                    print(f"   ✅ Shading done: az={azimuth}° angle={angle}° "
+                        f"| {visible_count} classes")
+                    print(f"{'='*60}\n")
+
+                    if hasattr(self.app_window, 'statusBar'):
+                        self.app_window.statusBar().showMessage(
+                            f"🌗 ShadingMode: {azimuth}°/{angle}°, "
+                            f"{visible_count} classes visible",
+                            2500
+                        )
+
                 except Exception as e:
-                    print(f"⚠️ execute_tool failed for {tool}: {e}")
+                    try:
+                        self.app_window._shading_visibility_override = None
+                    except Exception:
+                        pass
+                    print(f"⚠️ Failed to apply ShadingMode preset: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                finally:
+                    _QTimer.singleShot(
+                        ShortcutExecutionGuard.COOLDOWN_SHADING,
+                        self._shortcut_guard.force_unlock
+                    )
+
+                return True
+
+            # ====================================================================
+            # DrawSettings shortcut handler
+            # ====================================================================
+            if tool == "DrawSettings":
+                preset = shortcut.get("preset")
+                print(f"✅ SHORTCUT MATCH: {combo} → DrawSettings")
+
+                if not preset:
+                    print("⚠️ DrawSettings shortcut has no preset")
+                    return True
+
+                try:
+                    print(f"\n{'='*60}")
+                    print(f"🎨 APPLYING DRAW SETTINGS PRESET FROM SHORTCUT")
+                    print(f"{'='*60}")
+
+                    tools = preset.get("tools", {})
+
+                    if hasattr(self.app_window, 'digitizer') and \
+                            hasattr(self.app_window.digitizer, 'draw_tool_styles'):
+                        for tool_key, style in tools.items():
+                            self.app_window.digitizer.draw_tool_styles[tool_key] = \
+                                dict(style)
+                        print(f"   ✅ Applied {len(tools)} tool styles to digitizer")
+                    else:
+                        print("   ⚠️ Digitizer not available")
+
+                    from gui.draw_settings_dialog import save_draw_settings
+                    save_draw_settings(tools)
+                    print(f"   ✅ Saved to QSettings")
+
+                    active_tool = preset.get("active_tool", "smartline")
+                    if hasattr(self.app_window, 'digitizer') and \
+                            self.app_window.digitizer:
+                        digi = self.app_window.digitizer
+                        if hasattr(digi, 'enable'):
+                            digi.enable(True)
+                        elif hasattr(digi, 'enabled'):
+                            digi.enabled = True
+
+                        if hasattr(digi, 'set_tool'):
+                            digi.set_tool(active_tool)
+                            print(f"   ✅ Activated digitizer: {active_tool}")
+                        elif hasattr(digi, 'active_tool'):
+                            digi.active_tool = active_tool
+                            print(f"   ✅ Set active_tool: {active_tool}")
+                    else:
+                        print("   ⚠️ Digitizer not found")
+
+                    if hasattr(self.app_window, 'draw_settings_dialog') and \
+                            self.app_window.draw_settings_dialog is not None and \
+                            self.app_window.draw_settings_dialog.isVisible():
+                        try:
+                            self.app_window.draw_settings_dialog._load_styles()
+                            print(f"   ✅ Refreshed Draw Settings dialog")
+                        except Exception:
+                            pass
+
+                    if hasattr(self.app_window, 'statusBar'):
+                        self.app_window.statusBar().showMessage(
+                            f"🎨 DrawSettings: {active_tool} activated "
+                            f"({len(tools)} tools updated)",
+                            2500
+                        )
+
+                    print(f"   ✅ DrawSettings complete")
+                    print(f"{'='*60}\n")
+
+                except Exception as e:
+                    print(f"⚠️ Failed to apply DrawSettings preset: {e}")
                     import traceback
                     traceback.print_exc()
                 finally:
                     _QTimer.singleShot(
-                        ShortcutExecutionGuard.COOLDOWN_NORMAL,
+                        ShortcutExecutionGuard.COOLDOWN_DRAW,
                         self._shortcut_guard.force_unlock
                     )
+
                 return True
-            return False
+
+            # ====================================================================
+            # No shortcut match — pass through
+            # ====================================================================
+            if not shortcut:
+                return False
+
+            if tool in ("ShadingMode", "DisplayMode", "DrawSettings"):
+                print(f"⚠️ {tool} reached fallback — already handled inline")
+                return True
+
+            # ====================================================================
+            # Classification tools
+            # ====================================================================
+            if not self._shortcut_guard.try_acquire(tool or "tool"):
+                if hasattr(self.app_window, 'statusBar'):
+                    self.app_window.statusBar().showMessage(
+                        "⚠️ Please wait — previous shortcut still processing",
+                        1500
+                    )
+                return True
+
+            from_cls = shortcut.get("from")
+            to_cls   = shortcut.get("to")
+
+            print(f"✅ SHORTCUT MATCH: {combo} → {tool}, "
+                f"from={from_cls}, to={to_cls}")
+            try:
+                execute_tool(self.app_window, tool, from_cls, to_cls)
+            except Exception as e:
+                print(f"⚠️ execute_tool failed for {tool}: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                _QTimer.singleShot(
+                    ShortcutExecutionGuard.COOLDOWN_NORMAL,
+                    self._shortcut_guard.force_unlock
+                )
+            return True
+
+        return False
              
     def _refresh_cut_section(self, view_idx):
         """

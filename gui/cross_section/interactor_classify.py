@@ -1,6 +1,4 @@
-
-####
-from json import tool
+﻿from json import tool
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage, vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper, vtkCoordinate
 from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray
@@ -8,14 +6,10 @@ from vtkmodules.vtkCommonCore import vtkPoints
 import vtk
 import numpy as np
 import time
-from gui.vtk_utils import force_vtk_pipeline_update
 # ✅ Shared helper — avoids triggering shading rebuild when no mesh exists yet
 from gui.classification_tools import _shading_mesh_exists
           
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-    QDoubleSpinBox, QPushButton, QSlider, QWidget
-)
+from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import QTimer
 from PySide6.QtCore import Qt, QPoint, QPointF, QLineF
 from PySide6.QtGui import QPainter, QColor, QPen
@@ -660,6 +654,8 @@ class ClassificationInteractor:
         self._brush_stroke_positions = []
         self._last_brush_center = None
         self._brush_needs_render = False
+        self._brush_main_visible_classes = None
+        self._brush_main_visible_classes_arr = None
         self.app._suppress_section_refresh = False
         self.is_dragging = False
 
@@ -2403,6 +2399,8 @@ class ClassificationInteractor:
                         if has_index and to_class is not None:
                             classes = self.app.data["classification"]
                             from_classes = getattr(self.app, "from_classes", None)
+                            visible_classes = getattr(self, "_brush_main_visible_classes", None)
+                            visible_classes_arr = getattr(self, "_brush_main_visible_classes_arr", None)
 
                             for pos in positions:
                                 hit = self._get_points_in_radius_fast(
@@ -2415,6 +2413,15 @@ class ClassificationInteractor:
                                 fresh = hit[~self._brush_accumulated_mask[hit]]
                                 if len(fresh) == 0:
                                     continue
+
+                                # Filter by Main View visibility (slot 0): hidden classes are protected.
+                                if visible_classes == []:
+                                    continue
+                                if visible_classes_arr is not None:
+                                    vis_mask = np.isin(classes[fresh], visible_classes_arr)
+                                    fresh = fresh[vis_mask]
+                                    if len(fresh) == 0:
+                                        continue
 
                                 # Filter from_classes
                                 if from_classes:
@@ -2771,6 +2778,18 @@ class ClassificationInteractor:
             self._brush_render_counter = 0
             self._brush_last_render_time = 0.0
             self._brush_needs_render = False
+            self._brush_main_visible_classes = self._get_visible_classes_for_slot(0)
+            self._brush_main_visible_classes_arr = None
+            if self._brush_main_visible_classes not in (None, []):
+                self._brush_main_visible_classes_arr = np.asarray(
+                    self._brush_main_visible_classes,
+                    dtype=self.app.data["classification"].dtype,
+                )
+            elif self._brush_main_visible_classes == [] and hasattr(self.app, "statusBar"):
+                self.app.statusBar().showMessage(
+                    "No visible classes selected in Display Mode.",
+                    2000,
+                )
             # ✅ Only set suppress flag for BRUSH tool
             self.app._suppress_section_refresh = True
                 
@@ -2895,9 +2914,9 @@ class ClassificationInteractor:
 
         from ..classification_tools import (
             classify_above_line, classify_below_line,
-            classify_rectangle, classify_circle, classify_polygon,
+            classify_rectangle, classify_circle,
             classify_freehand, classify_brush, classify_point,
-            _get_cut_section_or_default, _get_visible_mask_from_viewport,
+            _get_cut_section_or_default,
             _apply_classification
         )
 
@@ -2957,6 +2976,8 @@ class ClassificationInteractor:
                 self._brush_stroke_positions = []
                 self._last_brush_center = None
                 self._brush_needs_render = False
+                self._brush_main_visible_classes = None
+                self._brush_main_visible_classes_arr = None
                 self.app._suppress_section_refresh = False
                 # In shaded_class mode keep OptimizedRefresh alive — shading mesh needs its own rebuild
                 if getattr(self.app, "display_mode", "class") != "shaded_class":
@@ -3094,8 +3115,7 @@ class ClassificationInteractor:
                         #     update_mask = np.zeros(len(self.app.data["xyz"]), dtype=bool)
                         #     update_mask[idxs_arr[local_mask]] = True
                         #     _apply_classification(self.app, update_mask, from_classes, to_class)
-                        #     from gui.vtk_utils import force_vtk_pipeline_update
-                        #     force_vtk_pipeline_update(self.app)
+                        #                             #     force_vtk_pipeline_update(self.app)
 
                         # self._refresh_all_views_after_classification(to_class)
                         # return
@@ -3270,6 +3290,7 @@ class ClassificationInteractor:
 
             # Clean stroke buffers
             for attr in ("_brush_accumulated_mask", "_brush_stroke_positions", 
+                        "_brush_main_visible_classes", "_brush_main_visible_classes_arr",
                         "_brush_section_indices", "_brush_section_pts2d", 
                         "_brush_section_local_mask", "_last_brush_center_uv"):
                 if hasattr(self, attr):
@@ -6876,20 +6897,14 @@ class ClassificationInteractor:
                 import traceback
                 traceback.print_exc()
         
-        # Store timer as instance variable to prevent garbage collection
         self._indicator_timer = timer
         animate_step()
 
-
     def _verify_buffer_classification(self, view_idx):
-        """
-        Debug helper to verify buffer points are being included in classification.
-        Call this after classification to confirm buffer points were modified.
-        """
+
         try:
             app = self.app
             
-            # Get masks
             core_mask = getattr(app, f"section_{view_idx}_core_mask", None)
             buffer_mask = getattr(app, f"section_{view_idx}_buffer_mask", None)
             combined_mask = getattr(app, f"section_{view_idx}_combined_mask", None)
@@ -6986,8 +7001,6 @@ class ClassificationInteractor:
         
         print(f"{'='*60}\n")
 
-
-    # In interactor_classify.py — wherever classification is committed:
     def _commit_classification(self, mask, from_classes, to_class):
         """Apply classification and maintain undo/redo stacks correctly."""
         import numpy as np
@@ -7006,8 +7019,6 @@ class ClassificationInteractor:
         }
         self.app.undo_stack.append(step)
 
-        # *** CRITICAL: Always clear redo when new classification is committed ***
-        # Without this, stale redo steps pollute subsequent undo/redo cycles.
         self.app.redo_stack.clear()
 
         # Cap undo stack
@@ -7016,11 +7027,8 @@ class ClassificationInteractor:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.app.undo_stack.pop(0))
 
-        # Invalidate section mirrors BEFORE emitting so _on_classification_finished
-        # gets clean mirrors to work with
         if hasattr(self.app, 'section_vtks'):
             for view_idx in self.app.section_vtks.keys():
                 self.app._sync_section_mirror_from_data(view_idx)
 
-        # Emit signal — triggers cross-section refresh via _on_classification_finished
         self.app.classification_finished.emit(mask)

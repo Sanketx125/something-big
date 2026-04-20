@@ -4,10 +4,10 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QSlider, QComboBox, QColorDialog, QWidget,
-    QListWidget, QListWidgetItem, QGroupBox, QSplitter
+    QListWidget, QListWidgetItem, QGroupBox
 )
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QColor, QPainter, QPen, QIcon
+from PySide6.QtGui import QColor, QPainter, QPen
 
 
 # ── Default styles per tool ─────────────────────────────────────────────────

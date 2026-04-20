@@ -1413,6 +1413,9 @@ def get_dialog_stylesheet() -> str:
         border-radius: 6px;
         background: {c.get('bg_primary')};
     }}
+    QScrollArea:focus {{
+        border: 2px solid {c.get('accent')};
+    }}    
     QScrollBar:vertical {{
         width: 10px;
         background: {c.get('bg_primary')};
@@ -1587,27 +1590,169 @@ def get_notice_banner_style(variant: str = "info") -> str:
 
 
 def get_icon_button_style(role: str = "default") -> str:
-    """Theme-aware style for small round icon buttons. Roles: default, danger, settings."""
+    """
+    Enhanced icon button styles with consistent sizing and keyboard focus support.
+    Roles: default, danger, settings
+    """
     c = ThemeColors
+    
+    # Base style with fixed dimensions and focus outline
+    base = f"""
+        QPushButton {{
+            border: 1px solid {c.get('border')};
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-size: 9px;
+            font-weight: bold;
+            min-height: 26px;
+            max-height: 26px;
+            outline: none;
+        }}
+        QPushButton:hover {{
+            border-width: 2px;
+        }}
+        QPushButton:focus {{
+            outline: 2px solid {c.get('accent')};
+            outline-offset: 1px;
+        }}
+        QPushButton:pressed {{
+            padding: 5px 7px 3px 9px;  /* Subtle press effect */
+        }}
+    """
+    
     if role == "danger":
-        bg = c.get('danger')
-        hover = c.get('danger_hover')
-        border = c.get('danger_dark')
+        return base + f"""
+            QPushButton {{
+                background: {c.get('danger')};
+                color: white;
+            }}
+            QPushButton:hover {{
+                background: {c.get('danger_hover')};
+                border-color: {c.get('danger_dark')};
+            }}
+            QPushButton:pressed {{
+                background: {c.get('danger_dark')};
+            }}
+        """
     elif role == "settings":
-        bg = c.get('bg_button')
-        hover = c.get('bg_button_hover')
-        border = c.get('border_light')
+        return base + f"""
+            QPushButton {{
+                background: {c.get('bg_button')};
+                color: {c.get('text_secondary')};
+            }}
+            QPushButton:hover {{
+                background: {c.get('bg_button_hover')};
+                border-color: {c.get('accent')};
+                color: {c.get('text_primary')};
+            }}
+            QPushButton:pressed {{
+                background: {c.get('bg_input')};
+            }}
+        """
+    else:  # default
+        return base + f"""
+            QPushButton {{
+                background: {c.get('bg_button')};
+                color: {c.get('text_primary')};
+            }}
+            QPushButton:hover {{
+                background: {c.get('bg_button_hover')};
+                border-color: {c.get('border_light')};
+            }}
+            QPushButton:pressed {{
+                background: {c.get('bg_input')};
+            }}
+        """
+def get_snt_file_button_style(role: str = "layers") -> str:
+    """
+    Specialized button styles for SNT file item rows.
+    Roles: layers, settings, remove
+    """
+    c = ThemeColors
+    
+    base = f"""
+        QPushButton {{
+            border: 1px solid {c.get('border_light')};
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 9px;
+            font-weight: 600;
+            min-height: 28px;
+            max-height: 28px;
+            text-align: center;
+            outline: none;
+        }}
+        QPushButton:hover {{
+            border: 2px solid {c.get('accent')};
+            padding: 5px 9px;  /* Compensate for thicker border */
+        }}
+        QPushButton:focus {{
+            border: 2px solid {c.get('accent')};
+            padding: 5px 9px;
+        }}
+        QPushButton:pressed {{
+            padding: 7px 9px 5px 11px;
+        }}
+    """
+    
+    if role == "layers":
+        return base + f"""
+            QPushButton {{
+                background: {c.get('dialog_primary_bg')};
+                color: {c.get('dialog_primary_text')};
+                min-width: 78px;
+            }}
+            QPushButton:hover {{
+                background: {c.get('dialog_primary_hover')};
+            }}
+            QPushButton:pressed {{
+                background: {c.get('dialog_primary_border')};
+            }}
+        """
+    elif role == "settings":
+        return base + f"""
+            QPushButton {{
+                background: {c.get('bg_button')};
+                color: {c.get('text_secondary')};
+                min-width: 88px;
+            }}
+            QPushButton:hover {{
+                background: {c.get('bg_button_hover')};
+                color: {c.get('text_primary')};
+            }}
+            QPushButton:pressed {{
+                background: {c.get('bg_input')};
+            }}
+        """
+    elif role == "remove":
+        return base + f"""
+            QPushButton {{
+                background: {c.get('danger')};
+                color: white;
+                font-size: 14px;
+                min-width: 28px;
+                max-width: 28px;
+                padding: 0px;
+            }}
+            QPushButton:hover {{
+                background: {c.get('danger_hover')};
+                border-color: {c.get('danger_dark')};
+            }}
+            QPushButton:pressed {{
+                background: {c.get('danger_dark')};
+            }}
+        """
     else:
-        bg = c.get('bg_button')
-        hover = c.get('bg_button_hover')
-        border = c.get('border_light')
-    return (
-        f"QPushButton{{background:{bg}; color:{c.get('text_on_active')}; "
-        f"border:1px solid {border}; border-radius:13px; font-size:13px; outline:none;}}"
-        f"QPushButton:hover{{background:{hover}; border:1px solid {border};}}"
-    )
-
-
+        return base + f"""
+            QPushButton {{
+                background: {c.get('bg_button')};
+                color: {c.get('text_primary')};
+            }}
+            QPushButton:hover {{
+                background: {c.get('bg_button_hover')};
+            }}
+        """
+    
 def _refresh_view_ribbon_styles(ribbon):
     """Re-apply theme styles to ViewRibbon sharpness/amplifier controls."""
     try:

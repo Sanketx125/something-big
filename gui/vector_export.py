@@ -4,11 +4,9 @@
 # Supports DXF, GeoJSON, and Shapefile formats with full metadata
 # ============================================================================
 
-import os
-import json
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 from PySide6.QtWidgets import QMessageBox, QFileDialog
 
 
@@ -75,7 +73,6 @@ def export_drawings_to_shapefile(app, output_path: str) -> bool:
     try:
         import geopandas as gpd
         from shapely.geometry import Point, LineString, Polygon
-        import pandas as pd
         
         print(f"\n{'='*60}")
         print(f"📤 EXPORTING DRAWINGS TO SHAPEFILE")

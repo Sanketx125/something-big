@@ -1,8 +1,7 @@
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame, QPushButton
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame
 )
-from PySide6.QtCore import Qt, QTimer, QEvent
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QTimer
 import numpy as np
 
 

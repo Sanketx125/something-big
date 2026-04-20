@@ -6,7 +6,6 @@ Handles render throttling, LOD, and GPU memory management
 import numpy as np
 import time
 from PySide6.QtCore import QTimer, QObject
-from PySide6.QtWidgets import QApplication
 
 
 class GPURenderManager(QObject):
@@ -38,6 +37,7 @@ class GPURenderManager(QObject):
         # Original render functions (to restore if needed)
         self._original_render = None
         self._original_add_points = None
+        self._camera_observer_ids = []
         
         print("✅ GPU Render Manager initialized")
     
@@ -84,13 +84,23 @@ class GPURenderManager(QObject):
         """Install observer for camera movements"""
         try:
             interactor = self.app.vtk_widget.interactor
+
+            # Idempotent install: clear stale observer hooks first
+            if self._camera_observer_ids:
+                for obs_id in self._camera_observer_ids:
+                    try:
+                        interactor.RemoveObserver(obs_id)
+                    except Exception:
+                        pass
+                self._camera_observer_ids = []
             
             # Mouse wheel events
-            interactor.AddObserver("MouseWheelForwardEvent", self._on_camera_interaction)
-            interactor.AddObserver("MouseWheelBackwardEvent", self._on_camera_interaction)
+            wheel_fwd = interactor.AddObserver("MouseWheelForwardEvent", self._on_camera_interaction)
+            wheel_back = interactor.AddObserver("MouseWheelBackwardEvent", self._on_camera_interaction)
             
             # Pan/zoom interactions
-            interactor.AddObserver("InteractionEvent", self._on_camera_interaction)
+            interaction = interactor.AddObserver("InteractionEvent", self._on_camera_interaction)
+            self._camera_observer_ids = [wheel_fwd, wheel_back, interaction]
             
             print("      ✓ Camera observers installed")
             
@@ -203,7 +213,32 @@ class GPURenderManager(QObject):
         """
         self.render_delay_ms = max(16, min(delay_ms, 500))  # Clamp 16-500ms
         print(f"⏱️  Render delay: {self.render_delay_ms}ms")
-    
+
+    def uninstall(self):
+        """Remove hooks and restore original render behavior."""
+        try:
+            self.render_timer.stop()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self.app, "vtk_widget") and self.app.vtk_widget and self._original_render:
+                self.app.vtk_widget.render = self._original_render
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self.app, "vtk_widget") and self.app.vtk_widget and self._camera_observer_ids:
+                interactor = self.app.vtk_widget.interactor
+                for obs_id in self._camera_observer_ids:
+                    try:
+                        interactor.RemoveObserver(obs_id)
+                    except Exception:
+                        pass
+                self._camera_observer_ids = []
+        except Exception:
+            pass
+
     def get_stats(self):
         """Return performance statistics"""
         total = self.render_count + self.skipped_renders

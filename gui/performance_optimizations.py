@@ -112,7 +112,6 @@ def update_pointcloud_optimized(app, mode):
     """
     import numpy as np
     import pyvista as pv
-    import matplotlib.pyplot as plt
 
     if app.data is None or "xyz" not in app.data:
         print("⚠️ No data to display")

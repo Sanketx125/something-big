@@ -1,19 +1,7 @@
-
-"""
-Grid Tool for Point Cloud Viewer
-Similar to MicroStation's grid functionality
-✅ Draw rectangle to define area
-✅ Configure grid: rows × columns OR spacing in meters
-✅ Creates matrix of grid lines
-✅ FIXED: Left-click starts, right-click finishes (same as select rectangle tool)
-"""
-
 import numpy as np
 import vtk
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                               QSpinBox, QDoubleSpinBox, QRadioButton, 
-                               QButtonGroup, QPushButton, QGroupBox, QMessageBox)
-from PySide6.QtCore import Qt
+                               QSpinBox, QDoubleSpinBox, QPushButton, QGroupBox, QMessageBox)
 
 
 class GridConfigDialog(QDialog):

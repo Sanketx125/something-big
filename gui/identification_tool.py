@@ -234,9 +234,6 @@ class IdentificationTool(QObject):
     def _apply_highlight_style(self, widget, class_code):
         """Apply a highlight animation/style to a widget."""
         try:
-            from PySide6.QtCore import QPropertyAnimation, QEasingCurve
-            from PySide6.QtGui import QColor
-            
             # Get the original style
             original_style = widget.styleSheet()
             

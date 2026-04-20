@@ -767,7 +767,6 @@ def _apply_classification(app, update_mask, from_classes, to_class):
             fast_classify_update,
             fast_cross_section_update,
             is_unified_actor_ready,
-            _push_uniforms_direct,
         )
         palette = getattr(app, 'class_palette', {})
  
@@ -851,67 +850,6 @@ def _apply_classification(app, update_mask, from_classes, to_class):
     return True
 
 
-
-def classify_points_example(app, selected_indices, target_class):
-    """
-    Example of how to classify points and ensure they're visible.
-    Add this pattern to ALL your classification functions.
-    """
-    
-    # 1. Perform the classification
-    app.data["classification"][selected_indices] = target_class
-    
-    # 2. ✅ CRITICAL: Mark this class as recently modified
-    # This makes update_class_mode() render it LAST (on top)
-    app._last_classified_to_class = target_class
-    
-    # 3. Trigger re-render (which will read the flag)
-    from gui.class_display import update_class_mode
-    update_class_mode(app)
-
-
-def debug_priority_rendering(app):
-    """
-    Debug helper to check if priority rendering flags are set correctly.
-    Call this after classification to verify the state.
-    """
-    print("\n" + "="*60)
-    print("🔍 PRIORITY RENDERING DEBUG")
-    print("="*60)
-    
-    # Check priority class flag
-    has_priority_class = hasattr(app, '_last_classified_to_class')
-    print(f"Priority class flag exists: {has_priority_class}")
-    if has_priority_class:
-        print(f"   → Class: {app._last_classified_to_class}")
-        
-        # Check if this class is in palette
-        if hasattr(app, 'class_palette') and app._last_classified_to_class in app.class_palette:
-            info = app.class_palette[app._last_classified_to_class]
-            print(f"   → Visible: {info.get('show', False)}")
-            print(f"   → Weight: {info.get('weight', 1.0)}")
-            print(f"   → Color: {info.get('color', (0,0,0))}")
-        else:
-            print(f"   ⚠️ Class {app._last_classified_to_class} NOT in palette!")
-    
-    # Check priority mask
-    has_priority_mask = hasattr(app, '_last_changed_mask')
-    print(f"\nPriority mask flag exists: {has_priority_mask}")
-    if has_priority_mask:
-        mask = app._last_changed_mask
-        print(f"   → Type: {type(mask)}")
-        print(f"   → Shape: {mask.shape}")
-        print(f"   → Points flagged: {np.sum(mask):,}")
-        print(f"   → Total dataset: {len(app.data['classification']):,}")
-        
-        # Check what classes these points belong to
-        if np.sum(mask) > 0:
-            flagged_classes = np.unique(app.data['classification'][mask])
-            print(f"   → Classes in flagged points: {flagged_classes}")
-    
-    print("="*60 + "\n")
-    
-    # The flag is automatically cleared after rendering
 
 def _get_visible_classes_for_current_view(app):
     """

@@ -1,8 +1,6 @@
-
-
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QComboBox, QPushButton,
                                QHBoxLayout, QListWidget, QListWidgetItem)
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QBrush, QPen, QLinearGradient
 import os
 

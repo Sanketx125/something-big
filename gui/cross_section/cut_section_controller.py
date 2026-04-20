@@ -1,12 +1,9 @@
-
-
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QDoubleSpinBox, QAbstractSpinBox, QMessageBox, QDockWidget, QPushButton, QHBoxLayout
 from PySide6.QtCore import Qt
 import vtk
-from scipy.spatial import cKDTree
 
 # ============ SAFE RENDER HELPER ============
 def _safe_vtk_render(vtk_widget):
@@ -4108,7 +4105,7 @@ class CutSectionController:
                             target_actor.GetProperty().Modified()
                         except:
                             pass
-                            
+                           
                         _safe_vtk_render(self.cut_vtk)
                         return  # 🔥 Performance Success: Exit immediately
 
@@ -4946,7 +4943,6 @@ class CutSectionController:
                         except:
                             pass
                 
-                # Render to show the removal
                 try:
                     _safe_vtk_render(vtk_widget)
                 except:

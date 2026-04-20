@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
     QProgressDialog, QApplication
 )
 from PySide6.QtCore import Qt, QTimer
-from typing import Optional, Set
 import time
 from vtkmodules.util import numpy_support
 import vtk
@@ -23,8 +22,6 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-import multiprocessing
-from concurrent.futures import ThreadPoolExecutor
 
 _LARGE_MESH_THRESHOLD = 50_000_000
 _MAX_STORED_SHADING_CACHES = 2

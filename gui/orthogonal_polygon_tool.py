@@ -75,7 +75,6 @@ INTEGRATION INTO digitize_tools.py  (two small edits only)
 from __future__ import annotations
 import math
 import numpy as np
-import vtk
 
 
 # ─────────────────────────────────────────────────────────────────────────────

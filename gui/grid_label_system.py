@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 import vtk
-from PySide6.QtWidgets import QMessageBox, QFileDialog,QHBoxLayout
+from PySide6.QtWidgets import QMessageBox, QFileDialog
 from PySide6.QtCore import QSettings
 import numpy as np
 
@@ -1095,7 +1095,7 @@ class GridLabelManager:
                 update_progress(85, "Building palette...", force=True)
                 
                 try:
-                    from gui.class_display import build_class_palette, update_class_mode
+                    from gui.class_display import build_class_palette
                     self.app.class_palette = build_class_palette(tile_data['classification'])
                     print(f"   ✅ Built palette: {len(self.app.class_palette)} classes")
                     

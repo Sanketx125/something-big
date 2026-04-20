@@ -19,11 +19,12 @@ from PySide6.QtWidgets import (
     QMessageBox, QPushButton, QRadioButton, QScrollArea,
     QVBoxLayout, QWidget, QProgressDialog,
 )
-
 from gui.theme_manager import (
     get_dialog_stylesheet, get_progress_dialog_stylesheet,
     get_title_banner_style, get_file_item_row_style,
-    get_badge_style, get_icon_button_style, get_notice_banner_style, ThemeColors,
+    get_badge_style, get_icon_button_style, get_notice_banner_style,
+    get_snt_file_button_style,  # ← Add this new import
+    ThemeColors,
 )
 
 
@@ -688,7 +689,7 @@ class SNTDisplayOptionsDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LAYER SELECTION DIALOG  (unchanged from v2.0)
+# LAYER SELECTION DIALOG  - FIXED VERSION
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SNTLayerSelectionDialog(QDialog):
@@ -713,10 +714,13 @@ class SNTLayerSelectionDialog(QDialog):
         title.setObjectName("dialogTitle")
         layout.addWidget(title)
 
+        # Layer list widget (NO checkbox here - this was the bug)
         self.layer_list = QListWidget()
         self.layer_list.setAlternatingRowColors(True)
+        self.layer_list.setFocusPolicy(Qt.StrongFocus)  # Enable keyboard navigation
         layout.addWidget(self.layer_list)
 
+        # Action buttons row
         action_row = QHBoxLayout()
         for label, slot in [("All On", self._select_all),
                              ("All Off", self._deselect_all),
@@ -724,28 +728,36 @@ class SNTLayerSelectionDialog(QDialog):
             btn = QPushButton(label)
             btn.setAutoDefault(False)
             btn.setDefault(False)
-            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setFocusPolicy(Qt.StrongFocus)
+            btn.setMinimumHeight(32)
             btn.clicked.connect(slot)
             action_row.addWidget(btn)
         layout.addLayout(action_row)
 
+        # OK/Cancel buttons
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        ok_btn = QPushButton("OK")
-        ok_btn.setDefault(True)  # Fix: Enter triggers OK
+        
+        ok_btn = QPushButton("✓ OK")
         ok_btn.setObjectName("primaryBtn")
-        ok_btn.setAutoDefault(False)
-        ok_btn.setDefault(False)
-        ok_btn.setFocusPolicy(Qt.NoFocus)
+        ok_btn.setDefault(True)  # Enter key triggers OK
+        ok_btn.setFocusPolicy(Qt.StrongFocus)
+        ok_btn.setMinimumHeight(36)
         ok_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("Cancel")
+        
+        cancel_btn = QPushButton("✖ Cancel")
         cancel_btn.setAutoDefault(False)
         cancel_btn.setDefault(False)
-        cancel_btn.setFocusPolicy(Qt.NoFocus)
+        cancel_btn.setFocusPolicy(Qt.StrongFocus)
+        cancel_btn.setMinimumHeight(36)
         cancel_btn.clicked.connect(self.reject)
+        
         btn_row.addWidget(ok_btn)
         btn_row.addWidget(cancel_btn)
         layout.addLayout(btn_row)
+
+        # Set initial focus to layer list
+        self.layer_list.setFocus()
 
     def _load_layers(self):
         parsed: Optional[Dict] = None
@@ -806,8 +818,6 @@ class SNTLayerSelectionDialog(QDialog):
             for i in range(self.layer_list.count())
             if self.layer_list.item(i).checkState() == Qt.Checked
         }
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # FILE ITEM WIDGET  (unchanged from v2.0)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -830,41 +840,70 @@ class SNTFileItem(QWidget):
 
     def _init_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setContentsMargins(8, 6, 8, 6)  # Better padding
         layout.setSpacing(8)
 
+        # Checkbox with fixed height
         self.checkbox = QCheckBox(f"{self.snt_path.name}")
         self.checkbox.setChecked(True)
-        self.checkbox.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-weight:bold; font-size:10px;")
+        self.checkbox.setStyleSheet(
+            f"color:{ThemeColors.get('accent')}; "
+            f"font-weight:bold; font-size:10px; "
+            f"min-height:28px; max-height:28px;"  # Fixed height
+        )
+        self.checkbox.setFocusPolicy(Qt.StrongFocus)  # Enable keyboard navigation
         self.checkbox.stateChanged.connect(self._on_checkbox_changed)
         layout.addWidget(self.checkbox, 1)
 
+        # Badge with fixed dimensions
         badge = QLabel("SNT")
-        badge.setStyleSheet(get_badge_style("success"))
+        badge.setStyleSheet(get_badge_style("success") + "min-height:24px; max-height:24px;")
+        badge.setAlignment(Qt.AlignCenter)
         layout.addWidget(badge)
 
+        # Count label with fixed height
         self.count_label = QLabel("...")
-        self.count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:9px;")
+        self.count_label.setStyleSheet(
+            f"color:{ThemeColors.get('text_muted')}; "
+            f"font-size:9px; min-height:24px; max-height:24px;"
+        )
+        self.count_label.setAlignment(Qt.AlignVCenter)
         layout.addWidget(self.count_label)
 
-        for icon, tip, slot, role in [
-            ("📋", "Select layers",   self._open_layer_selection, "default"),
-            ("⚙",  "Display options", self._open_display_options, "settings"),
-        ]:
-            btn = QPushButton(icon)
-            btn.setFixedSize(26, 26)
-            btn.setToolTip(tip)
-            btn.setStyleSheet(get_icon_button_style(role))
-            btn.clicked.connect(slot)
-            layout.addWidget(btn)
+        # Layer selection button with icon
+        layer_btn = QPushButton("📋 Layers")
+        layer_btn.setFixedSize(80, 28)  # Consistent size
+        layer_btn.setToolTip("Select layers to display")
+        layer_btn.setStyleSheet(get_icon_button_style("default"))
+        layer_btn.setFocusPolicy(Qt.StrongFocus)
+        layer_btn.clicked.connect(self._open_layer_selection)
+        layout.addWidget(layer_btn)
 
+        # Settings button with icon
+        settings_btn = QPushButton("⚙ Settings")
+        settings_btn.setFixedSize(90, 28)  # Consistent size
+        settings_btn.setToolTip("Display options (overlay/underlay, color override)")
+        settings_btn.setStyleSheet(get_icon_button_style("settings"))
+        settings_btn.setFocusPolicy(Qt.StrongFocus)
+        settings_btn.clicked.connect(self._open_display_options)
+        layout.addWidget(settings_btn)
+
+        # Remove button
         rm_btn = QPushButton("✖")
-        rm_btn.setFixedSize(26, 26)
+        rm_btn.setFixedSize(28, 28)
+        rm_btn.setToolTip("Remove this file")
         rm_btn.setStyleSheet(get_icon_button_style("danger"))
+        rm_btn.setFocusPolicy(Qt.StrongFocus)
         rm_btn.clicked.connect(lambda: self.remove_requested.emit(self))
         layout.addWidget(rm_btn)
 
-        self.setStyleSheet(get_file_item_row_style())
+        # Row styling with fixed height
+        self.setStyleSheet(
+            get_file_item_row_style() + 
+            "min-height:40px; max-height:40px;"  # Enforce consistent height
+        )
+        self.setMinimumHeight(40)
+        self.setMaximumHeight(40)
 
     def update_entity_count(self, count: int):
         self.entity_count = count
@@ -1056,54 +1095,69 @@ class MultiSNTAttachmentDialog(QDialog):
 
         file_group = QGroupBox("Select SNT Files")
         file_layout = QVBoxLayout()
-        browse_btn  = QPushButton("Browse and Add SNT Files...")
+        browse_btn  = QPushButton("📂 Browse and Add SNT Files...")
         browse_btn.setObjectName("secondaryBtn")
-        browse_btn.setAutoDefault(False)
-        browse_btn.setDefault(False)
-        browse_btn.setFocusPolicy(Qt.NoFocus)
+        browse_btn.setFocusPolicy(Qt.StrongFocus)  # Enable keyboard navigation
+        browse_btn.setMinimumHeight(36)
         browse_btn.clicked.connect(self._select_snt_files)
         file_layout.addWidget(browse_btn)
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
 
-        list_group = QGroupBox("Selected SNT Files  (click X to remove)")
+        list_group = QGroupBox("Selected SNT Files  (click ✖ to remove)")
         list_layout = QVBoxLayout()
 
+        # FIXED SCROLL AREA - proper cursor support
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setMinimumHeight(200)
         scroll.setMaximumHeight(320)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFocusPolicy(Qt.StrongFocus)  # Enable keyboard scrolling
+        
         self.file_list_widget = QWidget()
+        self.file_list_widget.setFocusPolicy(Qt.NoFocus)  # Let children handle focus
         self.file_list_layout = QVBoxLayout(self.file_list_widget)
-        self.file_list_layout.setSpacing(5)
+        self.file_list_layout.setSpacing(2)  # Tighter spacing for alignment
         self.file_list_layout.setContentsMargins(5, 5, 5, 5)
         self.file_list_layout.addStretch()
+        
         scroll.setWidget(self.file_list_widget)
         list_layout.addWidget(scroll)
 
         self.file_count_label = QLabel("No files selected")
-        self.file_count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px; padding:5px;")
+        self.file_count_label.setStyleSheet(
+            f"color:{ThemeColors.get('text_muted')}; "
+            f"font-size:10px; padding:8px; min-height:28px;"
+        )
+        self.file_count_label.setAlignment(Qt.AlignCenter)
         list_layout.addWidget(self.file_count_label)
         list_group.setLayout(list_layout)
         layout.addWidget(list_group)
 
         btn_row = QHBoxLayout()
-        clear_btn = QPushButton("Clear All")
+        clear_btn = QPushButton("🗑 Clear All")
         clear_btn.setObjectName("dangerBtn")
-        clear_btn.setAutoDefault(False)
-        clear_btn.setDefault(False)
-        clear_btn.setFocusPolicy(Qt.NoFocus)
+        clear_btn.setFocusPolicy(Qt.StrongFocus)
+        clear_btn.setMinimumHeight(36)
         clear_btn.clicked.connect(self._clear_all)
         btn_row.addWidget(clear_btn)
+        
         btn_row.addStretch()
-        attach_btn = QPushButton("Attach All SNT Files")
+        
+        attach_btn = QPushButton("✅ Attach All SNT Files")
         attach_btn.setObjectName("primaryBtn")
-        attach_btn.setAutoDefault(False)
-        attach_btn.setDefault(False)
-        attach_btn.setFocusPolicy(Qt.NoFocus)
+        attach_btn.setFocusPolicy(Qt.StrongFocus)
+        attach_btn.setMinimumHeight(36)
+        attach_btn.setDefault(True)  # Enter key triggers this
         attach_btn.clicked.connect(self._attach_all)
         btn_row.addWidget(attach_btn)
+        
         layout.addLayout(btn_row)
+
+        # Set initial focus to browse button
+        browse_btn.setFocus()
 
     # ── File selection ────────────────────────────────────────────────────
 

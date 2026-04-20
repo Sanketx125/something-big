@@ -1,19 +1,18 @@
-from ast import Pass
 import vtk
 import numpy as np
 try:
     from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                                    QLineEdit, QSpinBox, QFontComboBox, QComboBox,
+                                    QLineEdit, QSpinBox, QComboBox,
                                     QCheckBox, QPushButton, QGroupBox, QColorDialog,QRadioButton, QMenu)
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QColor, QCursor
 except ImportError:
     try:
-        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                                      QLineEdit, QSpinBox, QFontComboBox, QComboBox,
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,  # type: ignore
+                                      QLineEdit, QSpinBox, QComboBox,
                                       QCheckBox, QPushButton, QGroupBox, QColorDialog, QMenu)
-        from PyQt5.QtCore import Qt
-        from PyQt5.QtGui import QColor, QCursor
+        from PyQt5.QtCore import Qt  # type: ignore
+        from PyQt5.QtGui import QColor, QCursor  # type: ignore
     except ImportError:
         print("⚠️ Qt library not found - text editing will be limited")
 
@@ -6236,7 +6235,6 @@ class LineEditDialog(QDialog):
         
     def enable_pan_while_drawing(self):
         try:
-            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleUser
             current_style = self.interactor.GetInteractorStyle()
             if hasattr(current_style, 'SetMiddleButtonPressEvent'):
                 print("✅ Pan while drawing enabled (middle mouse button)")

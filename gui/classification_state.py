@@ -1,10 +1,3 @@
-"""
-Classification State Tracker - Dirty Flag System
-
-This is a NEW module that doesn't modify any existing code.
-It provides state tracking that the optimizer uses.
-"""
-
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Set, Optional, Dict, List

@@ -15,7 +15,7 @@ import numpy as np
 import laspy
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 import psutil
 import gc
 
@@ -434,36 +434,6 @@ def load_lidar_smart(filepath: str, progress_callback=None):
             'xyz': sampled_xyz,
             'note': 'Overview mode - use zoom to load detailed regions'
         }
-
-
-# ============================================
-# USAGE EXAMPLE
-# ============================================
-
-def example_usage():
-    """Show how to use the smart loader."""
-    
-    # Progress callback
-    def on_progress(percent, status):
-        print(f"[{percent:3d}%] {status}")
-    
-    # Load file
-    data = load_lidar_smart("large_file.laz", progress_callback=on_progress)
-    
-    # Check mode
-    if isinstance(data, dict) and data.get('mode') == 'tiled':
-        print("✅ Tiled mode active")
-        tiled_manager = data['tiled_manager']
-        
-        # Later: load tiles for current viewport
-        viewport = (100, 200, 150, 250)  # x_min, x_max, y_min, y_max
-        visible_tiles = tiled_manager.get_tiles_in_view(viewport)
-        
-        for tile in visible_tiles:
-            tiled_manager.load_tile(tile)
-    
-    else:
-        print(f"✅ Full load: {len(data['xyz']):,} points")
 
 
 # ============================================
