@@ -2668,10 +2668,75 @@ class ByClassDialog(QDialog):
         self._connected_display_dialog = display_dialog
         print("✅ ByClassDialog connected to display_mode_dialog.classes_loaded")
 
+
+    def _prune_stale_fences(self):
+        """
+        Remove any selected_fences whose drawing no longer exists in the
+        digitizer (e.g. user cleared them via the Draw toolbar).
+        """
+        digitizer = getattr(self.app, 'digitizer', None)
+        if not digitizer:
+            # No digitizer at all → can't validate → clear everything to be safe
+            if self.selected_fences:
+                print(f"   ⚠️ No digitizer — pruning all {len(self.selected_fences)} stale fences")
+                self.selected_fences = []
+                self._clear_fence_highlights()
+                self._reset_fence_ui()
+            return
+ 
+        existing_drawings = getattr(digitizer, 'drawings', [])
+ 
+        # Build a set of existing coordinate fingerprints for fast lookup
+        def coords_key(coords):
+            try:
+                return tuple(tuple(c[:2]) for c in coords)   # XY only, ignore Z rounding
+            except Exception:
+                return ()
+ 
+        existing_keys = {coords_key(d.get('coords', [])) for d in existing_drawings}
+ 
+        before = len(self.selected_fences)
+        self.selected_fences = [
+            f for f in self.selected_fences
+            if coords_key(f.get('coords', [])) in existing_keys
+        ]
+        after = len(self.selected_fences)
+ 
+        if before != after:
+            pruned = before - after
+            print(f"   🧹 Pruned {pruned} stale fence reference(s) "
+                  f"({after} remaining)")
+            # Remove any now-orphaned highlight actors
+            self._clear_fence_highlights()
+            self.update_fence_display()
+ 
+            if not self.selected_fences:
+                self._reset_fence_ui()
+ 
+ 
+    def _reset_fence_ui(self):
+        """Reset the fence status label to 'no fence selected'."""
+        self.selected_fences = []
+        self.permanent_fence_mode = False
+        self.fence_count_badge.setText("0")
+        self.fence_status.setText("❌ No fence selected")
+        self.fence_status.setStyleSheet("""
+            QLabel {
+                padding: 4px; background-color: #2c2c2c;
+                border-radius: 3px; color: #f44336;
+            }
+        """)
+
     def showEvent(self, event):
+        """Ensure dialog gets focus when shown."""
         super().showEvent(event)
-        self._connect_display_dialog()
-        self.refresh_class_lists(reason="dialog shown", update_status=False)
+        self.setFocus()
+        self.activateWindow()
+        # ✅ FIX: Do NOT restore blue highlights on show.
+        # They are selection-preview actors created inside select_fence().
+        # After classification they are cleared; we never want them restored
+        # automatically — that is what caused the phantom blue box.
+        print("🔵 ByClassHeightDialog activated and focused")
 
     def _get_selected_from_classes(self):
         return [item.data(Qt.UserRole) for item in self.from_list.selectedItems()]
@@ -3212,6 +3277,15 @@ class ByClassDialog(QDialog):
                     except Exception as e:
                         print(f"   ⚠️ Section {view_idx+1} refresh failed: {e}")
 
+            # Refresh Cut Section view if active
+            try:
+                ctrl = getattr(self.app, 'cut_section_controller', None)
+                if ctrl and getattr(ctrl, 'is_cut_view_active', False):
+                    if hasattr(ctrl, '_refresh_cut_colors_fast'):
+                            ctrl._refresh_cut_colors_fast()
+            except Exception as e:
+                print(f"   ⚠️ Cut Section refresh failed: {e}")
+
             # Update point count widget
             if hasattr(self.app, 'point_count_widget'):
                 self.app.point_count_widget.schedule_update()
@@ -3747,12 +3821,22 @@ class ClosedByClassDialog(QDialog):
                         except Exception as e:
                             print(f"   ⚠️ Section {view_idx+1} refresh failed: {e}")
 
+                # Refresh Cut Section view if active
+                try:
+                    ctrl = getattr(self.app, 'cut_section_controller', None)
+                    if ctrl and getattr(ctrl, 'is_cut_view_active', False):
+                        if hasattr(ctrl, '_refresh_cut_colors_fast'):
+                                ctrl._refresh_cut_colors_fast()
+                except Exception as e:
+                    print(f"   ⚠️ Cut Section refresh failed: {e}")
+
                 # Update point count widget
                 if hasattr(self.app, 'point_count_widget'):
                     self.app.point_count_widget.schedule_update()
 
                 
                 self.preview_label.setText("↶ Undo performed")
+                
                 self.preview_label.setStyleSheet("""
                     QLabel {
                         color: #ff9800;
@@ -3820,6 +3904,15 @@ class ClosedByClassDialog(QDialog):
                                 self.app._refresh_single_section_view(view_idx)
                         except Exception as e:
                             print(f"   ⚠️ Section {view_idx+1} refresh failed: {e}")
+
+                # Refresh Cut Section view if active
+                try:
+                    ctrl = getattr(self.app, 'cut_section_controller', None)
+                    if ctrl and getattr(ctrl, 'is_cut_view_active', False):
+                        if hasattr(ctrl, '_refresh_cut_colors_fast'):
+                                ctrl._refresh_cut_colors_fast()
+                except Exception as e:
+                    print(f"   ⚠️ Cut Section refresh failed: {e}")
 
                 # Update point count widget
                 if hasattr(self.app, 'point_count_widget'):
@@ -4417,6 +4510,15 @@ class ClosedByClassDialog(QDialog):
             if hasattr(self.app, 'point_count_widget'):
                 self.app.point_count_widget.schedule_update()
 
+            # Refresh Cut Section view if active
+            try:
+                ctrl = getattr(self.app, 'cut_section_controller', None)
+                if ctrl and getattr(ctrl, 'is_cut_view_active', False):
+                    if hasattr(ctrl, '_refresh_cut_colors_fast'):
+                        ctrl._refresh_cut_colors_fast()
+            except Exception as e:
+                print(f"   ⚠️ Cut Section refresh failed: {e}")
+
             return from_class_count
         
         # Get From class points (to convert)
@@ -4559,6 +4661,15 @@ class ClosedByClassDialog(QDialog):
                         self.app._refresh_single_section_view(view_idx)
                 except Exception as e:
                     print(f"   ⚠️ Section {view_idx+1} refresh failed: {e}")
+
+        # Refresh Cut Section view if active
+        try:
+            ctrl = getattr(self.app, 'cut_section_controller', None)
+            if ctrl and getattr(ctrl, 'is_cut_view_active', False):
+                if hasattr(ctrl, '_refresh_cut_colors_fast'):
+                        ctrl._refresh_cut_colors_fast()
+        except Exception as e:
+            print(f"   ⚠️ Cut Section refresh failed: {e}")
 
         # Update point count widget
         if hasattr(self.app, 'point_count_widget'):
@@ -5854,6 +5965,7 @@ class ByClassHeightDialog(QDialog):
             
             ap = QPushButton("Apply Selection")
             ap.setStyleSheet("QPushButton { background-color: #2e7d32; color: white; font-size: 10px; font-weight: bold; padding: 6px 16px; border-radius: 3px; }")
+
             def apply_sel():
                 highlight_fence_in_3d(None)
                 sel = [shp for cb, _, _, shp in custom_widgets if cb.isChecked()]
@@ -5878,10 +5990,13 @@ class ByClassHeightDialog(QDialog):
                 mt = "🔄 PERMANENT" if self.permanent_fence_mode else "TEMP"
                 self.fence_status.setText(f"✅ {fc} fence(s) ({tp} pts) - {mt}")
                 self.fence_status.setStyleSheet("QLabel { padding: 4px; background-color: #1b5e20; border-radius: 3px; color: #4caf50; font-weight: bold; }")
+                # ✅ THE FIX: hand the local blue actors to self so _clear_fence_highlights() can remove them
+                self._selection_highlight_actors = list(selection_highlight_actors.values())
                 try: self.app.vtk_widget.render()
                 except Exception: pass
                 self._fence_selection_dialog = None
                 dialog.close(); dialog.deleteLater()
+
             ap.clicked.connect(apply_sel)
             bl.addWidget(ap)
             
@@ -5903,31 +6018,77 @@ class ByClassHeightDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Fence dialog failed:\n{str(e)}")
 
     def clear_fence_selection(self):
+        """Clear fence selection AND remove the drawn shapes from the digitizer."""
+        # ✅ Remove actual drawn shapes from digitizer (mirrors InsideFenceDialog temp-mode cleanup)
+        if hasattr(self.app, 'digitizer') and self.app.digitizer and self.selected_fences:
+            digitizer = self.app.digitizer
+            for fence in list(self.selected_fences):
+                fence_coords = fence.get('coords', [])
+                for drawing in list(digitizer.drawings):
+                    drawing_coords = drawing.get('coords', [])
+                    if len(fence_coords) == len(drawing_coords) and all(
+                            tuple(a) == tuple(b)
+                            for a, b in zip(fence_coords, drawing_coords)):
+                        digitizer._remove_drawing(drawing)
+                        print(f"   🗑️ Removed drawn fence ({fence.get('type', 'unknown')})")
+                        break
+    
         self.selected_fences = []
         self.permanent_fence_mode = False
+    
         self.fence_status.setText("❌ No fence selected")
-        self.fence_status.setStyleSheet("QLabel { padding: 4px; background-color: #2c2c2c; border-radius: 3px; color: #f44336; }")
-        self._clear_fence_highlights()
+        self.fence_status.setStyleSheet("""
+            QLabel {
+                padding: 4px; background-color: #2c2c2c;
+                border-radius: 3px; color: #f44336;
+            }
+        """)
+    
+        self._clear_fence_highlights()  # removes blue + cyan VTK actors
         self.update_fence_display()
+    
+        try:
+            self.app.vtk_widget.render()
+        except Exception:
+            pass
+    
+        print("🗑️ Height fence: cleared selection + removed drawn shapes")
 
     def _clear_fence_highlights(self):
+        # Remove hover highlight (yellow)
         if hasattr(self, '_hover_highlight_actor') and self._hover_highlight_actor:
             try:
                 self.app.vtk_widget.renderer.RemoveViewProp(self._hover_highlight_actor)
                 self._hover_highlight_actor = None
-            except Exception: pass
+            except Exception:
+                pass
+    
+        # Remove selection highlights (blue)
         if hasattr(self, '_selection_highlight_actors'):
             for actor in self._selection_highlight_actors:
-                try: self.app.vtk_widget.renderer.RemoveViewProp(actor)
-                except Exception: pass
+                try:
+                    self.app.vtk_widget.renderer.RemoveViewProp(actor)
+                except Exception:
+                    pass
             self._selection_highlight_actors = []
+    
+        # ✅ FIX BUG 3: at same indent level (was wrongly nested inside block above)
         if hasattr(self, '_classified_fence_actors'):
             for actor in self._classified_fence_actors:
-                try: self.app.vtk_widget.renderer.RemoveViewProp(actor)
-                except Exception: pass
+                try:
+                    if hasattr(self.app, 'digitizer') and \
+                            hasattr(self.app.digitizer, 'overlay_renderer'):
+                        self.app.digitizer.overlay_renderer.RemoveActor(actor)
+                    else:
+                        self.app.vtk_widget.renderer.RemoveViewProp(actor)
+                except Exception:
+                    pass
             self._classified_fence_actors = []
-        try: self.app.vtk_widget.render()
-        except Exception: pass
+    
+        try:
+            self.app.vtk_widget.render()
+        except Exception:
+            pass
 
     def update_fence_display(self):
         self.fence_count_badge.setText(str(len(self.selected_fences)) if self.selected_fences else "0")
@@ -6549,16 +6710,24 @@ class ByClassHeightDialog(QDialog):
             
             # ✅ FENCE CLEANUP after successful conversion
             if use_fence:
-                self._clear_fence_highlights()
-                self._highlight_classified_fences()
-
+                self._clear_fence_highlights()          # remove blue actors
+                self._highlight_classified_fences()     # recolour drawn rect → cyan
+ 
                 if hasattr(self.app, 'digitizer') and self.app.digitizer:
                     try:
                         self.app.digitizer.rebind_drawings()
                         print("   🖊️ Drawing actors rebound to overlay after fence conversion")
                     except Exception as _rb_err:
                         print(f"   ⚠️ rebind_drawings failed: {_rb_err}")
-
+ 
+                # ✅ FIX: ALWAYS clear selected_fences after classification.
+                # This mirrors InsideFenceDialog behaviour ("dialog can't remember
+                # selected fence after classification"). Without this, showEvent
+                # calls _restore_highlights_from_data() when the QMessageBox
+                # closes and the blue box immediately reappears.
+                #
+                # The drawn rectangle (orange/cyan outline) stays visible.
+                # If temp mode, also delete the drawing from the digitizer.
                 if not self.permanent_fence_mode:
                     if hasattr(self.app, 'digitizer'):
                         for fence in list(self.selected_fences):
@@ -6566,16 +6735,21 @@ class ByClassHeightDialog(QDialog):
                                 fc = fence.get('coords', [])
                                 dc = drawing.get('coords', [])
                                 if len(fc) == len(dc) and all(
-                                    tuple(a) == tuple(b) for a, b in zip(fc, dc)):
+                                        tuple(a) == tuple(b) for a, b in zip(fc, dc)):
                                     self.app.digitizer._remove_drawing(drawing)
                                     break
-                    self.selected_fences = []
-                    self.update_fence_display()
-                    self.fence_status.setText("❌ No fence (temp mode - select again)")
-                    self.fence_status.setStyleSheet("""
-                        QLabel { padding: 4px; background-color: #2c2c2c;
-                            border-radius: 3px; color: #f44336; }
-                    """)
+ 
+                self.selected_fences = []           # ← KEY LINE (both modes)
+                self.update_fence_display()
+                self.fence_status.setText(
+                    "✅ Classified — select a fence again for next run"
+                )
+                self.fence_status.setStyleSheet("""
+                    QLabel {
+                        padding: 4px; background-color: #1b3a20;
+                        border-radius: 3px; color: #81c784; font-size: 9px;
+                    }
+                """)
             
             QMessageBox.information(self, "Conversion Complete",
                                    f"✅ Successfully converted {converted_count:,} points")
@@ -9251,16 +9425,15 @@ class InsideFenceDialog(QDialog):
             #     dialog.close()
 
             def on_close():
-                # ✅ NEW: Remove hover highlight when closing
                 highlight_fence_in_3d(None)
                 for actor in selection_highlight_actors.values():
                     try:
-                        self.app.vtk_widget.renderer.RemoveActor(actor)
+                        self.app.vtk_widget.renderer.RemoveActor(actor)  # ✅ fixed
                     except Exception:
                         pass
                 selection_highlight_actors.clear()
-                self._fence_selection_dialog = None  # ✅ Clear reference
-                dialog.close()  
+                self._fence_selection_dialog = None
+                dialog.close()
             
             
             close_btn.clicked.connect(on_close)
