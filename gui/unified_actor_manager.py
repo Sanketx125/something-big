@@ -17,7 +17,9 @@ _MAX_BORDER_GROWTH_PX = 3.0
 _BORDER_DEPTH_BIAS = 0.001
 # Fixed pixel-width for structured (object-edge) borders — stays constant at any zoom
 _STRUCTURED_BORDER_PX = 2.0
- 
+# Add right after _STRUCTURED_BORDER_PX = 2.0
+_SECTION_BUILD_COOLDOWN = 0.5  # seconds
+_section_build_timestamps = {}  # {view_idx: timestamp} 
  
 # ─────────────────────────────────────────────────────────────────────────────
 # VIEW SHADER CONTEXT
@@ -609,15 +611,53 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
     if 1 <= slot_idx <= 4:
         if not hasattr(app, 'view_borders'):
             app.view_borders = {}
-        # ── AUTHORITATIVE BORDER SOURCE ──────────────────────────────
-        # app.view_borders is set ONLY by the Display Mode dialog
-        # (on_apply / increase_border / decrease_border).
-        # NEVER overwrite it from a caller value — auto-display code
-        # can accidentally pass app.point_border_percent (main view).
+
         if slot_idx in app.view_borders:
             border = float(app.view_borders[slot_idx])
         elif border_explicitly_provided:
             app.view_borders[slot_idx] = float(border)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # ✅ COOLDOWN CHECK: Skip rebuild if actor was just built
+        # Prevents double-build when sync_palette_to_gpu is called right
+        # after build_section_unified_actor
+        # ═══════════════════════════════════════════════════════════════════
+        import time as _time_sync
+        last_build = _section_build_timestamps.get(view_idx, 0)
+        time_since = time.perf_counter() - last_build
+        
+        if time_since < _SECTION_BUILD_COOLDOWN:
+            # Actor was JUST built - update uniforms only, don't rebuild
+            existing_actor = vtk_widget.actors.get(actor_name)
+            if existing_actor is not None:
+                print(f"   ⚡ SKIP rebuild View {view_idx+1} (built {time_since*1000:.0f}ms ago)")
+                ctx = getattr(existing_actor, '_naksha_shader_ctx', None)
+                if ctx is not None:
+                    ctx.force_reload()
+                    ctx.load_from_palette(palette, float(border), 
+                                          float(getattr(existing_actor, '_naksha_base_point_size', _BASE_POINT_SIZE)))
+                    _push_uniforms_direct(existing_actor, ctx)
+                    
+                    # Update RGB if needed
+                    rgb_ptr = getattr(existing_actor, '_naksha_rgb_ptr', None)
+                    sc = getattr(existing_actor, '_naksha_section_class', None)
+                    if rgb_ptr is not None and sc is not None and _is_writable(rgb_ptr):
+                        _rewrite_rgb_from_palette(rgb_ptr, sc, palette)
+                        vtk_ca = getattr(existing_actor, '_naksha_vtk_array', None)
+                        if vtk_ca:
+                            vtk_ca.Modified()
+                        _mark_actor_dirty(existing_actor)
+                
+                if render:
+                    try:
+                        vtk_widget.render()
+                    except Exception:
+                        pass
+                
+                elapsed = (time.perf_counter() - t0) * 1000
+                print(f"   ⚡ GPU Sync (Slot {slot_idx}): {elapsed:.1f} ms [UNIFORMS ONLY]")
+                return True
+        
         # ─────────────────────────────────────────────────────────────
         if section_requires_legacy_border_render(app, view_idx, palette, float(border)):
 
@@ -631,7 +671,7 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
             app._refresh_single_section_view(view_idx, float(border))
             return True
         return False
- 
+    
     ctx = getattr(actor, '_naksha_shader_ctx', None)
     if ctx is None:
         ctx = ViewShaderContext(slot_idx)
@@ -1546,6 +1586,9 @@ def build_section_unified_actor(
     vtk_widget._naksha_section_render_mode = "unified"
     vtk_widget.camera_position = cam_pos
     vtk_widget.render()
+ 
+    # ✅ RECORD BUILD TIMESTAMP for cooldown check in sync_palette_to_gpu
+    _section_build_timestamps[view_idx] = time.perf_counter()
  
     elapsed = (time.perf_counter() - t0) * 1000
     print(f"   🏗️ Section {view_idx+1} unified actor: {n_pts:,} pts in {elapsed:.1f} ms "

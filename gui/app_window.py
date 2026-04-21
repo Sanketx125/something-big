@@ -2553,6 +2553,19 @@ class NakshaApp(QMainWindow):
                 
                 print(f"   🔗 Syncing section: View {target_idx + 1} from View {source_idx + 1} (mode={view_mode})")
                 
+                # ✅ COOLDOWN CHECK: Skip rebuild if target view was just built
+                try:
+                    from gui.unified_actor_manager import _section_build_timestamps, _SECTION_BUILD_COOLDOWN
+                    last_build = _section_build_timestamps.get(target_idx, 0)
+                    if (time.perf_counter() - last_build) < _SECTION_BUILD_COOLDOWN:
+                        print(f"      ⚡ SKIP sync rebuild View {target_idx+1} (recently built)")
+                        if source_cam:
+                            self._apply_camera_immediate(vtk_widget, source_cam)
+                            self._last_camera_states[target_idx] = source_cam.copy()
+                        continue
+                except Exception:
+                    pass
+                
                 # Save current active view
                 prev_active = getattr(self.section_controller, "active_view", None)
                 prev_vtk = getattr(self.section_controller, "current_vtk", None)
@@ -9890,9 +9903,17 @@ class NakshaApp(QMainWindow):
         """
         Optimized single cross-section view refresh.
         ✅ UNIFIED ACTOR PATH: Builds a single _section_X_unified actor per view.
-        This enables sync_palette_to_gpu, undo/redo, and per-view weights to work
-        through the same GPU uniform system as the Main View.
         """
+        # ✅ COOLDOWN CHECK: Skip if actor was just built
+        try:
+            from gui.unified_actor_manager import _section_build_timestamps, _SECTION_BUILD_COOLDOWN
+            last_build = _section_build_timestamps.get(view_idx, 0)
+            if (time.perf_counter() - last_build) < _SECTION_BUILD_COOLDOWN:
+                print(f"   ⚡ SKIP _refresh_single_section_view View {view_idx+1} (built {(time.perf_counter() - last_build)*1000:.0f}ms ago)")
+                return
+        except Exception:
+            pass
+        
         if not hasattr(self, 'section_vtks') or view_idx not in self.section_vtks:
             print(f"⏭️ View {view_idx} not found")
             return

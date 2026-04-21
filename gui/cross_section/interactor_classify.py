@@ -3940,16 +3940,8 @@ class ClassificationInteractor:
             
             print("✅ Classification tool cancelled")
         
-        # ✅ NEW: 'F' key to fly to current mouse position
         elif key == "f":
-            if not self._is_main_view():
-                try:
-                    x, y = self.interactor.GetEventPosition()
-                    pt = self._pick_world_point(x, y)
-                    self._fly_to_main_view(pt)
-                    print("✈️ 'F' key: Flying to cursor position")
-                except Exception as e:
-                    print(f"⚠️ 'F' key fly-to failed: {e}")
+            return
 
     def handle_escape(self):
         """Handle ESC key inside classification context safely."""
