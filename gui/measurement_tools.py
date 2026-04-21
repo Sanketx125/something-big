@@ -96,11 +96,56 @@ class MeasurementTool:
         self._overlay_renderer = ren
         return ren
 
+    def _prepare_overlay_actor(self, actor):
+        """
+        Apply front-most overlay settings before adding a prop to Layer 1.
+        """
+        if actor is None:
+            return
+
+        try:
+            if actor.IsA("vtkActor2D"):
+                return
+        except Exception:
+            pass
+
+        try:
+            prop = actor.GetProperty()
+        except Exception:
+            prop = None
+
+        if prop is not None:
+            try:
+                prop.SetDepthTestingEnabled(False)
+                return
+            except Exception:
+                pass
+
+        try:
+            mapper = actor.GetMapper()
+        except Exception:
+            mapper = None
+
+        if mapper is None:
+            return
+
+        try:
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetResolveCoincidentTopologyPolygonOffsetParameters(-1e5, -1e5)
+        except Exception:
+            pass
+
+        try:
+            mapper.SetResolveCoincidentTopologyLineOffsetParameters(-1e5, -1e5)
+        except Exception:
+            pass
+
     def _scene_add(self, actor):
         """Add a measurement actor to the overlay renderer (always on top)."""
         if actor is None:
             return
         ren = self._ensure_overlay_renderer()
+        self._prepare_overlay_actor(actor)
         ren.AddActor(actor)
 
     def _scene_remove(self, actor):
@@ -134,8 +179,8 @@ class MeasurementTool:
         Reuses a single persistent vtkPolyData — no allocation/GC on every mouse move.
         """
         if self._preview_polydata is None:
-            # One-time setup — allocate the reusable VTK pipeline
-            ren = self._ensure_overlay_renderer()   # only called once
+            # One-time setup â€” allocate the reusable VTK pipeline
+            self._ensure_overlay_renderer()   # only called once
 
             pts = vtk.vtkPoints()
             pts.SetNumberOfPoints(2)
@@ -167,17 +212,16 @@ class MeasurementTool:
             self._preview_pts = pts
             self._preview_polydata = pd
             self.temp_line_actor = actor
-            ren.AddActor(actor)
+            self._scene_add(actor)
             self._preview_actor_in_scene = True
         else:
-            # Hot path: just move the two endpoints — zero allocation, no renderer lookup
+            # Hot path: just move the two endpoints â€” zero allocation, no renderer lookup
             self._preview_pts.SetPoint(0, p1[0], p1[1], p1[2])
             self._preview_pts.SetPoint(1, p2[0], p2[1], p2[2])
             self._preview_pts.Modified()
             self._preview_polydata.Modified()
             if not self._preview_actor_in_scene:
-                ren = self._ensure_overlay_renderer()
-                ren.AddActor(self.temp_line_actor)
+                self._scene_add(self.temp_line_actor)
                 self._preview_actor_in_scene = True
 
     def _screen_to_world_fast(self):

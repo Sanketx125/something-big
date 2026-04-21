@@ -224,9 +224,7 @@ class GlobalShortcutFilter(QObject):
                 elif hasattr(self.app_window, 'measurement_tool') and \
                     hasattr(self.app_window.measurement_tool, 'active') and \
                     self.app_window.measurement_tool.active and \
-                    not getattr(self.app_window, 'active_classify_tool', None) and \
-                    not getattr(self.app_window, 'classify_interactor', None) and \
-                    not getattr(self.app_window, 'classify_interactors', None):
+                    not getattr(self.app_window, 'active_classify_tool', None):
 
                     measurement_tool = self.app_window.measurement_tool
 

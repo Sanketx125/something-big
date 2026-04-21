@@ -500,11 +500,6 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
             if hasattr(app_window.cut_section_controller, "_force_deactivate_pending_state"):
                 print("   🛑 Deactivating pending cut tool state...")
                 app_window.cut_section_controller._force_deactivate_pending_state()
-                
-            # ✅ Deactivate cut section if active
-            if getattr(app_window.cut_section_controller, "is_cut_view_active", False):
-                print("   🛑 Deactivating cut-section (switching to cross-section via shortcut)")
-                app_window.cut_section_controller.clear()
 
         # ✅ Deactivate measurement tool
         if hasattr(app_window, 'measurement_tool') and app_window.measurement_tool:

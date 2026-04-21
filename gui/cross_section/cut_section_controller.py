@@ -788,15 +788,7 @@ class CutSectionController:
         if self.cut_vtk is not None:
             iren = self.cut_vtk.interactor
             
-            # ✅ NUCLEAR CLEANUP: Remove ALL LeftButton/MouseMove observers
-            # This prevents ghost observers from stacking up
-            try:
-                iren.RemoveObservers("LeftButtonPressEvent")
-                iren.RemoveObservers("MouseMoveEvent")
-                print(f"  🧹 Cleared all LeftButton/MouseMove observers (nuclear cleanup)")
-            except Exception as e:
-                print(f"  ⚠️ Nuclear cleanup warning: {e}")
-            
+            # Then it sets its own
             def on_left_click(obj, evt):
                 print(f"🖱️ Left click in cut dock (state={self._state})")
                 if self._state == CutSectionState.IDLE:
@@ -1570,24 +1562,6 @@ class CutSectionController:
             del self._view_observer_ids['cut_dock']
 
         # ═══════════════════════════════════════════════════════════════
-        # ✅ CRITICAL FIX: Nuclear cleanup of ALL mouse observers on
-        #    the cut dock.  After a cut-in-cut the old on_mouse_move
-        #    handler from _activate_from_cut_dock() may still be alive
-        #    (observer IDs survive SetInteractorStyle changes).  When
-        #    state flips to WAITING_CENTER these ghosts would draw
-        #    preview lines inside the cut dock.
-        # ═══════════════════════════════════════════════════════════════
-        if self.cut_vtk is not None:
-            try:
-                iren_cut = self.cut_vtk.interactor
-                iren_cut.RemoveObservers("LeftButtonPressEvent")
-                iren_cut.RemoveObservers("MouseMoveEvent")
-                print("  🧹 Nuclear cleanup: ALL LeftButton/MouseMove "
-                    "observers removed from cut dock")
-            except Exception as e:
-                print(f"  ⚠️ Cut dock nuclear cleanup warning: {e}")
-        # ═══════════════════════════════════════════════════════════════
-
         # ✅ STEP 2: Clear ALL preview actors from cut dock
         if self.cut_vtk and hasattr(self.cut_vtk, "renderer") and self.cut_vtk.renderer:
             ren_cut = self.cut_vtk.renderer
@@ -1898,25 +1872,6 @@ class CutSectionController:
                             pass
             except Exception as e:
                 print(f"   ⚠️ Observer detach for {v_idx}: {e}")
-        
-        # Nuclear cleanup: Remove ALL LeftButton/MouseMove observers from ALL views
-        if hasattr(self.app, 'section_vtks'):
-            for view_idx, vtk_widget in self.app.section_vtks.items():
-                try:
-                    iren = vtk_widget.interactor
-                    iren.RemoveObservers("LeftButtonPressEvent")
-                    iren.RemoveObservers("MouseMoveEvent")
-                except:
-                    pass
-        
-        # Also nuclear cleanup cut dock
-        if self.cut_vtk is not None:
-            try:
-                iren = self.cut_vtk.interactor
-                iren.RemoveObservers("LeftButtonPressEvent")
-                iren.RemoveObservers("MouseMoveEvent")
-            except:
-                pass
         
         self._view_observer_ids.clear()
         print("   ✅ All observers detached")
