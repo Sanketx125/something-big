@@ -903,22 +903,18 @@ class FenceSelectorWidget(QWidget):
     """
     Self-contained fence selection component for classification dialogs.
     
-    FIX: Now watches the digitizer's drawings list.  When the user does
-    Shift+Clear (or any clear that empties digitizer.drawings), this
-    widget automatically:
-      1. Removes its selection-highlight actors from the VTK renderer
-      2. Clears its internal selected_fences list
-      3. Updates the status label
+    Supports both digitizer drawings AND curve tool curves as fences.
     
-    Without this fix, the blue/yellow fence highlight actors persisted
-    in the 3D view even after all drawings were cleared, because the
-    FenceSelectorWidget kept its own separate actor references.
+    FIX: Watches the digitizer's drawings list AND curve tool's finalized_actors.
+    When either is cleared, this widget automatically removes its
+    selection-highlight actors from the VTK renderer.
     """
 
     _SHAPE_ICONS = {
         'rectangle': '▭', 'circle': '○', 'polygon': '⬟',
         'polyline': '⬡', 'line': '─', 'smartline': '⚡',
         'smart_line': '⚡', 'freehand': '✏️',
+        'curve': '〰️',  # ✅ NEW: Curve tool icon
     }
 
     def __init__(self, app, parent=None):
@@ -956,17 +952,12 @@ class FenceSelectorWidget(QWidget):
         main.addWidget(self.status_lbl)
 
     # ──────────────────────────────────────────────────────────────
-    # FIX: Watch for digitizer drawings being cleared
+    # FIX: Watch for digitizer drawings AND curve tool changes
     # ──────────────────────────────────────────────────────────────
     def _start_fence_watch(self):
         """
         Start a lightweight timer that checks whether the digitizer's
-        drawings list has been cleared.  If our selected fences reference
-        drawings that no longer exist, auto-clear our actors.
-        
-        We use a timer instead of a signal because the digitizer's clear
-        function doesn't emit a signal — it just empties the list.
-        The timer runs every 500ms which is imperceptible to the user.
+        drawings list or curve tool's finalized_actors have been cleared.
         """
         self._check_timer = QTimer(self)
         self._check_timer.setInterval(500)
@@ -975,49 +966,67 @@ class FenceSelectorWidget(QWidget):
 
     def _check_fences_still_valid(self):
         """
-        Check if our selected fences still exist in the digitizer's
-        drawings list.  If the digitizer was cleared, our fence
-        references become stale — clean them up.
+        Check if our selected fences still exist.
+        Handles both digitizer drawings and curve tool curves.
         """
         if not self.selected_fences:
             return
 
+        # Build sets of valid IDs for both sources
         digitizer = getattr(self.app, 'digitizer', None)
-        if digitizer is None:
-            return
+        drawing_ids = set()
+        if digitizer:
+            drawings = getattr(digitizer, 'drawings', [])
+            if drawings is not None:
+                drawing_ids = {id(d) for d in drawings}
 
-        drawings = getattr(digitizer, 'drawings', None)
-        if drawings is None:
-            return
+        curve_tool = getattr(self.app, 'curve_tool', None)
+        curve_ids = set()
+        if curve_tool:
+            for curve_data in curve_tool.finalized_actors:
+                if isinstance(curve_data, dict):
+                    curve_ids.add(id(curve_data))
 
-        # If the digitizer's drawings list is empty but we still have
-        # selected fences, the user cleared all drawings
-        if len(drawings) == 0:
-            print("🧹 FenceSelectorWidget: digitizer cleared — removing fence actors")
-            self.clear_fences()
-            return
+        # Filter valid fences
+        still_valid = []
+        removed_actor_ids = set()
 
-        # Also check if any of our selected fences have been removed
-        # (partial clear or individual delete)
-        drawing_ids = {id(d) for d in drawings}
-        still_valid = [f for f in self.selected_fences if id(f) in drawing_ids]
+        for fence in self.selected_fences:
+            is_valid = False
+            
+            if fence.get('source') == 'curve_tool':
+                # Check if curve still exists
+                curve_ref = fence.get('curve_data')
+                if curve_ref and id(curve_ref) in curve_ids:
+                    is_valid = True
+                else:
+                    # Curve was removed - get actor ID for cleanup
+                    removed_actor_ids.add(id(fence))
+            else:
+                # Digitizer drawing
+                if id(fence) in drawing_ids:
+                    is_valid = True
+                else:
+                    removed_actor_ids.add(id(fence))
 
+            if is_valid:
+                still_valid.append(fence)
+
+        # Clean up actors for removed fences
+        for rid in removed_actor_ids:
+            if rid in self._sel_actors:
+                try:
+                    self.app.vtk_widget.renderer.RemoveActor(self._sel_actors[rid])
+                except Exception:
+                    pass
+                del self._sel_actors[rid]
+
+        # Update if anything changed
         if len(still_valid) < len(self.selected_fences):
-            # Some fences were removed — clean up the stale ones
-            removed_ids = {id(f) for f in self.selected_fences} - {id(f) for f in still_valid}
-            for rid in removed_ids:
-                if rid in self._sel_actors:
-                    try:
-                        self.app.vtk_widget.renderer.RemoveActor(self._sel_actors[rid])
-                    except Exception:
-                        pass
-                    del self._sel_actors[rid]
-
             self.selected_fences = still_valid
             self._update_status()
 
             if not self.selected_fences:
-                # All fences gone
                 try:
                     self.app.vtk_widget.render()
                 except Exception:
@@ -1028,8 +1037,94 @@ class FenceSelectorWidget(QWidget):
             return None
         combined = np.zeros(len(xyz), dtype=bool)
         for fence in self.selected_fences:
-            combined |= self._poly_mask(xyz, fence.get('coords', []))
+            coords = fence.get('coords', [])
+            if coords:
+                combined |= self._poly_mask(xyz, coords)
         return combined
+
+    def _poly_mask(self, xyz: np.ndarray, coords) -> np.ndarray:
+        """
+        Point-in-polygon test using ray casting algorithm.
+        
+        Args:
+            xyz: Nx3 array of point coordinates
+            coords: Polygon coordinates (list of [x,y,z] or Nx3 array)
+        
+        Returns:
+            Boolean mask of points inside the polygon
+        """
+        if len(coords) < 3:
+            return np.zeros(len(xyz), dtype=bool)
+        
+        try:
+            from matplotlib.path import Path
+        except ImportError:
+            # Fallback to manual ray casting
+            return self._ray_cast_mask(xyz, coords)
+        
+        # Extract XY coordinates only (ignore Z)
+        if isinstance(coords, list):
+            poly_xy = np.array([[c[0], c[1]] for c in coords])
+        else:
+            poly_xy = coords[:, :2]
+        
+        points_xy = xyz[:, :2]
+        
+        # 1. AABB Pre-filter (O(N) - Ultra Fast)
+        min_x, min_y = np.min(poly_xy, axis=0)
+        max_x, max_y = np.max(poly_xy, axis=0)
+        
+        bbox_mask = (
+            (points_xy[:, 0] >= min_x) & 
+            (points_xy[:, 0] <= max_x) & 
+            (points_xy[:, 1] >= min_y) & 
+            (points_xy[:, 1] <= max_y)
+        )
+        
+        inside = np.zeros(len(xyz), dtype=bool)
+        
+        # 2. Exact Polygon Check ONLY on points inside the bounding box
+        if np.any(bbox_mask):
+            # Close polygon if not already closed
+            if not np.allclose(poly_xy[0], poly_xy[-1]):
+                poly_xy = np.vstack([poly_xy, poly_xy[0]])
+            
+            poly_path = Path(poly_xy)
+            inside[bbox_mask] = poly_path.contains_points(points_xy[bbox_mask])
+        
+        return inside
+
+    def _ray_cast_mask(self, xyz: np.ndarray, coords) -> np.ndarray:
+        """
+        Manual ray casting fallback for point-in-polygon test.
+        Used when matplotlib is not available.
+        """
+        if isinstance(coords, list):
+            poly_xy = np.array([[c[0], c[1]] for c in coords])
+        else:
+            poly_xy = coords[:, :2]
+        
+        # Close polygon if not already closed
+        if not np.allclose(poly_xy[0], poly_xy[-1]):
+            poly_xy = np.vstack([poly_xy, poly_xy[0]])
+        
+        n_poly = len(poly_xy)
+        mask = np.zeros(len(xyz), dtype=bool)
+        points_xy = xyz[:, :2]
+        
+        for i, pt in enumerate(points_xy):
+            inside = False
+            j = n_poly - 1
+            for k in range(n_poly):
+                xi, yi = poly_xy[k]
+                xj, yj = poly_xy[j]
+                if ((yi > pt[1]) != (yj > pt[1])) and \
+                   (pt[0] < (xj - xi) * (pt[1] - yi) / (yj - yi + 1e-10) + xi):
+                    inside = not inside
+                j = k
+            mask[i] = inside
+        
+        return mask
 
     def cleanup_actors(self):
         """Remove all VTK actors and stop the watch timer."""
@@ -1038,19 +1133,47 @@ class FenceSelectorWidget(QWidget):
         if self._check_timer is not None:
             self._check_timer.stop()
 
+    def _remove_hover(self):
+        """Remove hover highlight actor."""
+        if self._hover_actor[0]:
+            try:
+                self.app.vtk_widget.renderer.RemoveActor(self._hover_actor[0])
+            except Exception:
+                pass
+            self._hover_actor[0] = None
+
+    def _remove_sel_actors(self):
+        """Remove all selection highlight actors."""
+        for actor in self._sel_actors.values():
+            try:
+                self.app.vtk_widget.renderer.RemoveActor(actor)
+            except Exception:
+                pass
+        self._sel_actors.clear()
+
     def open_fence_picker(self):
+        """Open fence picker dialog showing both digitizer drawings and curves."""
         digitize = getattr(self.app, 'digitizer', None)
-        if not digitize:
-            QMessageBox.warning(self.window(), "No Digitize Manager",
-                "Please draw at least one shape using the Digitize tools first.")
-            return
-        drawings = getattr(digitize, 'drawings', [])
-        valid = [d for d in drawings if d.get('type') in
-                 ['rectangle', 'circle', 'polygon', 'freehand',
-                  'line', 'smart_line', 'polyline', 'smartline']]
+        curve_tool = getattr(self.app, 'curve_tool', None)
+        
+        # ── Collect digitizer drawings ────────────────────────────
+        valid = []
+        if digitize:
+            drawings = getattr(digitize, 'drawings', [])
+            valid.extend([d for d in drawings if d.get('type') in
+                         ['rectangle', 'circle', 'polygon', 'freehand',
+                          'line', 'smart_line', 'polyline', 'smartline']])
+        
+        # ── Collect curve tool curves ✅ NEW ─────────────────────
+        curve_fences = []
+        if curve_tool and hasattr(curve_tool, 'get_curves_as_fences'):
+            curve_fences = curve_tool.get_curves_as_fences()
+            valid.extend(curve_fences)
+        
         if not valid:
             QMessageBox.warning(self.window(), "No Shapes Found",
-                "No shapes found.  Draw a shape using Digitize tools first.")
+                "No shapes or curves found.\n\n"
+                "Draw a shape using Digitize tools or Curve tool first.")
             return
 
         dlg = QDialog(self.window(), Qt.Window)
@@ -1064,6 +1187,13 @@ class FenceSelectorWidget(QWidget):
         from gui.theme_manager import ThemeColors
         info.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-weight:bold; padding:8px;")
         layout.addWidget(info)
+        
+        # Show source counts
+        digitizer_count = len(valid) - len(curve_fences)
+        curve_count = len(curve_fences)
+        source_info = QLabel(f"📐 Digitizer: {digitizer_count} | 〰️ Curves: {curve_count}")
+        source_info.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px; padding:2px 8px;")
+        layout.addWidget(source_info)
 
         perm_chk = QCheckBox("🔄 Permanent Fence Mode (keep all fences selected)")
         perm_chk.setChecked(self.permanent_fence_mode)
@@ -1082,39 +1212,87 @@ class FenceSelectorWidget(QWidget):
         picker_sel   = {}
 
         def _make_actor(coords, color, width):
-            try:
-                if hasattr(self.app, 'digitizer'):
-                    return self.app.digitizer._make_polyline_actor(
-                        coords, color=color, width=width)
-            except Exception:
-                pass
+            """Create a polyline actor for highlighting."""
+            # ✅ For curve tool, use Actor2D like the curve tool does
             try:
                 import vtk
                 pts = vtk.vtkPoints()
+                pts.SetDataTypeToDouble()
                 for c in coords:
-                    pts.InsertNextPoint(float(c[0]), float(c[1]),
-                                        float(c[2]) if len(c) > 2 else 0.0)
+                    z = float(c[2]) if len(c) > 2 else 0.0
+                    pts.InsertNextPoint(float(c[0]), float(c[1]), z)
+                
                 pl = vtk.vtkPolyLine()
                 pl.GetPointIds().SetNumberOfIds(len(coords))
                 for i in range(len(coords)):
                     pl.GetPointIds().SetId(i, i)
-                ca = vtk.vtkCellArray(); ca.InsertNextCell(pl)
-                pd = vtk.vtkPolyData(); pd.SetPoints(pts); pd.SetLines(ca)
-                mp = vtk.vtkPolyDataMapper(); mp.SetInputData(pd)
-                ac = vtk.vtkActor(); ac.SetMapper(mp)
+                
+                ca = vtk.vtkCellArray()
+                ca.InsertNextCell(pl)
+                
+                pd = vtk.vtkPolyData()
+                pd.SetPoints(pts)
+                pd.SetLines(ca)
+                
+                # Use Mapper2D for consistent rendering with curve tool
+                mapper = vtk.vtkPolyDataMapper2D()
+                mapper.SetInputData(pd)
+                
+                coord = vtk.vtkCoordinate()
+                coord.SetCoordinateSystemToWorld()
+                mapper.SetTransformCoordinate(coord)
+                
+                ac = vtk.vtkActor2D()
+                ac.SetMapper(mapper)
                 ac.GetProperty().SetColor(*color)
                 ac.GetProperty().SetLineWidth(width)
+                ac.GetProperty().SetDisplayLocationToForeground()
+                
                 return ac
             except Exception:
-                return None
+                # Fallback to 3D actor
+                try:
+                    import vtk
+                    pts = vtk.vtkPoints()
+                    for c in coords:
+                        pts.InsertNextPoint(float(c[0]), float(c[1]),
+                                            float(c[2]) if len(c) > 2 else 0.0)
+                    pl = vtk.vtkPolyLine()
+                    pl.GetPointIds().SetNumberOfIds(len(coords))
+                    for i in range(len(coords)):
+                        pl.GetPointIds().SetId(i, i)
+                    ca = vtk.vtkCellArray(); ca.InsertNextCell(pl)
+                    pd = vtk.vtkPolyData(); pd.SetPoints(pts); pd.SetLines(ca)
+                    mp = vtk.vtkPolyDataMapper(); mp.SetInputData(pd)
+                    ac = vtk.vtkActor(); ac.SetMapper(mp)
+                    ac.GetProperty().SetColor(*color)
+                    ac.GetProperty().SetLineWidth(width)
+                    return ac
+                except Exception:
+                    return None
 
         def _add(actor):
-            try: self.app.vtk_widget.renderer.AddActor(actor); self.app.vtk_widget.render()
-            except Exception: pass
+            """Add actor to renderer."""
+            try:
+                if actor:
+                    if hasattr(actor, 'IsA') and actor.IsA('vtkActor2D'):
+                        self.app.vtk_widget.renderer.AddViewProp(actor)
+                    else:
+                        self.app.vtk_widget.renderer.AddActor(actor)
+                    self.app.vtk_widget.render()
+            except Exception:
+                pass
 
         def _rem(actor):
-            try: self.app.vtk_widget.renderer.RemoveActor(actor)
-            except Exception: pass
+            """Remove actor from renderer."""
+            try:
+                if actor:
+                    if hasattr(actor, 'IsA') and actor.IsA('vtkActor2D'):
+                        self.app.vtk_widget.renderer.RemoveViewProp(actor)
+                    else:
+                        self.app.vtk_widget.renderer.RemoveActor(actor)
+            except Exception:
+                pass
 
         def on_hover(shape):
             if hover_actor[0]: _rem(hover_actor[0]); hover_actor[0] = None
@@ -1124,11 +1302,17 @@ class FenceSelectorWidget(QWidget):
                 return
             coords = shape.get('coords', [])
             if len(coords) == 0: return
+            # Use yellow for hover
             ac = _make_actor(coords, (1, 1, 0), 6)
             if ac: hover_actor[0] = ac; _add(ac)
 
         def on_toggle(shape, checked):
-            sid = id(shape)
+            # Use unique ID based on source type
+            if shape.get('source') == 'curve_tool':
+                sid = id(shape.get('curve_data', shape))
+            else:
+                sid = id(shape)
+            
             if not checked:
                 if sid in picker_sel: _rem(picker_sel.pop(sid))
                 try: self.app.vtk_widget.render()
@@ -1137,16 +1321,35 @@ class FenceSelectorWidget(QWidget):
             if sid not in picker_sel:
                 coords = shape.get('coords', [])
                 if len(coords) == 0: return
+                # Use blue for selection
                 ac = _make_actor(coords, (0, 0.5, 1), 5)
                 if ac: picker_sel[sid] = ac; _add(ac)
 
-        current_ids   = {id(f) for f in self.selected_fences}
+        # Build current selection IDs
+        current_ids = set()
+        for f in self.selected_fences:
+            if f.get('source') == 'curve_tool':
+                current_ids.add(id(f.get('curve_data', f)))
+            else:
+                current_ids.add(id(f))
+
         custom_rows   = []
 
         for idx, shape in enumerate(valid):
             stype  = shape.get('type', 'unknown')
             coords = shape.get('coords', [])
+            is_curve = shape.get('source') == 'curve_tool'
             icon   = self._SHAPE_ICONS.get(stype, '◆')
+            
+            # ✅ Different label for curves
+            if is_curve:
+                curve_idx = shape.get('curve_index', idx)
+                title_text = f"〰️ Curve #{curve_idx + 1}"
+                source_tag = "Curve Tool"
+            else:
+                title_text = f"{icon} #{idx + 1}: {stype.capitalize()}"
+                source_tag = "Digitizer"
+            
             try:
                 arr  = np.array(coords)
                 w    = arr[:, 0].max() - arr[:, 0].min()
@@ -1156,32 +1359,57 @@ class FenceSelectorWidget(QWidget):
                 size = ""
 
             item_widget = QWidget()
-            item_widget.setStyleSheet(f"background:{ThemeColors.get('bg_button')}; border-radius:5px;")
+            
+            # ✅ Different background color for curves
+            if is_curve:
+                bg_color = ThemeColors.get('bg_secondary')
+            else:
+                bg_color = ThemeColors.get('bg_button')
+            
+            item_widget.setStyleSheet(f"background:{bg_color}; border-radius:5px;")
             ilay = QHBoxLayout(item_widget); ilay.setContentsMargins(6, 4, 6, 4)
 
+            # Icon swatch
             swatch = QLabel(icon)
             swatch.setFixedSize(28, 28); swatch.setAlignment(Qt.AlignCenter)
-            swatch.setStyleSheet(
-                f"background:{ThemeColors.get('accent')}; border-radius:4px; color:{ThemeColors.get('text_on_active')};"
-                " font-size:14px; font-weight:bold;")
+            
+            # ✅ Different swatch color for curves
+            if is_curve:
+                curve_color = shape.get('color', (0, 1, 0))
+                swatch_color = f"rgb({int(curve_color[0]*255)}, {int(curve_color[1]*255)}, {int(curve_color[2]*255)})"
+                swatch.setStyleSheet(
+                    f"background:{swatch_color}; border-radius:4px; color:white;"
+                    " font-size:14px; font-weight:bold;")
+            else:
+                swatch.setStyleSheet(
+                    f"background:{ThemeColors.get('accent')}; border-radius:4px; color:{ThemeColors.get('text_on_active')};"
+                    " font-size:14px; font-weight:bold;")
             ilay.addWidget(swatch)
 
+            # Info column
             info_col = QVBoxLayout(); info_col.setSpacing(1)
-            title_l = QLabel(f"O #{idx+1}: {stype.capitalize()}")
+            title_l = QLabel(title_text)
             title_l.setStyleSheet(f"color:{ThemeColors.get('text_primary')}; font-weight:bold; font-size:11px;")
-            sub_l   = QLabel(f"{len(coords)} pts | {size}")
+            sub_l   = QLabel(f"{len(coords)} pts | {size} | {source_tag}")
             sub_l.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px;")
             info_col.addWidget(title_l); info_col.addWidget(sub_l)
             ilay.addLayout(info_col, 1)
 
+            # Selected badge
             badge = QLabel("Selected")
             badge.setStyleSheet(
                 f"background:{ThemeColors.get('accent')}; color:{ThemeColors.get('text_on_active')}; font-weight:bold;"
                 " font-size:10px; border-radius:4px; padding:3px 8px;")
-            badge.setVisible(id(shape) in current_ids)
+            
+            # Check if currently selected
+            if is_curve:
+                is_current = id(shape.get('curve_data', shape)) in current_ids
+            else:
+                is_current = id(shape) in current_ids
+            badge.setVisible(is_current)
 
             cb = QCheckBox()
-            cb.setChecked(id(shape) in current_ids)
+            cb.setChecked(is_current)
             cb.setStyleSheet(f"""
                 QCheckBox::indicator {{ width:20px; height:20px; }}
                 QCheckBox::indicator:unchecked {{
@@ -1190,18 +1418,19 @@ class FenceSelectorWidget(QWidget):
                     background:{ThemeColors.get('accent')}; border:2px solid {ThemeColors.get('accent')}; border-radius:3px; }}
             """)
 
-            def _connect(shp, bdg, checkbox):
+            def _connect(shp, bdg, checkbox, is_crv):
                 def _changed(state):
                     chk = bool(state)
                     bdg.setVisible(chk)
                     on_toggle(shp, chk)
+                    bg = ThemeColors.get('bg_active') if chk else (
+                        ThemeColors.get('bg_secondary') if is_crv else ThemeColors.get('bg_button'))
                     checkbox.parentWidget().setStyleSheet(
-                        f"background:{ThemeColors.get('bg_active')}; border-radius:5px;" if chk
-                        else f"background:{ThemeColors.get('bg_button')}; border-radius:5px;")
+                        f"background:{bg}; border-radius:5px;")
                 checkbox.stateChanged.connect(_changed)
-            _connect(shape, badge, cb)
+            _connect(shape, badge, cb, is_curve)
 
-            if id(shape) in current_ids:
+            if is_current:
                 item_widget.setStyleSheet(f"background:{ThemeColors.get('bg_active')}; border-radius:5px;")
                 on_toggle(shape, True)
 
@@ -1216,19 +1445,19 @@ class FenceSelectorWidget(QWidget):
             li = QListWidgetItem(fence_list)
             li.setSizeHint(item_widget.sizeHint())
             fence_list.setItemWidget(li, item_widget)
-            custom_rows.append((cb, shape))
+            custom_rows.append((cb, shape, is_curve))
 
         brow = QHBoxLayout()
 
         def do_sel_all():
-            for cb_, _ in custom_rows: cb_.setChecked(True)
+            for cb_, _, _ in custom_rows: cb_.setChecked(True)
         sel_all_btn = QPushButton("Select All")
         sel_all_btn.clicked.connect(do_sel_all)
 
         def do_clr_all():
             for sid_, ac_ in list(picker_sel.items()): _rem(ac_)
             picker_sel.clear()
-            for cb_, _ in custom_rows: cb_.setChecked(False)
+            for cb_, _, _ in custom_rows: cb_.setChecked(False)
             try: self.app.vtk_widget.render()
             except: pass
         clr_all_btn = QPushButton("Clear All")
@@ -1241,7 +1470,7 @@ class FenceSelectorWidget(QWidget):
 
         def do_apply():
             on_hover(None)
-            chosen = [shp for cb_, shp in custom_rows if cb_.isChecked()]
+            chosen = [shp for cb_, shp, _ in custom_rows if cb_.isChecked()]
             if not chosen:
                 QMessageBox.warning(dlg, "No Selection", "Select at least one fence.")
                 return
@@ -1249,17 +1478,35 @@ class FenceSelectorWidget(QWidget):
             if not self.permanent_fence_mode:
                 self._remove_sel_actors()
                 self.selected_fences = []
-            existing_ids = {id(f) for f in self.selected_fences}
+            
+            # Build existing IDs set
+            existing_ids = set()
+            for f in self.selected_fences:
+                if f.get('source') == 'curve_tool':
+                    existing_ids.add(id(f.get('curve_data', f)))
+                else:
+                    existing_ids.add(id(f))
+            
             for shp in chosen:
-                if id(shp) not in existing_ids:
+                # Determine unique ID
+                if shp.get('source') == 'curve_tool':
+                    fence_id = id(shp.get('curve_data', shp))
+                else:
+                    fence_id = id(shp)
+                
+                if fence_id not in existing_ids:
                     self.selected_fences.append(shp)
-                    existing_ids.add(id(shp))
-                if shp['type'] in ['line', 'smart_line', 'polyline', 'smartline']:
+                    existing_ids.add(fence_id)
+                
+                # Close open shapes for polygon-based masking
+                if shp['type'] in ['line', 'smart_line', 'polyline', 'smartline', 'curve']:
                     coords = shp.get('coords', [])
                     if len(coords) > 1:
                         arr = np.array(coords)
                         if not np.allclose(arr[0], arr[-1]):
                             shp['coords'] = list(arr) + [list(arr[0])]
+            
+            # Store picker selection actors
             for sid_, ac_ in picker_sel.items():
                 self._sel_actors[sid_] = ac_
             picker_sel.clear()
@@ -1287,32 +1534,40 @@ class FenceSelectorWidget(QWidget):
         brow.addStretch()
         brow.addWidget(apply_btn); brow.addWidget(close_btn)
         layout.addLayout(brow)
+        dlg.exec()
 
-        dlg.show()
+    def _update_status(self):
+        """Update status label with fence counts."""
+        if not self.selected_fences:
+            self.status_lbl.setText("No fence — runs on all points")
+            self.status_lbl.setStyleSheet("color:#888; font-size:10px; padding:2px 0;")
+            return
+        
+        digitizer_count = sum(1 for f in self.selected_fences 
+                             if f.get('source') != 'curve_tool')
+        curve_count = sum(1 for f in self.selected_fences 
+                         if f.get('source') == 'curve_tool')
+        
+        parts = []
+        if digitizer_count:
+            parts.append(f"📐 {digitizer_count} shape(s)")
+        if curve_count:
+            parts.append(f"〰️ {curve_count} curve(s)")
+        
+        text = " + ".join(parts) + " selected"
+        self.status_lbl.setText(text)
+        self.status_lbl.setStyleSheet("color:#4fc3f7; font-size:10px; padding:2px 0; font-weight:bold;")
 
     def clear_fences(self):
-        """Remove all fence actors from renderer and reset state."""
+        """Clear all fence selections and actors."""
         self._remove_hover()
         self._remove_sel_actors()
         self.selected_fences = []
         self._update_status()
-        # Force a render to make the cleared actors disappear immediately
         try:
             self.app.vtk_widget.render()
         except Exception:
             pass
-
-    def _update_status(self):
-        n = len(self.selected_fences)
-        if n == 0:
-            self.status_lbl.setText("No fence selected - runs on all points")
-            self.status_lbl.setStyleSheet("color:#888; font-size:10px; padding:2px 0;")
-        else:
-            mode = "PERMANENT" if self.permanent_fence_mode else "TEMP"
-            total_pts = sum(len(f.get('coords', [])) for f in self.selected_fences)
-            self.status_lbl.setText(f"{n} fence(s) active ({total_pts} pts) - {mode}")
-            self.status_lbl.setStyleSheet(
-                "color:#4caf50; font-size:10px; font-weight:bold; padding:2px 0;")
 
     def _remove_hover(self):
         if self._hover_actor[0]:
@@ -1335,23 +1590,6 @@ class FenceSelectorWidget(QWidget):
         except:
             pass
 
-    @staticmethod
-    def _poly_mask(points: np.ndarray, polygon_coords) -> np.ndarray:
-        from matplotlib.path import Path
-        if isinstance(polygon_coords, list):
-            poly_xy = np.array([(c[0], c[1]) for c in polygon_coords])
-        else:
-            poly_xy = np.asarray(polygon_coords)[:, :2]
-        if len(poly_xy) < 3:
-            return np.zeros(len(points), dtype=bool)
-        pts_xy = points[:, :2]
-        mn = poly_xy.min(axis=0); mx = poly_xy.max(axis=0)
-        bbox = ((pts_xy[:, 0] >= mn[0]) & (pts_xy[:, 0] <= mx[0]) &
-                (pts_xy[:, 1] >= mn[1]) & (pts_xy[:, 1] <= mx[1]))
-        inside = np.zeros(len(points), dtype=bool)
-        if bbox.any():
-            inside[bbox] = Path(poly_xy).contains_points(pts_xy[bbox])
-        return inside
 
 # ═══════════════════════════════════════════════════════════════════════
 # BACKGROUND WORKER

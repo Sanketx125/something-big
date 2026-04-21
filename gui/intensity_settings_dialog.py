@@ -6,9 +6,9 @@ Allows adjusting brightness/darkness of intensity display
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QSlider, QMessageBox, QGroupBox
+    QSlider, QMessageBox, QFrame, QGroupBox
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 
 
 class IntensitySettingsDialog(QDialog):

@@ -1,14 +1,25 @@
+"""
+DXF Attachment System with Multiple File Support and Management
+
+Features:
+- Select multiple DXF files at once
+- Auto-detect matching .PRJ files for each DXF
+- Manage attached DXFs with remove capability
+- Coordinate reprojection support
+- Overlay/underlay modes
+"""
+
 import os
 import numpy as np
 from pathlib import Path
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QMessageBox, QComboBox, QCheckBox, QGroupBox,
-    QRadioButton,
+    QRadioButton, QButtonGroup, QSpinBox, QDoubleSpinBox,
     QListWidget, QListWidgetItem, QWidget, QScrollArea
 )
 from PySide6.QtCore import Qt, Signal , QCoreApplication
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QFont, QColor, QIcon
 from gui.theme_manager import get_dialog_stylesheet, get_progress_dialog_stylesheet, get_title_banner_style, get_file_item_row_style, get_badge_style, get_icon_button_style, get_notice_banner_style, ThemeColors
 
 try:
@@ -149,7 +160,7 @@ class DXFProcessWorker(QThread):
                 7: (255, 255, 255)
             }
             return aci_colors.get(color_index, (255, 255, 255))
-        except:
+        except Exception:
             return (255, 255, 255)
         
 class DXFDisplayOptionsDialog(QDialog):
@@ -1260,7 +1271,7 @@ class MultiDXFAttachmentDialog(QDialog):
                         if hasattr(vtk_widget, 'actors'):
                             vtk_widget.actors.clear()
                         vtk_widget.render()
-                    except:
+                    except Exception:
                         pass
             
             # Clear internal state
@@ -2144,7 +2155,7 @@ class MultiDXFAttachmentDialog(QDialog):
                 7: (255, 255, 255) # White
             }
             return aci_colors.get(color_index, (255, 255, 255))
-        except:
+        except Exception:
             return (255, 255, 255)
     
     def render_dxf_in_vtk(self, attachment_data):
@@ -2533,7 +2544,7 @@ class MultiDXFAttachmentDialog(QDialog):
             if hasattr(self, 'app') and hasattr(self.app, 'vtk_widget'):
                 actor.SetCamera(self.app.vtk_widget.renderer.GetActiveCamera())
                 
-        except:
+        except Exception:
             pass
         actor.SetPosition(entity['position']) 
        
@@ -2788,7 +2799,7 @@ def show_multi_dxf_attachment_dialog(app):
             app._dxf_dialog.raise_()
             app._dxf_dialog.activateWindow()
             return app._dxf_dialog
-        except:
+        except Exception:
             pass
     
     # Create new dialog
@@ -2848,6 +2859,54 @@ def inspect_dxf_text_entities(dxf_path):
         except Exception as e:
             print(f"❌ Inspection failed: {e}")
     
+def debug_insert_blocks(dxf_path):
+    """Debug: Show all INSERT blocks and their attributes"""
+    try:
+        import ezdxf
+        print(f"\n🔍 DEBUG: Analyzing INSERT blocks in: {dxf_path}")
+        
+        dxf_doc = ezdxf.readfile(str(dxf_path))
+        modelspace = dxf_doc.modelspace()
+        
+        insert_count = 0
+        for entity in modelspace:
+            if entity.dxftype() == 'INSERT':
+                insert_count += 1
+                print(f"\n📦 INSERT #{insert_count}:")
+                print(f"   Block name: {entity.dxf.name}")
+                print(f"   Position: {entity.dxf.insert}")
+                
+                if hasattr(entity, 'attribs'):
+                    print(f"   Attributes ({len(entity.attribs)}):")
+                    for idx, attrib in enumerate(entity.attribs):
+                        tag = attrib.dxf.tag if hasattr(attrib.dxf, 'tag') else 'NO TAG'
+                        text = attrib.dxf.text if hasattr(attrib.dxf, 'text') else 'NO TEXT'
+                        print(f"     [{idx}] Tag: {tag}, Text: '{text}'")
+                else:
+                    print(f"   ⚠️ No attributes")
+                
+                # Check block definition
+                try:
+                    block = dxf_doc.blocks.get(entity.dxf.name)
+                    print(f"   Block definition entities: {len(list(block))}")
+                    for block_entity in block:
+                        if block_entity.dxftype() in ('TEXT', 'MTEXT', 'ATTDEF'):
+                            text = block_entity.dxf.text if hasattr(block_entity.dxf, 'text') else 'NO TEXT'
+                            print(f"     - {block_entity.dxftype()}: '{text}'")
+                except Exception:
+                    print(f"   ⚠️ Could not read block definition")
+        
+        print(f"\n📊 Total INSERT blocks: {insert_count}")
+        
+    except Exception as e:
+        print(f"❌ Debug failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        
+        
+        
+        
 class DXFLayerSelectionDialog(QDialog):
     """MicroStation-style layer/level selection dialog"""
     

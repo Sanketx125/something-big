@@ -234,6 +234,9 @@ class IdentificationTool(QObject):
     def _apply_highlight_style(self, widget, class_code):
         """Apply a highlight animation/style to a widget."""
         try:
+            from PySide6.QtCore import QPropertyAnimation, QEasingCurve
+            from PySide6.QtGui import QColor
+            
             # Get the original style
             original_style = widget.styleSheet()
             
@@ -301,7 +304,7 @@ class IdentificationTool(QObject):
                             if color_item:
                                 color = color_item.background().color().getRgb()[:3]
                                 return color
-                    except:
+                    except Exception:
                         continue
         
         # Fallback to default gray
@@ -320,7 +323,7 @@ class IdentificationTool(QObject):
                     if code == class_code:
                         desc = table.item(row, 2).text()  # Description column
                         return desc
-                except:
+                except Exception:
                     continue
         # Try to get from app's class palette first
         if hasattr(self.app, 'class_palette') and self.app.class_palette:
@@ -585,7 +588,7 @@ class IdentificationTool(QObject):
                     if code == class_code:
                         lvl_item = table.item(row, 4)  # Column 4 = Lvl
                         return lvl_item.text() if lvl_item else ""
-                except:
+                except Exception:
                     continue
         
         # Fallback

@@ -2,7 +2,7 @@ import os
 import json
 import numpy as np
 import laspy
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 def _parse_filter(selected_filter: str):
     sf = (selected_filter or "").lower()
@@ -106,7 +106,7 @@ def _serialize_drawings(app) -> bytes:
                 elif len(coords) == 0:
                     print(f"  ⚠️ Skipping drawing with empty list")
                     continue
-            except:
+            except Exception:
                 print(f"  ⚠️ Skipping drawing with invalid coordinates")
                 continue
             
@@ -312,6 +312,25 @@ def finalize_drawing_render(app):
         import traceback
         traceback.print_exc()
     
+def debug_renderer_setup(app):
+    """Debug helper to understand renderer configuration"""
+    print("\n🔍 RENDERER DEBUG:")
+    
+    if hasattr(app, 'digitizer'):
+        print(f"  Digitizer renderer: {id(app.digitizer.renderer)}")
+    
+    if hasattr(app, 'vtk_widget'):
+        print(f"  VTK widget renderer: {id(app.vtk_widget.renderer)}")
+        
+    if hasattr(app, 'renderer'):
+        print(f"  App renderer: {id(app.renderer)}")
+    
+    # Check if they're the same object
+    if hasattr(app, 'digitizer') and hasattr(app, 'vtk_widget'):
+        same = app.digitizer.renderer == app.vtk_widget.renderer
+        print(f"  Same renderer? {same}")    
+    print()    
+
 def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dialog=True):
     """
     ✅ Enhanced Save behavior:

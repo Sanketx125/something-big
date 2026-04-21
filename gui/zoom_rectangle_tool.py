@@ -31,17 +31,7 @@ class ZoomRectangleTool(QObject):
         self.last_pan_pos = None
         
         if hasattr(self.app, 'vtk_widget') and self.app.vtk_widget:
-            rw = None
-            try:
-                rw = self.app.vtk_widget.GetRenderWindow()
-            except Exception:
-                rw = None
-
-            self.interactor = rw.GetInteractor() if rw is not None else None
-            if self.interactor is None:
-                print("⚠️ Zoom Rectangle Tool activation skipped: interactor not available")
-                self.active = False
-                return
+            self.interactor = self.app.vtk_widget.GetRenderWindow().GetInteractor()
             
             # Remove any existing observers first to be safe
             self._remove_observers()
@@ -55,6 +45,7 @@ class ZoomRectangleTool(QObject):
                 self.interactor.AddObserver('MouseMoveEvent', self.on_mouse_move, 1.0),
                 self.interactor.AddObserver('RightButtonPressEvent', self.on_right_button_down, 1.0)
             ]
+            
             print(f"✅ Zoom Rectangle Tool activated (State Clean, Observers: {self.observer_ids})")
     
     def deactivate(self):
@@ -73,8 +64,8 @@ class ZoomRectangleTool(QObject):
                 renderer = self.app.vtk_widget.renderer
                 renderer.RemoveActor(self.rubber_band_actor)
                 self.rubber_band_actor = None
-                self._safe_render_main_widget()
-            except:
+                self.app.vtk_widget.GetRenderWindow().Render()
+            except Exception:
                 pass
         
         # Remove ALL zoom-related observers safely by ID
@@ -92,36 +83,6 @@ class ZoomRectangleTool(QObject):
                 except Exception as e:
                     pass 
             self.observer_ids = []
-
-    def _safe_render_main_widget(self):
-        """Render main VTK widget safely (guards stale/deleted VTK objects)."""
-        vtk_widget = getattr(self.app, "vtk_widget", None)
-        if vtk_widget is None:
-            return False
-
-        try:
-            from gui.vtk_safety import safe_render
-            if safe_render(vtk_widget, widget_id=id(vtk_widget)):
-                return True
-        except Exception:
-            pass
-
-        try:
-            rw = vtk_widget.GetRenderWindow() if hasattr(vtk_widget, "GetRenderWindow") else None
-            if rw is not None and rw.GetInteractor() is not None:
-                rw.Render()
-                return True
-        except Exception:
-            pass
-
-        try:
-            if hasattr(vtk_widget, "render"):
-                vtk_widget.render()
-                return True
-        except Exception:
-            pass
-
-        return False
 
     def _safe_abort(self, obj):
         """Safely try to abort event propagation in VTK without AttributeErrors"""
@@ -258,7 +219,7 @@ class ZoomRectangleTool(QObject):
         # Add to renderer
         renderer = self.app.vtk_widget.renderer
         renderer.AddActor(self.rubber_band_actor)
-        self._safe_render_main_widget()
+        self.app.vtk_widget.GetRenderWindow().Render()
                
     def zoom_to_bounds(self, min_x, max_x, min_y, max_y):
         """Zoom to fit EXACTLY the drawn rectangle (tight fit) - FIXED clipping"""
@@ -302,7 +263,7 @@ class ZoomRectangleTool(QObject):
         camera.SetClippingRange(near_clip, far_clip)
         
         # Force render
-        self._safe_render_main_widget()
+        self.app.vtk_widget.GetRenderWindow().Render()
         
         print(f"✅ Zoomed to exact rectangle: {width:.1f}m × {height:.1f}m")
         print(f"   Camera distance: {camera_distance:.1f}m, Clipping: {near_clip:.1f} - {far_clip:.1f}m")

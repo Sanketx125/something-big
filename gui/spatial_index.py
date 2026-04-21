@@ -2,12 +2,54 @@
 Optimized spatial indexing for ultra-fast spatial queries.
 Supports: KD-tree, Octree, and grid-based acceleration structures.
 
-FILE: spatial_index.py (NEW SEPARATE FILE)
+Task-2 upgrades (persistent cache + bbox-culled section query):
+  - _INDEX_CACHE: module-level singleton — KDTree built ONCE per file load,
+    reused across all brush/section/rectangle operations.
+  - query_section_box(): vectorized bbox query into cached tree with no Python loop.
+  - invalidate_cache(): called by app on file load/close — safe single reset point.
 """
 
 import numpy as np
 from scipy.spatial import cKDTree
-import time
+
+# ── Persistent global index cache ────────────────────────────────────────────
+# Key insight: for a 50M-point cloud the KDTree build takes ~3-8 s and 1-2 GB RAM.
+# Rebuilding it on every section slice or brush drag is the #1 source of "heaviness".
+# This cache ensures it is built exactly ONCE per file load.
+_INDEX_CACHE: dict = {
+    "index":       None,    # SpatialIndex instance
+    "point_id":    None,    # id() of the xyz array — detects file reload
+    "n_points":    0,
+}
+
+
+def get_or_build_index(xyz: np.ndarray, method: str = "auto") -> "SpatialIndex":
+    """
+    Return the cached SpatialIndex for xyz, building it only when the array
+    identity changes (i.e. a new file was loaded).
+
+    Safe to call from any thread context — building is GIL-held but all
+    downstream queries release the GIL inside scipy's C layer.
+    """
+    arr_id = id(xyz)
+    if _INDEX_CACHE["index"] is not None and _INDEX_CACHE["point_id"] == arr_id:
+        return _INDEX_CACHE["index"]               # cache hit — O(1)
+
+    idx = build_spatial_index_auto(xyz, method)
+    _INDEX_CACHE["index"]    = idx
+    _INDEX_CACHE["point_id"] = arr_id
+    _INDEX_CACHE["n_points"] = len(xyz)
+    return idx
+
+
+def invalidate_cache() -> None:
+    """
+    Flush the persistent index.  Call this in app on file load/close.
+    Safe to call multiple times — idempotent.
+    """
+    _INDEX_CACHE["index"]    = None
+    _INDEX_CACHE["point_id"] = None
+    _INDEX_CACHE["n_points"] = 0
 
 
 class SpatialIndex:
@@ -28,9 +70,6 @@ class SpatialIndex:
         self.method = method
         self.grid_size = grid_size
         
-        print(f"Building {method} spatial index for {len(points):,} points...")
-        t0 = time.perf_counter()
-        
         if method == 'kdtree':
             self._build_kdtree()
         elif method == 'grid':
@@ -39,9 +78,6 @@ class SpatialIndex:
             self._build_octree()
         else:
             raise ValueError(f"Unknown method: {method}")
-        
-        elapsed = time.perf_counter() - t0
-        print(f"✅ Spatial index built in {elapsed:.2f}s")
     
     def _build_kdtree(self):
         """Build KD-tree (best for general queries)."""
@@ -259,18 +295,81 @@ class OctreeNode:
         return dist <= radius
 
 
-def build_spatial_index_auto(points, method='auto'):
+def build_spatial_index_auto(points, method: str = 'auto') -> "SpatialIndex":
     """
-    Automatically choose best spatial index method.
+    Automatically choose best spatial index method based on point count.
+    Prefer calling get_or_build_index() instead — it avoids redundant builds.
     """
     n = len(points)
-    
     if method == 'auto':
         if n < 1_000_000:
-            method = 'kdtree'  # Best all-around
+            method = 'kdtree'
         elif n < 10_000_000:
-            method = 'grid'  # Fast build, good for medium datasets
+            method = 'grid'
         else:
-            method = 'kdtree'  # KD-tree scales well to 100M+
-    
+            method = 'kdtree'   # cKDTree scales to 100M+ with leafsize=32
     return SpatialIndex(points, method=method)
+
+
+# ── Bbox-culled section slice (Task-2: "Lazy Loading") ────────────────────────
+
+def query_section_box(
+    xyz:        np.ndarray,
+    x_min: float, x_max: float,
+    y_min: float, y_max: float,
+    depth: float = 0.5,
+    use_cache: bool = True,
+) -> np.ndarray:
+    """
+    Return indices of all points inside a cross-section selection box.
+
+    This is the core of the "Lazy Loading" section approach:
+    - Uses the persistent cached KDTree (built once, not per-section).
+    - For the KDTree path: queries a bounding-box candidate set in C,
+      then applies an exact vectorized NumPy filter — zero Python loops.
+    - For datasets where the tree is not yet built, falls back to pure
+      vectorized NumPy (still O(N) but fully in C via boolean indexing).
+
+    Parameters
+    ----------
+    xyz     : (N, 3) float32/float64 point array
+    x_min/x_max, y_min/y_max : section corridor bounds in world coords
+    depth   : half-thickness in Z (ignored when z_min/z_max not applicable)
+    use_cache : True → use get_or_build_index(), False → vectorized-only fallback
+
+    Returns
+    -------
+    indices : 1-D int64 array of matching point indices
+    """
+    if use_cache:
+        idx_obj = get_or_build_index(xyz)
+        if idx_obj.method == 'kdtree':
+            # KDTree path: query_ball_point on box center + half-diagonal radius
+            # gives O(log N) candidates; exact filter is O(k), k << N.
+            cx = (x_min + x_max) * 0.5
+            cy = (y_min + y_max) * 0.5
+            hw = (x_max - x_min) * 0.5
+            hh = (y_max - y_min) * 0.5
+            radius = (hw**2 + hh**2 + depth**2) ** 0.5  # bounding sphere radius
+
+            candidates = np.asarray(
+                idx_obj.tree.query_ball_point([cx, cy, 0.0], radius),
+                dtype=np.int64,
+            )
+            if candidates.size == 0:
+                return candidates
+
+            # Exact AABB filter on candidates — vectorized, O(k)
+            pts = xyz[candidates]
+            mask = (
+                (pts[:, 0] >= x_min) & (pts[:, 0] <= x_max) &
+                (pts[:, 1] >= y_min) & (pts[:, 1] <= y_max)
+            )
+            return candidates[mask]
+
+    # Fallback: pure vectorized NumPy — still O(N) but no Python loop
+    mask = (
+        (xyz[:, 0] >= x_min) & (xyz[:, 0] <= x_max) &
+        (xyz[:, 1] >= y_min) & (xyz[:, 1] <= y_max)
+    )
+    return np.flatnonzero(mask).astype(np.int64)

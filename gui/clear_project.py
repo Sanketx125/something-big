@@ -1,3 +1,4 @@
+
 from PySide6.QtWidgets import QMessageBox
 from PySide6.QtCore import QSettings
 import os
@@ -425,7 +426,7 @@ def clear_project(app):
                 if hasattr(app, attr):
                     try:
                         delattr(app, attr)
-                    except:
+                    except Exception:
                         pass
         print("✅ Stored section data cleared")
 

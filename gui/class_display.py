@@ -1,4 +1,8 @@
+
+import numpy as np
+import pyvista as pv
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QDoubleSpinBox, QHBoxLayout, QPushButton, QComboBox
+from .views import set_view
 
 def sync_main_view_weights_to_palette(app):
     """

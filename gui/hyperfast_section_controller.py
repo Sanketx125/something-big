@@ -456,12 +456,12 @@ class HyperFastCrossSectionController:
         if hasattr(self, "_core_actor") and self._core_actor is not None:
             try:
                 vtk_widget.remove_actor(self._core_actor, reset_camera=False)
-            except:
+            except Exception:
                 pass
         if hasattr(self, "_buffer_actor") and self._buffer_actor is not None:
             try:
                 vtk_widget.remove_actor(self._buffer_actor, reset_camera=False)
-            except:
+            except Exception:
                 pass
         
         self._core_actor = None
@@ -609,7 +609,7 @@ class HyperFastCrossSectionController:
                 if hasattr(dialog, 'view_palettes') and target_slot in dialog.view_palettes:
                     return dialog.view_palettes[target_slot]
             return getattr(self.app, 'class_palette', {})
-        except:
+        except Exception:
             return {}
     
     def _get_visible_classes_from_palette(self, palette):
@@ -627,7 +627,7 @@ class HyperFastCrossSectionController:
         if self.rubber_actor:
             try:
                 self.app.vtk_widget.renderer.RemoveActor(self.rubber_actor)
-            except:
+            except Exception:
                 pass
         self.rubber_actor = None
         self.rubber_points = None

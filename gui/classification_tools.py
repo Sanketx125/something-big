@@ -2,6 +2,45 @@ import numpy as np
 from matplotlib.path import Path
 from vtkmodules.util import numpy_support
 
+# ── Bug-6: single master debug switch — set True only during development ──────
+# When False, ALL diagnostic print() calls in hot classification paths are
+# compiled to no-ops by the interpreter (the `if _DBG:` block is never entered).
+_DBG: bool = False
+
+
+def _log(msg: str) -> None:
+    """Zero-cost logger: skipped entirely when _DBG is False."""
+    if _DBG:
+        print(msg)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION-VIEW BOUNDING BOX CULLING HELPERS
+# Called once per classification event — O(1) per section view.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _edit_bbox(xyz: np.ndarray, indices: np.ndarray):
+    """Return (xmin,xmax,ymin,ymax,zmin,zmax) of the edited point set. O(k)."""
+    pts = xyz[indices]
+    mn  = pts.min(axis=0)
+    mx  = pts.max(axis=0)
+    return mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]
+
+
+def _section_bbox_overlaps(app, view_idx: int, edit_bb: tuple) -> bool:
+    """
+    Return True when the edit bounding box overlaps the stored section bbox.
+    Falls back to True (conservative) when no section bbox is available.
+    Prevents redundant fast_cross_section_update calls for distant sections.
+    """
+    sbbox = getattr(app, f"_section_{view_idx}_bbox", None)
+    if sbbox is None:
+        return True                              # unknown → assume overlap
+    ex0, ex1, ey0, ey1, ez0, ez1 = edit_bb
+    sx0, sx1, sy0, sy1, sz0, sz1 = sbbox
+    return (ex0 <= sx1 and ex1 >= sx0 and
+            ey0 <= sy1 and ey1 >= sy0 and
+            ez0 <= sz1 and ez1 >= sz0)
+
 def _shading_mesh_exists(app):
     """Return True if the shaded mesh has been built and is active."""
     return (
@@ -322,17 +361,35 @@ def _get_cut_section_or_default(app, mask, section_points):
     # CROSS-SECTION VIEW LOGIC (includes buffers)
     # ═══════════════════════════════════════════════════════════
     if active_view is not None:
-        # Try pre-computed combined data first
+        # Prefer pre-built global_indices (core-first order, matches points_transformed)
+        global_indices = getattr(app, f"_section_{active_view}_global_indices", None)
+        points_transformed = getattr(app, f"section_{active_view}_points_transformed", None)
+        if global_indices is not None and points_transformed is not None:
+            if len(global_indices) == len(points_transformed):
+                print(f"📋 Classification mask: PRE-COMPUTED combined (core + buffer)")
+                print(f"   Total: {len(global_indices):,} points (transformed)")
+                return global_indices, points_transformed
+
+        # Fallback: boolean combined_mask → convert to int array so callers always
+        # get an index array in the same order as points_transformed (core-first).
         combined_mask = getattr(app, f"section_{active_view}_combined_mask", None)
         points_transformed = getattr(app, f"section_{active_view}_points_transformed", None)
-        
+
         if combined_mask is not None and points_transformed is not None:
-            num_points = combined_mask.sum() if hasattr(combined_mask, 'sum') else 0
-            print(f"📋 Classification mask: PRE-COMPUTED combined (core + buffer)")
-            print(f"   Total: {num_points:,} points (transformed)")
-            return combined_mask, points_transformed
-        
-        # Fallback: build combined mask
+            # Build core-first index array: core indices first, then buffer indices
+            core_mask_fb  = getattr(app, f"section_{active_view}_core_mask",   None)
+            buf_mask_fb   = getattr(app, f"section_{active_view}_buffer_mask",  None)
+            if core_mask_fb is not None and buf_mask_fb is not None:
+                gi = np.concatenate([np.flatnonzero(core_mask_fb),
+                                     np.flatnonzero(buf_mask_fb)])
+            else:
+                gi = np.flatnonzero(combined_mask)  # best-effort scan-order
+            if len(gi) == len(points_transformed):
+                print(f"📋 Classification mask: PRE-COMPUTED combined (core + buffer)")
+                print(f"   Total: {len(gi):,} points (transformed)")
+                return gi, points_transformed
+
+        # Last fallback: build from stored masks
         core_mask = getattr(app, f"section_{active_view}_core_mask", None)
         buffer_mask = getattr(app, f"section_{active_view}_buffer_mask", None)
 
@@ -340,23 +397,24 @@ def _get_cut_section_or_default(app, mask, section_points):
             include_buffer = _include_buffer_for_classification(app)
 
             if include_buffer and buffer_mask is not None:
-                combined_mask = core_mask | buffer_mask
-                core_count = core_mask.sum()
-                buffer_count = (buffer_mask & ~core_mask).sum()
+                core_idx = np.flatnonzero(core_mask)
+                buf_idx  = np.flatnonzero(buffer_mask)
+                gi = np.concatenate([core_idx, buf_idx])
                 print(f"📋 Classification mask: CORE + BUFFER (include_buffer=True)")
-                print(f"   Core: {core_count:,}, Buffer: {buffer_count:,}")
+                print(f"   Core: {len(core_idx):,}, Buffer: {len(buf_idx):,}")
             else:
-                combined_mask = core_mask
+                gi = np.flatnonzero(core_mask)
                 print(f"📋 Classification mask: CORE ONLY (include_buffer=False)")
 
-            # Try to get transformed points
             points_transformed = getattr(app, f"section_{active_view}_points_transformed", None)
-            if points_transformed is not None:
-                return combined_mask, points_transformed
-            
-            # Fallback to raw xyz
-            section_xyz = app.data["xyz"][combined_mask]
-            return combined_mask, section_xyz
+            if points_transformed is not None and len(gi) == len(points_transformed):
+                return gi, points_transformed
+
+            # Absolute last resort: raw xyz (scan-order, but gi is scan-order too)
+            section_xyz = app.data["xyz"][np.flatnonzero(core_mask | buffer_mask)
+                                          if (include_buffer and buffer_mask is not None)
+                                          else np.flatnonzero(core_mask)]
+            return gi, section_xyz
 
     # ═══════════════════════════════════════════════════════════
     # FALLBACK: Use provided mask/points
@@ -392,19 +450,29 @@ def _get_section_data_with_buffer(app, mask=None, section_points=None):
         return (mask, section_points) if (mask is not None and section_points is not None) else (None, None)
 
     # ═══════════════════════════════════════════════════════════
-    # PATH 1: Try pre-computed combined mask + transformed points (BEST)
+    # PATH 1: Pre-built global_indices + transformed points (BEST)
+    # ─────────────────────────────────────────────────────────
+    # CRITICAL: points_transformed is in core-first order (np.vstack of core then
+    # buffer). The boolean combined_mask is in scan-order (full-cloud flatnonzero).
+    # Using np.flatnonzero(combined_mask)[local_mask] would misalign core-first
+    # local_mask against scan-order indices → wrong global points get classified.
+    # _section_{v}_global_indices is built by build_section_unified_actor in the
+    # same core-first order as points_transformed, so subscripting it with a
+    # core-first local_mask gives the correct global indices.
     # ═══════════════════════════════════════════════════════════
-    combined_mask = getattr(app, f"section_{active_view}_combined_mask", None)
+    global_indices = getattr(app, f"_section_{active_view}_global_indices", None)
     points_transformed = getattr(app, f"section_{active_view}_points_transformed", None)
-    
-    if combined_mask is not None and points_transformed is not None:
-        num_points = combined_mask.sum() if hasattr(combined_mask, 'sum') else 0
-        print(f"📋 Using PRE-COMPUTED combined data (core + buffer)")
-        print(f"   Total points: {num_points:,} (transformed)")
-        return combined_mask, points_transformed
+
+    if global_indices is not None and points_transformed is not None:
+        if len(global_indices) == len(points_transformed):
+            print(f"📋 Using PRE-COMPUTED combined data (core + buffer)")
+            print(f"   Total points: {len(global_indices):,} (transformed)")
+            return global_indices, points_transformed
 
     # ═══════════════════════════════════════════════════════════
-    # PATH 2: Build combined mask from core + buffer (FALLBACK)
+    # PATH 2: Build core-first index array from stored masks
+    # Always return int index array (never boolean) so callers use the
+    # correct `else: mask_or_indices[local_mask]` branch.
     # ═══════════════════════════════════════════════════════════
     core_mask = getattr(app, f"section_{active_view}_core_mask", None)
     buffer_mask = getattr(app, f"section_{active_view}_buffer_mask", None)
@@ -413,52 +481,45 @@ def _get_section_data_with_buffer(app, mask=None, section_points=None):
     if core_mask is None:
         return (mask, section_points) if (mask is not None and section_points is not None) else (None, None)
 
-    # ✅ Build combined mask
+    # Build core-first index array
+    core_idx = np.flatnonzero(core_mask)
     if include_buffer and buffer_mask is not None:
-        combined_mask = core_mask | buffer_mask
-        core_count = core_mask.sum() if hasattr(core_mask, 'sum') else 0
-        buffer_count = (buffer_mask & ~core_mask).sum() if hasattr(buffer_mask, 'sum') else 0
-        print(f"📋 Using BUILT combined mask (core + buffer)")
-        print(f"   Core: {core_count:,}, Buffer: {buffer_count:,}, Total: {core_count + buffer_count:,}")
+        buf_idx = np.flatnonzero(buffer_mask)
+        gi = np.concatenate([core_idx, buf_idx])
+        print(f"📋 Using BUILT combined indices (core + buffer)")
+        print(f"   Core: {len(core_idx):,}, Buffer: {len(buf_idx):,}, Total: {len(gi):,}")
     else:
-        combined_mask = core_mask
-        core_count = core_mask.sum() if hasattr(core_mask, 'sum') else 0
+        gi = core_idx
         print(f"📋 Using CORE ONLY (buffer excluded)")
-        print(f"   Core: {core_count:,}")
+        print(f"   Core: {len(gi):,}")
 
-    # ═══════════════════════════════════════════════════════════
-    # SUB-PATH 2A: Try to get transformed points (PREFERRED)
-    # ═══════════════════════════════════════════════════════════
-    
-    # Try pre-transformed combined points first
+    # ─── Try pre-stored transformed points first (PREFERRED) ─────────────
     points_transformed = getattr(app, f"section_{active_view}_points_transformed", None)
-    if points_transformed is not None:
+    if points_transformed is not None and len(gi) == len(points_transformed):
         print(f"   ✅ Using transformed points (pre-computed)")
-        return combined_mask, points_transformed
-    
-    # Try building from separate core + buffer transformed points
+        return gi, points_transformed
+
+    # ─── Build transformed points from core + buffer parts ───────────────
+    core_pts = getattr(app, f"section_{active_view}_core_points", None)
     if include_buffer and buffer_mask is not None:
-        core_pts = getattr(app, f"section_{active_view}_core_points", None)
         buffer_pts = getattr(app, f"section_{active_view}_buffer_points", None)
-        
         if core_pts is not None and buffer_pts is not None:
             section_xyz = np.vstack([core_pts, buffer_pts])
             print(f"   ✅ Using transformed points (built from core + buffer)")
-            return combined_mask, section_xyz
+            return gi, section_xyz
         elif core_pts is not None:
-            print(f"   ⚠️ Using transformed core points only (no buffer points available)")
-            return combined_mask, core_pts
-    else:
-        # Core only - try transformed core points
-        core_pts = getattr(app, f"section_{active_view}_core_points", None)
-        if core_pts is not None:
-            print(f"   ✅ Using transformed core points")
-            return combined_mask, core_pts
+            gi = core_idx   # mismatch — fall back to core only
+            print(f"   ⚠️ Using transformed core points only")
+            return gi, core_pts
+    elif core_pts is not None:
+        print(f"   ✅ Using transformed core points")
+        return gi, core_pts
 
     # ═══════════════════════════════════════════════════════════
     # SUB-PATH 2B: Build from raw xyz + transform (LAST RESORT)
+    # gi is still valid (core-first index array built above)
     # ═══════════════════════════════════════════════════════════
-    section_xyz_original = app.data["xyz"][combined_mask]
+    section_xyz_original = app.data["xyz"][gi]
     P1 = getattr(app, f"section_{active_view}_P1", None)
     P2 = getattr(app, f"section_{active_view}_P2", None)
 
@@ -466,13 +527,13 @@ def _get_section_data_with_buffer(app, mask=None, section_points=None):
         try:
             section_xyz = app.section_controller._transform_to_section_coordinates(section_xyz_original, P1, P2)
             print(f"   ✅ Using computed transform from raw xyz")
-            return combined_mask, section_xyz
+            return gi, section_xyz
         except Exception as e:
             print(f"   ⚠️ Transform failed: {e}, using raw xyz")
-            return combined_mask, section_xyz_original
+            return gi, section_xyz_original
     else:
         print(f"   ⚠️ Using raw xyz (no transform available)")
-        return combined_mask, section_xyz_original
+        return gi, section_xyz_original
 
 
 # ✅ CHANGE: Make decorators pass cut section context
@@ -561,7 +622,7 @@ def classify_with_stats_update(classify_func):
 #         if is_cut_locked and app.cut_section_controller._cut_index_map is not None:
 #             cut_idx = app.cut_section_controller._cut_index_map
 #             # Direct intersection to avoid large mask creation
-#             current_true_indices = np.where(update_mask)[0]
+#             current_true_indices = np.flatnonzero(update_mask)
 #             update_mask = np.zeros_like(update_mask)
 #             valid_indices = np.intersect1d(current_true_indices, cut_idx, assume_unique=True)
 #             update_mask[valid_indices] = True
@@ -570,7 +631,7 @@ def classify_with_stats_update(classify_func):
 #     # STEP 3: Filter indices
 #     # ═══════════════════════════════════════════════════════════════════════
 #     classes = app.data["classification"]
-#     update_idx = np.where(update_mask)[0]
+#     update_idx = np.flatnonzero(update_mask)
     
 #     if update_idx.size == 0:
 #         return
@@ -711,57 +772,73 @@ def classify_with_stats_update(classify_func):
 #         print(f"{'='*60}\n")
 
 
-def _apply_classification(app, update_mask, from_classes, to_class):
+def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: int) -> bool:
     """
-    🚀 PRODUCTION-GRADE CLASSIFICATION ENGINE
-    MicroStation-style: only touched points updated, no full RGB rewrite.
+    Vectorized classification engine — zero Python loops.
+
+    All filtering, index mapping, and GPU pokes are O(k) NumPy C-layer operations
+    where k = number of changed points.  No set(), no range(len()), no list.append().
     """
     if app.data is None or to_class is None:
         return False
 
-    app._gpu_sync_done = False
+    app._gpu_sync_done     = False
     app._last_changed_mask = None
- 
-    classes = app.data["classification"]
-    update_idx = np.where(update_mask)[0]
+
+    classes    = app.data["classification"]
+    orig_dtype = classes.dtype                   # capture dtype — must not drift
+
+    # ── 1. Candidate indices (vectorized flatnonzero, faster than np.where()[0]) ─
+    update_idx = np.flatnonzero(update_mask)
     if update_idx.size == 0:
         return False
- 
-    # --- 1. Visibility & Filter Protection ---
+
+    # ── 2. Visibility filter — O(k) vectorized isin, no Python loop ──────
     visible_classes = _get_visible_classes_for_current_view(app)
     if visible_classes is not None:
-        visible_mask = np.isin(classes[update_idx], visible_classes)
-        update_idx = update_idx[visible_mask]
- 
+        update_idx = update_idx[np.isin(classes[update_idx], visible_classes,
+                                        assume_unique=False)]
+
+    # ── 3. from_classes filter — O(k) vectorized isin ────────────────────
     if from_classes:
-        class_mask = np.isin(classes[update_idx], from_classes)
-        update_idx = update_idx[class_mask]
- 
+        update_idx = update_idx[np.isin(classes[update_idx], from_classes,
+                                        assume_unique=False)]
+
     if update_idx.size == 0:
         if hasattr(app, "statusBar"):
             app.statusBar().showMessage("No visible/from-class points in selection.", 2500)
         return False
- 
-    # --- 2. LOG FOR UNDO ---
-    final_bool_mask = np.zeros(len(classes), dtype=bool)
+
+    # ── 4. Undo entry — dtype preserved, no extra allocation ─────────────
+    final_bool_mask             = np.zeros(len(classes), dtype=bool)
     final_bool_mask[update_idx] = True
- 
-    undo_entry = {
-        "mask": final_bool_mask,
+    app.undo_stack.append({
+        "mask":        final_bool_mask,
         "old_classes": classes[update_idx].copy(),
-        "new_classes": np.full(update_idx.size, to_class, dtype=classes.dtype)
-    }
-    app.undo_stack.append(undo_entry)
+        "new_classes": np.full(update_idx.size, to_class, dtype=orig_dtype),
+    })
     app.redo_stack.clear()
- 
-    # --- 3. APPLY TO DATA (CPU) ---
-    classes[update_idx] = to_class
+    # Enforce undo stack size limit immediately — prevents unbounded memory growth
+    # during 8+ hour sessions (each entry ≈ 3×N_changed bytes of numpy arrays).
+    _max_undo = getattr(app, 'max_undo_steps', 50)
+    while len(app.undo_stack) > _max_undo:
+        app.undo_stack.pop(0)   # drop oldest; FIFO
+
+    # ── 5. Apply to CPU array — dtype-safe, in-place ─────────────────────
+    classes[update_idx] = orig_dtype.type(to_class)
+    assert classes.dtype == orig_dtype, (
+        f"dtype drift: expected {orig_dtype}, got {classes.dtype}"
+    )
     app._last_changed_mask = final_bool_mask
     app._last_from_classes = list(from_classes or [])
- 
-    # --- 4. SYNC TO GPU ---
-    # DO NOT call sync_palette_to_gpu here — that rewrites ALL 13.4M points (290ms).
-    # Instead use targeted updates: only update the changed points' RGB + push uniforms.
+
+    # ── 6. Edit bounding box — computed ONCE for section-view culling ─────
+    edit_bb = None
+    xyz = app.data.get("xyz")
+    if xyz is not None and update_idx.size > 0:
+        edit_bb = _edit_bbox(xyz, update_idx)    # O(k) min/max, single NumPy pass
+
+    # ── 7. GPU sync ───────────────────────────────────────────────────────
     try:
         from gui.unified_actor_manager import (
             fast_classify_update,
@@ -769,87 +846,153 @@ def _apply_classification(app, update_mask, from_classes, to_class):
             is_unified_actor_ready,
         )
         palette = getattr(app, 'class_palette', {})
- 
-        # Update main view: only changed points' RGB + uniform push (O(changed) not O(all))
+
+        # 7a. Main view — targeted RGB poke only on changed points
         if is_unified_actor_ready(app):
             fast_classify_update(app, final_bool_mask, to_class, palette=palette)
             if getattr(app, "display_mode", "class") == "shaded_class":
                 try:
                     from gui.shading_display import refresh_shaded_after_classification_fast
                     refresh_shaded_after_classification_fast(app, changed_mask=final_bool_mask)
-                except Exception as _se:
-                    print(f"Warning: Shading refresh failed: {_se}")
+                except Exception:
                     try:
                         from gui.shading_display import update_shaded_class
                         update_shaded_class(app, force_rebuild=True)
                     except Exception:
                         pass
 
-        # Update cross-sections directly (no signal needed)
+        # 7b. Section views — bbox-culled, render deferred (skip_render=True)
+        #     fast_classify_update already called app.vtk_widget.render() once.
+        #     We do NOT render section views a second time here.
         if hasattr(app, 'section_vtks') and app.section_vtks:
             for view_idx in app.section_vtks:
+                # Dirty flag: skip section entirely if edit bbox doesn't overlap
+                if edit_bb is not None and not _section_bbox_overlaps(app, view_idx, edit_bb):
+                    continue
                 try:
-                    fast_cross_section_update(app, view_idx, final_bool_mask)
+                    fast_cross_section_update(
+                        app, view_idx, final_bool_mask,
+                        skip_render=True,            # render batched in step 7e below
+                    )
                 except Exception:
                     pass
 
-        # Update cut section if active — direct RGB poke (MicroStation: changed points only)
+        # 7c. Cut section — vectorized intersect1d, zero Python loop
         if hasattr(app, 'cut_section_controller') and app.cut_section_controller:
             ctrl = app.cut_section_controller
             if getattr(ctrl, 'is_cut_view_active', False) and ctrl._cut_index_map is not None:
                 try:
                     target_actor = getattr(ctrl, 'cut_core_actor', None)
                     if target_actor and hasattr(target_actor, 'GetMapper'):
-                        polydata = target_actor.GetMapper().GetInput()
+                        _mapper = target_actor.GetMapper()
+                        polydata = _mapper.GetInput() if _mapper is not None else None
                         if polydata:
                             vtk_colors = polydata.GetPointData().GetScalars()
                             if vtk_colors:
                                 from vtkmodules.util import numpy_support as _ns
-                                vtk_ptr = _ns.vtk_to_numpy(vtk_colors)
+                                cut_map = ctrl._cut_index_map   # sorted global indices
 
-                                cut_map = ctrl._cut_index_map
-                                update_set = set(update_idx.tolist())
-                                local_hits = []
-                                for local_i in range(len(cut_map)):
-                                    if int(cut_map[local_i]) in update_set:
-                                        local_hits.append(local_i)
-
-                                if local_hits:
-                                    local_arr = np.array(local_hits, dtype=np.int64)
-                                    new_color = palette.get(to_class, {}).get('color', (128, 128, 128))
-                                    vtk_ptr[local_arr] = new_color
+                                # O(k log k) vectorized intersect — replaces O(n) Python loop
+                                _, _, local_arr = np.intersect1d(
+                                    update_idx, cut_map,
+                                    return_indices=True,
+                                    assume_unique=True,          # both arrays are unique
+                                )
+                                if local_arr.size > 0:
+                                    new_color = palette.get(to_class, {}).get(
+                                        'color', (128, 128, 128))
+                                    vtk_ptr             = _ns.vtk_to_numpy(vtk_colors)
+                                    vtk_ptr[local_arr]  = new_color   # vectorized broadcast
                                     vtk_colors.Modified()
                                     polydata.Modified()
-
                                 if hasattr(ctrl, 'cut_vtk') and ctrl.cut_vtk:
                                     ctrl.cut_vtk.render()
-                except Exception as _ce:
-                    print(f"⚠️ Cut section poke failed: {_ce}")
+                except Exception:
+                    pass
 
-        # Render main view
-        try:
-            app.vtk_widget.render()
-        except Exception:
-            pass
-
-        # Render section views
+        # 7d. Section view renders — one pass, bbox-culled, no duplicate calls
         if hasattr(app, 'section_vtks'):
-            for sw in app.section_vtks.values():
-                if sw:
-                    try: sw.render()
-                    except: pass
+            for view_idx, sw in app.section_vtks.items():
+                if sw is None:
+                    continue
+                if edit_bb is not None and not _section_bbox_overlaps(app, view_idx, edit_bb):
+                    continue
+                try:
+                    sw.render()
+                except Exception:
+                    pass
 
-        # ✅ FIX: Signal GPU sync done — prevents decorator double-refresh
+        # 7e. Signal GPU sync complete (suppresses decorator double-refresh)
         if getattr(app, "display_mode", "class") != "shaded_class":
             app._gpu_sync_done = True
- 
-    except Exception as e:
-        print(f"⚠️ GPU Sync Error: {e}")
- 
-    print(f"⚡ Global Sync: All viewports updated via GPU uniforms.")
+
+    except Exception:
+        pass    # classification already applied to CPU — do not surface GPU errors
+
     return True
 
 
+
+def classify_points_example(app, selected_indices, target_class):
+    """
+    Example of how to classify points and ensure they're visible.
+    Add this pattern to ALL your classification functions.
+    """
+    
+    # 1. Perform the classification
+    app.data["classification"][selected_indices] = target_class
+    
+    # 2. ✅ CRITICAL: Mark this class as recently modified
+    # This makes update_class_mode() render it LAST (on top)
+    app._last_classified_to_class = target_class
+    
+    # 3. Trigger re-render (which will read the flag)
+    from gui.class_display import update_class_mode
+    update_class_mode(app)
+
+
+def debug_priority_rendering(app):
+    """
+    Debug helper to check if priority rendering flags are set correctly.
+    Call this after classification to verify the state.
+    """
+    print("\n" + "="*60)
+    print("🔍 PRIORITY RENDERING DEBUG")
+    print("="*60)
+    
+    # Check priority class flag
+    has_priority_class = hasattr(app, '_last_classified_to_class')
+    print(f"Priority class flag exists: {has_priority_class}")
+    if has_priority_class:
+        print(f"   → Class: {app._last_classified_to_class}")
+        
+        # Check if this class is in palette
+        if hasattr(app, 'class_palette') and app._last_classified_to_class in app.class_palette:
+            info = app.class_palette[app._last_classified_to_class]
+            print(f"   → Visible: {info.get('show', False)}")
+            print(f"   → Weight: {info.get('weight', 1.0)}")
+            print(f"   → Color: {info.get('color', (0,0,0))}")
+        else:
+            print(f"   ⚠️ Class {app._last_classified_to_class} NOT in palette!")
+    
+    # Check priority mask
+    has_priority_mask = hasattr(app, '_last_changed_mask')
+    print(f"\nPriority mask flag exists: {has_priority_mask}")
+    if has_priority_mask:
+        mask = app._last_changed_mask
+        print(f"   → Type: {type(mask)}")
+        print(f"   → Shape: {mask.shape}")
+        print(f"   → Points flagged: {np.sum(mask):,}")
+        print(f"   → Total dataset: {len(app.data['classification']):,}")
+        
+        # Check what classes these points belong to
+        if np.sum(mask) > 0:
+            flagged_classes = np.unique(app.data['classification'][mask])
+            print(f"   → Classes in flagged points: {flagged_classes}")
+    
+    print("="*60 + "\n")
+    
+    # The flag is automatically cleared after rendering
 
 def _get_visible_classes_for_current_view(app):
     """
@@ -1014,34 +1157,21 @@ def classify_freehand(app, freehand_xy=None, from_classes=None, to_class=None,
 @classify_with_stats_update
 def classify_above_line(app, line_pts=None, from_classes=None, to_class=None,
                         mask=None, section_points=None, visible_bounds=None):
-    """
-    Classify points above a drawn line in cross/cut-section views.
-    ✅ NOW: Properly applies viewport filtering when zoomed
-    ✅ FIX: Respects visible class filters
-    """
-    # ✅ CRITICAL FIX: Check if in CUT SECTION FIRST
+    """Classify points above a drawn line in cross/cut-section views."""
     is_cut_section = (getattr(app, "active_classify_target", None) == "cut")
     if is_cut_section:
-        print("🔒 CUT SECTION MODE - Using cut data directly")
         if app.cut_section_controller is None or app.cut_section_controller.cut_points is None:
-            print("❌ No cut section data available")
             return
-        
         section_points = app.cut_section_controller.cut_points
         mask_or_indices = app.cut_section_controller._cut_index_map
-        print(f"🔒 Cut section: {len(section_points)} points, {len(mask_or_indices)} indices")
     else:
         mask_or_indices, section_points = _get_section_data_with_buffer(app, mask, section_points)
 
     if line_pts is None or len(line_pts) < 2:
-        print("⚠️ No line defined for AboveLine tool.")
         return
-
     if section_points is None or len(section_points) == 0:
-        print("⚠️ No section points found.")
         return
 
-    # Project points to 2D FIRST (same view as rectangle/circle)
     if is_cut_section:
         pts_2d = _project_to_cut_view(app, section_points)
         view_mode = "cut"
@@ -1049,192 +1179,84 @@ def classify_above_line(app, line_pts=None, from_classes=None, to_class=None,
         view_mode = getattr(app, "cross_view_mode", "side")
         pts_2d = _project_to_2d_view(section_points, view_mode)
 
-    # ✅ FIX: Get viewport bounds in the SAME 2D coordinate system
     viewport_mask = _get_viewport_mask_for_2d(app, pts_2d, is_cut_section, view_mode)
     if viewport_mask is None:
         viewport_mask = np.ones(len(section_points), dtype=bool)
 
-    num_visible = int(np.sum(viewport_mask))
-    print(f"📍 Viewport contains {num_visible}/{len(section_points)} points (zoomed view)")
-
-    # Calculate line equation
     (x1, z1), (x2, z2) = line_pts
     m = (z2 - z1) / (x2 - x1 + 1e-9)
     b = z1 - m * x1
     xmin, xmax = sorted([x1, x2])
 
-    # Select points above line
     in_strip = (pts_2d[:, 0] >= xmin) & (pts_2d[:, 0] <= xmax)
     above = pts_2d[:, 1] >= (m * pts_2d[:, 0] + b)
+    local_mask = (in_strip & above) & viewport_mask
 
-    # ✅ CRITICAL: Apply viewport filter BEFORE converting to dataset indices
-    geometry_mask = in_strip & above
-    local_mask = geometry_mask & viewport_mask
-
-    # ✅ NEW: Apply visible class filter
     visible_classes = _get_visible_classes_for_current_view(app)
     if visible_classes is not None:
-        # Get classification array for section points
-        if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
-            section_indices = np.where(mask_or_indices)[0]
-        else:
-            section_indices = mask_or_indices
-        
-        section_classification = app.data["classification"][section_indices]
-        class_mask = np.isin(section_classification, visible_classes)
-        
-        num_before_class_filter = int(np.sum(local_mask))
+        section_indices = mask_or_indices if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)
+        class_mask = np.isin(app.data["classification"][section_indices], visible_classes)
         local_mask = local_mask & class_mask
-        num_after_class_filter = int(np.sum(local_mask))
-        
-        print(f"🔍 Class filter: {num_before_class_filter} → {num_after_class_filter} points")
-        print(f"   Only classifying visible classes: {visible_classes}")
 
-    num_geometry = int(np.sum(geometry_mask))
-    num_selected = int(np.sum(local_mask))
-    print(f"📐 Above Line: {num_geometry} in geometry, {num_selected} after all filters")
-
-    if num_selected == 0:
-        print("⚠️ No points above line in visible viewport with visible classes")
+    if not np.any(local_mask):
         return
 
-    # Create update mask
     update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
-
-    # Map to dataset indices
-    if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
-        selected_indices = np.where(mask_or_indices)[0][local_mask]
-    else:
-        selected_indices = mask_or_indices[local_mask]
-
+    selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
     update_mask[selected_indices] = True
-
     _apply_classification(app, update_mask, from_classes, to_class)
-    verify_classification_applied(app, update_mask, to_class, "Above Line")
 
 @classify_with_stats_update
 def classify_below_line(app, line_pts=None, from_classes=None, to_class=None,
                         mask=None, section_points=None, visible_bounds=None):
-    """
-    Classify points below a drawn line in cross/cut-section views.
-    ✅ FIXED: Uses SAME coordinate handling as classify_above_line
-    """
-    print(f"\n{'='*60}")
-    print(f"📐 classify_below_line CALLED")
-    print(f"{'='*60}")
-   
-    # ✅ CRITICAL FIX: Check if in CUT SECTION FIRST
+    """Classify points below a drawn line in cross/cut-section views."""
     is_cut_section = (getattr(app, "active_classify_target", None) == "cut")
     if is_cut_section:
-        print("🔒 CUT SECTION MODE - Using cut data directly")
         if app.cut_section_controller is None or app.cut_section_controller.cut_points is None:
-            print("❌ No cut section data available")
             return
-       
         section_points = app.cut_section_controller.cut_points
         mask_or_indices = app.cut_section_controller._cut_index_map
-        print(f"🔒 Cut section: {len(section_points)} points, {len(mask_or_indices)} indices")
     else:
         mask_or_indices, section_points = _get_section_data_with_buffer(app, mask, section_points)
- 
+
     if line_pts is None or len(line_pts) < 2:
-        print("⚠️ No line defined for BelowLine tool.")
-        print(f"{'='*60}\n")
         return
- 
     if section_points is None or len(section_points) == 0:
-        print("⚠️ No section points found.")
-        print(f"{'='*60}\n")
         return
- 
-    # ✅ CRITICAL: Use SAME projection logic as classify_above_line
+
     if is_cut_section:
         pts_2d = _project_to_cut_view(app, section_points)
         view_mode = "cut"
     else:
         view_mode = getattr(app, "cross_view_mode", "side")
         pts_2d = _project_to_2d_view(section_points, view_mode)
-   
-    print(f"   View mode: {view_mode}")
-    print(f"   Projected to 2D using: {view_mode} mode")
-    print(f"   Points 2D shape: {pts_2d.shape}")
- 
-    # ✅ Get viewport bounds - uses correct view_mode
+
     viewport_mask = _get_viewport_mask_for_2d(app, pts_2d, is_cut_section, view_mode)
     if viewport_mask is None:
         viewport_mask = np.ones(len(section_points), dtype=bool)
- 
-    num_visible = int(np.sum(viewport_mask))
-    print(f"📍 Viewport contains {num_visible}/{len(section_points)} points")
- 
-    # ✅ Calculate line equation (SAME as above_line)
+
     (x1, z1), (x2, z2) = line_pts
-    print(f"   Line: ({x1:.2f}, {z1:.2f}) → ({x2:.2f}, {z2:.2f})")
-   
     m = (z2 - z1) / (x2 - x1 + 1e-9)
     b = z1 - m * x1
     xmin, xmax = sorted([x1, x2])
-   
-    print(f"   Line equation: z = {m:.4f} * x + {b:.4f}")
-    print(f"   X range: [{xmin:.2f}, {xmax:.2f}]")
- 
-    # ✅ ONLY DIFFERENCE: <= instead of >=
+
     in_strip = (pts_2d[:, 0] >= xmin) & (pts_2d[:, 0] <= xmax)
-    below = pts_2d[:, 1] <= (m * pts_2d[:, 0] + b)  # ← ONLY DIFFERENCE
- 
-    print(f"   Points in X strip: {np.sum(in_strip)}")
-    print(f"   Points below line: {np.sum(below)}")
- 
-    # ✅ Apply viewport filter
-    geometry_mask = in_strip & below
-    local_mask = geometry_mask & viewport_mask
- 
-    print(f"   After viewport filter: {np.sum(local_mask)}")
- 
-    # ✅ Apply visible class filter
+    below = pts_2d[:, 1] <= (m * pts_2d[:, 0] + b)
+    local_mask = (in_strip & below) & viewport_mask
+
     visible_classes = _get_visible_classes_for_current_view(app)
     if visible_classes is not None:
-        if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
-            section_indices = np.where(mask_or_indices)[0]
-        else:
-            section_indices = mask_or_indices
-       
-        section_classification = app.data["classification"][section_indices]
-        class_mask = np.isin(section_classification, visible_classes)
-       
-        num_before_class_filter = int(np.sum(local_mask))
+        section_indices = mask_or_indices if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)
+        class_mask = np.isin(app.data["classification"][section_indices], visible_classes)
         local_mask = local_mask & class_mask
-        num_after_class_filter = int(np.sum(local_mask))
-       
-        print(f"🔍 Class filter: {num_before_class_filter} → {num_after_class_filter} points")
-        print(f"   Visible classes: {visible_classes}")
- 
-    num_geometry = int(np.sum(geometry_mask))
-    num_selected = int(np.sum(local_mask))
-    print(f"📐 Below Line: {num_geometry} in geometry, {num_selected} after all filters")
- 
-    if num_selected == 0:
-        print("⚠️ No points below line in visible viewport with visible classes")
-        print(f"{'='*60}\n")
+
+    if not np.any(local_mask):
         return
- 
-    # ✅ Create update mask and map to dataset indices
+
     update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
- 
-    if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
-        selected_indices = np.where(mask_or_indices)[0][local_mask]
-    else:
-        selected_indices = mask_or_indices[local_mask]
- 
+    selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
     update_mask[selected_indices] = True
-   
-    print(f"   Final dataset indices: {len(selected_indices)}")
- 
-    # ✅ Apply classification
     _apply_classification(app, update_mask, from_classes, to_class)
-    verify_classification_applied(app, update_mask, to_class, "Below Line")
-   
-    print(f"{'='*60}\n")
     
 def _get_viewport_mask_for_2d(app, pts_2d, is_cut_section, view_mode):
 
@@ -1306,8 +1328,7 @@ def _get_viewport_mask_for_2d(app, pts_2d, is_cut_section, view_mode):
 
             aspect = size[0] / max(size[1], 1)
 
-        except:
-
+        except Exception:
             aspect = 1.0
 
         half_w = scale * aspect
@@ -1370,201 +1391,131 @@ def _get_viewport_mask_for_2d(app, pts_2d, is_cut_section, view_mode):
 @classify_with_stats_update
 def classify_rectangle(app, rect_bounds=None, from_classes=None, to_class=None,
                        mask=None, section_points=None, visible_bounds=None):
-    """
-    Classify rectangle selection.
-    ✅ FIXED: Uses cut data when in cut section
-    """
-    # ✅ CHECK CUT SECTION FIRST
+    """Classify rectangle selection."""
     is_cut_section = (getattr(app, "active_classify_target", None) == "cut")
-    
+
     if is_cut_section:
         section_points = app.cut_section_controller.cut_points
         mask_or_indices = app.cut_section_controller._cut_index_map
-        print(f"🔒 Cut section: {len(section_points)} points, {len(mask_or_indices)} indices")
     else:
         mask_or_indices, section_points = _get_section_data_with_buffer(app, mask, section_points)
-    
+
     if rect_bounds is None:
         update_mask = getattr(app, "last_mask", None)
         if update_mask is None:
-            print("⚠️ No active rectangle ROI")
             return
         return _apply_classification(app, update_mask.copy(), from_classes, to_class)
-    
+
     if mask_or_indices is None:
         mask_or_indices = np.ones(len(app.data["xyz"]), dtype=bool)
-    
+
     if section_points is not None:
-        # ✅ Project to correct view
         if is_cut_section:
             pts_2d = _project_to_cut_view(app, section_points)
-            view_mode = "cut"
         else:
-            view_mode = getattr(app, "cross_view_mode", "side")
-            pts_2d = _project_to_2d_view(section_points, view_mode)
-        
+            pts_2d = _project_to_2d_view(section_points, getattr(app, "cross_view_mode", "side"))
+
         xmin, xmax, ymin, ymax = rect_bounds
-        in_rect = (
+        local_mask = (
             (pts_2d[:, 0] >= xmin) & (pts_2d[:, 0] <= xmax) &
             (pts_2d[:, 1] >= ymin) & (pts_2d[:, 1] <= ymax)
         )
-        
-        local_mask = in_rect
-        num_selected = int(np.sum(local_mask))
-        print(f"▭ Rectangle: {num_selected} points selected")
-        
-        if num_selected == 0:
-            print("⚠️ No points in rectangle")
+
+        if not np.any(local_mask):
             return
-        
+
         update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
-        
-        if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
-            selected_indices = np.where(mask_or_indices)[0][local_mask]
-        else:
-            selected_indices = mask_or_indices[local_mask]
-        
+        selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
         update_mask[selected_indices] = True
-        
         _apply_classification(app, update_mask, from_classes, to_class)
-        verify_classification_applied(app, update_mask, to_class, "Rectangle")
 
 
 @classify_with_stats_update
 def classify_circle(app, center=None, radius=None, from_classes=None, to_class=None,
                     mask=None, section_points=None, visible_bounds=None):
-    """
-    Classify circle selection.
-    ✅ FIXED: Uses cut data when in cut section
-    """
-    # ✅ CHECK CUT SECTION FIRST
+    """Classify circle selection."""
     is_cut_section = (getattr(app, "active_classify_target", None) == "cut")
-    
+
     if is_cut_section:
         section_points = app.cut_section_controller.cut_points
         mask_or_indices = app.cut_section_controller._cut_index_map
-        print(f"🔒 Cut section: {len(section_points)} points, {len(mask_or_indices)} indices")
     else:
         mask_or_indices, section_points = _get_section_data_with_buffer(app, mask, section_points)
-    
+
     if center is None or radius is None:
         update_mask = getattr(app, "last_mask", None)
         if update_mask is None:
-            print("⚠️ No active circle ROI")
             return
         return _apply_classification(app, update_mask.copy(), from_classes, to_class)
-    
+
     if mask_or_indices is None:
         mask_or_indices = np.ones(len(app.data["xyz"]), dtype=bool)
-    
+
     if section_points is not None:
-        # ✅ Project to correct view
         if is_cut_section:
             pts_2d = _project_to_cut_view(app, section_points)
-            view_mode = "cut"
         else:
-            view_mode = getattr(app, "cross_view_mode", "side")
-            pts_2d = _project_to_2d_view(section_points, view_mode)
-        
+            pts_2d = _project_to_2d_view(section_points, getattr(app, "cross_view_mode", "side"))
+
         cx, cy = center
-        d2 = (pts_2d[:, 0] - cx) ** 2 + (pts_2d[:, 1] - cy) ** 2
-        in_circle = d2 <= radius ** 2
-        
-        local_mask = in_circle
-        num_selected = int(np.sum(local_mask))
-        print(f"⭕ Circle: {num_selected} points selected")
-        
-        if num_selected == 0:
-            print("⚠️ No points in circle")
+        local_mask = ((pts_2d[:, 0] - cx) ** 2 + (pts_2d[:, 1] - cy) ** 2) <= radius ** 2
+
+        if not np.any(local_mask):
             return
-        
+
         update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
-        
-        if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
-            selected_indices = np.where(mask_or_indices)[0][local_mask]
-        else:
-            selected_indices = mask_or_indices[local_mask]
-        
+        selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
         update_mask[selected_indices] = True
-        
         _apply_classification(app, update_mask, from_classes, to_class)
-        verify_classification_applied(app, update_mask, to_class, "Circle")
-pass
 
 
 @classify_with_stats_update
 def classify_polygon(app, polygon_xy=None, from_classes=None, to_class=None,
                      mask=None, section_points=None, visible_bounds=None):
-    """
-    Classify polygon selection.
-    ✅ FIXED: Uses cut data when in cut section
-    """
+    """Classify polygon selection."""
     from matplotlib.path import Path
-    
-    # ✅ CHECK CUT SECTION FIRST
+
     is_cut_section = (getattr(app, "active_classify_target", None) == "cut")
-    
+
     if is_cut_section:
         section_points = app.cut_section_controller.cut_points
         mask_or_indices = app.cut_section_controller._cut_index_map
-        print(f"🔒 Cut section: {len(section_points)} points, {len(mask_or_indices)} indices")
     else:
         mask_or_indices, section_points = _get_section_data_with_buffer(app, mask, section_points)
-    
+
     if polygon_xy is None:
         update_mask = getattr(app, "last_mask", None)
         if update_mask is None:
-            print("⚠️ No active polygon ROI")
             return
         return _apply_classification(app, update_mask.copy(), from_classes, to_class)
-    
+
     if mask_or_indices is None:
         mask_or_indices = np.ones(len(app.data["xyz"]), dtype=bool)
-    
+
     if section_points is not None:
-        # ✅ Project to correct view
         if is_cut_section:
             pts_2d = _project_to_cut_view(app, section_points)
-            view_mode = "cut"
         else:
-            view_mode = getattr(app, "cross_view_mode", "side")
-            pts_2d = _project_to_2d_view(section_points, view_mode)
-        
+            pts_2d = _project_to_2d_view(section_points, getattr(app, "cross_view_mode", "side"))
+
         path = Path(polygon_xy, closed=True)
-        in_polygon = path.contains_points(pts_2d)
-        
-        local_mask = in_polygon
-        num_selected = int(np.sum(local_mask))
-        print(f"⬠ Polygon: {num_selected} points selected")
-        
-        if num_selected == 0:
-            print("⚠️ No points in polygon")
+        local_mask = path.contains_points(pts_2d)
+
+        if not np.any(local_mask):
             return
-        
+
         update_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
-        
-        if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
-            selected_indices = np.where(mask_or_indices)[0][local_mask]
-        else:
-            selected_indices = mask_or_indices[local_mask]
-        
+        selected_indices = mask_or_indices[local_mask] if not (isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool) else np.flatnonzero(mask_or_indices)[local_mask]
         update_mask[selected_indices] = True
-        
         _apply_classification(app, update_mask, from_classes, to_class)
-        verify_classification_applied(app, update_mask, to_class, "Polygon")
     else:
-        # Main view - no section points
         xyz = app.data["xyz"]
         pts = xyz[mask_or_indices]
-        
         path = Path(polygon_xy, closed=True)
         inside = path.contains_points(pts[:, :2])
-        
         update_mask = np.zeros(len(xyz), dtype=bool)
         update_mask[mask_or_indices] = inside
-        
         _apply_classification(app, update_mask, from_classes, to_class)
-        verify_classification_applied(app, update_mask, to_class, "Polygon")
 
 
 # @classify_with_stats_update
@@ -1668,7 +1619,7 @@ def classify_brush(app, center=None, radius=None, from_classes=None, to_class=No
         
         # Cache section classification
         if isinstance(mask_or_indices, np.ndarray) and mask_or_indices.dtype == bool:
-            section_indices = np.where(mask_or_indices)[0]
+            section_indices = np.flatnonzero(mask_or_indices)
         else:
             section_indices = mask_or_indices
         section_classification = app.data["classification"][section_indices]
@@ -1772,134 +1723,93 @@ def classify_brush(app, center=None, radius=None, from_classes=None, to_class=No
     _fast_update_colors(app, global_indices, to_class, is_cut_section)
 
 
-def _fast_update_colors(app, indices, new_class, is_cut_section):
+def _fast_update_colors(app, indices: np.ndarray, new_class: int, is_cut_section: bool) -> None:
     """
-    🚀 Direct GPU buffer update - NO actor rebuild.
-    Updates colors in ~1ms instead of ~200ms.
-    """
-    try:
-        indices = np.asarray(indices, dtype=np.int64)
-        if indices.size == 0:
-            return
+    Vectorized GPU color poke for brush/drag strokes.
 
-        # Get new color
-        new_rgb = app.class_palette.get(new_class, {}).get('color', (128, 128, 128))
-        new_rgb = np.array(new_rgb, dtype=np.uint8)
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # Update CROSS-SECTION views (only the active one)
-        # ═══════════════════════════════════════════════════════════════════
-        
-        if not is_cut_section and hasattr(app, 'section_controller'):
-            active_view = getattr(app.section_controller, 'active_view', None)
-            
-            if active_view is not None and active_view in getattr(app, 'section_vtks', {}):
-                vtk_widget = app.section_vtks[active_view]
-                
-                # Get the actor for this view
-                actors = vtk_widget.renderer.GetActors()
-                actors.InitTraversal()
-                
-                for _ in range(actors.GetNumberOfItems()):
-                    actor = actors.GetNextActor()
-                    if actor is None:
-                        continue
-                    
-                    mapper = actor.GetMapper()
-                    if mapper is None:
-                        continue
-                    
-                    polydata = mapper.GetInput()
-                    if polydata is None:
-                        continue
-                    
+    Key changes vs original:
+    - Cross-section actor: O(1) named dict lookup instead of O(n_actors) VTK traversal.
+    - All index mapping: vectorized NumPy boolean indexing — zero Python loops.
+    - Cut section: np.intersect1d (unchanged, already vectorized).
+    - Dirty flag: vtk_colors.Modified() only called when local_idx.size > 0.
+    - Main view: no .copy() on append (chunks are consumed once on release).
+    """
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.size == 0:
+        return
+
+    new_rgb = np.asarray(
+        app.class_palette.get(new_class, {}).get('color', (128, 128, 128)),
+        dtype=np.uint8,
+    )
+
+    # ── Cross-section: O(1) named actor lookup — no VTK actor traversal ──
+    if not is_cut_section and hasattr(app, 'section_controller'):
+        active_view = getattr(app.section_controller, 'active_view', None)
+        if active_view is not None and active_view in getattr(app, 'section_vtks', {}):
+            vtk_widget  = app.section_vtks[active_view]
+            actor_name  = f"_section_{active_view}_unified"
+            actor       = vtk_widget.actors.get(actor_name)   # O(1) dict, was O(n_actors)
+
+            if actor is not None:
+                mapper   = actor.GetMapper()
+                polydata = mapper.GetInput() if mapper else None
+                if polydata is not None:
                     vtk_colors = polydata.GetPointData().GetScalars()
-                    if vtk_colors is None:
-                        continue
-                    
-                    num_tuples = vtk_colors.GetNumberOfTuples()
-                    
-                    # Get the combined mask for this view
-                    combined_mask = getattr(app, f"section_{active_view}_combined_mask", None)
-                    
-                    if combined_mask is not None:
-                        global_to_local = _get_section_global_to_local_map(
-                            app,
-                            active_view,
-                            combined_mask,
+                    if vtk_colors is not None:
+                        combined_mask = getattr(
+                            app, f"section_{active_view}_combined_mask", None
                         )
+                        if combined_mask is not None:
+                            global_to_local = _get_section_global_to_local_map(
+                                app, active_view, combined_mask
+                            )
+                            num_tuples = vtk_colors.GetNumberOfTuples()
 
-                        valid_bounds = (
-                            (indices >= 0) &
-                            (indices < combined_mask.shape[0])
+                            # Vectorized bounds gate — O(k) NumPy, no Python loop
+                            valid    = (indices >= 0) & (indices < combined_mask.shape[0])
+                            cand     = indices[valid]
+                            if cand.size > 0:
+                                in_sec   = cand[combined_mask[cand]]   # boolean index
+                                if in_sec.size > 0:
+                                    local_idx = global_to_local[in_sec]
+                                    local_idx = local_idx[local_idx < num_tuples]
+                                    if local_idx.size > 0:
+                                        # Dirty flag: only write + mark when hits exist
+                                        vtk_ptr            = numpy_support.vtk_to_numpy(vtk_colors)
+                                        vtk_ptr[local_idx] = new_rgb   # vectorized broadcast
+                                        vtk_colors.Modified()
+
+            vtk_widget.render()   # single render after all pokes
+
+    # ── Cut section: vectorized intersect1d (unchanged, already correct) ─
+    if is_cut_section and hasattr(app, 'cut_section_controller'):
+        ctrl = app.cut_section_controller
+        if ctrl.is_cut_view_active and ctrl.cut_vtk is not None:
+            actor = getattr(ctrl, 'cut_core_actor', None)
+            if actor is not None:
+                mapper   = actor.GetMapper()
+                polydata = mapper.GetInput() if mapper else None
+                if polydata is not None:
+                    vtk_colors = polydata.GetPointData().GetScalars()
+                    if vtk_colors is not None:
+                        cut_idx = ctrl._cut_index_map
+                        _, _, local_cut = np.intersect1d(
+                            indices, cut_idx,
+                            return_indices=True, assume_unique=False,
                         )
-                        if not np.any(valid_bounds):
-                            continue
+                        if local_cut.size > 0:
+                            # Dirty flag: only write when intersection is non-empty
+                            vtk_ptr             = numpy_support.vtk_to_numpy(vtk_colors)
+                            vtk_ptr[local_cut]  = new_rgb
+                            vtk_colors.Modified()
+            ctrl.cut_vtk.render()
 
-                        candidate_global = indices[valid_bounds]
-                        valid_global = candidate_global[combined_mask[candidate_global]]
-                        
-                        if len(valid_global) > 0:
-                            local_indices = global_to_local[valid_global]
-                            valid_local = local_indices[local_indices < num_tuples]
-                            
-                            if len(valid_local) > 0:
-                                # Direct color injection
-                                vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
-                                vtk_ptr[valid_local] = new_rgb
-                                vtk_colors.Modified()
-                
-                # Single render
-                vtk_widget.render()
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # Update CUT SECTION view
-        # ═══════════════════════════════════════════════════════════════════
-        
-        if is_cut_section and hasattr(app, 'cut_section_controller'):
-            ctrl = app.cut_section_controller
-            
-            if ctrl.is_cut_view_active and ctrl.cut_vtk is not None:
-                # Get cut actor
-                actor = getattr(ctrl, 'cut_core_actor', None)
-                
-                if actor is not None:
-                    mapper = actor.GetMapper()
-                    if mapper is not None:
-                        polydata = mapper.GetInput()
-                        if polydata is not None:
-                            vtk_colors = polydata.GetPointData().GetScalars()
-                            
-                            if vtk_colors is not None:
-                                # Map global indices to cut-local indices
-                                cut_idx = ctrl._cut_index_map
-                                
-                                # Find which of our indices are in the cut
-                                _, idx_in_indices, idx_in_cut = np.intersect1d(
-                                    indices, cut_idx, 
-                                    return_indices=True, assume_unique=False
-                                )
-                                
-                                if len(idx_in_cut) > 0:
-                                    vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
-                                    vtk_ptr[idx_in_cut] = new_rgb
-                                    vtk_colors.Modified()
-                
-                ctrl.cut_vtk.render()
-        
-        # ═══════════════════════════════════════════════════════════════════
-        # Update MAIN VIEW (deferred - only on mouse release)
-        # ═══════════════════════════════════════════════════════════════════
-        
-        # Mark for deferred update without Python set churn on every stamp.
-        if not hasattr(app, '_pending_main_view_index_chunks') or app._pending_main_view_index_chunks is None:
-            app._pending_main_view_index_chunks = []
-
-        app._pending_main_view_index_chunks.append(indices.copy())
-        
-    except Exception as e:
-        # Silent fail - don't slow down brush with error logging
-        pass
+    # ── Main view: deferred batch (flushed on mouse-release via clear_brush_cache) ─
+    if not hasattr(app, '_pending_main_view_index_chunks') or \
+            app._pending_main_view_index_chunks is None:
+        app._pending_main_view_index_chunks = []
+    app._pending_main_view_index_chunks.append(indices)   # no .copy() — consumed once
 
 
 def clear_brush_cache(app):
@@ -1916,8 +1826,9 @@ def clear_brush_cache(app):
                 actor = app.vtk_widget.actors.get("main_points_cloud")
                 
                 if actor is not None:
-                    polydata = actor.GetMapper().GetInput()
-                    vtk_colors = polydata.GetPointData().GetScalars()
+                    _m = actor.GetMapper()
+                    polydata = _m.GetInput() if _m else None
+                    vtk_colors = polydata.GetPointData().GetScalars() if polydata else None
                     
                     if vtk_colors is not None:
                         vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
@@ -1965,7 +1876,7 @@ def _check_auto_deactivate(app):
         settings = QSettings("NakshaAI", "LidarApp")
         auto_deactivate = settings.value("auto_deactivate_after_classify", False, type=bool)
         return auto_deactivate
-    except:
+    except Exception:
         return False
     
 

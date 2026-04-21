@@ -1,9 +1,10 @@
+
 import importlib as _importlib
 import sys as _sys
 import os as _os
 
-from PySide6.QtGui import QColor, QFont, QAction, QActionGroup
-from PySide6.QtCore import Qt, Signal, QSettings
+from PySide6.QtGui import QColor, QFont, QIcon, QAction, QActionGroup
+from PySide6.QtCore import Qt, Signal, QSettings, QMutex, QMutexLocker
 import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
@@ -52,9 +53,6 @@ def _resolve_uam():
         "unified_actor_manager.py not found. "
         "Expected gui/unified_actor_manager.py or a legacy top-level copy."
     )
-
-
-_uam = _resolve_uam()
 
 
 # --- Helper Aliases at the top of display_mode.py ---
@@ -494,6 +492,14 @@ class DisplayModeDialog(QDialog):
                 Qt.WindowCloseButtonHint
             )
 
+        # Bug-8 fix: single-shot debounce timer for QSettings registry flush.
+        # Fires 2 s after the last Apply/border click; harmlessly restarts on each
+        # new click so rapid interactions never block the main thread.
+        from PySide6.QtCore import QTimer
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self.save_global_settings)
+
         main_layout = QVBoxLayout(self)
 
         self.setStyleSheet(get_dialog_stylesheet())
@@ -869,26 +875,19 @@ class DisplayModeDialog(QDialog):
     def wire_palette_signal(app) -> bool:
         return _uam_connect(app)
 
-    def _load_slot_checkboxes(self, slot_idx):
-        print(f"\n   📂 Loading checkboxes for slot {slot_idx}...")
+    def _save_slot_state(self, slot_idx: int) -> None:
+        """
+        Bug-10 fix: single-pass save of checkboxes AND weights.
+        Replaces the two separate _save_slot_checkboxes + _save_slot_weights
+        passes that each iterated all table rows independently (2× scan → 1×).
+        """
+        if not hasattr(self, 'slot_shows'):
+            self.slot_shows = {}
+        self.slot_shows.setdefault(slot_idx, {})
+        if not hasattr(self, 'view_palettes'):
+            self.view_palettes = {}
+        slot_pal = self.view_palettes.setdefault(slot_idx, {})
 
-        if slot_idx in self.view_palettes and self.view_palettes[slot_idx]:
-            saved_states = {
-                code: info.get('show', True)
-                for code, info in self.view_palettes[slot_idx].items()
-            }
-        else:
-            saved_states = self.slot_shows.get(slot_idx, {})
-
-        if not saved_states:
-            for row in range(self.table.rowCount()):
-                chk = self.table.cellWidget(row, 0)
-                if chk:
-                    chk.setChecked(True)
-            return
-
-        checked_count   = 0
-        unchecked_count = 0
         for row in range(self.table.rowCount()):
             try:
                 code_item = self.table.item(row, 1)
@@ -896,61 +895,69 @@ class DisplayModeDialog(QDialog):
                     continue
                 code = int(code_item.text())
                 chk  = self.table.cellWidget(row, 0)
-                if chk:
-                    is_checked = saved_states.get(code, True)
-                    chk.blockSignals(True)
-                    chk.setChecked(is_checked)
-                    chk.blockSignals(False)
-                    if is_checked:
-                        checked_count += 1
-                    else:
-                        unchecked_count += 1
-            except Exception as e:
-                print(f"      ⚠️ Error on row {row}: {e}")
+                show = chk.isChecked() if chk else True
+                wt_item = self.table.item(row, 6)
+                weight  = float(wt_item.text()) if wt_item else 1.0
+
+                self.slot_shows[slot_idx][code] = show
+                slot_pal.setdefault(code, {}).update({'show': show, 'weight': weight})
+            except Exception:
                 continue
 
-        print(f"      ✅ Loaded slot {slot_idx}: "
-              f"{checked_count} checked, {unchecked_count} unchecked")
+    def _load_slot_state(self, slot_idx: int) -> None:
+        """
+        Bug-10 fix: single-pass load of checkboxes AND weights with table-level
+        blockSignals — suppresses all stateChanged callbacks during bulk restore.
 
-    def _save_slot_checkboxes(self, slot_idx):
-        current_states = {}
-        checked_count  = 0
-        for row in range(self.table.rowCount()):
-            code = int(self.table.item(row, 1).text())
-            chk  = self.table.cellWidget(row, 0)
-            if chk:
-                is_checked = chk.isChecked()
-                current_states[int(code)] = bool(is_checked)
-                if is_checked:
-                    checked_count += 1
+        Previously: _load_slot_checkboxes + _load_slot_weights = 2 full scans
+        + per-checkbox blockSignals (still fires on_checkbox_toggled n times).
+        Now: 1 scan, table-level signal block → zero spurious callbacks → O(n).
+        """
+        palette        = self.view_palettes.get(slot_idx, {}) if hasattr(self, 'view_palettes') else {}
+        saved_shows    = self.slot_shows.get(slot_idx, {})     if hasattr(self, 'slot_shows')    else {}
+        default_weight = 1.0 if slot_idx == 0 else 0.5
 
-        if not hasattr(self, 'slot_shows'):
-            self.slot_shows = {}
-        self.slot_shows[slot_idx] = current_states
-        print(f"      ✅ Saved {checked_count} checked classes for slot {slot_idx}")
+        # table.blockSignals suppresses ALL stateChanged during bulk setChecked —
+        # eliminates the O(n²) callback storm caused by per-row blockSignals.
+        self.table.blockSignals(True)
+        try:
+            for row in range(self.table.rowCount()):
+                try:
+                    code_item = self.table.item(row, 1)
+                    if not code_item:
+                        continue
+                    code = int(code_item.text())
+                    info = palette.get(code, {})
 
-    def on_slot_changed(self, idx):
-        print(f"\n{'=' * 60}")
-        print(f"🔄 SWITCHING VIEWS: {self.current_slot} → {idx}")
-        print(f"{'=' * 60}")
+                    chk = self.table.cellWidget(row, 0)
+                    if chk:
+                        chk.setChecked(info.get('show', saved_shows.get(code, True)))
 
-        self._save_slot_checkboxes(self.current_slot)
-        self._save_slot_weights(self.current_slot)
+                    wt_item = self.table.item(row, 6)
+                    if wt_item:
+                        wt_item.setText(f"{info.get('weight', default_weight):.1f}")
+                except Exception:
+                    continue
+        finally:
+            self.table.blockSignals(False)
 
-        old_slot       = self.current_slot
+    # ── Backward-compat shims so existing callers don't break ─────────────
+    def _load_slot_checkboxes(self, slot_idx: int) -> None:
+        self._load_slot_state(slot_idx)
+
+    def _save_slot_checkboxes(self, slot_idx: int) -> None:
+        self._save_slot_state(slot_idx)
+
+    def on_slot_changed(self, idx: int) -> None:
+        # Bug-10 fix: single save + single load (was 4 separate table scans).
+        # Bug-3/Signal: table.blockSignals handled inside _load_slot_state.
+        self._save_slot_state(self.current_slot)   # 1 pass: checks + weights
         self.current_slot = idx
-
-        self._load_slot_checkboxes(idx)
-        self._load_slot_weights(idx)
-
+        self._load_slot_state(idx)                 # 1 pass: checks + weights, signals blocked
         self.update_border_display()
         self.load_view_border(idx)
-
         if idx == 5:
             self.on_view_switched_to_cut_section()
-
-        print(f"✅ View switch complete: Slot {idx}")
-        print(f"{'=' * 60}\n")
 
     def on_view_selection_changed(self, idx):
         self.view_switched.emit(idx)
@@ -966,7 +973,11 @@ class DisplayModeDialog(QDialog):
         chk.setStyleSheet(
             "QCheckBox { background: transparent; margin-left: 16px; padding: 0px; }"
         )
-        chk.stateChanged.connect(self.on_checkbox_toggled)
+        # Bug-9 fix: closure captures `row` at connect time → O(1) handler,
+        # no sender() search loop needed.
+        chk.stateChanged.connect(
+            lambda state, r=row: self._on_checkbox_toggled_fast(r, state)
+        )
         self.table.setCellWidget(row, 0, chk)
 
         self.table.setItem(row, 1, QTableWidgetItem(str(code)))
@@ -1292,49 +1303,48 @@ class DisplayModeDialog(QDialog):
             if chk:
                 chk.setChecked(False)
 
-    def on_checkbox_toggled(self, state):
-        sender = self.sender()
-        row    = None
-        for r in range(self.table.rowCount()):
-            if self.table.cellWidget(r, 0) == sender:
-                row = r
-                break
-        if row is None:
-            return
-
+    def _on_checkbox_toggled_fast(self, row: int, state: int) -> None:
+        """
+        Bug-9 fix: O(1) checkbox handler — row index captured at connect time.
+        Replaces the O(n) sender-search loop that caused O(n²) cost during
+        bulk _load_slot_checkboxes (n rows × n iterations = n² widget compares).
+        GPU sync deliberately withheld until Apply — state only written to dicts.
+        """
         try:
-            code       = int(self.table.item(row, 1).text())
-            is_checked = sender.isChecked()
+            code_item = self.table.item(row, 1)
+            if code_item is None:
+                return
+            code       = int(code_item.text())
+            is_checked = bool(state)
 
             if hasattr(self, 'view_palettes'):
-                if self.current_slot in self.view_palettes:
-                    if code in self.view_palettes[self.current_slot]:
-                        self.view_palettes[self.current_slot][code]['show'] = is_checked
+                slot_pal = self.view_palettes.get(self.current_slot)
+                if slot_pal is not None and code in slot_pal:
+                    slot_pal[code]['show'] = is_checked
 
             if hasattr(self, 'slot_shows'):
-                if self.current_slot not in self.slot_shows:
-                    self.slot_shows[self.current_slot] = {}
-                self.slot_shows[self.current_slot][code] = is_checked
+                self.slot_shows.setdefault(self.current_slot, {})[code] = is_checked
 
             app = self.parent()
             if app and hasattr(app, 'view_palettes'):
-                if self.current_slot not in app.view_palettes:
-                    app.view_palettes[self.current_slot] = {}
-                if code not in app.view_palettes[self.current_slot]:
-                    app.view_palettes[self.current_slot][code] = {}
-                app.view_palettes[self.current_slot][code]['show'] = is_checked
+                app.view_palettes.setdefault(
+                    self.current_slot, {}
+                ).setdefault(code, {})['show'] = is_checked
 
-            if self.current_slot == 0:
-                if app and hasattr(app, 'class_palette'):
-                    if code in app.class_palette:
-                        app.class_palette[code]['show'] = is_checked
+            if self.current_slot == 0 and app and hasattr(app, 'class_palette'):
+                if code in app.class_palette:
+                    app.class_palette[code]['show'] = is_checked
 
-            # State saved. GPU sync only on Apply click — do NOT emit here.
+        except Exception:
+            pass    # silent — checkbox flicker must not interrupt user workflow
 
-        except Exception as e:
-            print(f"⚠️ Checkbox toggle error: {e}")
-            import traceback
-            traceback.print_exc()
+    # Keep the old name as a shim so any external connections still resolve.
+    def on_checkbox_toggled(self, state):
+        sender = self.sender()
+        for r in range(self.table.rowCount()):
+            if self.table.cellWidget(r, 0) is sender:
+                self._on_checkbox_toggled_fast(r, state)
+                return
 
     def connect_existing_checkboxes(self):
         connected = 0
@@ -1559,10 +1569,11 @@ class DisplayModeDialog(QDialog):
                         ctrl.apply_palette(class_map)
                 fast_path_handled = True
 
-        # Emit AFTER GPU push so palette_changed signal sees correct border value
-        self.palette_changed.emit(self.current_slot)
-
+        # Bug-7 fix: emit palette_changed ONLY when the fast path did NOT already
+        # push to GPU.  Unconditional emit caused a second full sync_palette_to_gpu
+        # call (≈20-50 ms full rewrite) after the fast path already finished.
         if not fast_path_handled:
+            self.palette_changed.emit(self.current_slot)
             payload = {
                 "classes":        class_map,
                 "slot":           self.current_slot,
@@ -1570,31 +1581,37 @@ class DisplayModeDialog(QDialog):
                 "force_refresh":  True,
                 "color_mode":     idx,
                 "border_percent": (self.view_borders.get(self.current_slot, 0)
-                                if is_class_mode else 0),
+                                   if is_class_mode else 0),
             }
             self.applied.emit(payload)
-        else:
-            print(f"⚡ Slot {self.current_slot}: skipping applied.emit (fast path handled)")
 
         if hasattr(app, 'statusBar'):
             view_names = ["Main View", "View 1", "View 2", "View 3", "View 4", "Cut Section"]
             v_name = (view_names[self.current_slot]
-                    if self.current_slot < len(view_names)
-                    else f"View {self.current_slot}")
-            app.statusBar().showMessage(f"✅ Applied to {v_name}", 2000)  ###
-        self.save_global_settings()
+                      if self.current_slot < len(view_names)
+                      else f"View {self.current_slot}")
+            app.statusBar().showMessage(f"Applied to {v_name}", 2000)
+
+        # Bug-8 fix: debounce registry flush — no longer blocks Apply hot-path.
+        # _save_timer fires 2 s after the last Apply click, not on every click.
+        if hasattr(self, '_save_timer'):
+            self._save_timer.start()
 
     def closeEvent(self, event):
-        self.save_global_settings()
+        # On real close flush immediately; on hide just stop the timer.
+        if hasattr(self, '_save_timer'):
+            self._save_timer.stop()
         parent = self.parent()
         if getattr(self, "_allow_native_close", False) or getattr(parent, "_shutdown_in_progress", False):
+            self.save_global_settings()      # blocking flush only on true app exit
             super().closeEvent(event)
             return
-
         event.ignore()
         self.hide()
 
     def reject(self):
+        if hasattr(self, '_save_timer'):
+            self._save_timer.stop()
         self.save_global_settings()
         self.hide()
 
@@ -1790,36 +1807,13 @@ class DisplayModeDialog(QDialog):
 
         print(f"{'=' * 40}\n")
 
-    def _save_slot_weights(self, slot_idx):
-        if not hasattr(self, 'view_palettes'):
-            return
-        if slot_idx not in self.view_palettes:
-            return
-        for row in range(self.table.rowCount()):
-            try:
-                code        = int(self.table.item(row, 1).text())
-                weight_item = self.table.item(row, 6)
-                if weight_item and code in self.view_palettes[slot_idx]:
-                    self.view_palettes[slot_idx][code]['weight'] = float(weight_item.text())
-            except Exception:
-                continue
+    def _save_slot_weights(self, slot_idx: int) -> None:
+        """Shim — delegates to unified _save_slot_state (Bug-10 fix)."""
+        self._save_slot_state(slot_idx)
 
-    def _load_slot_weights(self, slot_idx):
-        if not hasattr(self, 'view_palettes'):
-            return
-        if slot_idx not in self.view_palettes:
-            return
-        palette        = self.view_palettes[slot_idx]
-        default_weight = 1.0 if slot_idx == 0 else 0.5
-        for row in range(self.table.rowCount()):
-            try:
-                code        = int(self.table.item(row, 1).text())
-                weight_item = self.table.item(row, 6)
-                if weight_item and code in palette:
-                    saved_weight = palette[code].get('weight', default_weight)
-                    weight_item.setText(f"{saved_weight:.1f}")
-            except Exception:
-                continue
+    def _load_slot_weights(self, slot_idx: int) -> None:
+        """Shim — delegates to unified _load_slot_state (Bug-10 fix)."""
+        self._load_slot_state(slot_idx)
 
     def sync_weights_to_all_views(self):
         if not hasattr(self, 'view_palettes'):

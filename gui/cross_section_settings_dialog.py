@@ -185,7 +185,7 @@ class CrossSectionSettingsDialog(QDialog):
                     # Fallback to reset on error
                     try:
                         self.app.vtk_widget.renderer.RemoveActor(sc.rubber_actor)
-                    except:
+                    except Exception:
                         pass
                     sc.rubber_actor = None
                     sc.rubber_points = None

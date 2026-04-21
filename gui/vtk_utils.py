@@ -16,6 +16,7 @@ Author: Enhanced fix for border rendering glitch
 Date: 2026-01-05
 """
 
+import numpy as np
 
 
 def force_vtk_pipeline_update_with_borders(app):
@@ -336,7 +337,7 @@ def clear_border_actors(app, renderer=None):
                 try:
                     app.vtk_widget.remove_actor(name)
                     removed_count += 1
-                except:
+                except Exception:
                     pass
         
         if removed_count > 0:

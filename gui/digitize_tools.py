@@ -1,18 +1,19 @@
+from ast import Pass
 import vtk
 import numpy as np
 try:
     from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                                    QLineEdit, QSpinBox, QComboBox,
+                                    QLineEdit, QSpinBox, QFontComboBox, QComboBox,
                                     QCheckBox, QPushButton, QGroupBox, QColorDialog,QRadioButton, QMenu)
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QColor, QCursor
 except ImportError:
     try:
-        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,  # type: ignore
-                                      QLineEdit, QSpinBox, QComboBox,
+        from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                                      QLineEdit, QSpinBox, QFontComboBox, QComboBox,
                                       QCheckBox, QPushButton, QGroupBox, QColorDialog, QMenu)
-        from PyQt5.QtCore import Qt  # type: ignore
-        from PyQt5.QtGui import QColor, QCursor  # type: ignore
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtGui import QColor, QCursor
     except ImportError:
         print("⚠️ Qt library not found - text editing will be limited")
 
@@ -511,8 +512,10 @@ class DigitizeManager:
             self._add_actor_to_overlay(actor)
             setattr(self, attr_name, actor)
         else:
-            actor.GetMapper().SetInputData(poly)
-            actor.GetMapper().Modified()
+            _dm = actor.GetMapper()
+            if _dm is not None:
+                _dm.SetInputData(poly)
+                _dm.Modified()
             actor.GetProperty().SetColor(float(color[0]), float(color[1]), float(color[2]))
             actor.GetProperty().SetLineWidth(float(width))
             self._apply_world_line_style(actor.GetProperty(), line_style=line_style)
@@ -822,11 +825,12 @@ class DigitizeManager:
         self.renderer.Modified()
         try:
             self.app.vtk_widget.interactor.GetRenderWindow().Render()
-        except: pass
+        except Exception:
+            pass
         try:
             self.app.vtk_widget.render()
-        except: pass
-
+        except Exception:
+            pass
     def _auto_select_last_drawing(self):
         # """Automatically selects the newly created drawing."""
         # if not self.drawings: return
@@ -902,7 +906,8 @@ class DigitizeManager:
                     print("❌ Freehand cancelled (not enough points)")
                     if hasattr(self, "_preview_actor") and self._preview_actor:
                         try: self.renderer.RemoveViewProp(self._preview_actor)
-                        except: pass
+                        except Exception:
+                            pass
                         self._preview_actor = None
                                 
                 self.temp_points = []
@@ -1045,7 +1050,8 @@ class DigitizeManager:
                 if hasattr(self, '_line_vertex_markers'):
                     for m in self._line_vertex_markers:
                         try: self._remove_actor_from_overlay(m)
-                        except: pass
+                        except Exception:
+                            pass
                     self._line_vertex_markers = []
                 self._remove_preview_actor_2d('_preview_line_actor')
                 self._remove_preview_actor_2d('_continuous_line_actor')
@@ -1057,7 +1063,8 @@ class DigitizeManager:
                 if hasattr(self, '_polyline_vertex_markers'):
                     for m in self._polyline_vertex_markers:
                         try: self._remove_actor_from_overlay(m)
-                        except: pass
+                        except Exception:
+                            pass
                     self._polyline_vertex_markers = []
                 self._remove_preview_actor_2d('_preview_line_actor')
                 self._remove_preview_actor_2d('_continuous_line_actor')
@@ -1136,7 +1143,8 @@ class DigitizeManager:
                 old_markers = self._suspended_state.get("markers", [])
                 for m in old_markers:
                     try: self._remove_actor_from_overlay(m)
-                    except: pass
+                    except Exception:
+                        pass
                 self._clear_suspended_preview_actor()
                 if old_pts:
                     self._clear_live_preview_actors()
@@ -1204,7 +1212,7 @@ class DigitizeManager:
                     self.app.statusBar().showMessage(
                         "🔄 Permanent Polyline Mode - Draw multiple polylines (Shift+Esc to exit)"
                     )
-                except:
+                except Exception:
                     pass    
             
         # REPLACE WITH:
@@ -1873,17 +1881,27 @@ class DigitizeManager:
     def _on_middle_press(self, obj, evt):
         """Start panning - always works, even during drawing."""
         print("🖱️ Middle button PRESSED - starting pan")
-        
+
         self._consume_vtk_event(obj)
         self.middle_down = True
         self._is_panning = True
         self._pan_start_pos = self.interactor.GetEventPosition()
         self._last_pos = None
+
+        # ── Smooth pan: tell VTK this is interactive mode so it can skip
+        # expensive still-render steps (anti-aliasing, SSAO, etc.).
+        try:
+            rw = self.interactor.GetRenderWindow()
+            if rw is not None:
+                rw.SetDesiredUpdateRate(30.0)   # interactive = fast render
+        except Exception:
+            pass
+
         # Allow VTK's built-in pan to also handle this
         style = self.interactor.GetInteractorStyle()
         if hasattr(style, "OnMiddleButtonDown"):
             style.OnMiddleButtonDown()
-        
+
         # ✅ NEW: Ensure release handler has HIGH priority
         self.interactor.RemoveObservers("MiddleButtonReleaseEvent")
         self.interactor.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release, 10.0)
@@ -1901,17 +1919,28 @@ class DigitizeManager:
         self._consume_vtk_event(obj)
         if not self._is_panning:
             return
-            
+
         print("🛑 Middle button RELEASED - stopping pan NOW")
-        
+
         self.middle_down = False
         self._is_panning = False
         self._pan_start_pos = None
-        
+
         style = self.interactor.GetInteractorStyle()
         if hasattr(style, "OnMiddleButtonUp"):
             style.OnMiddleButtonUp()
-        
+
+        # ── Restore still-render quality after pan ends.
+        # DesiredUpdateRate=0.001 tells VTK to render at full quality for the
+        # final still frame. Force one render so the user sees crisp result.
+        try:
+            rw = self.interactor.GetRenderWindow()
+            if rw is not None:
+                rw.SetDesiredUpdateRate(0.001)  # still render = full quality
+                rw.Render()
+        except Exception:
+            pass
+
         # ✅ Refresh preview lines after pan moved camera
         if self.temp_points and self.active_tool:
             try:
@@ -1919,7 +1948,7 @@ class DigitizeManager:
             except ImportError:
                 from PyQt5.QtCore import QTimer
             QTimer.singleShot(0, self._deferred_preview_update)
-        
+
         print("✅ Pan stopped")
             
     def debug_pan_state(self):
@@ -2387,7 +2416,7 @@ class DigitizeManager:
                                 if mk in d and d[mk]:
                                     try:
                                         self._remove_actor_from_overlay(d[mk])
-                                    except:
+                                    except Exception:
                                         pass
                                     d[mk] = None
                             start_pt, end_pt = coords[0], coords[-1]
@@ -2432,7 +2461,7 @@ class DigitizeManager:
                             if mk in d and d[mk]:
                                 try:
                                     self._remove_actor_from_overlay(d[mk])
-                                except:
+                                except Exception:
                                     pass
                                 d[mk] = None
                         start_pt, end_pt = coords[0], coords[-1]
@@ -2489,7 +2518,7 @@ class DigitizeManager:
                 self.active_tool = None
                 try:
                     self.app.statusBar().showMessage("Move Vertex mode exited")
-                except:
+                except Exception:
                     pass
                 return
             
@@ -2601,10 +2630,12 @@ class DigitizeManager:
                     else:
                         # Legacy billboard text
                         try: self.renderer.RemoveViewProp(drawing["actor"])
-                        except: pass
+                        except Exception:
+                            pass
                     # Safety net
                     try: self._remove_actor_from_overlay(drawing["actor"])
-                    except: pass
+                    except Exception:
+                        pass
                 else:
                     self._remove_actor_from_overlay(drawing["actor"])
 
@@ -2612,14 +2643,16 @@ class DigitizeManager:
             for key in ("start_marker", "end_marker"):
                 if key in drawing and drawing[key]:
                     try: self._remove_actor_from_overlay(drawing[key])
-                    except: pass
+                    except Exception:
+                        pass
                     drawing[key] = None
 
             # --- 3️⃣ Remove explicitly linked vertex markers ---
             if "vertex_markers" in drawing and drawing["vertex_markers"]:
                 for marker in drawing["vertex_markers"]:
                     try: self._remove_actor_from_overlay(marker)
-                    except: pass
+                    except Exception:
+                        pass
                 drawing["vertex_markers"] = []
             
             # --- 4️⃣ Remove 2D arrow overlays ---
@@ -2628,7 +2661,8 @@ class DigitizeManager:
                 if not isinstance(arrows, list): arrows = [arrows]
                 for arr in arrows:
                     try: self.renderer.RemoveActor2D(arr)
-                    except: pass
+                    except Exception:
+                        pass
                 drawing["arrow_actor"] = None
 
             # --- 5️⃣ Remove from list ---
@@ -2767,11 +2801,11 @@ class DigitizeManager:
                         else:
                             try:
                                 self.renderer.RemoveViewProp(d["actor"])
-                            except:
+                            except Exception:
                                 pass
                             try:
                                 self._remove_actor_from_overlay(d["actor"])
-                            except:
+                            except Exception:
                                 pass
                     else:
                         self._remove_actor_from_overlay(d["actor"])
@@ -2780,7 +2814,7 @@ class DigitizeManager:
                     if key in d and d[key]:
                         try:
                             self._remove_actor_from_overlay(d[key])
-                        except:
+                        except Exception:
                             pass
                 
                 if "vertex_markers" in d and d["vertex_markers"]:
@@ -2797,7 +2831,7 @@ class DigitizeManager:
                     for arr in arrows:
                         try:
                             self.renderer.RemoveActor2D(arr)
-                        except:
+                        except Exception:
                             pass
             except Exception:
                 pass
@@ -4003,24 +4037,29 @@ class DigitizeManager:
                     try:
                         if hasattr(self, 'overlay_renderer') and self.overlay_renderer:
                             self.overlay_renderer.RemoveActor(actor)
-                    except: pass
+                    except Exception:
+                        pass
                 else:
                     # Legacy billboard text
                     try: self.renderer.RemoveViewProp(actor)
-                    except: pass
+                    except Exception:
+                        pass
                     try: self.renderer.RemoveActor2D(actor)
-                    except: pass
+                    except Exception:
+                        pass
                 # Safety net
                 try: self._remove_actor_from_overlay(actor)
-                except: pass
+                except Exception:
+                    pass
             else:
                 try:
                     if hasattr(self, 'overlay_renderer') and self.overlay_renderer:
                         self.overlay_renderer.RemoveActor(actor)
-                except: pass
+                except Exception:
+                    pass
                 try: self.renderer.RemoveActor(actor)
-                except: pass
-
+                except Exception:
+                    pass
         for d in list(self.drawings):
             try:
                 # ✅ Skip cyan classified fences unless Shift+Clear
@@ -4032,8 +4071,8 @@ class DigitizeManager:
                 if d.get('actor') is not None:
                     _safe_remove(d['actor'], is_text=is_text, is_scalable=is_scalable)
                     try: d['actor'].VisibilityOff()
-                    except: pass
-
+                    except Exception:
+                        pass
                 # Endpoint markers (always in overlay)
                 _safe_remove(d.get('start_marker'), is_text=False)
                 _safe_remove(d.get('end_marker'), is_text=False)
@@ -4049,8 +4088,8 @@ class DigitizeManager:
                         arrows = [arrows]
                     for arr in arrows:
                         try: self.renderer.RemoveActor2D(arr)
-                        except: pass
-
+                        except Exception:
+                            pass
             except Exception as e:
                 print(f"⚠️ Failed to remove drawing: {e}")
 
@@ -4072,7 +4111,8 @@ class DigitizeManager:
             actor = getattr(self, attr, None)
             if actor:
                 try: self.renderer.RemoveViewProp(actor)
-                except: pass
+                except Exception:
+                    pass
                 setattr(self, attr, None)
 
         # Freehand in-progress preview (now in overlay)
@@ -4116,7 +4156,8 @@ class DigitizeManager:
             if dlg:
                 for actor in getattr(dlg, '_classified_fence_actors', []):
                     try: self.overlay_renderer.RemoveActor(actor)
-                    except: pass
+                    except Exception:
+                        pass
                 dlg._classified_fence_actors = []
                 dlg.selected_fences = []
                 dlg._clear_fence_highlights()
@@ -4202,7 +4243,7 @@ class DigitizeManager:
         self.renderer.Modified()
         try: 
             self.app.vtk_widget.render()
-        except: 
+        except Exception:
             pass
         print("✅ Rebind complete.")
 
@@ -4304,7 +4345,7 @@ class DigitizeManager:
                 for marker in drawing['vertex_markers']:
                     try:
                         self._remove_actor_from_overlay(marker)
-                    except:
+                    except Exception:
                         pass
                 
                 drawing['vertex_markers'] = []
@@ -4327,7 +4368,7 @@ class DigitizeManager:
                 for arr in arrows:
                     try:
                         self.renderer.RemoveActor2D(arr)
-                    except:
+                    except Exception:
                         pass
                 
                 if getattr(self, f"{drawing['type']}_arrow_mode", False):
@@ -5023,11 +5064,11 @@ class DigitizeManager:
                 else:
                     try:
                         self.renderer.RemoveViewProp(actor)
-                    except:
+                    except Exception:
                         pass
                     try:
                         self._remove_actor_from_overlay(actor)
-                    except:
+                    except Exception:
                         pass
             
             if drawing in self.drawings:
@@ -5154,10 +5195,11 @@ class DigitizeManager:
                     self._remove_actor_from_overlay(actor)
                 else:
                     try: self.renderer.RemoveViewProp(actor)
-                    except: pass
+                    except Exception:
+                        pass
                     try: self._remove_actor_from_overlay(actor)
-                    except: pass
-                
+                    except Exception:
+                        pass
                 # Create new scalable text actor
                 new_actor = self._make_scalable_text_actor(
                     text=values['text'],
@@ -5947,7 +5989,7 @@ class DigitizeManager:
         try:
             self.app.statusBar().showMessage(
                 "🔄 Move Vertex Mode - Click near a vertex to move it (ESC to exit)")
-        except:
+        except Exception:
             pass
 
 
@@ -6235,6 +6277,7 @@ class LineEditDialog(QDialog):
         
     def enable_pan_while_drawing(self):
         try:
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleUser
             current_style = self.interactor.GetInteractorStyle()
             if hasattr(current_style, 'SetMiddleButtonPressEvent'):
                 print("✅ Pan while drawing enabled (middle mouse button)")

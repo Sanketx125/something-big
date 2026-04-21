@@ -1,9 +1,11 @@
+
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QDoubleSpinBox, QAbstractSpinBox, QMessageBox, QDockWidget, QPushButton, QHBoxLayout
 from PySide6.QtCore import Qt
 import vtk
+from scipy.spatial import cKDTree
 
 # ============ SAFE RENDER HELPER ============
 def _safe_vtk_render(vtk_widget):
@@ -425,7 +427,16 @@ class CutSectionController:
 
         # Refresh view with new palette
         try:
-            self._refresh_cut_colors_fast()
+            refreshed = False
+            try:
+                from gui.unified_actor_manager import sync_palette_to_gpu
+                border_pct = float(getattr(self.app, "view_borders", {}).get(5, 0.0))
+                refreshed = bool(sync_palette_to_gpu(self.app, 5, self.cut_palette, border_pct, render=True))
+            except Exception:
+                refreshed = False
+
+            if not refreshed:
+                self._refresh_cut_colors_fast()
             print("   ✅ Cut section view refreshed with new palette")
         except Exception as e:
             print(f"   ⚠️ Cut palette refresh failed: {e}")
@@ -520,7 +531,7 @@ class CutSectionController:
                     rw = self.cut_vtk.GetRenderWindow()
                     if rw is not None:
                         is_vtk_valid = rw.GetMapped() and not rw.IsA('vtkObject') or True
-                except:
+                except Exception:
                     is_vtk_valid = False
                     print("   ⚠️ VTK render window already destroyed")
             
@@ -595,7 +606,7 @@ class CutSectionController:
                     # Python GC will collect it, but explicit deletion helps
                     del self._kdtree_cache
                     print("   ✅ KDTree cache cleared")
-                except:
+                except Exception:
                     pass
             self._kdtree_cache = None
             
@@ -633,7 +644,7 @@ class CutSectionController:
                         if obj is not None and hasattr(obj, 'Delete'):
                             obj.Delete()  # Delete VTK objects
                         delattr(self, attr)
-                    except:
+                    except Exception:
                         pass
             
             print("   ✅ All cached geometry cleared")
@@ -715,7 +726,7 @@ class CutSectionController:
                 # Force to translucent pass (rendered last, no depth test)
                 actor.ForceTranslucentOn()
                 prop.SetOpacity(0.99)  # Just below 1.0 to trigger translucent pass
-            except:
+            except Exception:
                 pass
             
             actor.SetUseBounds(False)
@@ -788,7 +799,15 @@ class CutSectionController:
         if self.cut_vtk is not None:
             iren = self.cut_vtk.interactor
             
-            # Then it sets its own
+            # ✅ NUCLEAR CLEANUP: Remove ALL LeftButton/MouseMove observers
+            # This prevents ghost observers from stacking up
+            # try:
+            #     iren.RemoveObservers("LeftButtonPressEvent")
+            #     iren.RemoveObservers("MouseMoveEvent")
+            #     print(f"  🧹 Cleared all LeftButton/MouseMove observers (nuclear cleanup)")
+            # except Exception as e:
+            #     print(f"  ⚠️ Nuclear cleanup warning: {e}")
+            
             def on_left_click(obj, evt):
                 print(f"🖱️ Left click in cut dock (state={self._state})")
                 if self._state == CutSectionState.IDLE:
@@ -919,7 +938,7 @@ class CutSectionController:
             height_extent = parallel_scale * 2.0
             zmin = center[2] - height_extent
             zmax = center[2] + height_extent
-        except:
+        except Exception:
             if self.cut_points is not None:
                 zmin = float(np.min(self.cut_points[:, 2]))
                 zmax = float(np.max(self.cut_points[:, 2]))
@@ -1098,8 +1117,16 @@ class CutSectionController:
             active_view = getattr(self.app.section_controller, "active_view", 0)
             section_points_transformed = getattr(self.app, f"section_{active_view}_points_transformed", None)
             combined_mask = getattr(self.app, f"section_{active_view}_combined_mask", None)
+            section_global_indices = getattr(self.app, f"section_{active_view}_indices", None)
+            if section_global_indices is None:
+                core_indices = getattr(self.app, f"section_{active_view}_core_indices", None)
+                buffer_indices = getattr(self.app, f"section_{active_view}_buffer_indices", None)
+                if core_indices is not None and buffer_indices is not None:
+                    section_global_indices = np.concatenate([core_indices, buffer_indices])
+                elif combined_mask is not None:
+                    section_global_indices = np.flatnonzero(combined_mask)
 
-            if section_points_transformed is None or combined_mask is None:
+            if section_points_transformed is None or section_global_indices is None:
                 print("❌ No transformed section data!")
                 
                 # ✅ BUG #11 FIX: Reset state
@@ -1203,7 +1230,7 @@ class CutSectionController:
                 return
 
             xyz_in_depth = section_points_transformed[depth_mask]
-            depth_indices = np.where(combined_mask)[0][depth_mask]
+            depth_indices = section_global_indices[depth_mask]
 
             # Viewport filter
             if picked_world:
@@ -1557,11 +1584,29 @@ class CutSectionController:
                     try:
                         iren.RemoveObserver(oid)
                         print(f"  🧹 Removed tracked observer: {oid}")
-                    except:
+                    except Exception:
                         pass
             del self._view_observer_ids['cut_dock']
 
         # ═══════════════════════════════════════════════════════════════
+        # ✅ CRITICAL FIX: Nuclear cleanup of ALL mouse observers on
+        #    the cut dock.  After a cut-in-cut the old on_mouse_move
+        #    handler from _activate_from_cut_dock() may still be alive
+        #    (observer IDs survive SetInteractorStyle changes).  When
+        #    state flips to WAITING_CENTER these ghosts would draw
+        #    preview lines inside the cut dock.
+        # ═══════════════════════════════════════════════════════════════
+        # if self.cut_vtk is not None:
+        #     try:
+        #         iren_cut = self.cut_vtk.interactor
+        #         iren_cut.RemoveObservers("LeftButtonPressEvent")
+        #         iren_cut.RemoveObservers("MouseMoveEvent")
+        #         print("  🧹 Nuclear cleanup: ALL LeftButton/MouseMove "
+        #             "observers removed from cut dock")
+        #     except Exception as e:
+        #         print(f"  ⚠️ Cut dock nuclear cleanup warning: {e}")
+        # ═══════════════════════════════════════════════════════════════
+
         # ✅ STEP 2: Clear ALL preview actors from cut dock
         if self.cut_vtk and hasattr(self.cut_vtk, "renderer") and self.cut_vtk.renderer:
             ren_cut = self.cut_vtk.renderer
@@ -1776,7 +1821,7 @@ class CutSectionController:
                         if actor is not None:
                             try:
                                 ren.RemoveActor(actor)
-                            except:
+                            except Exception:
                                 pass
                     _safe_vtk_render(vtk_widget)
                 except Exception as e:
@@ -1790,10 +1835,10 @@ class CutSectionController:
                     if actor is not None:
                         try:
                             ren.RemoveActor(actor)
-                        except:
+                        except Exception:
                             pass
                 _safe_vtk_render(self.active_vtk)
-            except:
+            except Exception:
                 pass
         
         # ✅ CRITICAL FIX: Clear preview actors from CUT DOCK view
@@ -1814,7 +1859,7 @@ class CutSectionController:
                         try:
                             ren.RemoveActor(actor)
                             removed_count += 1
-                        except:
+                        except Exception:
                             pass
                 
                 if removed_count > 0:
@@ -1846,7 +1891,7 @@ class CutSectionController:
             if hasattr(self, attr):
                 try:
                     delattr(self, attr)
-                except:
+                except Exception:
                     pass
         
         print("   ✅ Preview actors cleared")
@@ -1861,17 +1906,36 @@ class CutSectionController:
                         for oid in ids:
                             try:
                                 iren.RemoveObserver(oid)
-                            except:
+                            except Exception:
                                 pass
                 elif v_idx in getattr(self.app, "section_vtks", {}):
                     iren = self.app.section_vtks[v_idx].interactor
                     for oid in ids:
                         try:
                             iren.RemoveObserver(oid)
-                        except:
+                        except Exception:
                             pass
             except Exception as e:
                 print(f"   ⚠️ Observer detach for {v_idx}: {e}")
+        
+        # Nuclear cleanup: Remove ALL LeftButton/MouseMove observers from ALL views
+        # if hasattr(self.app, 'section_vtks'):
+        #     for view_idx, vtk_widget in self.app.section_vtks.items():
+        #         try:
+        #             iren = vtk_widget.interactor
+        #             iren.RemoveObservers("LeftButtonPressEvent")
+        #             iren.RemoveObservers("MouseMoveEvent")
+        #         except Exception:
+        #             pass
+        
+        # # Also nuclear cleanup cut dock
+        # if self.cut_vtk is not None:
+        #     try:
+        #         iren = self.cut_vtk.interactor
+        #         iren.RemoveObservers("LeftButtonPressEvent")
+        #         iren.RemoveObservers("MouseMoveEvent")
+        #     except Exception:
+        #         pass
         
         self._view_observer_ids.clear()
         print("   ✅ All observers detached")
@@ -1925,7 +1989,7 @@ class CutSectionController:
                 self.depth_spin.blockSignals(True)
                 self.depth_spin.setValue(self.dynamic_depth)
                 self.depth_spin.blockSignals(False)
-            except:
+            except Exception:
                 pass
         
         print("   ✅ State machine reset to IDLE")
@@ -1936,7 +2000,7 @@ class CutSectionController:
         # Update status bar
         try:
             self.app.statusBar().showMessage("🔄 Cut tool state reset", 1500)
-        except:
+        except Exception:
             pass
         
         print("✅ Pending state deactivated\n")
@@ -2275,7 +2339,7 @@ class CutSectionController:
                 if hasattr(self, attr):
                     try:
                         delattr(self, attr)
-                    except:
+                    except Exception:
                         pass
             
             # Update status bar
@@ -2308,25 +2372,25 @@ class CutSectionController:
                             try:
                                 ren.RemoveActor(self.line_actor)
                                 removed_count += 1
-                            except:
+                            except Exception:
                                 pass
                         if self.buffer_actor_upper is not None:
                             try:
                                 ren.RemoveActor(self.buffer_actor_upper)
                                 removed_count += 1
-                            except:
+                            except Exception:
                                 pass
                         if self.buffer_actor_lower is not None:
                             try:
                                 ren.RemoveActor(self.buffer_actor_lower)
                                 removed_count += 1
-                            except:
+                            except Exception:
                                 pass
                         
                         if removed_count > 0:
                             print(f"   🧹 Removed {removed_count} lingering actors from View {view_idx + 1}")
                             _safe_vtk_render(vtk_widget)
-                    except:
+                    except Exception:
                         pass
 
             # Clear actor references
@@ -2350,7 +2414,7 @@ class CutSectionController:
                                 if iren.HasObserver(oid):
                                     iren.RemoveObserver(oid)
                                     removed_count += 1
-                            except:
+                            except Exception:
                                 pass
                         if removed_count > 0:
                             print(f"   🧹 Removed {removed_count} tracked observers from View {view_index + 1}")
@@ -2361,7 +2425,7 @@ class CutSectionController:
                         iren.RemoveObservers("LeftButtonPressEvent")
                         iren.RemoveObservers("MouseMoveEvent")
                         print(f"   ✅ Nuclear cleanup: All LeftButton/MouseMove observers removed from View {view_index + 1}")
-                    except:
+                    except Exception:
                         pass
 
             # Clear observer tracking dictionary
@@ -2685,7 +2749,7 @@ class CutSectionController:
                             # ✅ CRITICAL: Explicitly delete VTK C++ object (Bug #7 fix)
                             try:
                                 actor.Delete()
-                            except:
+                            except Exception:
                                 pass  # PyVista actors may not have Delete()
                         except Exception as e:
                             print(f"    ⚠️ Actor removal warning: {e}")
@@ -2711,9 +2775,9 @@ class CutSectionController:
                             cross_renderer.RemoveActor(actor)
                             try:
                                 actor.Delete()
-                            except:
+                            except Exception:
                                 pass
-                        except:
+                        except Exception:
                             pass
             
             # ✅ STEP 2: CRITICAL - Disable render window IMMEDIATELY
@@ -2741,7 +2805,7 @@ class CutSectionController:
                     while timer_id < 100:  # Remove up to 100 timers
                         try:
                             iren.DestroyTimer(timer_id)
-                        except:
+                        except Exception:
                             pass
                         timer_id += 1
                     
@@ -2756,7 +2820,7 @@ class CutSectionController:
                     # Terminate event loop
                     try:
                         iren.TerminateApp()
-                    except:
+                    except Exception:
                         pass
                     
                     print("   ✅ Observers and timers removed")
@@ -2826,9 +2890,9 @@ class CutSectionController:
                             renderer.RemoveActor(actor)
                             try:
                                 actor.Delete()
-                            except:
+                            except Exception:
                                 pass
-                        except:
+                        except Exception:
                             pass
      
             # ✅ STEP 7: Reset state flags
@@ -2864,7 +2928,7 @@ class CutSectionController:
                     # Disconnect signals
                     try:
                         self.cut_dock.visibilityChanged.disconnect()
-                    except:
+                    except Exception:
                         pass
                     # Hide first
                     self.cut_dock.setVisible(False)
@@ -2928,7 +2992,7 @@ class CutSectionController:
             # ✅ STEP 13: Update status bar
             try:
                 self.app.statusBar().showMessage("✂️ Cut Section closed - Cross-section restored", 1500)
-            except:
+            except Exception:
                 pass
             
             print("✅ CUT SECTION CANCELED\n")
@@ -2943,7 +3007,7 @@ class CutSectionController:
             self._is_destroying = False
             try:
                 self.app.set_cross_cursor_active(False)
-            except:
+            except Exception:
                 pass
 
     def _detach_all_view_observers(self):
@@ -3037,7 +3101,7 @@ class CutSectionController:
                             ren_cut.RemoveActor(actor)
                             try:
                                 actor.Delete()
-                            except:
+                            except Exception:
                                 pass
                         except Exception:
                             pass
@@ -3117,7 +3181,7 @@ class CutSectionController:
                         xyz = np.asarray(xyz, dtype=float)
                         zmin = float(np.min(xyz[:, 2])) - 10.0
                         zmax = float(np.max(xyz[:, 2])) + 10.0
-                    except:
+                    except Exception:
                         zmin, zmax = center[2] - 100.0, center[2] + 100.0
                 else:
                     zmin, zmax = center[2] - 100.0, center[2] + 100.0
@@ -3194,12 +3258,12 @@ class CutSectionController:
                 for view_idx, vw in self.app.section_vtks.items():
                     try:
                         vw.renderer.RemoveActor(self.line_actor)
-                    except:
+                    except Exception:
                         pass
                 
                 # Add to current view only
                 ren.AddActor(self.line_actor)
-            except:
+            except Exception:
                 pass
         
         try:
@@ -3470,7 +3534,7 @@ class CutSectionController:
                 if actor is not None:
                     try:
                         ren.RemoveActor(actor)
-                    except:
+                    except Exception:
                         pass
                 
                 actor = vtk.vtkActor()
@@ -3511,7 +3575,7 @@ class CutSectionController:
                         if vw != vtk_widget:
                             try:
                                 vw.renderer.RemoveActor(actor)
-                            except:
+                            except Exception:
                                 pass
                     
                     # Check if actor is already in renderer
@@ -3525,7 +3589,7 @@ class CutSectionController:
                     
                     if not found:
                         ren.AddActor(actor)
-                except:
+                except Exception:
                     pass
             
             # Ensure visibility
@@ -3602,7 +3666,7 @@ class CutSectionController:
                 if actor is not None:
                     try:
                         ren.RemoveActor(actor)
-                    except:
+                    except Exception:
                         pass
                 
                 actor = vtk.vtkActor()
@@ -3668,7 +3732,7 @@ class CutSectionController:
             if hasattr(self, 'parent_index_map') and self.parent_index_map is not None:
                 print("   Type: NESTED CUT (cut-from-cut)")
                 
-                local_indices = np.where(self.cut_mask_in_section)[0]
+                local_indices = np.flatnonzero(self.cut_mask_in_section)
                 
                 # ✅ BUG #3 FIX: Validate indices are within parent_index_map bounds
                 parent_size = len(self.parent_index_map)
@@ -3728,7 +3792,7 @@ class CutSectionController:
                 # Get the cross-section rectangle selection mask
                 if hasattr(self.app.section_controller, 'last_mask'):
                     cross_section_mask = self.app.section_controller.last_mask
-                    cross_section_indices = np.where(cross_section_mask)[0]
+                    cross_section_indices = np.flatnonzero(cross_section_mask)
                     
                     print(f"   Rectangle selection: {len(cross_section_indices)} indices")
                     
@@ -3754,7 +3818,7 @@ class CutSectionController:
                             cval = float(self.center_point[axis])
                             
                             new_mask = np.abs(selected_xyz[:, axis] - cval) <= self.dynamic_depth
-                            local_indices = np.where(new_mask)[0]
+                            local_indices = np.flatnonzero(new_mask)
                             
                             # ✅ BUG #3 FIX: Bounds check before indexing
                             if len(local_indices) > 0 and np.max(local_indices) >= len(cross_section_indices):
@@ -3766,7 +3830,7 @@ class CutSectionController:
                             print(f"   ✅ Rebuilt and mapped {len(self._cut_index_map)} cut points")
                         else:
                             # Sizes match - use the mask directly
-                            local_indices = np.where(cut_local_mask)[0]
+                            local_indices = np.flatnonzero(cut_local_mask)
                             
                             # ✅ BUG #3 FIX: Bounds check before indexing
                             if len(local_indices) > 0:
@@ -4033,10 +4097,11 @@ class CutSectionController:
             # 3. Fast Path: GPU Buffer Update
             target_actor = getattr(self, 'cut_core_actor', None)
             if target_actor and hasattr(target_actor, 'GetMapper'):
-                polydata = target_actor.GetMapper().GetInput()
+                _mapper = target_actor.GetMapper()
+                polydata = _mapper.GetInput() if _mapper is not None else None
                 if polydata:
                     vtk_colors = polydata.GetPointData().GetScalars()
-                    
+
                     # Ensure the existing VTK scalar array is compatible
                     if vtk_colors and vtk_colors.GetNumberOfTuples() == len(classes):
                         # Vectorized mapping: Map classes to RGB via LUT
@@ -4050,17 +4115,6 @@ class CutSectionController:
                         
                         # Trigger VTK pipeline update without rebuilding the actor
                         vtk_colors.Modified()
-                        try:
-                            # CRITICAL FIX: Ensure the entire pipeline knows data changed
-                            # This fixes intermittent classification refresh failures in cut section
-                            polydata.GetPointData().Modified()
-                            polydata.Modified()
-                            target_actor.GetMapper().Modified()
-                            target_actor.Modified()
-                            target_actor.GetProperty().Modified()
-                        except:
-                            pass
-                           
                         _safe_vtk_render(self.cut_vtk)
                         return  # 🔥 Performance Success: Exit immediately
 
@@ -4091,6 +4145,169 @@ class CutSectionController:
             import traceback
             traceback.print_exc()
 
+
+    def _build_cut_unified_actor(self, points, classes, point_size=3):
+        """Build cut-section actor with the same shader contract as section views."""
+        if points is None or len(points) == 0 or self.cut_vtk is None:
+            return None
+
+        try:
+            from vtkmodules.util import numpy_support
+            from gui.unified_actor_manager import (
+                ViewShaderContext,
+                _BASE_POINT_SIZE,
+                _attach_view_shader_context,
+                _compute_boundary_flags,
+                _ensure_opengl_polydata_mapper,
+                _get_lut,
+            )
+
+            actor_name = "_cut_section_unified"
+            palette = getattr(self, "cut_palette", None) or getattr(self.app, "class_palette", {}) or {}
+            border_pct = float(getattr(self.app, "view_borders", {}).get(5, 0.0))
+            actual_pt_size = max(1.0, float(point_size or _BASE_POINT_SIZE))
+
+            try:
+                if hasattr(self.cut_vtk, "actors") and actor_name in self.cut_vtk.actors:
+                    self.cut_vtk.remove_actor(actor_name, render=False)
+            except Exception:
+                pass
+
+            cloud = pv.PolyData(points)
+
+            cls_i32 = np.asarray(classes, dtype=np.int32)
+            cls_f32 = cls_i32.astype(np.float32, copy=False)
+            class_vtk = numpy_support.numpy_to_vtk(cls_f32, deep=False)
+            class_vtk.SetName("Classification")
+            cloud.GetPointData().AddArray(class_vtk)
+
+            boundary = _compute_boundary_flags(points, cls_i32) if border_pct > 0.0 else np.zeros(len(points), dtype=np.float32)
+            boundary_vtk = numpy_support.numpy_to_vtk(boundary, deep=False)
+            boundary_vtk.SetName("BoundaryFlag")
+            cloud.GetPointData().AddArray(boundary_vtk)
+
+            rgb_buffer = _get_lut("cut_section").map_classes(cls_i32, palette)
+            rgb_vtk = numpy_support.numpy_to_vtk(rgb_buffer, deep=False)
+            rgb_vtk.SetName("RGB")
+            cloud.GetPointData().SetScalars(rgb_vtk)
+
+            actor = self.cut_vtk.add_points(
+                cloud,
+                scalars="RGB",
+                rgb=True,
+                point_size=actual_pt_size,
+                render_points_as_spheres=False,
+                name=actor_name,
+                reset_camera=False,
+                render=False,
+            )
+            if actor is None:
+                return None
+
+            actor.GetProperty().LightingOff()
+            _ensure_opengl_polydata_mapper(actor, cloud)
+
+            mapper = actor.GetMapper()
+            mesh = mapper.GetInput() if mapper is not None else None
+            if mesh is None:
+                self.cut_core_actor = actor
+                self.cut_buffer_actor = None
+                return actor
+
+            vtk_ca = mesh.GetPointData().GetScalars()
+            vtk_rgb = numpy_support.vtk_to_numpy(vtk_ca)
+            np.copyto(vtk_rgb, rgb_buffer)
+            vtk_ca.Modified()
+
+            class_vtk_arr = mesh.GetPointData().GetArray("Classification")
+            vtk_cls = numpy_support.vtk_to_numpy(class_vtk_arr) if class_vtk_arr is not None else cls_f32.copy()
+
+            try:
+                actor._naksha_render_window = self.cut_vtk.render_window
+            except Exception:
+                pass
+
+            actor._naksha_rgb_ptr = vtk_rgb
+            actor._naksha_vtk_array = vtk_ca
+            actor._naksha_vtk_rgb_ref = vtk_ca
+            actor._naksha_mesh = mesh
+            actor._naksha_section_class = vtk_cls
+            actor._naksha_base_point_size = actual_pt_size
+            actor._naksha_boundary_vtk = boundary_vtk
+
+            ctx = ViewShaderContext(slot_idx=5)
+            ctx.load_from_palette(palette, border_pct, actual_pt_size)
+            _attach_view_shader_context(actor, ctx, actor_name)
+
+            self.cut_core_actor = actor
+            self.cut_buffer_actor = None
+            setattr(self.cut_vtk, "_cut_section_unified_actor", actor)
+            return actor
+
+        except Exception as e:
+            print(f"Failed to build unified cut actor: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _refresh_cut_colors_fast(self):
+        """Refresh cut-section colors and shader classification state in-place."""
+        if not self.is_cut_view_active or self.cut_points is None or self._cut_index_map is None:
+            return
+
+        if self.cut_vtk is None or not hasattr(self.app, 'data'):
+            return
+
+        try:
+            from vtkmodules.util import numpy_support
+
+            classes = self.app.data["classification"][self._cut_index_map].astype(int)
+            palette = getattr(self, 'cut_palette', getattr(self.app, "class_palette", {}))
+
+            max_class_val = int(classes.max()) if classes.size > 0 else 0
+            palette_max = max(palette.keys()) if palette else 0
+            lut_size = max(max_class_val, palette_max) + 1
+
+            lut = np.zeros((lut_size, 3), dtype=np.uint8)
+            for code, info in palette.items():
+                lut[code] = info.get('color', (128, 128, 128)) if info.get('show', True) else (0, 0, 0)
+
+            target_actor = getattr(self, 'cut_core_actor', None)
+            if target_actor is None and hasattr(self.cut_vtk, "actors"):
+                target_actor = self.cut_vtk.actors.get("_cut_section_unified")
+
+            if target_actor and hasattr(target_actor, 'GetMapper'):
+                mapper = target_actor.GetMapper()
+                polydata = mapper.GetInput() if mapper is not None else None
+                if polydata:
+                    vtk_colors = polydata.GetPointData().GetScalars()
+                    if vtk_colors and vtk_colors.GetNumberOfTuples() == len(classes):
+                        vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
+                        np.copyto(vtk_ptr, safe_lut_indexing(lut, classes))
+
+                        class_vtk_arr = polydata.GetPointData().GetArray("Classification")
+                        if class_vtk_arr is not None:
+                            cls_ptr = numpy_support.vtk_to_numpy(class_vtk_arr)
+                            np.copyto(cls_ptr, classes.astype(np.float32, copy=False))
+                            class_vtk_arr.Modified()
+                            target_actor._naksha_section_class = cls_ptr
+
+                        vtk_colors.Modified()
+                        try:
+                            from gui.unified_actor_manager import _mark_actor_dirty
+                            _mark_actor_dirty(target_actor)
+                        except Exception:
+                            pass
+                        _safe_vtk_render(self.cut_vtk)
+                        return
+
+            self._build_cut_unified_actor(self.cut_points, classes, point_size=3)
+            _safe_vtk_render(self.cut_vtk)
+
+        except Exception as e:
+            print(f"Cut color refresh failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _ensure_cut_section_dock(self):
             """Create dedicated dock window for cut section with INLINE depth control."""
@@ -4204,9 +4421,9 @@ class CutSectionController:
                 if hasattr(self.app, 'data') and 'xyz' in self.app.data:
                     xyz = self.app.data['xyz']
                     # Max depth should be ~10% of dataset extent (prevents freezing)
-                    x_extent = float(np.ptp(xyz[:, 0]))  # ptp = peak-to-peak (max - min)
-                    y_extent = float(np.ptp(xyz[:, 1]))
-                    z_extent = float(np.ptp(xyz[:, 2]))
+                    x_extent = float(xyz[:, 0].max() - xyz[:, 0].min())
+                    y_extent = float(xyz[:, 1].max() - xyz[:, 1].min())
+                    z_extent = float(xyz[:, 2].max() - xyz[:, 2].min())
                     
                     max_extent = max(x_extent, y_extent, z_extent)
                     max_depth = min(max_extent * 0.1, 100.0)  # Cap at 100m
@@ -4328,7 +4545,7 @@ class CutSectionController:
                                 f"Unexpected error during close:\n{str(e)}\n\n"
                                 "Dock will remain open. Please restart application."
                             )
-                        except:
+                        except Exception:
                             pass
                     else:
                         # Cleanup succeeded but post-processing failed
@@ -4368,7 +4585,7 @@ class CutSectionController:
                     rw = self.cut_vtk.GetRenderWindow()
                     if rw is not None:
                         is_vtk_valid = not rw.IsA('vtkWin32OpenGLRenderWindow') or rw.GetMapped()
-                except:
+                except Exception:
                     is_vtk_valid = False
             
             if force_close:
@@ -4448,25 +4665,25 @@ class CutSectionController:
         except Exception:
             pass
         
-        # Create point cloud
-        cloud = pv.PolyData(points)
-        cloud["RGB"] = colors
-        
-        # Render with borders if needed
-        # border_percent = getattr(self.app, "point_border_percent", 0)
-        border_percent = 0
-        if hasattr(self.app, "view_borders"):
-            border_percent = self.app.view_borders.get(5, 0)
-
         base_size = 3
-        
-        if border_percent > 0:
-            border_scale = border_percent / 50.0
-            border_size = base_size * (1.0 + border_scale)
-            self.cut_core_actor = self.cut_vtk.add_points(cloud, color='black', point_size=border_size, render_points_as_spheres=False)
-            self.cut_buffer_actor = self.cut_vtk.add_points(cloud, scalars="RGB", rgb=True, point_size=base_size, render_points_as_spheres=False)
-        else:
-            self.cut_core_actor = self.cut_vtk.add_points(cloud, scalars="RGB", rgb=True, point_size=base_size, render_points_as_spheres=False)
+        actor = None
+        if classes is not None and self._cut_index_map is not None:
+            actor = self._build_cut_unified_actor(points, cut_classes, point_size=base_size)
+
+        if actor is None:
+            cloud = pv.PolyData(points)
+            cloud["RGB"] = colors
+            self.cut_core_actor = self.cut_vtk.add_points(
+                cloud,
+                scalars="RGB",
+                rgb=True,
+                point_size=base_size,
+                render_points_as_spheres=False,
+                name="_cut_section_unified",
+                reset_camera=False,
+                render=False,
+            )
+            self.cut_buffer_actor = None
         
         # Set camera along tangent
         if self.section_tangent is not None:
@@ -4845,16 +5062,19 @@ class CutSectionController:
                     mapper = actor.GetMapper()
                     
                     if mapper is not None:
+                        _poly = mapper.GetInput()
+                        if _poly is None:
+                            raise RuntimeError("mapper.GetInput() returned None")
                         # Create color array for VTK
                         vtk_colors = vtk.vtkUnsignedCharArray()
                         vtk_colors.SetNumberOfComponents(3)
                         vtk_colors.SetName("RGB")
-                        
+
                         for color in colors:
                             vtk_colors.InsertNextTuple3(int(color[0]), int(color[1]), int(color[2]))
-                        
+
                         # Assign to mapper
-                        mapper.GetInput().GetPointData().SetScalars(vtk_colors)
+                        _poly.GetPointData().SetScalars(vtk_colors)
                         print("   ✅ Colors applied to actor mapper")
                         return
                 except Exception as e:
@@ -4895,12 +5115,13 @@ class CutSectionController:
                     if actor is not None:
                         try:
                             ren.RemoveActor(actor)
-                        except:
+                        except Exception:
                             pass
                 
+                # Render to show the removal
                 try:
                     _safe_vtk_render(vtk_widget)
-                except:
+                except Exception:
                     pass
-            except:
+            except Exception:
                 pass

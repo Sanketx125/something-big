@@ -1,7 +1,8 @@
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame, QPushButton
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QEvent
+from PySide6.QtGui import QFont
 import numpy as np
 
 
@@ -210,7 +211,7 @@ class PointCountWidget(QWidget):
                             try:
                                 rgb = color_item.background().color().getRgb()[:3]
                                 color = tuple(rgb)
-                            except:
+                            except Exception:
                                 pass
                         
                         # Column 0: Show (checkbox)

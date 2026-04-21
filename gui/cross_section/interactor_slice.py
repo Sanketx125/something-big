@@ -160,3 +160,4 @@ class CrossSectionInteractor(vtk.vtkInteractorStyleTrackballCamera):
             self.P1 = None
             self.P2 = None
             self.slice_state = 0
+

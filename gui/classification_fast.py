@@ -1,3 +1,124 @@
+# # In classification_tools.py or wherever you handle classification
+
+# def classify_region_ultra_fast(app, region_mask, new_class):
+#     """
+#     FASTEST classification - no geometry rebuild, color-only update.
+#     Works on datasets with 100M+ points.
+#     """
+#     if not np.any(region_mask):
+#         return
+    
+#     changed_indices = np.where(region_mask)[0]
+#     n_changed = len(changed_indices)
+    
+#     if n_changed == 0:
+#         return
+    
+#     print(f"⚡ Classifying {n_changed:,} points...")
+    
+#     # ✅ Store old for undo (only changed points to save memory)
+#     old_classes = app.data["classification"][region_mask].copy()
+    
+#     # ✅ Apply change
+#     app.data["classification"][region_mask] = new_class
+    
+#     # ✅ Add to undo (compact format)
+#     app.undo_stack.append({
+#         "indices": changed_indices,
+#         "old_classes": old_classes,
+#         "new_class": new_class
+#     })
+    
+#     # ✅ Limit undo stack to prevent memory bloat
+#     if len(app.undo_stack) > 50:
+#         app.undo_stack.pop(0)
+    
+#     # ✅ CRITICAL: Only update colors in-place, NO geometry rebuild
+#     try:
+#         from gui.performance_optimizations import fast_update_colors_optimized
+#         fast_update_colors_optimized(app, region_mask)
+#     except ImportError:
+#         # Fallback
+#         from gui.pointcloud_display import fast_update_colors
+#         fast_update_colors(app, region_mask)
+    
+#     print(f"✅ Classification complete ({n_changed:,} points → class {new_class})")
+
+
+# def classify_brush_ultra_fast(app, center_3d, radius, new_class):
+#     """
+#     Ultra-fast brush using spatial index (O(log n) instead of O(n)).
+#     """
+#     # ✅ Use spatial index if available (100x faster!)
+#     if hasattr(app, 'spatial_index') and app.spatial_index:
+#         try:
+#             indices = app.spatial_index.query_radius(center_3d, radius)
+            
+#             if len(indices) == 0:
+#                 return
+            
+#             # Create mask from indices
+#             mask = np.zeros(len(app.data["xyz"]), dtype=bool)
+#             mask[indices] = True
+            
+#             print(f"🎯 Brush (spatial index): {len(indices):,} points in {radius:.2f}m radius")
+            
+#         except Exception as e:
+#             print(f"⚠️ Spatial index failed: {e}, falling back...")
+#             # Fallback below
+#             mask = None
+#     else:
+#         mask = None
+    
+#     # ✅ Fallback: vectorized distance calculation
+#     if mask is None:
+#         distances = np.linalg.norm(app.data["xyz"] - center_3d, axis=1)
+#         mask = distances <= radius
+#         print(f"🎯 Brush (fallback): {mask.sum():,} points")
+    
+#     classify_region_ultra_fast(app, mask, new_class)
+
+
+# def classify_rectangle_ultra_fast(app, x_min, x_max, y_min, y_max, new_class):
+#     """
+#     Ultra-fast rectangular selection using spatial index.
+#     """
+#     if hasattr(app, 'spatial_index') and app.spatial_index:
+#         try:
+#             indices = app.spatial_index.query_rectangle(x_min, x_max, y_min, y_max)
+            
+#             if len(indices) == 0:
+#                 return
+            
+#             mask = np.zeros(len(app.data["xyz"]), dtype=bool)
+#             mask[indices] = True
+            
+#             print(f"📦 Rectangle (spatial index): {len(indices):,} points")
+            
+#         except Exception as e:
+#             print(f"⚠️ Spatial index failed: {e}, falling back...")
+#             mask = None
+#     else:
+#         mask = None
+    
+#     # Fallback: vectorized bounds check
+#     if mask is None:
+#         xyz = app.data["xyz"]
+#         mask = ((xyz[:, 0] >= x_min) & (xyz[:, 0] <= x_max) &
+#                 (xyz[:, 1] >= y_min) & (xyz[:, 1] <= y_max))
+#         print(f"📦 Rectangle (fallback): {mask.sum():,} points")
+    
+#     classify_region_ultra_fast(app, mask, new_class)
+"""
+Ultra-optimized classification tools for massive point clouds (100M+ points)
+Key optimizations:
+- Batch processing for multiple operations
+- Minimal memory allocation
+- Direct color buffer updates (no rebuilds)
+- Chunked processing for huge datasets
+- Async/threaded color updates
+"""
+
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import time

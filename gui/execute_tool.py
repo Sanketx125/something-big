@@ -1,3 +1,5 @@
+
+
 TOOL_MAP = {
     "AboveLine": "above_line",
     "BelowLine": "below_line",
@@ -14,17 +16,75 @@ TOOL_MAP = {
     "MeasureLine": "measure_line",
     "MeasurePath": "measure_path",
     "ClearMeasurements": "clear_measurements",
-    "DisplayMode": "display_mode",      # ✅ ADDED
-    "ShadingMode": "shading_mode",      # ✅ ADDED
+    "DisplayMode": "display_mode",
+    "ShadingMode": "shading_mode",
 }
 
-def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # ✅ Added preset parameter
+
+def _deactivate_curve_tool_safely(app_window, reason="switching tools"):
+    """
+    Safely deactivate curve tool in all modes.
+    Called when switching to any other tool context.
+    """
+    if not hasattr(app_window, 'curve_tool') or app_window.curve_tool is None:
+        return
+    
+    ct = app_window.curve_tool
+    
+    # Check if curve tool has any active mode
+    is_active = ct.active
+    is_select_mode = getattr(ct, '_select_mode', False)
+    
+    if not is_active and not is_select_mode:
+        return
+    
+    print(f"   🎨 Deactivating curve tool ({reason})")
+    
+    # Cancel active drawing if in progress
+    if is_active:
+        ct._cancel_curve()
+    
+    # Exit select mode if active
+    if is_select_mode:
+        ct.deactivate_select_mode()
+
+
+def _deactivate_measurement_tool_safely(app_window, reason="switching tools"):
+    """
+    Safely deactivate measurement tool.
+    Called when switching to classification or section tools.
+    """
+    if not hasattr(app_window, 'measurement_tool') or app_window.measurement_tool is None:
+        return
+    
+    mt = app_window.measurement_tool
+    
+    if not getattr(mt, 'active', False) and not getattr(mt, 'is_measuring', False):
+        return
+    
+    print(f"   📏 Deactivating measurement tool ({reason})")
+    
+    if hasattr(mt, 'deactivate'):
+        try:
+            mt.deactivate()
+        except Exception as e:
+            print(f"      ⚠️ Measurement deactivate failed: {e}")
+    
+    # Force flags even if deactivate() didn't clear them
+    mt.active = False
+    mt.is_measuring = False
+    if hasattr(mt, 'is_drawing'):
+        mt.is_drawing = False
+
+
+def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):
     """
     Execute a classification or cross-section tool.
     ✅ FIXED: Uses open_next_cross_section_view() for direct activation (no dialog)
     ✅ FIXED: Preserves classification parameters across view changes
     ✅ FIXED: Returns focus to correct view for immediate use
     ✅ NEW: Handles DisplayMode and ShadingMode presets
+    ✅ FIXED: Properly deactivates curve/measurement tools when switching contexts
     """
     
     print(f"🔧 execute_tool called: tool={tool}, from_cls={from_cls}, to_cls={to_cls}, preset={preset is not None}")
@@ -44,14 +104,11 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     # ========================================================================
     # ✅ NEW: DISPLAY MODE PRESET (Non-classification)
     # ========================================================================
-    # In gui/tools.py, inside execute_tool function
-
-    """
-    REPLACE the entire DisplayMode section in execute_tool.py with this:
-    """
-
     if tool_name == "display_mode":
         print("🎨 Applying DisplayMode preset from shortcut")
+        
+        # ✅ Deactivate curve tool when switching to display mode
+        _deactivate_curve_tool_safely(app_window, "switching to DisplayMode")
         
         if preset is None:
             print("   ⚠️ No preset provided for DisplayMode")
@@ -71,6 +128,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
             # Clear shading cache
             from gui.shading_display import clear_shading_cache
             clear_shading_cache("switching to DisplayMode")
+            
             # ✅ Extract multi-view preset data
             views = preset.get("views", {})
             border_percent = preset.get("border_percent", 0)
@@ -116,7 +174,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
                         "show": info.get("show", False),
                         "description": info.get("description", ""),
                         "color": info.get("color", (128, 128, 128)),
-                        "weight": preset_weight,  # ✅ USE PRESET OR DEFAULT!
+                        "weight": preset_weight,
                         "draw": info.get("draw", ""),
                         "lvl": info.get("lvl", "")
                     }
@@ -148,12 +206,6 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
             app_window._preserve_view = True
             update_class_mode(app_window, force_refresh=True)
             
-            total_views = len(views)
-            total_visible = sum(
-                sum(1 for c in classes.values() if c.get("show"))
-                for classes in views.values()
-            )
-            
             if hasattr(app_window, "statusBar"):
                 app_window.statusBar().showMessage(
                     f"✅ DisplayMode: Main=1.0, Views 1-5=0.5",
@@ -176,6 +228,9 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     # ========================================================================
     if tool_name == "shading_mode":
         print("🌗 Applying ShadingMode preset from shortcut")
+        
+        # ✅ Deactivate curve tool when switching to shading mode
+        _deactivate_curve_tool_safely(app_window, "switching to ShadingMode")
         
         if preset is None:
             print("   ⚠️ No preset provided for ShadingMode")
@@ -212,12 +267,10 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
             app_window.shade_ambient = ambient
             
             # ✅ CRITICAL: Only update visibility for classes in the preset
-            # Don't touch classes not in the preset
             if classes and hasattr(app_window, 'class_palette'):
                 for code, info in classes.items():
                     code_int = int(code)
                     if code_int in app_window.class_palette:
-                        # Only update the 'show' flag, preserve other attributes
                         app_window.class_palette[code_int]["show"] = info.get("show", False)
                 
                 print(f"   ✅ Updated visibility for {len(classes)} classes")
@@ -260,6 +313,9 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     if tool_name in ("measure_line", "measure_path"):
         print(f"📏 Activating measurement shortcut: {tool_name}")
 
+        # ✅ Deactivate curve tool when switching to measurement
+        _deactivate_curve_tool_safely(app_window, "switching to measurement")
+
         try:
             if hasattr(app_window, "_sync_tools_for_ribbon_tab"):
                 app_window._sync_tools_for_ribbon_tab("measure")
@@ -300,8 +356,11 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
 
     if tool_name == "top_view":
         print("🔝 Activating Top View")
+        
+        # ✅ Deactivate curve tool when switching to top view
+        _deactivate_curve_tool_safely(app_window, "switching to TopView")
+        
         try:
-            # ✅ Complete camera setup (matches manual method exactly)
             from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
             
             cam = app_window.vtk_widget.renderer.GetActiveCamera()
@@ -310,26 +369,18 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
             cam.SetPosition(0, 0, 1)
             cam.SetFocalPoint(0, 0, 0)
             
-            # ✅ Reset camera (needed for proper zoom)
             app_window.vtk_widget.renderer.ResetCamera()
-            
-            # ✅ Render
             app_window.vtk_widget.render()
             print("   ✅ Camera configured (top view + orthographic + reset)")
             
-            # ✅ CRITICAL - Lock interactor to 2D mode (pan/zoom only, NO rotation!)
             interactor = app_window.vtk_widget.interactor
             style = vtkInteractorStyleImage()
             interactor.SetInteractorStyle(style)
             print("   🔒 Interactor LOCKED to 2D (pan/zoom only, no rotation)")
             
-            # Set state
             app_window.current_view = "top"
-            
-            # Clear any active classification tool
             app_window.active_classify_tool = None
             
-            # Return focus to main view
             _return_focus_to_main_view(app_window)
             
             if hasattr(app_window, "statusBar"):
@@ -347,7 +398,11 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     if tool in ("Depth", "RGB", "Intensity", "Elevation", "Class"):
         
         print(f"🎨 Switching to {tool} display mode")
-        # ✅ ADD THIS: Clear shading actors when switching display modes
+        
+        # ✅ Deactivate curve tool when switching display modes
+        _deactivate_curve_tool_safely(app_window, f"switching to {tool} mode")
+        
+        # Clear shading actors
         if hasattr(app_window, '_shaded_mesh_actor') and app_window._shaded_mesh_actor:
             app_window.vtk_widget.remove_actor('shaded_mesh', render=False)
             app_window._shaded_mesh_actor = None
@@ -355,7 +410,6 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
         if hasattr(app_window, '_shaded_mesh_polydata'):
             app_window._shaded_mesh_polydata = None
         
-        # Clear shading cache
         from gui.shading_display import clear_shading_cache
         clear_shading_cache(f"switching to {tool} mode")
         
@@ -372,16 +426,13 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
         if mode in ['depth', 'rgb', 'intensity', 'elevation']:
             print(f"   🔳 Clearing borders for {mode} mode")
             
-            # Force borders to 0
             app_window.point_border_percent = 0
             app_window._main_view_borders_active = False
             
-            # Update display mode dialog if it exists
             if hasattr(app_window, 'display_mode_dialog') and app_window.display_mode_dialog:
                 dlg = app_window.display_mode_dialog
-                dlg.view_borders[0] = 0  # Clear main view border
+                dlg.view_borders[0] = 0
                 
-                # Update UI elements if dialog is visible
                 if dlg.isVisible():
                     if hasattr(dlg, 'border_slider'):
                         dlg.border_slider.blockSignals(True)
@@ -395,17 +446,10 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
             print(f"   ✅ Borders set to 0%")
         
         elif mode == 'class':
-            # ✅ CRITICAL: Clear shading visibility state BEFORE switching to class mode
             if hasattr(app_window, 'shading_class_visibility'):
                 print(f"   🗑️ Clearing shading_class_visibility")
                 app_window.shading_class_visibility = {}
 
-            # ✅ DO NOT remove actors here — the unified GPU actor
-            # (_naksha_unified_cloud) must stay alive so set_display_mode("class")
-            # can write colors directly into its RGB buffer without a full rebuild.
-            # Removing it caused all points to become invisible (black on black).
-
-            # Restore borders for classification mode if they were previously set
             if hasattr(app_window, 'display_mode_dialog') and app_window.display_mode_dialog:
                 dlg = app_window.display_mode_dialog
                 saved_border = dlg.view_borders.get(0, 0)
@@ -415,16 +459,13 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
                     app_window._main_view_borders_active = True
                     print(f"   ✅ Restored borders to {saved_border}%")
 
-            # ✅ Ensure at least one class is visible so nothing renders black
             palette = getattr(app_window, 'class_palette', {})
             if palette and not any(v.get('show', True) for v in palette.values()):
                 for code in palette:
                     palette[code]['show'] = True
                 print(f"   ⚠️ All classes were hidden — reset to visible")
 
-
         try:
-            # ✅ Method 1: Try calling the handler directly
             if hasattr(app_window, 'on_display_changed'):
                 app_window.on_display_changed(mode)
                 print(f"   ✅ Called on_display_changed({mode})")
@@ -435,7 +476,6 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
                 app_window.change_display_mode(mode)
                 print(f"   ✅ Called change_display_mode({mode})")
             else:
-                # Method 2: Emit signal (if connected)
                 if hasattr(app_window, 'view_ribbon'):
                     app_window.view_ribbon.display_changed.emit(mode)
                     print(f"   ✅ Emitted display_changed signal: {mode}")
@@ -443,10 +483,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
                     print(f"   ⚠️ No display mode handler found!")
                     return
             
-            # Clear any active classification tool
             app_window.active_classify_tool = None
-            
-            # Return focus to main view
             _return_focus_to_main_view(app_window)
             
             icon_map = {"depth": "🧱", "rgb": "🌈", "intensity": "💡", "elevation": "📊", "class": "🏷️"}
@@ -469,8 +506,14 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     # ========================================================================
     if tool_name == "cross_section":
         print("🔧 Activating Cross Section tool - SHOWING POPUP DIALOG")
-        # ✅ Clear any active classification session first so preview actors
-        # are cleaned up before the cross-section interactor takes over.
+        
+        # ✅ Deactivate curve tool when switching to cross-section
+        _deactivate_curve_tool_safely(app_window, "switching to cross-section")
+        
+        # ✅ Deactivate measurement tool
+        _deactivate_measurement_tool_safely(app_window, "switching to cross-section")
+        
+        # Clear any active classification session
         class_picker = getattr(app_window, "class_picker", None)
         classification_active = bool(
             getattr(app_window, "active_classify_tool", None)
@@ -481,7 +524,6 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
         )
 
         if classification_active and hasattr(app_window, "deactivate_classification_tool"):
-            # Guard: ensure cross_action exists and is not None before preserve logic
             has_cross_action = (
                 hasattr(app_window, 'cross_action') 
                 and app_window.cross_action is not None
@@ -489,31 +531,13 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
             app_window.deactivate_classification_tool(
                 preserve_cross_section=has_cross_action
             )
-
             app_window.active_classify_tool = None
         
-    if tool_name == "cross_section":
-        print("🔧 Activating Cross Section tool - SHOWING POPUP DIALOG")
-        
-             # ✅ Deactivate cut section pending state before proceeding
+        # ✅ Deactivate cut section pending state
         if hasattr(app_window, "cut_section_controller") and app_window.cut_section_controller:
             if hasattr(app_window.cut_section_controller, "_force_deactivate_pending_state"):
                 print("   🛑 Deactivating pending cut tool state...")
                 app_window.cut_section_controller._force_deactivate_pending_state()
-
-        # ✅ Deactivate measurement tool
-        if hasattr(app_window, 'measurement_tool') and app_window.measurement_tool:
-            mt = app_window.measurement_tool
-            if getattr(mt, 'active', False):
-                print("   📏 Deactivating measurement tool (switching to cross-section)")
-                if hasattr(mt, 'deactivate'):
-                    try:
-                        mt.deactivate()
-                    except Exception as e:
-                        print(f"      ⚠️ Measurement deactivate failed: {e}")
-                mt.active = False
-                if hasattr(mt, 'is_drawing'):
-                    mt.is_drawing = False
 
         # ✅ CRITICAL: Use enable_cross_section_mode() to show popup dialog FIRST
         if hasattr(app_window, "enable_cross_section_mode"):
@@ -523,7 +547,6 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
             app_window.open_next_cross_section_view()
             print("   ⚠️ Fell back to open_next_cross_section_view() - auto-select view")
         
-        # ✅ Return focus to main view immediately
         _return_focus_to_main_view(app_window)
         
         if hasattr(app_window, "statusBar"):
@@ -538,14 +561,15 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     if tool_name == "cut_section":
         print("🔧 Activating Cut Section tool")
         
+        # ✅ Deactivate curve tool when switching to cut-section
+        _deactivate_curve_tool_safely(app_window, "switching to cut-section")
+        
+        # ✅ Deactivate measurement tool
+        _deactivate_measurement_tool_safely(app_window, "switching to cut-section")
+        
         try:
-            # ✅ DON'T clear classification parameters - they should persist!
             app_window.active_classify_tool = None
-            
-            # Activate cut section
             app_window.cut_section_controller.activate()
-            
-            # ✅ Return focus to main view
             _return_focus_to_main_view(app_window)
             
             if hasattr(app_window, "statusBar"):
@@ -560,11 +584,17 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     # CutFromCross/CutFromCut
     # ========================================================================
     if tool_name == "CutFromCross":
+        # ✅ Deactivate curve tool
+        _deactivate_curve_tool_safely(app_window, "switching to CutFromCross")
+        
         if hasattr(app_window, "cut_section_controller"):
             app_window.cut_section_controller.activate_from_cross_shortcut()
         return
 
     if tool_name == "CutFromCut":
+        # ✅ Deactivate curve tool
+        _deactivate_curve_tool_safely(app_window, "switching to CutFromCut")
+        
         if hasattr(app_window, "cut_section_controller"):
             app_window.cut_section_controller.activate_from_cut_shortcut()
         return
@@ -575,28 +605,16 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
     
     print(f"🎯 Activating classification tool: {tool_name}")
     
-    # ✅ CRITICAL: Determine classification target (main/cross/cut)
+    # ✅ CRITICAL: Deactivate curve tool when switching to classification
+    _deactivate_curve_tool_safely(app_window, "switching to classification")
+    
+    # ✅ CRITICAL: Deactivate measurement tool when switching to classification
+    _deactivate_measurement_tool_safely(app_window, "switching to classification")
+    
+    # ✅ Determine classification target (main/cross/cut)
     classification_target = _determine_classification_target(app_window)
     
     print(f"   📍 Classification target: {classification_target}")
-    
-    # ========================================================================
-    # ✅ CRITICAL: Deactivate measurement tool when switching to classification
-    # This prevents Ctrl+Z from routing to measurement undo after shortcut switch
-    # ========================================================================
-    if hasattr(app_window, 'measurement_tool') and app_window.measurement_tool:
-        mt = app_window.measurement_tool
-        if getattr(mt, 'active', False):
-            print("   📏 Deactivating measurement tool (switching to classification)")
-            if hasattr(mt, 'deactivate'):
-                try:
-                    mt.deactivate()
-                except Exception as e:
-                    print(f"      ⚠️ Measurement deactivate failed: {e}")
-            # Force flags even if deactivate() didn't clear them
-            mt.active = False
-            if hasattr(mt, 'is_drawing'):
-                mt.is_drawing = False
 
     # Set classification parameters
     app_window.from_classes = from_cls
@@ -624,10 +642,8 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None):  # 
 
     # ✅ CRITICAL: Update ClassPicker BUT keep focus on main view
     if hasattr(app_window, "class_picker") and app_window.class_picker:
-        # Update picker in background (no focus steal)
         app_window.class_picker.sync_with_app()
         
-        # ✅ Keep picker visible but don't activate it
         if not app_window.class_picker.isVisible():
             app_window.class_picker.show()
 
@@ -672,11 +688,9 @@ def _determine_classification_target(app_window):
         active_view = getattr(app_window.section_controller, 'active_view', None)
         
         if active_view is not None:
-            # Check if the cross-section window is visible and active
             if hasattr(app_window, 'section_vtks') and active_view in app_window.section_vtks:
                 vtk_widget = app_window.section_vtks[active_view]
                 
-                # Check if widget exists and is visible
                 if vtk_widget and hasattr(vtk_widget, 'isVisible') and vtk_widget.isVisible():
                     print(f"   📊 Cross-section view {active_view} is active")
                     return "cross"
@@ -692,13 +706,11 @@ def _return_focus_to_main_view(app_window):
     This allows next shortcut key to work immediately without clicking
     """
     try:
-        # Strategy 1: Focus the VTK widget directly
         if hasattr(app_window, 'vtk_widget') and app_window.vtk_widget:
             app_window.vtk_widget.setFocus()
             print("   🎯 Focus returned to main VTK widget")
             return
         
-        # Strategy 2: Focus the main window
         if hasattr(app_window, 'setFocus'):
             app_window.setFocus()
             print("   🎯 Focus returned to main window")
@@ -727,7 +739,6 @@ def _return_focus_to_cross_section(app_window):
             _return_focus_to_main_view(app_window)
             return
         
-        # Get the VTK widget for this view
         if hasattr(app_window, 'section_vtks') and active_view in app_window.section_vtks:
             vtk_widget = app_window.section_vtks[active_view]
             
@@ -756,7 +767,6 @@ def _return_focus_to_cut_section(app_window):
         
         ctrl = app_window.cut_section_controller
         
-        # Get the cut VTK widget
         if hasattr(ctrl, 'cut_vtk') and ctrl.cut_vtk:
             if hasattr(ctrl.cut_vtk, 'setFocus'):
                 ctrl.cut_vtk.setFocus()

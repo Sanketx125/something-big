@@ -438,7 +438,7 @@ class PRJBlockIdentifierDialog(QDialog):
                 for old_actor in self._highlight_actors:
                     try:
                         renderer.RemoveActor(old_actor)
-                    except:
+                    except Exception:
                         pass
         
         # Initialize list to store all highlight actors
@@ -955,7 +955,7 @@ class PRJBlockIdentifierDialog(QDialog):
                     for highlight_actor in self._highlight_actors:
                         try:
                             renderer.RemoveActor(highlight_actor)
-                        except:
+                        except Exception:
                             pass
                     self.app.vtk_widget.GetRenderWindow().Render()
             
@@ -1078,7 +1078,7 @@ def show_block_identifier_dialog(app):
             app.block_identifier_dialog.raise_()
             app.block_identifier_dialog.activateWindow()
             return app.block_identifier_dialog
-        except:
+        except Exception:
             # If dialog was deleted/closed, ignore and recreate
             pass
    

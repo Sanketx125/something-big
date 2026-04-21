@@ -4,7 +4,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QPushButton, QSlider, QRadioButton,
     QButtonGroup, QGroupBox, QFrame
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QColor, QPalette, QFont
 
 class BrushSizeDialog(QDialog):
     """

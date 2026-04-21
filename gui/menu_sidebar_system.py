@@ -1,3 +1,4 @@
+
 """
 Menu-Based Ribbon System for NakshaAI
 Displays all menu options horizontally in a ribbon layout
@@ -5700,7 +5701,7 @@ class ByClassHeightDialog(QDialog):
             self.info_banner.setText("📏 Convert points based on height above ground (Class 1)")
 
     def select_fence(self):
-        """Select fences from digitize manager"""
+        """Select fences from digitize manager AND curve tool"""
         if hasattr(self, '_fence_selection_dialog') and self._fence_selection_dialog is not None:
             try:
                 self._fence_selection_dialog.close()
@@ -5709,23 +5710,35 @@ class ByClassHeightDialog(QDialog):
             self._fence_selection_dialog = None
         
         digitize = getattr(self.app, 'digitizer', None)
-        if not digitize:
-            QMessageBox.warning(self, "No Digitize Manager",
-                "Digitize manager not found.\nDraw at least one shape first.")
-            return
+        curve_tool = getattr(self.app, 'curve_tool', None)
         
-        drawings = getattr(digitize, 'drawings', [])
-        if not drawings:
-            QMessageBox.warning(self, "No Drawings",
-                "No shapes found. Draw a shape using Digitize tools first.")
-            return
+        # ── Collect digitizer drawings ────────────────────────────
+        valid_shapes = []
+        if digitize:
+            drawings = getattr(digitize, 'drawings', [])
+            if drawings:
+                valid_shapes = [d for d in drawings if d.get('type') in 
+                            ['rectangle', 'circle', 'polygon', 'freehand', 'line',
+                             'smart_line', 'polyline', 'smartline']]
         
-        valid_shapes = [d for d in drawings if d.get('type') in 
-                    ['rectangle', 'circle', 'polygon', 'freehand', 'line',
-                     'smart_line', 'polyline', 'smartline']]
-        if not valid_shapes:
+        # ── Collect curve tool curves ✅ NEW ─────────────────────
+        curve_fences = []
+        if curve_tool and hasattr(curve_tool, 'get_curves_as_fences'):
+            curve_fences = curve_tool.get_curves_as_fences()
+        
+        # Combine all
+        all_fences = valid_shapes + curve_fences
+        
+        if not valid_shapes and not curve_fences:
             QMessageBox.warning(self, "No Shapes Found",
-                "No valid shapes found.\nSupported: rectangle, circle, polygon, freehand, line, polyline")
+                "No shapes or curves found.\n\n"
+                "• Draw shapes using Digitize tools, OR\n"
+                "• Draw curves using the Curve tool")
+            return
+        
+        if not digitize and not curve_tool:
+            QMessageBox.warning(self, "No Tools Available",
+                "Digitize manager and Curve tool not found.")
             return
         
         from PySide6.QtWidgets import (QListWidget, QAbstractItemView, QVBoxLayout,
@@ -5738,13 +5751,21 @@ class ByClassHeightDialog(QDialog):
             self._fence_selection_dialog = dialog
             dialog.setWindowTitle("Select Fence(s) for Height Classification")
             dialog.setWindowModality(Qt.NonModal)
-            dialog.resize(400, 500)
+            dialog.resize(420, 500)
             
             dlayout = QVBoxLayout(dialog)
             
-            info_label = QLabel("Select fence(s) to restrict height classification area")
+            # Header with source counts
+            shape_count = len(valid_shapes)
+            curve_count = len(curve_fences)
+            info_text = f"Select fence(s) to restrict height classification area"
+            info_label = QLabel(info_text)
             info_label.setStyleSheet("color: #9c27b0; font-weight: bold; padding: 8px;")
             dlayout.addWidget(info_label)
+            
+            count_label = QLabel(f"📐 Digitizer: {shape_count}  |  〰️ Curves: {curve_count}")
+            count_label.setStyleSheet("color: #888888; font-size: 10px; padding: 0 8px;")
+            dlayout.addWidget(count_label)
             
             permanent_check = QCheckBox("🔄 Permanent Fence Mode")
             permanent_check.setChecked(True)
@@ -5764,22 +5785,90 @@ class ByClassHeightDialog(QDialog):
             """)
             fence_list.setSelectionMode(QAbstractItemView.NoSelection)
             
-            SHAPE_ICONS = {'rectangle': '▭', 'circle': '○', 'polygon': '⬟', 'polyline': '⬡',
-                           'line': '─', 'smartline': '⚡', 'freehand': '✏️'}
+            # ✅ UPDATED: Shape icons including curve
+            SHAPE_ICONS = {
+                'rectangle': '▭', 'circle': '○', 'polygon': '⬟', 'polyline': '⬡',
+                'line': '─', 'smartline': '⚡', 'freehand': '✏️', 'curve': '〰️'
+            }
             
             custom_widgets = []
             current_hover_actor = [None]
             selection_highlight_actors = {}
             
+            def _add_actor_to_renderer(actor):
+                """Add actor handling both Actor and Actor2D"""
+                if actor is None:
+                    return
+                try:
+                    if hasattr(actor, 'IsA') and actor.IsA('vtkActor2D'):
+                        self.app.vtk_widget.renderer.AddViewProp(actor)
+                    else:
+                        self.app.vtk_widget.renderer.AddActor(actor)
+                except Exception:
+                    pass
+            
+            def _rem_actor_from_renderer(actor):
+                """Remove actor handling both Actor and Actor2D"""
+                if actor is None:
+                    return
+                try:
+                    if hasattr(actor, 'IsA') and actor.IsA('vtkActor2D'):
+                        self.app.vtk_widget.renderer.RemoveViewProp(actor)
+                    else:
+                        self.app.vtk_widget.renderer.RemoveActor(actor)
+                except Exception:
+                    pass
+            
+            def _make_highlight_actor(coords, color, width):
+                """Create highlight actor (Actor2D for curves, Actor for digitizer)"""
+                try:
+                    import vtk
+                    pts = vtk.vtkPoints()
+                    pts.SetDataTypeToDouble()
+                    for c in coords:
+                        z = float(c[2]) if len(c) > 2 else 0.0
+                        pts.InsertNextPoint(float(c[0]), float(c[1]), z)
+                    
+                    pl = vtk.vtkPolyLine()
+                    pl.GetPointIds().SetNumberOfIds(len(coords))
+                    for i in range(len(coords)):
+                        pl.GetPointIds().SetId(i, i)
+                    
+                    ca = vtk.vtkCellArray()
+                    ca.InsertNextCell(pl)
+                    
+                    pd = vtk.vtkPolyData()
+                    pd.SetPoints(pts)
+                    pd.SetLines(ca)
+                    
+                    # Use Actor2D for consistent overlay rendering
+                    mapper = vtk.vtkPolyDataMapper2D()
+                    mapper.SetInputData(pd)
+                    
+                    coord = vtk.vtkCoordinate()
+                    coord.SetCoordinateSystemToWorld()
+                    mapper.SetTransformCoordinate(coord)
+                    
+                    actor = vtk.vtkActor2D()
+                    actor.SetMapper(mapper)
+                    actor.GetProperty().SetColor(*color)
+                    actor.GetProperty().SetLineWidth(width)
+                    actor.GetProperty().SetDisplayLocationToForeground()
+                    
+                    return actor
+                except Exception:
+                    # Fallback to 3D actor
+                    try:
+                        if hasattr(self.app, 'digitizer'):
+                            return self.app.digitizer._make_polyline_actor(coords, color=color, width=width)
+                    except Exception:
+                        pass
+                    return None
+            
             def highlight_fence_in_3d(shape):
                 if current_hover_actor[0]:
-                    try:
-                        if hasattr(self.app, 'digitizer') and hasattr(self.app.digitizer, 'overlay_renderer'):
-                            self.app.digitizer.overlay_renderer.RemoveActor(current_hover_actor[0])
-                        else:
-                            self.app.vtk_widget.renderer.RemoveActor(current_hover_actor[0])
-                        current_hover_actor[0] = None
-                    except Exception: pass
+                    _rem_actor_from_renderer(current_hover_actor[0])
+                    current_hover_actor[0] = None
                 if not shape:
                     try: self.app.vtk_widget.render()
                     except Exception: pass
@@ -5787,26 +5876,11 @@ class ByClassHeightDialog(QDialog):
                 coords = shape.get('coords', [])
                 if not coords: return
                 try:
-                    if hasattr(self.app, 'digitizer'):
-                        ha = self.app.digitizer._make_polyline_actor(coords, color=(1, 1, 0), width=6)
-                    else:
-                        import vtk
-                        pts = vtk.vtkPoints()
-                        for c in coords: pts.InsertNextPoint(c)
-                        ln = vtk.vtkPolyLine()
-                        ln.GetPointIds().SetNumberOfIds(len(coords))
-                        for i in range(len(coords)): ln.GetPointIds().SetId(i, i)
-                        cls = vtk.vtkCellArray(); cls.InsertNextCell(ln)
-                        pd = vtk.vtkPolyData(); pd.SetPoints(pts); pd.SetLines(cls)
-                        mp = vtk.vtkPolyDataMapper(); mp.SetInputData(pd)
-                        ha = vtk.vtkActor(); ha.SetMapper(mp)
-                        ha.GetProperty().SetColor(1, 1, 0); ha.GetProperty().SetLineWidth(6)
-                    if hasattr(self.app, 'digitizer') and hasattr(self.app.digitizer, 'overlay_renderer'):
-                        self.app.digitizer.overlay_renderer.AddActor(ha)
-                    else:
-                        self.app.vtk_widget.renderer.AddActor(ha)
-                    current_hover_actor[0] = ha
-                    self.app.vtk_widget.render()
+                    ha = _make_highlight_actor(coords, (1, 1, 0), 6)  # Yellow
+                    if ha:
+                        _add_actor_to_renderer(ha)
+                        current_hover_actor[0] = ha
+                        self.app.vtk_widget.render()
                 except Exception as e:
                     print(f"⚠️ Hover highlight failed: {e}")
             
@@ -5814,103 +5888,151 @@ class ByClassHeightDialog(QDialog):
                 coords = shp.get('coords', [])
                 if not coords: return
                 try:
-                    if hasattr(self.app, 'digitizer'):
-                        act = self.app.digitizer._make_polyline_actor(coords, color=(0, 0.5, 1), width=5)
-                    else:
-                        import vtk
-                        pts = vtk.vtkPoints()
-                        for c in coords: pts.InsertNextPoint(c)
-                        ln = vtk.vtkPolyLine()
-                        ln.GetPointIds().SetNumberOfIds(len(coords))
-                        for i in range(len(coords)): ln.GetPointIds().SetId(i, i)
-                        cls = vtk.vtkCellArray(); cls.InsertNextCell(ln)
-                        pd = vtk.vtkPolyData(); pd.SetPoints(pts); pd.SetLines(cls)
-                        mp = vtk.vtkPolyDataMapper(); mp.SetInputData(pd)
-                        act = vtk.vtkActor(); act.SetMapper(mp)
-                        act.GetProperty().SetColor(0, 0.5, 1); act.GetProperty().SetLineWidth(5)
-                    self.app.vtk_widget.renderer.AddActor(act)
-                    selection_highlight_actors[id(shp)] = act
-                    self.app.vtk_widget.render()
+                    act = _make_highlight_actor(coords, (0, 0.5, 1), 5)  # Blue
+                    if act:
+                        _add_actor_to_renderer(act)
+                        # Use stable ID based on source
+                        if shp.get('source') == 'curve_tool':
+                            selection_highlight_actors[id(shp.get('curve_data', shp))] = act
+                        else:
+                            selection_highlight_actors[id(shp)] = act
+                        self.app.vtk_widget.render()
                 except Exception as e:
                     print(f"⚠️ Selection highlight failed: {e}")
 
             def remove_selection_highlight(shp):
-                act = selection_highlight_actors.pop(id(shp), None)
+                # Get stable ID based on source
+                if shp.get('source') == 'curve_tool':
+                    sid = id(shp.get('curve_data', shp))
+                else:
+                    sid = id(shp)
+                act = selection_highlight_actors.pop(sid, None)
                 if act:
-                    try:
-                        self.app.vtk_widget.renderer.RemoveViewProp(act)
-                        self.app.vtk_widget.render()
+                    _rem_actor_from_renderer(act)
+                    try: self.app.vtk_widget.render()
                     except Exception: pass
             
-            for idx, shape in enumerate(valid_shapes):
-                shape_type = shape.get('type', 'unknown')
-                coords = np.array(shape.get('coords', []))
-                coord_count = len(coords)
-                min_pt = coords.min(axis=0); max_pt = coords.max(axis=0)
-                w = max_pt[0] - min_pt[0]; h = max_pt[1] - min_pt[1]
-                icon = SHAPE_ICONS.get(shape_type, '◆')
+            # ── Build current selection IDs ───────────────────────
+            current_ids = set()
+            for f in self.selected_fences:
+                if f.get('source') == 'curve_tool':
+                    current_ids.add(id(f.get('curve_data', f)))
+                else:
+                    current_ids.add(id(f))
+            
+            # ── Build list items ──────────────────────────────────
+            for idx, fence in enumerate(all_fences):
+                stype = fence.get('type', 'unknown')
+                coords = fence.get('coords', [])
+                is_curve = fence.get('source') == 'curve_tool'
+                icon = SHAPE_ICONS.get(stype, '◆')
                 
+                # Title and source
+                if is_curve:
+                    curve_idx = fence.get('curve_index', idx)
+                    title_text = f"〰️ Curve #{curve_idx + 1}"
+                    source_tag = "Curve Tool"
+                else:
+                    title_text = f"{icon} #{idx+1}: {stype.capitalize()}"
+                    source_tag = "Digitizer"
+                
+                try:
+                    arr = np.array(coords)
+                    w = arr[:, 0].max() - arr[:, 0].min()
+                    h = arr[:, 1].max() - arr[:, 1].min()
+                    size_str = f"{w:.1f}×{h:.1f}m"
+                except Exception:
+                    size_str = ""
+                
+                # Check if currently selected
+                if is_curve:
+                    is_current = id(fence.get('curve_data', fence)) in current_ids
+                else:
+                    is_current = id(fence) in current_ids
+                
+                # Build item widget
                 item_widget = QWidget()
-                item_widget.setStyleSheet("QWidget { background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 6px; padding: 8px; margin: 2px; } QWidget:hover { background-color: #3c3c3c; border: 1px solid #555555; }")
-                item_widget.setMouseTracking(True)
+                bg = "#1a2a1a" if is_curve else "#2a2a2a"
+                item_widget.setStyleSheet(f"QWidget {{ background-color: {bg}; border: 1px solid #3a3a3a; border-radius: 6px; padding: 8px; margin: 2px; }} QWidget:hover {{ background-color: #3c3c3c; border: 1px solid #555555; }}")
                 il = QHBoxLayout(item_widget); il.setContentsMargins(8, 8, 8, 8)
                 
                 cb = QCheckBox()
-                cb.setStyleSheet("QCheckBox::indicator { width: 18px; height: 18px; border-radius: 3px; border: 1px solid #555555; background-color: #1e1e1e; } QCheckBox::indicator:checked { background-color: #9c27b0; border: 1px solid #9c27b0; }")
+                cb.setStyleSheet("QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 3px; border: 1px solid #555555; background-color: #1e1e1e; }} QCheckBox::indicator:checked {{ background-color: #9c27b0; border: 1px solid #9c27b0; }}")
                 il.addWidget(cb)
                 
-                tl = QLabel2(f"{icon} #{idx+1}: {shape_type.capitalize()}\n{coord_count} pts | {w:.1f}×{h:.1f}m")
+                tl = QLabel2(f"{title_text}\n{len(coords)} pts | {size_str} | {source_tag}")
                 tl.setStyleSheet("color: #eeeeee; font-size: 10px; background: transparent;")
                 il.addWidget(tl, 1)
                 
                 sb = QLabel2("Selected")
                 sb.setStyleSheet("QLabel { background-color: #6a1b9a; color: white; font-size: 9px; font-weight: bold; padding: 4px 8px; border-radius: 3px; }")
-                sb.setVisible(False)
+                sb.setVisible(is_current)
                 il.addWidget(sb)
                 
                 li = QListWidgetItem(fence_list)
                 
-                db = QPushButton("🗑️")
-                db.setStyleSheet("QPushButton { background-color: transparent; color: #f44336; font-size: 14px; border: none; padding: 4px; } QPushButton:hover { background-color: #4a1414; border-radius: 4px; }")
-                il.addWidget(db)
+                # No delete button for curves (managed by curve tool)
+                if not is_curve:
+                    db = QPushButton("🗑️")
+                    db.setStyleSheet("QPushButton { background-color: transparent; color: #f44336; font-size: 14px; border: none; padding: 4px; } QPushButton:hover { background-color: #4a1414; border-radius: 4px; }")
+                    il.addWidget(db)
+                else:
+                    # Placeholder for layout alignment
+                    spacer = QWidget()
+                    spacer.setFixedSize(28, 28)
+                    il.addWidget(spacer)
                 
-                def make_toggle(badge, widget, shp):
+                def make_toggle(badge, widget, shp, ic):
                     def toggle(checked):
                         badge.setVisible(checked)
                         if checked:
-                            widget.setStyleSheet("background-color: #3a2a4a; border: 1px solid #6a1b9a; border-radius: 6px; padding: 8px; margin: 2px;")
+                            bg_c = "#2a3a2a" if ic else "#3a2a4a"
+                            widget.setStyleSheet(f"background-color: {bg_c}; border: 1px solid #6a1b9a; border-radius: 6px; padding: 8px; margin: 2px;")
                             add_selection_highlight(shp)
                         else:
                             widget.setStyleSheet("QWidget { background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 6px; padding: 8px; margin: 2px; } QWidget:hover { background-color: #3c3c3c; border: 1px solid #555555; }")
                             remove_selection_highlight(shp)
                     return toggle
-                cb.toggled.connect(make_toggle(sb, item_widget, shape))
+                cb.toggled.connect(make_toggle(sb, item_widget, fence, is_curve))
                 
-                def make_click(checkbox, delbtn):
-                    def on_press(event):
-                        if not delbtn.underMouse():
+                if is_current:
+                    item_widget.setStyleSheet("background-color: #3a2a4a; border: 1px solid #6a1b9a; border-radius: 6px; padding: 8px; margin: 2px;")
+                    add_selection_highlight(fence)
+                
+                # Click to toggle (but not on delete button)
+                if not is_curve:
+                    def make_click(checkbox, delbtn):
+                        def on_press(event):
+                            if not delbtn.underMouse():
+                                checkbox.setChecked(not checkbox.isChecked())
+                        return on_press
+                    item_widget.mousePressEvent = make_click(cb, db)
+                    
+                    def make_del(shp, lst_item, tidx):
+                        def do_del():
+                            remove_selection_highlight(shp)
+                            highlight_fence_in_3d(None)
+                            if hasattr(self.app, 'digitizer'):
+                                self.app.digitizer.clear_coordinate_labels()
+                                self.app.digitizer._remove_drawing(shp)
+                            if shp in self.selected_fences:
+                                self.selected_fences.remove(shp)
+                            for i, cw in enumerate(custom_widgets):
+                                if cw[3] is shp: custom_widgets.pop(i); break
+                            fence_list.takeItem(fence_list.row(lst_item))
+                            update_stats(); self.update_fence_display()
+                            try: self.app.vtk_widget.render()
+                            except Exception: pass
+                        return do_del
+                    db.clicked.connect(make_del(fence, li, idx))
+                else:
+                    def make_click_curve(checkbox):
+                        def on_press(event):
                             checkbox.setChecked(not checkbox.isChecked())
-                    return on_press
-                item_widget.mousePressEvent = make_click(cb, db)
-                item_widget.setCursor(Qt.PointingHandCursor)
+                        return on_press
+                    item_widget.mousePressEvent = make_click_curve(cb)
                 
-                def make_del(shp, lst_item, tidx):
-                    def do_del():
-                        remove_selection_highlight(shp)
-                        highlight_fence_in_3d(None)
-                        if hasattr(self.app, 'digitizer'):
-                            self.app.digitizer.clear_coordinate_labels()
-                            self.app.digitizer._remove_drawing(shp)
-                        if shp in self.selected_fences:
-                            self.selected_fences.remove(shp)
-                        for i, cw in enumerate(custom_widgets):
-                            if cw[3] is shp: custom_widgets.pop(i); break
-                        fence_list.takeItem(fence_list.row(lst_item))
-                        update_stats(); self.update_fence_display()
-                        try: self.app.vtk_widget.render()
-                        except Exception: pass
-                    return do_del
-                db.clicked.connect(make_del(shape, li, idx))
+                item_widget.setCursor(Qt.PointingHandCursor)
                 
                 class HoverFilter(QWidget):
                     def __init__(self, parent, sd):
@@ -5919,16 +6041,11 @@ class ByClassHeightDialog(QDialog):
                         if event.type() == QEvent.Enter: highlight_fence_in_3d(self.sd)
                         elif event.type() == QEvent.Leave: highlight_fence_in_3d(None)
                         return super().eventFilter(obj, event)
-                item_widget.installEventFilter(HoverFilter(item_widget, shape))
+                item_widget.installEventFilter(HoverFilter(item_widget, fence))
                 
                 li.setSizeHint(item_widget.sizeHint())
                 fence_list.setItemWidget(li, item_widget)
-                custom_widgets.append((cb, item_widget, sb, shape))
-            
-            if self.selected_fences:
-                sids = {id(f) for f in self.selected_fences}
-                for cb, _, _, shp in custom_widgets:
-                    if id(shp) in sids: cb.setChecked(True)
+                custom_widgets.append((cb, item_widget, sb, fence))
             
             dlayout.addWidget(fence_list)
             
@@ -5953,8 +6070,7 @@ class ByClassHeightDialog(QDialog):
             def clear_all():
                 for cb, _, _, _ in custom_widgets: cb.setChecked(False)
                 for act in selection_highlight_actors.values():
-                    try: self.app.vtk_widget.renderer.RemoveActor(act)
-                    except Exception: pass
+                    _rem_actor_from_renderer(act)
                 selection_highlight_actors.clear()
                 self.selected_fences = []; self._clear_fence_highlights()
                 self.fence_status.setText("❌ No fence selected")
@@ -5974,24 +6090,50 @@ class ByClassHeightDialog(QDialog):
                     return
                 self.permanent_fence_mode = permanent_check.isChecked()
                 if not self.permanent_fence_mode: self.selected_fences = []
-                eids = {id(f) for f in self.selected_fences}
+                
+                # Build existing IDs
+                existing_ids = set()
+                for f in self.selected_fences:
+                    if f.get('source') == 'curve_tool':
+                        existing_ids.add(id(f.get('curve_data', f)))
+                    else:
+                        existing_ids.add(id(f))
+                
                 for s in sel:
-                    if id(s) not in eids:
-                        self.selected_fences.append(s); eids.add(id(s))
-                for s in self.selected_fences:
-                    coords = s.get('coords', [])
-                    if isinstance(coords, list): coords = np.array(coords)
-                    if s['type'] in ['line', 'smart_line', 'polyline', 'smartline']:
+                    if s.get('source') == 'curve_tool':
+                        fence_id = id(s.get('curve_data', s))
+                    else:
+                        fence_id = id(s)
+                    
+                    if fence_id not in existing_ids:
+                        self.selected_fences.append(s)
+                        existing_ids.add(fence_id)
+                    
+                    # Close open shapes for polygon masking
+                    if s['type'] in ['line', 'smart_line', 'polyline', 'smartline', 'curve']:
+                        coords = s.get('coords', [])
+                        if isinstance(coords, list): coords = np.array(coords)
                         if len(coords) > 0 and not np.array_equal(coords[0], coords[-1]):
                             s['coords'] = np.vstack([coords, coords[0]]) if isinstance(coords, np.ndarray) else coords + [coords[0]]
+                
+                # Store picker actors as selection actors
+                for sid, act in selection_highlight_actors.items():
+                    if sid not in {id(f.get('curve_data', f)) if f.get('source') == 'curve_tool' else id(f) for f in self.selected_fences}:
+                        pass  # Skip actors for unselected
+                self._selection_highlight_actors = list(selection_highlight_actors.values())
+                
                 self.update_fence_display()
                 fc = len(self.selected_fences)
+                shape_fc = sum(1 for f in self.selected_fences if f.get('source') != 'curve_tool')
+                curve_fc = sum(1 for f in self.selected_fences if f.get('source') == 'curve_tool')
                 tp = sum(len(f.get('coords', [])) for f in self.selected_fences)
                 mt = "🔄 PERMANENT" if self.permanent_fence_mode else "TEMP"
-                self.fence_status.setText(f"✅ {fc} fence(s) ({tp} pts) - {mt}")
+                parts = []
+                if shape_fc: parts.append(f"{shape_fc} shape(s)")
+                if curve_fc: parts.append(f"{curve_fc} curve(s)")
+                self.fence_status.setText(f"✅ {' + '.join(parts)} ({tp} pts) - {mt}")
                 self.fence_status.setStyleSheet("QLabel { padding: 4px; background-color: #1b5e20; border-radius: 3px; color: #4caf50; font-weight: bold; }")
-                # ✅ THE FIX: hand the local blue actors to self so _clear_fence_highlights() can remove them
-                self._selection_highlight_actors = list(selection_highlight_actors.values())
+                
                 try: self.app.vtk_widget.render()
                 except Exception: pass
                 self._fence_selection_dialog = None
@@ -6005,8 +6147,7 @@ class ByClassHeightDialog(QDialog):
             def on_cl():
                 highlight_fence_in_3d(None)
                 for act in selection_highlight_actors.values():
-                    try: self.app.vtk_widget.renderer.RemoveActor(act)
-                    except Exception: pass
+                    _rem_actor_from_renderer(act)
                 selection_highlight_actors.clear()
                 self._fence_selection_dialog = None; dialog.close()
             cl.clicked.connect(on_cl)
@@ -8782,7 +8923,7 @@ class InsideFenceDialog(QDialog):
     
     
     def select_fence(self):
-        """Allow user to select single or multiple fences from digitize manager (NON-MODAL)"""
+        """Allow user to select fences from digitize manager AND curve tool"""
         
         print("\n" + "="*60)
         print("🔷 SELECT_FENCE() called")
@@ -8791,657 +8932,469 @@ class InsideFenceDialog(QDialog):
         # ✅ FIX: Reuse existing dialog instead of creating multiple instances
         if hasattr(self, '_fence_selection_dialog') and self._fence_selection_dialog is not None:
             try:
-                # Always destroy the old dialog so it gets rebuilt with fresh drawings
                 self._fence_selection_dialog.close()
             except RuntimeError:
                 pass
             self._fence_selection_dialog = None
         
         digitize = getattr(self.app, 'digitizer', None)
+        curve_tool = getattr(self.app, 'curve_tool', None)
+        
         print(f"   Digitizer found: {digitize is not None}")
+        print(f"   Curve tool found: {curve_tool is not None}")
         
-        if not digitize:
-            print("   ❌ No digitizer - showing warning")
-            QMessageBox.warning(
-                self,
-                "No Digitize Manager",
-                "Digitize manager not found.\n\n"
-                "Please ensure:\n"
-                "1. Drawing tools are enabled (Draw menu)\n"
-                "2. You've drawn at least one shape"
-            )
-            return
+        # ── Collect digitizer drawings ────────────────────────────
+        valid_shapes = []
+        if digitize:
+            drawings = getattr(digitize, 'drawings', [])
+            print(f"   Total drawings: {len(drawings)}")
+            if drawings:
+                valid_shapes = [d for d in drawings if d.get('type') in 
+                            ['rectangle', 'circle', 'polygon', 'freehand', 'line', 
+                             'smart_line', 'polyline', 'smartline']]
         
-        drawings = getattr(digitize, 'drawings', [])
-        print(f"   Total drawings: {len(drawings)}")
+        # ── Collect curve tool curves ✅ NEW ─────────────────────
+        curve_fences = []
+        if curve_tool and hasattr(curve_tool, 'get_curves_as_fences'):
+            curve_fences = curve_tool.get_curves_as_fences()
+            print(f"   Curve fences: {len(curve_fences)}")
         
-        if not drawings:
-            print("   ❌ No drawings - showing warning")
-            QMessageBox.warning(
-                self,
-                "No Drawings",
-                "No shapes found. Please draw a shape using Digitize tools first."
-            )
-            return
+        # Combine all
+        all_fences = valid_shapes + curve_fences
+        shape_count = len(valid_shapes)
+        curve_count = len(curve_fences)
         
-        # Print all drawing types
-        for idx, d in enumerate(drawings):
-            print(f"      Drawing {idx}: type='{d.get('type', 'unknown')}'")
+        print(f"   Valid shapes: {shape_count}")
+        print(f"   Curve fences: {curve_count}")
+        print(f"   Total: {len(all_fences)}")
         
-        valid_shapes = [d for d in drawings if d.get('type') in 
-                    ['rectangle', 'circle', 'polygon', 'freehand', 'line', 'smart_line', 'polyline', 'smartline']]
-        
-        print(f"   Valid shapes: {len(valid_shapes)}")
-        
-        if not valid_shapes:
-            print("   ❌ No valid shapes - showing warning")
+        if not all_fences:
             QMessageBox.warning(
                 self,
                 "No Shapes Found",
-                "No shapes found. Please draw a shape using Digitize tools first.\n\n"
-                "Supported: rectangle, circle, polygon, freehand, line, smart_line, polyline"
+                "No shapes or curves found.\n\n"
+                "• Draw shapes using Digitize tools, OR\n"
+                "• Draw curves using the Curve tool"
             )
             return
         
         print("   ✅ Creating dialog...")
         
-        # ✅ NON-MODAL MULTI-FENCE SELECTION DIALOG
         from PySide6.QtWidgets import QListWidget, QAbstractItemView, QVBoxLayout, QHBoxLayout, QPushButton, QCheckBox, QWidget, QLabel as QLabel2
         from PySide6.QtCore import Qt, QEvent
         
         try:
-            # # dialog = QDialog(self, Qt.Window)
-            # dialog.setWindowTitle("Select Fence(s)")
             dialog = QDialog(self, Qt.Window)
-            self._fence_selection_dialog = dialog  # ✅ Store reference
+            self._fence_selection_dialog = dialog
             dialog.setWindowTitle("Select Fence(s)")
-
-            dialog.setWindowModality(Qt.NonModal)  # ← CRITICAL: Non-modal
-            # dialog.setStyleSheet(self.naksha_dark_theme()) # Inherits global theme
-            dialog.resize(400, 500)
+            dialog.setWindowModality(Qt.NonModal)
+            dialog.resize(420, 500)
             
             print("   ✅ Dialog created successfully")
             
             layout = QVBoxLayout(dialog)
             
-            # Info label
+            # Info label with counts
             info_label = QLabel("Select one or more fences to use for conversion")
             info_label.setStyleSheet("color: #9c27b0; font-weight: bold; padding: 8px;")
             layout.addWidget(info_label)
+            
+            count_label = QLabel(f"📐 Digitizer: {shape_count}  |  〰️ Curves: {curve_count}")
+            count_label.setStyleSheet("color: #888888; font-size: 10px; padding: 0 8px;")
+            layout.addWidget(count_label)
             
             # Permanent mode checkbox
             permanent_check = QCheckBox("🔄 Permanent Fence Mode (keep all fences selected)")
             permanent_check.setChecked(True)
             self.permanent_fence_mode = True
             permanent_check.setStyleSheet("""
-                QCheckBox {
-                    color: #eeeeee;
-                    font-size: 11px;
-                    padding: 8px;
-                    font-weight: bold;
-                }
-                QCheckBox::indicator {
-                    width: 18px;
-                    height: 18px;
-                }
-                QCheckBox::indicator:unchecked {
-                    background-color: #2c2c2c;
-                    border: 1px solid #555555;
-                    border-radius: 3px;
-                }
-                QCheckBox::indicator:checked {
-                    background-color: #9c27b0;
-                    border: 1px solid #9c27b0;
-                    border-radius: 3px;
-                }
+                QCheckBox { color: #eeeeee; font-size: 11px; padding: 8px; font-weight: bold; }
+                QCheckBox::indicator { width: 18px; height: 18px; }
+                QCheckBox::indicator:unchecked { background-color: #2c2c2c; border: 1px solid #555555; border-radius: 3px; }
+                QCheckBox::indicator:checked { background-color: #9c27b0; border: 1px solid #9c27b0; border-radius: 3px; }
             """)
             layout.addWidget(permanent_check)
             
-            # ✅ NEW: Custom list widget with NO default styling
             fence_list = QListWidget()
             fence_list.setStyleSheet("""
-                QListWidget {
-                    background-color: #1e1e1e;
-                    border: 1px solid #3a3a3a;
-                    border-radius: 4px;
-                    padding: 4px;
-                }
-                QListWidget::item {
-                    background: transparent;
-                    border: none;
-                    padding: 2px;
-                }
+                QListWidget { background-color: #1e1e1e; border: 1px solid #3a3a3a; border-radius: 4px; padding: 4px; }
+                QListWidget::item { background: transparent; border: none; padding: 2px; }
             """)
-            fence_list.setSelectionMode(QAbstractItemView.NoSelection)  # ✅ Disable default selection
+            fence_list.setSelectionMode(QAbstractItemView.NoSelection)
             
-            # Shape icons
+            # ✅ UPDATED: Shape icons including curve
             SHAPE_ICONS = {
-                'rectangle': '▭',
-                'circle': '○',
-                'polygon': '⬟',
-                'polyline': '⬡',
-                'line': '─',
-                'smartline': '⚡',
-                'freehand': '✏️'
+                'rectangle': '▭', 'circle': '○', 'polygon': '⬟', 'polyline': '⬡',
+                'line': '─', 'smartline': '⚡', 'freehand': '✏️', 'curve': '〰️'
             }
-
-            # ✅ NEW: Create custom widget items with checkbox and "Selected" badge
-            from PySide6.QtWidgets import QListWidgetItem
-            from PySide6.QtGui import QColor
-            import numpy as np
             
-            custom_widgets = []  # Store references to custom widgets
+            custom_widgets = []
+            current_hover_actor = [None]
+            selection_highlight_actors = {}
             
-            # ✅ NEW: Hover highlight tracking
-            current_hover_actor = [None]  # Use list to maintain reference in closures
+            def _add_actor_to_renderer(actor):
+                if actor is None: return
+                try:
+                    if hasattr(actor, 'IsA') and actor.IsA('vtkActor2D'):
+                        self.app.vtk_widget.renderer.AddViewProp(actor)
+                    else:
+                        self.app.vtk_widget.renderer.AddActor(actor)
+                except Exception: pass
+            
+            def _rem_actor_from_renderer(actor):
+                if actor is None: return
+                try:
+                    if hasattr(actor, 'IsA') and actor.IsA('vtkActor2D'):
+                        self.app.vtk_widget.renderer.RemoveViewProp(actor)
+                    else:
+                        self.app.vtk_widget.renderer.RemoveActor(actor)
+                except Exception: pass
+            
+            def _make_highlight_actor(coords, color, width):
+                try:
+                    import vtk
+                    pts = vtk.vtkPoints()
+                    pts.SetDataTypeToDouble()
+                    for c in coords:
+                        z = float(c[2]) if len(c) > 2 else 0.0
+                        pts.InsertNextPoint(float(c[0]), float(c[1]), z)
+                    
+                    pl = vtk.vtkPolyLine()
+                    pl.GetPointIds().SetNumberOfIds(len(coords))
+                    for i in range(len(coords)):
+                        pl.GetPointIds().SetId(i, i)
+                    
+                    ca = vtk.vtkCellArray()
+                    ca.InsertNextCell(pl)
+                    
+                    pd = vtk.vtkPolyData()
+                    pd.SetPoints(pts)
+                    pd.SetLines(ca)
+                    
+                    mapper = vtk.vtkPolyDataMapper2D()
+                    mapper.SetInputData(pd)
+                    
+                    coord = vtk.vtkCoordinate()
+                    coord.SetCoordinateSystemToWorld()
+                    mapper.SetTransformCoordinate(coord)
+                    
+                    actor = vtk.vtkActor2D()
+                    actor.SetMapper(mapper)
+                    actor.GetProperty().SetColor(*color)
+                    actor.GetProperty().SetLineWidth(width)
+                    actor.GetProperty().SetDisplayLocationToForeground()
+                    
+                    return actor
+                except Exception:
+                    try:
+                        if hasattr(self.app, 'digitizer'):
+                            return self.app.digitizer._make_polyline_actor(coords, color=color, width=width)
+                    except Exception: pass
+                    return None
             
             def highlight_fence_in_3d(shape):
-                """Highlight a fence in the 3D view"""
-                # Remove previous hover highlight
                 if current_hover_actor[0]:
-                    try:
-                        if hasattr(self.app, 'digitizer') and hasattr(self.app.digitizer, 'overlay_renderer'):
-                            self.app.digitizer.overlay_renderer.RemoveActor(current_hover_actor[0])
-                        else:
-                            self.app.vtk_widget.renderer.RemoveActor(current_hover_actor[0])
-                        current_hover_actor[0] = None
-                    except Exception:
-                        pass
-                
+                    _rem_actor_from_renderer(current_hover_actor[0])
+                    current_hover_actor[0] = None
                 if not shape:
-                    try:
-                        self.app.vtk_widget.render()
-                    except Exception:
-                        pass
+                    try: self.app.vtk_widget.render()
+                    except Exception: pass
                     return
-                
                 coords = shape.get('coords', [])
-                if not coords:
-                    return
-                
+                if not coords: return
                 try:
-                    # Create yellow highlight actor
-                    if hasattr(self.app, 'digitizer'):
-                        highlight_actor = self.app.digitizer._make_polyline_actor(
-                            coords,
-                            color=(1, 1, 0),  # Yellow
-                            width=6
-                        )
-                    else:
-                        # Fallback: create basic actor
-                        import vtk
-                        points = vtk.vtkPoints()
-                        for c in coords:
-                            points.InsertNextPoint(c)
-                        
-                        line = vtk.vtkPolyLine()
-                        line.GetPointIds().SetNumberOfIds(len(coords))
-                        for i in range(len(coords)):
-                            line.GetPointIds().SetId(i, i)
-                        
-                        cells = vtk.vtkCellArray()
-                        cells.InsertNextCell(line)
-                        
-                        polydata = vtk.vtkPolyData()
-                        polydata.SetPoints(points)
-                        polydata.SetLines(cells)
-                        
-                        mapper = vtk.vtkPolyDataMapper()
-                        mapper.SetInputData(polydata)
-                        
-                        highlight_actor = vtk.vtkActor()
-                        highlight_actor.SetMapper(mapper)
-                        highlight_actor.GetProperty().SetColor(1, 1, 0)  # Yellow
-                        highlight_actor.GetProperty().SetLineWidth(6)
-                    
-                    if hasattr(self.app, 'digitizer') and hasattr(self.app.digitizer, 'overlay_renderer'):
-                        self.app.digitizer.overlay_renderer.AddActor(highlight_actor)
-                    else:
-                        self.app.vtk_widget.renderer.AddActor(highlight_actor)
-                    current_hover_actor[0] = highlight_actor
-                    self.app.vtk_widget.render()
-                    
+                    ha = _make_highlight_actor(coords, (1, 1, 0), 6)
+                    if ha:
+                        _add_actor_to_renderer(ha)
+                        current_hover_actor[0] = ha
+                        self.app.vtk_widget.render()
                 except Exception as e:
                     print(f"⚠️ Hover highlight failed: {e}")
             
-            for idx, shape in enumerate(valid_shapes):
-                shape_type = shape.get('type', 'unknown')
-                coords = np.array(shape.get('coords', []))
-                
-                coord_count = len(coords)
-                min_pt = coords.min(axis=0)
-                max_pt = coords.max(axis=0)
-                width = max_pt[0] - min_pt[0]
-                height = max_pt[1] - min_pt[1]
-                
-                icon = SHAPE_ICONS.get(shape_type, '◆')
-                
-                # ... [Keep your SHAPE_ICONS definition above this] ...
+            def add_selection_highlight(shp):
+                coords = shp.get('coords', [])
+                if not coords: return
+                try:
+                    act = _make_highlight_actor(coords, (0, 0.5, 1), 5)
+                    if act:
+                        _add_actor_to_renderer(act)
+                        if shp.get('source') == 'curve_tool':
+                            selection_highlight_actors[id(shp.get('curve_data', shp))] = act
+                        else:
+                            selection_highlight_actors[id(shp)] = act
+                        self.app.vtk_widget.render()
+                except Exception as e:
+                    print(f"⚠️ Selection highlight failed: {e}")
 
-                # ✅ CREATE CUSTOM WIDGET
-                item_widget = QWidget()
-                item_widget.setStyleSheet("""
-                    QWidget {
-                        background-color: #2a2a2a;
-                        border: 1px solid #3a3a3a;
-                        border-radius: 6px;
-                        padding: 8px;
-                        margin: 2px;
-                    }
-                    QWidget:hover {
-                        background-color: #3c3c3c;
-                        border: 1px solid #555555;
-                    }
-                """)
+            def remove_selection_highlight(shp):
+                if shp.get('source') == 'curve_tool':
+                    sid = id(shp.get('curve_data', shp))
+                else:
+                    sid = id(shp)
+                act = selection_highlight_actors.pop(sid, None)
+                if act:
+                    _rem_actor_from_renderer(act)
+                    try: self.app.vtk_widget.render()
+                    except Exception: pass
+            
+            # ── Build current selection IDs ───────────────────────
+            current_ids = set()
+            for f in self.selected_fences:
+                if f.get('source') == 'curve_tool':
+                    current_ids.add(id(f.get('curve_data', f)))
+                else:
+                    current_ids.add(id(f))
+            
+            # ── Build list items ──────────────────────────────────
+            for idx, fence in enumerate(all_fences):
+                stype = fence.get('type', 'unknown')
+                coords = fence.get('coords', [])
+                is_curve = fence.get('source') == 'curve_tool'
+                icon = SHAPE_ICONS.get(stype, '◆')
                 
-                item_widget.setMouseTracking(True)
+                if is_curve:
+                    curve_idx = fence.get('curve_index', idx)
+                    title_text = f"〰️ Curve #{curve_idx + 1}"
+                    source_tag = "Curve Tool"
+                else:
+                    title_text = f"{icon} #{idx+1}: {stype.capitalize()}"
+                    source_tag = "Digitizer"
+                
+                try:
+                    arr = np.array(coords)
+                    w = arr[:, 0].max() - arr[:, 0].min()
+                    h = arr[:, 1].max() - arr[:, 1].min()
+                    size_str = f"{w:.1f}×{h:.1f}m"
+                except Exception:
+                    size_str = ""
+                
+                if is_curve:
+                    is_current = id(fence.get('curve_data', fence)) in current_ids
+                else:
+                    is_current = id(fence) in current_ids
+                
+                item_widget = QWidget()
+                bg = "#1a2a1a" if is_curve else "#2a2a2a"
+                item_widget.setStyleSheet(f"QWidget {{ background-color: {bg}; border: 1px solid #3a3a3a; border-radius: 6px; padding: 8px; margin: 2px; }} QWidget:hover {{ background-color: #3c3c3c; border: 1px solid #555555; }}")
                 item_layout = QHBoxLayout(item_widget)
                 item_layout.setContentsMargins(8, 8, 8, 8)
                 
-                # 1. Checkbox
                 checkbox = QCheckBox()
-                checkbox.setStyleSheet("""
-                    QCheckBox::indicator {
-                        width: 18px; height: 18px;
-                        border-radius: 3px; border: 1px solid #555555;
-                        background-color: #1e1e1e;
-                    }
-                    QCheckBox::indicator:checked {
-                        background-color: #9c27b0; border: 1px solid #9c27b0;
-                    }
-                """)
+                checkbox.setStyleSheet("QCheckBox::indicator { width: 18px; height: 18px; border-radius: 3px; border: 1px solid #555555; background-color: #1e1e1e; } QCheckBox::indicator:checked { background-color: #9c27b0; border: 1px solid #9c27b0; }")
                 item_layout.addWidget(checkbox)
                 
-                # 2. Text info
-                text_label = QLabel2(f"{icon} #{idx+1}: {shape_type.capitalize()}\n{coord_count} pts | {width:.1f}×{height:.1f}m")
+                text_label = QLabel2(f"{title_text}\n{len(coords)} pts | {size_str} | {source_tag}")
                 text_label.setStyleSheet("color: #eeeeee; font-size: 10px; background: transparent;")
                 item_layout.addWidget(text_label, 1)
                 
-                # 3. "Selected" badge
                 selected_badge = QLabel2("Selected")
-                selected_badge.setStyleSheet("""
-                    QLabel {
-                        background-color: #6a1b9a; color: white;
-                        font-size: 9px; font-weight: bold;
-                        padding: 4px 8px; border-radius: 3px;
-                    }
-                """)
-                selected_badge.setVisible(False)
+                selected_badge.setStyleSheet("QLabel { background-color: #6a1b9a; color: white; font-size: 9px; font-weight: bold; padding: 4px 8px; border-radius: 3px; }")
+                selected_badge.setVisible(is_current)
                 item_layout.addWidget(selected_badge)
 
-                # 4. Create the List Item FIRST so we can reference it in the delete closure
                 list_item = QListWidgetItem(fence_list)
                 
-                # 🛑 5. BULLETPROOF DELETE BUTTON 🛑
-                delete_btn = QPushButton("🗑️")
-                delete_btn.setToolTip("Delete this fence permanently")
-                delete_btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: transparent; color: #f44336;
-                        font-size: 14px; border: none; padding: 4px;
-                    }
-                    QPushButton:hover {
-                        background-color: #4a1414; border-radius: 4px;
-                    }
-                """)
-                item_layout.addWidget(delete_btn)
+                # No delete button for curves
+                if not is_curve:
+                    delete_btn = QPushButton("🗑️")
+                    delete_btn.setToolTip("Delete this fence permanently")
+                    delete_btn.setStyleSheet("QPushButton { background-color: transparent; color: #f44336; font-size: 14px; border: none; padding: 4px; } QPushButton:hover { background-color: #4a1414; border-radius: 4px; }")
+                    item_layout.addWidget(delete_btn)
+                else:
+                    spacer = QWidget()
+                    spacer.setFixedSize(28, 28)
+                    item_layout.addWidget(spacer)
 
-                # Store selection highlights separately from hover
-                selection_highlight_actors = getattr(self, '_dialog_selection_actors', {})
-
-                # --- (Keep your add_selection_highlight and remove_selection_highlight here) ---
-                def add_selection_highlight(shp):
-                    # ... [Your existing add_selection_highlight logic] ...
-                    pass # Replace with your actual code
-
-                def remove_selection_highlight(shp):
-                    # ... [Your existing remove_selection_highlight logic] ...
-                    pass # Replace with your actual code
-
-                # Toggle function
-                def make_toggle_func(badge, widget, shp):
+                def make_toggle_func(badge, widget, shp, ic):
                     def toggle(checked):
                         badge.setVisible(checked)
                         if checked:
-                            widget.setStyleSheet("background-color: #3a2a4a; border: 1px solid #6a1b9a; border-radius: 6px; padding: 8px; margin: 2px;")
+                            bg_c = "#2a3a2a" if ic else "#3a2a4a"
+                            widget.setStyleSheet(f"background-color: {bg_c}; border: 1px solid #6a1b9a; border-radius: 6px; padding: 8px; margin: 2px;")
                             add_selection_highlight(shp)
                         else:
                             widget.setStyleSheet("QWidget { background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 6px; padding: 8px; margin: 2px; } QWidget:hover { background-color: #3c3c3c; border: 1px solid #555555; }")
                             remove_selection_highlight(shp)
                     return toggle
                 
-                checkbox.toggled.connect(make_toggle_func(selected_badge, item_widget, shape))
-                # ADD RIGHT AFTER that line:
-                def make_row_click_func(cb, btn):
-                    def on_mouse_press(event):
-                        # Only toggle if click is NOT on the delete button
-                        if not btn.underMouse():
+                checkbox.toggled.connect(make_toggle_func(selected_badge, item_widget, fence, is_curve))
+                
+                if is_current:
+                    item_widget.setStyleSheet("background-color: #3a2a4a; border: 1px solid #6a1b9a; border-radius: 6px; padding: 8px; margin: 2px;")
+                    add_selection_highlight(fence)
+                
+                if not is_curve:
+                    def make_row_click_func(cb, btn):
+                        def on_mouse_press(event):
+                            if not btn.underMouse():
+                                cb.setChecked(not cb.isChecked())
+                        return on_mouse_press
+                    item_widget.mousePressEvent = make_row_click_func(checkbox, delete_btn)
+                    
+                    def make_delete_func(shp, lst_item, target_idx):
+                        def delete_action():
+                            remove_selection_highlight(shp)
+                            highlight_fence_in_3d(None)
+                            if hasattr(self.app, 'digitizer'):
+                                self.app.digitizer.clear_coordinate_labels()
+                                self.app.digitizer._remove_drawing(shp)
+                            if shp in self.selected_fences:
+                                self.selected_fences.remove(shp)
+                            for i, cw in enumerate(custom_widgets):
+                                if cw[3] is shp: custom_widgets.pop(i); break
+                            fence_list.takeItem(fence_list.row(lst_item))
+                            update_stats(); self.update_fence_display()
+                            try: self.app.vtk_widget.render()
+                            except Exception: pass
+                        return delete_action
+                    delete_btn.clicked.connect(make_delete_func(fence, list_item, idx))
+                else:
+                    def make_click_curve(cb):
+                        def on_mouse_press(event):
                             cb.setChecked(not cb.isChecked())
-                    return on_mouse_press
-
-                item_widget.mousePressEvent = make_row_click_func(checkbox, delete_btn)
+                        return on_mouse_press
+                    item_widget.mousePressEvent = make_click_curve(checkbox)
+                
                 item_widget.setCursor(Qt.PointingHandCursor)
 
-                # ✅ CRITICAL MEMORY-SAFE DELETION CLOSURE
-                # ✅ CRITICAL MEMORY-SAFE DELETION CLOSURE
-                def make_delete_func(shp, lst_item, target_idx):
-                    def delete_action():
-                        print(f"🗑️ Deleting fence #{target_idx+1}...")
-                        
-                        # A. Strip Dialog Highlights
-                        remove_selection_highlight(shp)
-                        highlight_fence_in_3d(None)
-
-                        # B. Destroy VTK actors via DigitizeManager
-                        if hasattr(self.app, 'digitizer'):
-                            # 🛑 FAILSAFE: Force clear the selection markers from the UI
-                            self.app.digitizer.clear_coordinate_labels()
-                            self.app.digitizer._remove_drawing(shp)
-                        
-                        # C. Remove from Dialog's selected tracker
-                        if shp in self.selected_fences:
-                            self.selected_fences.remove(shp)
-                        
-                        # D. Remove from tracking arrays
-                        for i, cw in enumerate(custom_widgets):
-                            if cw[3] is shp:
-                                custom_widgets.pop(i)
-                                break
-                                
-                        # E. Rip it out of the Qt UI
-                        row = fence_list.row(lst_item)
-                        fence_list.takeItem(row)
-                        
-                        # F. Update Stats & UI
-                        update_stats()
-                        self.update_fence_display()
-                        
-                        # G. Force VTK hardware flush
-                        try:
-                            self.app.vtk_widget.render()
-                        except Exception: pass
-                        
-                    return delete_action
-                
-                # Bind the closure
-                delete_btn.clicked.connect(make_delete_func(shape, list_item, idx))
-
-                # Event filter for hover
                 class HoverEventFilter(QWidget):
                     def __init__(self, parent, shape_data):
                         super().__init__(parent)
                         self.shape_data = shape_data
-                    
                     def eventFilter(self, obj, event):
-                        if event.type() == QEvent.Enter:
-                            highlight_fence_in_3d(self.shape_data)
-                        elif event.type() == QEvent.Leave:
-                            highlight_fence_in_3d(None)
+                        if event.type() == QEvent.Enter: highlight_fence_in_3d(self.shape_data)
+                        elif event.type() == QEvent.Leave: highlight_fence_in_3d(None)
                         return super().eventFilter(obj, event)
                 
-                item_widget.installEventFilter(HoverEventFilter(item_widget, shape))
-                checkbox.setProperty("shape_data", shape)
+                item_widget.installEventFilter(HoverEventFilter(item_widget, fence))
                 
-                # Bind widget to the list item we created earlier
                 list_item.setSizeHint(item_widget.sizeHint())
-                fence_list.addItem(list_item) # Technically already attached by passing fence_list to constructor, but safe.
+                fence_list.addItem(list_item)
                 fence_list.setItemWidget(list_item, item_widget)
                 
-                custom_widgets.append((checkbox, item_widget, selected_badge, shape))
-            
-            # Pre-select already selected fences
-            # ✅ FIXED: Pre-select already selected fences using ID comparison
-            if self.selected_fences:
-                selected_fence_ids = {id(f) for f in self.selected_fences}
-                for checkbox, widget, badge, shape in custom_widgets:
-                    if id(shape) in selected_fence_ids:
-                        checkbox.setChecked(True)
+                custom_widgets.append((checkbox, item_widget, selected_badge, fence))
             
             layout.addWidget(fence_list)
             
-            # Stats label
             stats_label = QLabel("Select one or more fences")
             stats_label.setStyleSheet("color: #aaaaaa; font-size: 9px; padding: 4px;")
             layout.addWidget(stats_label)
             
             def update_stats():
                 count = sum(1 for cb, _, _, _ in custom_widgets if cb.isChecked())
-                if count == 0:
-                    stats_label.setText("⚠️ No fences selected")
-                elif count == 1:
-                    stats_label.setText("✅ 1 fence selected")
-                else:
-                    stats_label.setText(f"✅ {count} fences selected")
+                if count == 0: stats_label.setText("⚠️ No fences selected")
+                elif count == 1: stats_label.setText("✅ 1 fence selected")
+                else: stats_label.setText(f"✅ {count} fences selected")
             
-            # Connect all checkboxes to stats update
             for checkbox, _, _, _ in custom_widgets:
                 checkbox.toggled.connect(update_stats)
             
-            # Buttons
             button_layout = QHBoxLayout()
             
             select_all_btn = QPushButton("Select All")
-            select_all_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #1976d2;
-                    color: white;
-                    font-size: 10px;
-                    padding: 6px 12px;
-                    border-radius: 3px;
-                }
-                QPushButton:hover {
-                    background-color: #1565c0;
-                }
-            """)
-            
-            def select_all():
-                for checkbox, _, _, _ in custom_widgets:
-                    checkbox.setChecked(True)
-            
-            select_all_btn.clicked.connect(select_all)
+            select_all_btn.setStyleSheet("QPushButton { background-color: #1976d2; color: white; font-size: 10px; padding: 6px 12px; border-radius: 3px; }")
+            select_all_btn.clicked.connect(lambda: [cb.setChecked(True) for cb, _, _, _ in custom_widgets])
             button_layout.addWidget(select_all_btn)
             
             clear_btn = QPushButton("Clear All")
-            clear_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #555555;
-                    color: white;
-                    font-size: 10px;
-                    padding: 6px 12px;
-                    border-radius: 3px;
-                }
-                QPushButton:hover {
-                    background-color: #666666;
-                }
-            """)
-            
+            clear_btn.setStyleSheet("QPushButton { background-color: #555555; color: white; font-size: 10px; padding: 6px 12px; border-radius: 3px; }")
             def clear_all_fences():
-                """Clear list selection AND stored fences"""
-                for checkbox, _, _, _ in custom_widgets:
-                    checkbox.setChecked(False)
+                for cb, _, _, _ in custom_widgets: cb.setChecked(False)
                 for actor in selection_highlight_actors.values():
-                    try:
-                        self.app.vtk_widget.renderer.RemoveActor(actor)
-                    except Exception:
-                        pass
+                    _rem_actor_from_renderer(actor)
                 selection_highlight_actors.clear()
                 self.selected_fences = []
                 self._clear_fence_highlights()
-                
                 self.fence_status.setText("❌ No fence selected")
-                self.fence_status.setStyleSheet("""
-                    QLabel {
-                        padding: 6px;
-                        background-color: #2c2c2c;
-                        border-radius: 3px;
-                        color: #f44336;
-                    }
-                """)
-                
+                self.fence_status.setStyleSheet("QLabel { padding: 6px; background-color: #2c2c2c; border-radius: 3px; color: #f44336; }")
                 self.fence_count_badge.setText("0")
                 stats_label.setText("⚠️ All fences cleared")
-                print("🗑️ Clear All: Removed all fence selections and highlights")
-                if hasattr(self.app, 'digitizer'):
-                    self.app.digitizer.drawings.clear()
-                    custom_widgets.clear()
-                    fence_list.clear()
-                    try: self.app.vtk_widget.render()
-                    except Exception: pass
-                print("🗑️ Clear All: Removed all fence selections, highlights and drawings")
-
-            clear_btn.clicked.connect(clear_all_fences) 
+            clear_btn.clicked.connect(clear_all_fences)
             button_layout.addWidget(clear_btn)
             
             button_layout.addStretch()
             
-            # Apply button
             apply_btn = QPushButton("Apply Selection")
-            apply_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #2e7d32;
-                    color: white;
-                    font-size: 10px;
-                    font-weight: bold;
-                    padding: 6px 16px;
-                    border-radius: 3px;
-                }
-                QPushButton:hover {
-                    background-color: #388e3c;
-                }
-            """)
+            apply_btn.setStyleSheet("QPushButton { background-color: #2e7d32; color: white; font-size: 10px; font-weight: bold; padding: 6px 16px; border-radius: 3px; }")
             
             def apply_selection():
-                print("   🔘 Apply Selection clicked")
-                
-                # ✅ Only remove HOVER highlight (yellow), DON'T clear selection highlights (blue)
                 highlight_fence_in_3d(None)
-                
-                # Get checked items
-                selected_shapes = [shape for checkbox, _, _, shape in custom_widgets if checkbox.isChecked()]
+                selected_shapes = [shp for cb, _, _, shp in custom_widgets if cb.isChecked()]
                 
                 if not selected_shapes:
                     QMessageBox.warning(dialog, "No Selection", "Please select at least one fence")
                     return
                 
-                # ✅ SAVE PERMANENT MODE STATE FIRST
                 self.permanent_fence_mode = permanent_check.isChecked()
-                print(f"🔍 DEBUG: Permanent mode set to = {self.permanent_fence_mode}")
                 
-                # ✅ CLEAR old fences ONLY if temporary mode
                 if not self.permanent_fence_mode:
-                    print("   → TEMPORARY mode - will clear fences after conversion")
                     self.selected_fences = []
-                else:
-                    print("   → PERMANENT mode - will keep fences after conversion")
                 
-                # ✅ FIXED: Use ID-based comparison instead of direct comparison
-                existing_fence_ids = {id(f) for f in self.selected_fences}
+                # Build existing IDs
+                existing_ids = set()
+                for f in self.selected_fences:
+                    if f.get('source') == 'curve_tool':
+                        existing_ids.add(id(f.get('curve_data', f)))
+                    else:
+                        existing_ids.add(id(f))
                 
                 for shape in selected_shapes:
-                    if id(shape) not in existing_fence_ids:
+                    if shape.get('source') == 'curve_tool':
+                        fence_id = id(shape.get('curve_data', shape))
+                    else:
+                        fence_id = id(shape)
+                    
+                    if fence_id not in existing_ids:
                         self.selected_fences.append(shape)
-                        existing_fence_ids.add(id(shape))
+                        existing_ids.add(fence_id)
+                    
+                    # Close open shapes
+                    if shape['type'] in ['line', 'smart_line', 'polyline', 'smartline', 'curve']:
+                        coords = shape.get('coords', [])
+                        if isinstance(coords, list): coords = np.array(coords)
+                        if len(coords) > 0 and not np.array_equal(coords[0], coords[-1]):
+                            shape['coords'] = np.vstack([coords, coords[0]]) if isinstance(coords, np.ndarray) else coords + [coords[0]]
                 
+                self._selection_highlight_actors = list(selection_highlight_actors.values())
                 self.update_fence_display()
                 
-                # Close lines into polygons
-                for shape in self.selected_fences:
-                    shape_type = shape['type']
-                    coords = shape.get('coords', [])
-                    
-                    if isinstance(coords, list):
-                        coords = np.array(coords)
-                    
-                    if shape_type in ['line', 'smart_line', 'polyline', 'smartline']:
-                        if len(coords) > 0:
-                            first_point = coords[0]
-                            last_point = coords[-1]
-                            
-                            if not np.array_equal(first_point, last_point):
-                                if isinstance(coords, list):
-                                    coords = coords + [coords[0]]
-                                else:
-                                    coords = np.vstack([coords, coords[0]])
-                                
-                                shape['coords'] = coords
-                
                 fence_count = len(self.selected_fences)
-                total_points = sum(len(f.get('coords', [])) for f in self.selected_fences)
-                
+                shape_fc = sum(1 for f in self.selected_fences if f.get('source') != 'curve_tool')
+                curve_fc = sum(1 for f in self.selected_fences if f.get('source') == 'curve_tool')
+                total_pts = sum(len(f.get('coords', [])) for f in self.selected_fences)
                 mode_text = "🔄 PERMANENT" if self.permanent_fence_mode else "TEMP"
                 
-                self.fence_status.setText(
-                    f"✅ {fence_count} fence(s) selected ({total_points} total points) - {mode_text}"
-                )
-                self.fence_status.setStyleSheet("""
-                    QLabel {
-                        padding: 6px;
-                        background-color: #1b5e20;
-                        border-radius: 3px;
-                        color: #4caf50;
-                        font-weight: bold;
-                    }
-                """)
+                parts = []
+                if shape_fc: parts.append(f"{shape_fc} shape(s)")
+                if curve_fc: parts.append(f"{curve_fc} curve(s)")
                 
-                print(f"   ✅ Applied: {fence_count} fence(s) - {mode_text} mode")
+                self.fence_status.setText(f"✅ {' + '.join(parts)} selected ({total_pts} pts) - {mode_text}")
+                self.fence_status.setStyleSheet("QLabel { padding: 6px; background-color: #1b5e20; border-radius: 3px; color: #4caf50; font-weight: bold; }")
                 
-                try:
-                    self.app.vtk_widget.render()
-                except Exception:
-                    pass
+                try: self.app.vtk_widget.render()
+                except Exception: pass
                 
-                self._fence_selection_dialog = None  # ← ADD THIS
+                self._fence_selection_dialog = None
                 dialog.close()
                 dialog.deleteLater()
-                print(f"   ✅ Dialog closed (blue selection highlights remain)")
-                            
+            
             apply_btn.clicked.connect(apply_selection)
             button_layout.addWidget(apply_btn)
             
-            # Close button
             close_btn = QPushButton("Close")
-            close_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #555555;
-                    color: white;
-                    font-size: 10px;
-                    padding: 6px 16px;
-                    border-radius: 3px;
-                }
-                QPushButton:hover {
-                    background-color: #666666;
-                }
-            """)
-            
-            # def on_close():
-            #     # ✅ NEW: Remove hover highlight when closing
-            #     highlight_fence_in_3d(None)
-            #     for actor in selection_highlight_actors.values():
-            #         try:
-            #             self.app.vtk_widget.renderer.RemoveActor(actor)
-            #         except Exception:
-            #             pass
-            #     selection_highlight_actors.clear()
-            #     dialog.close()
-
+            close_btn.setStyleSheet("QPushButton { background-color: #555555; color: white; font-size: 10px; padding: 6px 16px; border-radius: 3px; }")
             def on_close():
                 highlight_fence_in_3d(None)
                 for actor in selection_highlight_actors.values():
-                    try:
-                        self.app.vtk_widget.renderer.RemoveActor(actor)  # ✅ fixed
-                    except Exception:
-                        pass
+                    _rem_actor_from_renderer(actor)
                 selection_highlight_actors.clear()
                 self._fence_selection_dialog = None
                 dialog.close()
-            
-            
             close_btn.clicked.connect(on_close)
             button_layout.addWidget(close_btn)
             
             layout.addLayout(button_layout)
             
-            print("   ✅ Showing dialog...")
             dialog.show()
             print("   ✅ Dialog shown successfully!")
             print("="*60 + "\n")
@@ -9451,7 +9404,6 @@ class InsideFenceDialog(QDialog):
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Failed to create fence selection dialog:\n{str(e)}")
-        
 
     # ==================== CONVERSION LOGIC ====================
 

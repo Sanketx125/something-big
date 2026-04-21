@@ -3,7 +3,7 @@ Curve Ribbon for NakshaAI
 Provides curve drawing tools with MicroStation-style point-by-point workflow
 """
 
-from PySide6.QtWidgets import QWidget, QHBoxLayout
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton
 from PySide6.QtCore import Signal
 
 

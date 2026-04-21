@@ -1165,6 +1165,172 @@ class NakshaApp(QMainWindow):
         except Exception:
             pass                       #####
 
+    def clear_project(app):
+        """
+        Safely clear the current project from the NakshaApp instance.
+        Resets all viewers, layers, drawings, and temporary states.
+        ✅ FIXED: Now properly closes all cross-section windows
+        """
+        reply = QMessageBox.question(
+            app,
+            "Confirm Clear Project",
+            "Are you sure you want to clear the current project?\n"
+            "All unsaved data, drawings, and layers will be removed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.No:
+            return
+
+        try:
+            print("\n" + "="*60)
+            print("🧹 CLEARING PROJECT")
+            print("="*60)
+
+            # --- Clear main viewer ---
+            if hasattr(app, "vtk_widget") and app.vtk_widget:
+                app.vtk_widget.clear()
+                app.vtk_widget.render()
+                print("✅ Main viewer cleared")
+
+            # --- ✅ Close ALL cross-section dock windows (Views 1-4) ---
+            if hasattr(app, "section_docks") and app.section_docks:
+                for view_idx, dock in list(app.section_docks.items()):
+                    try:
+                        print(f"   Closing Cross Section View {view_idx + 1}...")
+                        dock.setVisible(False)  # Hide first
+                        dock.close()            # Then close
+                        dock.deleteLater()      # Schedule deletion
+                        print(f"   ✅ Closed Cross Section View {view_idx + 1}")
+                    except Exception as e:
+                        print(f"   ⚠️ Failed to close View {view_idx + 1}: {e}")
+                
+                # Clear the dictionaries
+                app.section_docks.clear()
+                print("✅ All cross-section docks closed")
+
+            # --- ✅ Clear cross-section VTK widgets ---
+            if hasattr(app, "section_vtks") and app.section_vtks:
+                for view_idx, vtk_widget in list(app.section_vtks.items()):
+                    try:
+                        vtk_widget.clear()
+                        vtk_widget.render()
+                        print(f"✅ Cleared VTK widget for View {view_idx + 1}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to clear VTK View {view_idx + 1}: {e}")
+                
+                app.section_vtks.clear()
+
+            # --- Clear legacy section view ---
+            if hasattr(app, "sec_vtk") and app.sec_vtk:
+                app.sec_vtk.clear()
+                app.sec_vtk.render()
+                print("✅ Legacy section view cleared")
+
+            # --- ✅ Clear section controller ---
+            if hasattr(app, "section_controller") and app.section_controller:
+                try:
+                    app.section_controller.clear()
+                    app.section_controller.active_view = None
+                    app.section_controller.current_vtk = None
+                    if hasattr(app.section_controller, 'view_vtks'):
+                        app.section_controller.view_vtks.clear()
+                    print("✅ Section controller cleared")
+                except Exception as e:
+                    print(f"⚠️ Section controller clear failed: {e}")
+
+            # --- ✅ Clear cut section if active ---
+            if hasattr(app, "cut_section_controller") and app.cut_section_controller:
+                try:
+                    if hasattr(app.cut_section_controller, 'clear'):
+                        app.cut_section_controller.clear()
+                    app.cut_section_controller.cut_points = None
+                    print("✅ Cut section cleared")
+                except Exception as e:
+                    print(f"⚠️ Cut section clear failed: {e}")
+
+            # --- Clear layers ---
+            if hasattr(app, "layers"):
+                app.layers.clear()
+                print("✅ Layers cleared")
+
+            # --- Clear digitizer drawings ---
+            if hasattr(app, "digitizer"):
+                app.digitizer.clear_drawings()
+                print("✅ Drawings cleared")
+
+            # --- ✅ Clear stored section data ---
+            for i in range(4):
+                for attr in [f"section_{i}_core_points", f"section_{i}_buffer_points",
+                            f"section_{i}_core_mask", f"section_{i}_buffer_mask"]:
+                    if hasattr(app, attr):
+                        try:
+                            delattr(app, attr)
+                        except Exception:
+                            pass
+            print("✅ Section data cleared")
+
+            # --- ✅ Close Display Mode dialog ---
+            if hasattr(app, "display_dialog") and app.display_dialog:
+                try:
+                    app.display_dialog.close()
+                    app.display_dialog = None
+                    print("✅ Display Mode dialog closed")
+                except Exception:
+                    pass
+
+            if hasattr(app, "display_mode_dialog") and app.display_mode_dialog:
+                try:
+                    app.display_mode_dialog.close()
+                    app.display_mode_dialog = None
+                except Exception:
+                    pass
+
+            # --- ✅ Close Class Picker ---
+            if hasattr(app, "class_picker") and app.class_picker:
+                try:
+                    app.class_picker.close()
+                    app.class_picker = None
+                    print("✅ Class Picker closed")
+                except Exception:
+                    pass
+
+            # --- Reset classification and data ---
+            app.data = None
+            app.project_crs_epsg = None
+            app.project_crs_wkt = None
+            app.loaded_file = None
+            app.last_save_path = None
+            app.class_palette = {}
+
+            # --- ✅ Clear view palettes ---
+            if hasattr(app, "view_palettes"):
+                app.view_palettes.clear()
+
+            # --- ✅ Clear undo/redo ---
+            if hasattr(app, "undo_stack"):
+                app.undo_stack.clear()
+            if hasattr(app, "redo_stack"):
+                app.redo_stack.clear()
+
+            # --- ✅ Deactivate classification tools ---
+            app.active_classify_tool = None
+
+            # --- Reset window title ---
+            app._update_window_title(None, None)
+            app.statusBar().showMessage("🧹 Project cleared successfully.", 3000)
+            
+            print("="*60)
+            print("✅ PROJECT CLEARED SUCCESSFULLY")
+            print("="*60 + "\n")
+
+        except Exception as e:
+            print(f"⚠️ Error while clearing project: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(app, "Error", f"Failed to clear project:\n{e}")
+
     def _update_settings_icon(self):
         import os
         from pathlib import Path
@@ -2552,19 +2718,6 @@ class NakshaApp(QMainWindow):
                     pass
                 
                 print(f"   🔗 Syncing section: View {target_idx + 1} from View {source_idx + 1} (mode={view_mode})")
-                
-                # ✅ COOLDOWN CHECK: Skip rebuild if target view was just built
-                try:
-                    from gui.unified_actor_manager import _section_build_timestamps, _SECTION_BUILD_COOLDOWN
-                    last_build = _section_build_timestamps.get(target_idx, 0)
-                    if (time.perf_counter() - last_build) < _SECTION_BUILD_COOLDOWN:
-                        print(f"      ⚡ SKIP sync rebuild View {target_idx+1} (recently built)")
-                        if source_cam:
-                            self._apply_camera_immediate(vtk_widget, source_cam)
-                            self._last_camera_states[target_idx] = source_cam.copy()
-                        continue
-                except Exception:
-                    pass
                 
                 # Save current active view
                 prev_active = getattr(self.section_controller, "active_view", None)
@@ -9903,17 +10056,9 @@ class NakshaApp(QMainWindow):
         """
         Optimized single cross-section view refresh.
         ✅ UNIFIED ACTOR PATH: Builds a single _section_X_unified actor per view.
+        This enables sync_palette_to_gpu, undo/redo, and per-view weights to work
+        through the same GPU uniform system as the Main View.
         """
-        # ✅ COOLDOWN CHECK: Skip if actor was just built
-        try:
-            from gui.unified_actor_manager import _section_build_timestamps, _SECTION_BUILD_COOLDOWN
-            last_build = _section_build_timestamps.get(view_idx, 0)
-            if (time.perf_counter() - last_build) < _SECTION_BUILD_COOLDOWN:
-                print(f"   ⚡ SKIP _refresh_single_section_view View {view_idx+1} (built {(time.perf_counter() - last_build)*1000:.0f}ms ago)")
-                return
-        except Exception:
-            pass
-        
         if not hasattr(self, 'section_vtks') or view_idx not in self.section_vtks:
             print(f"⏭️ View {view_idx} not found")
             return

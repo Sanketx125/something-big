@@ -96,7 +96,7 @@ def safe_vtk_operation(func):
             try:
                 from PySide6.QtCore import QTimer
                 QTimer.singleShot(20, lambda: func(*args, **kwargs))
-            except:
+            except Exception:
                 pass
             return None
         

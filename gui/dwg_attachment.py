@@ -1,6 +1,41 @@
+
+"""
+dwg_attachment.py
+─────────────────────────────────────────────────────────────────────────────
+Direct DWG loading system for NakshaAI.
+
+NO conversion. NO temp files. NO DXF intermediate.
+Reads DWG binary directly via ezdxf (supports AC1015–AC1032 / R2000–R2018+).
+
+Architecture
+────────────
+  DWGLoadWorker          – QThread: reads DWG, counts layers, detects PRJ
+  DWGFileItem            – Row widget per file (checkbox, PRJ badge, count,
+                           layer picker, display options, remove)
+  DWGLayerDialog         – Checkbox list of layers with All/None/Invert
+  DWGDisplayDialog       – Overlay/Underlay + colour override
+  MultiDWGDialog         – Main dialog (Browse → list → Attach All)
+
+Integration
+────────────
+  • app.vtk_widget.renderer   – renderer used directly
+  • app.vtk_widget.renderer.GetActiveCamera() – for follower actors
+  • app.crs                   – project CRS (pyproj)
+  • app.dwg_actors            – list[dict] stored on app (mirrors dxf_actors)
+  • app.dwg_attachments       – list[dict] stored on app
+
+Coordinates
+────────────
+  If a .PRJ sits next to the .DWG and app.crs is set, every vertex is
+  reprojected with pyproj Transformer (always_xy=True) in the worker thread,
+  so the render is already in project coordinates by the time the main thread
+  touches it.  z_offset of +0.1 m places DWG above the point cloud.
+"""
+
 from __future__ import annotations
 
 import os
+import struct
 import traceback
 import numpy as np
 from pathlib import Path
@@ -9,9 +44,10 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QMessageBox, QCheckBox, QGroupBox, QRadioButton,
     QScrollArea, QWidget, QComboBox, QListWidget, QListWidgetItem,
-    QProgressDialog,
+    QProgressDialog, QSizePolicy,
 )
 from PySide6.QtCore import Qt, Signal, QThread, QCoreApplication
+from PySide6.QtGui import QColor
 from gui.theme_manager import (
     get_dialog_stylesheet, get_progress_dialog_stylesheet,
     get_title_banner_style, get_file_item_row_style,
@@ -21,6 +57,7 @@ from gui.theme_manager import (
 # ── optional deps (always available in the target env) ──────────────────────
 try:
     import ezdxf
+    from ezdxf.document import Drawing
     from ezdxf.addons import odafc as _odafc
     _EZDXF = True
 except ImportError:

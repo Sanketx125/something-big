@@ -149,7 +149,7 @@ class SectionController:
                         self._draw_freehand_preview_cut()
                     else:
                         self._draw_freehand_preview()
-                except:
+                except Exception:
                     pass
                 return
             
@@ -165,7 +165,7 @@ class SectionController:
                         self._draw_brush_preview_cut(pt, radius)
                     else:
                         self._draw_brush_preview(pt, radius)
-                except:
+                except Exception:
                     pass
                 return
             
@@ -177,7 +177,7 @@ class SectionController:
     
                 P2 = self._display_to_world_no_snap(x, y, z_lock=self.P1[2])
                 
-            except:
+            except Exception:
                 return
 
             
@@ -439,7 +439,7 @@ class SectionController:
         if hasattr(self, "rubber_actor") and self.rubber_actor:
             try:
                 self.app.vtk_widget.renderer.RemoveActor(self.rubber_actor)
-            except:
+            except Exception:
                 pass
         
         # Create points array
@@ -744,7 +744,9 @@ class SectionController:
         """
         TRUE cursor-following centerline (2D overlay, no depth test)
         """
- 
+        if self._should_throttle_update():
+            return
+
         # Initialize 2D overlay if needed
         if not hasattr(self, '_centerline_actor_2d') or self._centerline_actor_2d is None:
             self._init_centerline_2d()
@@ -985,7 +987,7 @@ class SectionController:
         if hasattr(self, 'rubber_actor') and self.rubber_actor:
             try:
                 self.app.vtk_widget.renderer.RemoveActor(self.rubber_actor)
-            except:
+            except Exception:
                 pass
             self.rubber_actor = None
        
@@ -1043,7 +1045,7 @@ class SectionController:
             vtk_widget = self._get_active_vtk()
             if vtk_widget:
                 renderers.append(vtk_widget.renderer)
-        except:
+        except Exception:
             pass
  
         # Digitize / picked renderer (CRITICAL)
@@ -1059,7 +1061,7 @@ class SectionController:
                     ren.RemoveActor2D(actor)
                 else:
                     ren.RemoveActor(actor)
-            except:
+            except Exception:
                 pass
  
  
@@ -1100,280 +1102,306 @@ class SectionController:
 
 
     def finalize_section(self, P1, P2):
-        """
-        ✅ MICROSTATION METHOD:
-        - Width = ONLY what user dragged (half_width)
-        - Buffer extends LENGTH (along the line) only
-        ✅ FIXED:
-        - Stores section-local transformed coordinates (X=along, Y=across, Z=elev)
-            so CUT SECTION works again
-        - Creates the selected cross-section dock on-demand
-        - Keeps world-point copies for debugging / future needs
-        """
-
-        import numpy as np
-
-        # ---------------- SAFETY ----------------
-        if self.half_width is None:
-            print("⚠️ Half width not set")
-            return
-
-        if not hasattr(self.app, 'data') or self.app.data is None or 'xyz' not in self.app.data:
-            print("❌ No point cloud data loaded!")
-            self.finalize_rectangle()
-            return
-
-        xyz = self.app.data["xyz"]
-        if xyz is None or len(xyz) == 0:
-            print("❌ Point cloud data is empty!")
-            self.finalize_rectangle()
-            return
-
-        # Apply line style before finalizing rectangle
-        style = getattr(self.app, "cross_line_style", "solid")
-        if style != "solid":
-            print(f"🎨 Applying {style} style to rectangle before finalization")
-            if hasattr(self, 'update_rectangle_style'):
-                try:
-                    self.update_rectangle_style()
-                    self.app.vtk_widget.render()
-                    print(f"✅ Style applied: {style}")
-                except Exception as e:
-                    print(f"⚠️ Failed to apply style: {e}")
-
-        # Remove preview rectangle
-        self.finalize_rectangle()
-
-        # ---------------- GEOMETRY ----------------
-        v = P2[:2] - P1[:2]
-        length = float(np.linalg.norm(v))
-        if length < 1e-9:
-            print("❌ Invalid section line (zero length)")
-            return
-
-        dir_vec = v / length
-        perp = np.array([-dir_vec[1], dir_vec[0]], dtype=np.float64)
-
-        buffer = float(getattr(self.app, "section_buffer", 2.0))
-
-        print(f"✅ Cross-section computed:")
-        print(f"   Line: P1={P1[:2]}, P2={P2[:2]}")
-        print(f"   Length: {length:.2f}m")
-        print(f"   Core width: ±{self.half_width:.2f}m (user drag)")
-        print(f"   Buffer depth: {buffer:.2f}m (length extension only)")
-
-        rel = xyz[:, :2] - P1[:2]
-        along = rel @ dir_vec
-        across = rel @ perp
-
-        core_mask = (
-            (along >= 0.0) & (along <= length) &
-            (np.abs(across) <= float(self.half_width))
-        )
-
-        buffer_mask = (
-            (along >= -buffer) & (along <= length + buffer) &
-            (np.abs(across) <= float(self.half_width)) &
-            (~core_mask)
-        )
-
-        full_mask = core_mask | buffer_mask
-
-        core_count = int(np.sum(core_mask))
-        buf_count = int(np.sum(buffer_mask))
-        total_count = int(np.sum(full_mask))
-
-        print(f"   Core points: {core_count}")
-        print(f"   Buffer points: {buf_count}")
-
-        if total_count == 0:
-            print("⚠️ No points found in cross-section")
-            return
-
-        # ---------------- BUILD SECTION-LOCAL POINTS ----------------
-        # SECTION-LOCAL COORDINATE SYSTEM (this is what your cut-section expects):
-        #   X = along distance (0..length)
-        #   Y = perpendicular distance (±half_width)
-        #   Z = elevation
-        core_points_local = np.column_stack([
-            along[core_mask],
-            across[core_mask],
-            xyz[core_mask, 2]
-        ]).astype(np.float64, copy=False)
-
-        buffer_points_local = np.column_stack([
-            along[buffer_mask],
-            across[buffer_mask],
-            xyz[buffer_mask, 2]
-        ]).astype(np.float64, copy=False)
-
-        all_points_local = np.column_stack([
-            along[full_mask],
-            across[full_mask],
-            xyz[full_mask, 2]
-        ]).astype(np.float64, copy=False)
-
-        # World copies (optional but useful)
-        core_points_world = xyz[core_mask]
-        buffer_points_world = xyz[buffer_mask]
-        all_points_world = xyz[full_mask]
-
-        # ---------------- STORE PER-VIEW DATA ----------------
-        view_index = int(getattr(self, "active_view", 0))
-
-        core_indices = np.where(core_mask)[0]
-        buffer_indices = np.where(buffer_mask)[0]
-        section_indices = np.where(full_mask)[0]
-
-        setattr(self.app, f'section_{view_index}_P1', P1)
-        setattr(self.app, f'section_{view_index}_P2', P2)
-        setattr(self.app, f'section_{view_index}_half_width', float(self.half_width))
-
-        # ✅ Store LOCAL points (used for plotting + picking + cut-section workflow)
-        setattr(self.app, f'section_{view_index}_core_points', core_points_local)
-        setattr(self.app, f'section_{view_index}_buffer_points', buffer_points_local)
-
-        # ✅ Store WORLD points too (safe, doesn’t break anything)
-        setattr(self.app, f'section_{view_index}_core_points_world', core_points_world)
-        setattr(self.app, f'section_{view_index}_buffer_points_world', buffer_points_world)
-        setattr(self.app, f'section_{view_index}_points_world', all_points_world)
-
-        setattr(self.app, f'section_{view_index}_core_mask', core_mask)
-        setattr(self.app, f'section_{view_index}_buffer_mask', buffer_mask)
-        setattr(self.app, f'section_{view_index}_core_indices', core_indices)
-        setattr(self.app, f'section_{view_index}_buffer_indices', buffer_indices)
-        setattr(self.app, f'section_{view_index}_indices', section_indices)
-
-        # ✅ These are what CutSectionController reads
-        setattr(self.app, f'section_{view_index}_points_transformed', all_points_local)
-        setattr(self.app, f'section_{view_index}_combined_mask', full_mask)
-
-                # ✅ Clear build cache when NEW section data is created
-        try:
-            from gui.unified_actor_manager import _section_build_timestamps
-            _section_build_timestamps.pop(view_index, None)
-        except Exception:
-            pass
-        
-        print(f"💾 Stored section data for View {view_index + 1}")
-        print(f"   ✅ Transformed coordinates stored for cut section ({len(all_points_local)} points)")
-
-        # ---------------- STORE GLOBAL (BACKWARD COMPAT) ----------------
-        # Many parts of your app re-use these globals
-        self.app.section_core_points = core_points_local
-        self.app.section_buffer_points = buffer_points_local
-        self.app.section_core_mask = core_mask
-        self.app.section_core_indices = core_indices
-        self.app.section_indices = section_indices
-
-        self.last_mask = full_mask
-        self.app.section_points = all_points_local  # ✅ IMPORTANT: section_points should be LOCAL in cross-section context
-
-        # ---------------- ENSURE DOCK EXISTS ----------------
-        if not hasattr(self.app, 'section_vtks') or view_index not in self.app.section_vtks:
-            print(f"🔨 Creating View {view_index + 1} dock on-demand...")
-            if hasattr(self.app, '_open_specific_cross_section_view'):
-                self.app._open_specific_cross_section_view(view_index)
-                print(f"✅ View {view_index + 1} dock created")
-            else:
-                print("❌ Cannot create dock - _open_specific_cross_section_view not found")
-                return
-        if view_index in self.app.section_docks:
-            dock = self.app.section_docks[view_index]
-        
-            # Restore from minimized state
-            if dock.isMinimized():
-                dock.showNormal()
-        
-            # Make visible if hidden
-            if not dock.isVisible():
-                dock.show()
-        
-            # Bring to front and activate
-            dock.raise_()
-            dock.activateWindow()
-        
-            print(f"✨ Auto-displayed Cross Section View {view_index + 1}")    
-
-        # ---------------- PLOT (LOCAL POINTS) ----------------
-        # ✅ CRITICAL FIX: Disable camera sync during initial rendering
-        # This prevents the initial plot + zoom from triggering a sync cascade
-        prev_syncing = getattr(self.app, '_syncing_camera', False)
-        self.app._syncing_camera = True
-
-        self._plot_section(
-            core_points_local,
-            buffer_points_local,
-            view=getattr(self.app, "cross_view_mode", "front")
-        )
-
-        try:
-            vtk_widget = self._get_active_vtk()
-            self._fit_camera_to_section_points(vtk_widget, core_points_local)
-        except Exception as e:
-            print(f"   ⚠️ Force zoom failed: {e}")  ###
+                """
+                ✅ MICROSTATION METHOD:
+                - Width = ONLY what user dragged (half_width)
+                - Buffer extends LENGTH (along the line) only
+                ✅ FIXED:
+                - Stores section-local transformed coordinates (X=along, Y=across, Z=elev)
+                    so CUT SECTION works again
+                - Creates the selected cross-section dock on-demand
+                - Keeps world-point copies for debugging / future needs
+                """
     
-        # ✅ Re-enable camera sync BEFORE auto-apply
-        # Auto-apply will handle its own sync prevention
-        self.app._syncing_camera = prev_syncing
+                import numpy as np
+    
+                # ---------------- SAFETY ----------------
+                if self.half_width is None:
+                    print("⚠️ Half width not set")
+                    return
+    
+                if not hasattr(self.app, 'data') or self.app.data is None or 'xyz' not in self.app.data:
+                    print("❌ No point cloud data loaded!")
+                    self.finalize_rectangle()
+                    return
+    
+                xyz = self.app.data["xyz"]
+                if xyz is None or len(xyz) == 0:
+                    print("❌ Point cloud data is empty!")
+                    self.finalize_rectangle()
+                    return
+    
+                # Apply line style before finalizing rectangle
+                style = getattr(self.app, "cross_line_style", "solid")
+                if style != "solid":
+                    print(f"🎨 Applying {style} style to rectangle before finalization")
+                    if hasattr(self, 'update_rectangle_style'):
+                        try:
+                            self.update_rectangle_style()
+                            self.app.vtk_widget.render()
+                            print(f"✅ Style applied: {style}")
+                        except Exception as e:
+                            print(f"⚠️ Failed to apply style: {e}")
+    
+                # Remove preview rectangle
+                self.finalize_rectangle()
+    
+                # ---------------- GEOMETRY ----------------
+                v = P2[:2] - P1[:2]
+                length = float(np.linalg.norm(v))
+                if length < 1e-9:
+                    print("❌ Invalid section line (zero length)")
+                    return
+    
+                dir_vec = v / length
+                perp = np.array([-dir_vec[1], dir_vec[0]], dtype=np.float64)
+    
+                buffer = float(getattr(self.app, "section_buffer", 2.0))
+    
+                print(f"✅ Cross-section computed:")
+                print(f"   Line: P1={P1[:2]}, P2={P2[:2]}")
+                print(f"   Length: {length:.2f}m")
+                print(f"   Core width: ±{self.half_width:.2f}m (user drag)")
+                print(f"   Buffer depth: {buffer:.2f}m (length extension only)")
+    
+                # ── MICROSTATION-LEVEL MEMORY: minimal allocs for 50M-point files ──
+                # rel would be (N,2) float64 = 800 MB for 50M pts — avoid it.
+                # @ operator with (N,2)·(2,) is BLAS-optimised; peak = 1.6 GB.
+                rel    = xyz[:, :2] - P1[:2]   # (N,2) float64 — freed below
+                along  = rel @ dir_vec          # (N,)  float64
+                across = rel @ perp             # (N,)  float64
+                del rel                         # free 800 MB immediately
 
-        # ════════════════════════════════════════════════════════════════════════════════════
-        # ✅ AUTO-APPLY: Isolated palette to THIS VIEW ONLY (NOT main view)
-        # ════════════════════════════════════════════════════════════════════════════════════
+                half_w = float(self.half_width)
+                core_mask = (
+                    (along >= 0.0) & (along <= length) &
+                    (np.abs(across) <= half_w)
+                )
 
-        try:
-            if hasattr(self.app, 'display_mode_dialog') and self.app.display_mode_dialog is not None:
-                dialog = self.app.display_mode_dialog
-                target_slot = view_index + 1  # View 0 = slot 1, View 1 = slot 2, etc.
+                buffer_mask = (
+                    (along >= -buffer) & (along <= length + buffer) &
+                    (np.abs(across) <= half_w) &
+                    (~core_mask)
+                )
+
+                full_mask = core_mask | buffer_mask
+
+                core_count  = int(np.count_nonzero(core_mask))
+                buf_count   = int(np.count_nonzero(buffer_mask))
+                total_count = core_count + buf_count
+
+                print(f"   Core points: {core_count}")
+                print(f"   Buffer points: {buf_count}")
+
+                if total_count == 0:
+                    del along, across
+                    print("⚠️ No points found in cross-section")
+                    return
+
+                # ── BUILD SECTION-LOCAL POINTS (float32 — sufficient for display) ──
+                # Coordinate system: X=along (0..length), Y=across (±half_w), Z=elev.
+                # float64 → float32 halves section-point memory (12 B vs 24 B/pt).
+                core_indices    = np.flatnonzero(core_mask)
+                buffer_indices  = np.flatnonzero(buffer_mask)
+                # section_indices: core-first, buffer-second (preserves display order)
+                section_indices = np.concatenate([core_indices, buffer_indices])
+
+                # Extract filtered coords from along/across, then free them
+                _ca = along[core_mask];   _cb = across[core_mask]
+                _ba = along[buffer_mask]; _bb = across[buffer_mask]
+                del along, across   # free 800 MB — masks already computed
+
+                core_points_local = np.column_stack([
+                    _ca, _cb, xyz[core_indices, 2]
+                ]).astype(np.float32, copy=False)
+                del _ca, _cb
+
+                buffer_points_local = np.column_stack([
+                    _ba, _bb, xyz[buffer_indices, 2]
+                ]).astype(np.float32, copy=False)
+                del _ba, _bb
+
+                # all_points_local: concat instead of recomputing full_mask pass
+                all_points_local = np.vstack([core_points_local, buffer_points_local])
+
+                # World-coordinate copies eliminated — use indices for on-demand access.
+                # (xyz[section_indices] if ever needed downstream)
+
+                # ---------------- STORE PER-VIEW DATA ----------------
+                view_index = int(getattr(self, "active_view", 0))
+    
+                setattr(self.app, f'section_{view_index}_P1', P1)
+                setattr(self.app, f'section_{view_index}_P2', P2)
+                setattr(self.app, f'section_{view_index}_half_width', float(self.half_width))
+    
+                # ✅ Store LOCAL points (used for plotting + picking + cut-section workflow)
+                setattr(self.app, f'section_{view_index}_core_points', core_points_local)
+                setattr(self.app, f'section_{view_index}_buffer_points', buffer_points_local)
+    
+                setattr(self.app, f'section_{view_index}_core_mask', core_mask)
+                setattr(self.app, f'section_{view_index}_buffer_mask', buffer_mask)
+                setattr(self.app, f'section_{view_index}_core_indices', core_indices)
+                setattr(self.app, f'section_{view_index}_buffer_indices', buffer_indices)
+                setattr(self.app, f'section_{view_index}_indices', section_indices)
+    
+                # ✅ These are what CutSectionController reads
+                setattr(self.app, f'section_{view_index}_points_transformed', all_points_local)
+                setattr(self.app, f'section_{view_index}_combined_mask', full_mask)
+    
+                print(f"💾 Stored section data for View {view_index + 1}")
+                print(f"   ✅ Transformed coordinates stored for cut section ({len(all_points_local)} points)")
+    
+                # ---------------- STORE GLOBAL (BACKWARD COMPAT) ----------------
+                # Many parts of your app re-use these globals
+                self.app.section_core_points = core_points_local
+                self.app.section_buffer_points = buffer_points_local
+                self.app.section_core_mask = core_mask
+                self.app.section_core_indices = core_indices
+                self.app.section_indices = section_indices
+    
+                self.last_mask = full_mask
+                self.app.section_points = all_points_local  # ✅ IMPORTANT: section_points should be LOCAL in cross-section context
+    
+                # ---------------- ENSURE DOCK EXISTS ----------------
+                if not hasattr(self.app, 'section_vtks') or view_index not in self.app.section_vtks:
+                    print(f"🔨 Creating View {view_index + 1} dock on-demand...")
+                    if hasattr(self.app, '_open_specific_cross_section_view'):
+                        self.app._open_specific_cross_section_view(view_index)
+                        print(f"✅ View {view_index + 1} dock created")
+                    else:
+                        print("❌ Cannot create dock - _open_specific_cross_section_view not found")
+                        return
+                if view_index in self.app.section_docks:
+                    dock = self.app.section_docks[view_index]
+                
+                    # Restore from minimized state
+                    if dock.isMinimized():
+                        dock.showNormal()
+                
+                    # Make visible if hidden
+                    if not dock.isVisible():
+                        dock.show()
+                
+                    # Bring to front and activate
+                    dock.raise_()
+                    dock.activateWindow()
+                
+                    print(f"✨ Auto-displayed Cross Section View {view_index + 1}")    
+    
+                # ---------------- PLOT (LOCAL POINTS) ----------------
+                # ✅ CRITICAL FIX: Disable camera sync during initial rendering
+                # This prevents the initial plot + zoom from triggering a sync cascade
+                prev_syncing = getattr(self.app, '_syncing_camera', False)
+                self.app._syncing_camera = True
+    
+                self._plot_section(
+                    core_points_local,
+                    buffer_points_local,
+                    view=getattr(self.app, "cross_view_mode", "front")
+                )
+    
+                # # ---------------- FORCE ZOOM TO CORE ----------------
+                # # Fixes "view zoomed out/down" issue by ignoring buffer points for camera setup
+                # try:
+                #     vtk_widget = self._get_active_vtk()
+                #     if vtk_widget and len(core_points_local) > 0:
+                #         # 1. Calculate bounds of ONLY the core (user-selected) points
+                #         xmin, ymin, zmin = core_points_local.min(axis=0)
+                #         xmax, ymax, zmax = core_points_local.max(axis=0)
+
+                #         # 2. Force 2D orthographic camera BEFORE ResetCamera
+                #         # Cross section local coords: X=along, Y=across, Z=elevation
+                #         # We look along the Y axis so we see X (along) vs Z (elevation)
+                #         camera = vtk_widget.renderer.GetActiveCamera()
+                #         camera.ParallelProjectionOn()
+                #         xc = (xmin + xmax) / 2.0
+                #         zc = (zmin + zmax) / 2.0
+                #         y_dist = max(xmax - xmin, zmax - zmin) * 3.0 + 1.0
+                #         camera.SetPosition(xc, -y_dist, zc)
+                #         camera.SetFocalPoint(xc, 0.0, zc)
+                #         camera.SetViewUp(0.0, 0.0, 1.0)
+
+                #         # 3. Reset camera to fit the XZ data bounds (along vs elevation)
+                #         bounds = [xmin, xmax, ymin, ymax, zmin, zmax]
+                #         vtk_widget.renderer.ResetCamera(bounds)
+
+                #         # 4. Zoom out slightly (5% margin) so points aren't touching edges
+                #         camera.Zoom(0.95)
+
+                #         vtk_widget.renderer.ResetCameraClippingRange()
+                #         vtk_widget.render()
+                #         print(f"   🔎 2D view: Zoomed to core bounds X=[{xmin:.2f}, {xmax:.2f}] Z=[{zmin:.2f}, {zmax:.2f}]")
+                # except Exception as e:
+                #     print(f"   ⚠️ Force zoom failed: {e}")
+
+                # ---------------- FIT CAMERA ----------------
+                try:
+                    vtk_widget = self._get_active_vtk()
+                    self._fit_camera_to_section_points(vtk_widget, core_points_local)
+                except Exception as e:
+                    print(f"   ⚠️ Force zoom failed: {e}")  ###
             
-                if hasattr(dialog, 'view_palettes') and target_slot in dialog.view_palettes:
-                    view_palette = dialog.view_palettes[target_slot]
-                
-                    print(f" 📋 Using view_palettes[{target_slot}] for View {view_index + 1}")
-                    print(f" 📊 Palette has {len(view_palette)} classes")
-                
-                    # ✅ CRITICAL: Call ISOLATED apply (only affects THIS view, not main)
-                    self._auto_apply_view_palette(view_index, view_palette)
-                
-                    print(f" ✅ Auto-apply complete for View {view_index + 1}")
-                else:
-                    print(f" ⚠️ No view-specific palette for slot {target_slot}")
-            else:
-                print(f" ⚠️ Display Mode dialog not open - skipping auto-apply")
-            
-        except Exception as e:
-            print(f" ⚠️ Auto-apply failed: {e}")
-            import traceback
-            traceback.print_exc()
+                # ✅ Re-enable camera sync BEFORE auto-apply
+                # Auto-apply will handle its own sync prevention
+                self.app._syncing_camera = prev_syncing
+    
+                # ════════════════════════════════════════════════════════════════════════════════════
+                # ✅ AUTO-APPLY: Isolated palette to THIS VIEW ONLY (NOT main view)
+                # ════════════════════════════════════════════════════════════════════════════════════
+    
+                try:
+                    if hasattr(self.app, 'display_mode_dialog') and self.app.display_mode_dialog is not None:
+                        dialog = self.app.display_mode_dialog
+                        target_slot = view_index + 1  # View 0 = slot 1, View 1 = slot 2, etc.
+                    
+                        if hasattr(dialog, 'view_palettes') and target_slot in dialog.view_palettes:
+                            view_palette = dialog.view_palettes[target_slot]
+                        
+                            print(f" 📋 Using view_palettes[{target_slot}] for View {view_index + 1}")
+                            print(f" 📊 Palette has {len(view_palette)} classes")
+                        
+                            # ✅ CRITICAL: Call ISOLATED apply (only affects THIS view, not main)
+                            self._auto_apply_view_palette(view_index, view_palette)
+                        
+                            print(f" ✅ Auto-apply complete for View {view_index + 1}")
+                        else:
+                            print(f" ⚠️ No view-specific palette for slot {target_slot}")
+                    else:
+                        print(f" ⚠️ Display Mode dialog not open - skipping auto-apply")
+                    
+                except Exception as e:
+                    print(f" ⚠️ Auto-apply failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+    
+                finally:
+                    print(f"{'='*60}\n")
 
-        finally:
-            print(f"{'='*60}\n")
+                # ═══════════════════════════════════════════════════════════
+                # FIX 3: View Context Invalidation — flush stale state
+                # ═══════════════════════════════════════════════════════════
+                try:
+                    # Invalidate classify interactor coord cache for this view
+                    if hasattr(self.app, 'classify_interactors'):
+                        interactor = self.app.classify_interactors.get(view_index)
+                        if interactor and hasattr(interactor, '_invalidate_coord_cache'):
+                            interactor._invalidate_coord_cache()
+                            print(f"   🔄 View {view_index + 1}: coord cache invalidated")
 
-        # ═══════════════════════════════════════════════════════════
-        # FIX 3: View Context Invalidation — flush stale state
-        # ═══════════════════════════════════════════════════════════
-        try:
-            # Invalidate classify interactor coord cache for this view
-            if hasattr(self.app, 'classify_interactors'):
-                interactor = self.app.classify_interactors.get(view_index)
-                if interactor and hasattr(interactor, '_invalidate_coord_cache'):
-                    interactor._invalidate_coord_cache()
-                    print(f"   🔄 View {view_index + 1}: coord cache invalidated")
-
-            # Build unified actor for this cross-section view
-            if hasattr(self.app, '_refresh_single_section_view'):
-                self.app._refresh_single_section_view(view_index)
-                print(f"   ✅ View {view_index + 1}: unified actor built")
-            else:
-                # Fallback to sync if refresh not available
-                from gui.unified_actor_manager import sync_palette_to_gpu
-                slot_idx = view_index + 1
-                sync_palette_to_gpu(self.app, slot_idx)
-                print(f"   ⚡ View {view_index + 1}: GPU palette synced (slot {slot_idx})")
-        except ImportError:
-            pass
-        except Exception as e:
-            print(f"   ⚠️ View context invalidation failed: {e}")
+                    # Build unified actor for this cross-section view
+                    if hasattr(self.app, '_refresh_single_section_view'):
+                        self.app._refresh_single_section_view(view_index)
+                        print(f"   ✅ View {view_index + 1}: unified actor built")
+                    else:
+                        # Fallback to sync if refresh not available
+                        from gui.unified_actor_manager import sync_palette_to_gpu
+                        slot_idx = view_index + 1
+                        sync_palette_to_gpu(self.app, slot_idx)
+                        print(f"   ⚡ View {view_index + 1}: GPU palette synced (slot {slot_idx})")
+                except ImportError:
+                    pass
+                except Exception as e:
+                    print(f"   ⚠️ View context invalidation failed: {e}")
 
     ##NEWWW
     def _fit_camera_to_section_points(self, vtk_widget, points, padding_fraction=0.18):
@@ -1586,7 +1614,7 @@ class SectionController:
                     "ps": cam.GetParallelScale(),
                     "pp": cam.GetParallelProjection(),
                 }
-            except:
+            except Exception:
                 cam_state = None
            
             # ✅ CRITICAL: Disable camera sync during this render to prevent blinking cascade
@@ -2150,8 +2178,9 @@ class SectionController:
             active_palette = palette or getattr(self.app, 'class_palette', {})
 
             # Access the VTK Color Buffer
-            polydata = actor.GetMapper().GetInput()
-            vtk_colors = polydata.GetPointData().GetScalars()
+            _m = actor.GetMapper()
+            polydata = _m.GetInput() if _m else None
+            vtk_colors = polydata.GetPointData().GetScalars() if polydata else None
             
             if vtk_colors:
                 # Create a local Lookup Table for speed
@@ -2597,7 +2626,7 @@ class SectionController:
         if self.rubber_actor:
             try:
                 self.app.vtk_widget.renderer.RemoveActor(self.rubber_actor)
-            except:
+            except Exception:
                 pass
             self.rubber_actor = None
         
@@ -2669,7 +2698,7 @@ class SectionController:
                 continue
 
             # VTK index in core actor
-            vtk_i = np.where(self.app.section_core_mask)[0].tolist().index(idx)
+            vtk_i = np.flatnonzero(self.app.section_core_mask).tolist().index(idx)
 
             code = int(cls[idx])
             entry = palette.get(code, {"color": (128,128,128)})
@@ -2764,7 +2793,7 @@ class SectionController:
                 try:
                     self.app.classify_interactor._invalidate_coord_cache()
                     print("   ✅ Classification coordinate cache cleared")
-                except:
+                except Exception:
                     pass
             
             # Get section data for active view

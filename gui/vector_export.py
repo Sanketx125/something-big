@@ -4,9 +4,11 @@
 # Supports DXF, GeoJSON, and Shapefile formats with full metadata
 # ============================================================================
 
+import os
+import json
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from PySide6.QtWidgets import QMessageBox, QFileDialog
 
 
@@ -26,7 +28,7 @@ def diagnose_app_data(app):
                     print(f"   • {attr}: {type(val).__name__} (length: {len(val)})")
                 elif not callable(val):
                     print(f"   • {attr}: {type(val).__name__}")
-            except:
+            except Exception:
                 pass
     
     # Check for point cloud specifically
@@ -73,6 +75,7 @@ def export_drawings_to_shapefile(app, output_path: str) -> bool:
     try:
         import geopandas as gpd
         from shapely.geometry import Point, LineString, Polygon
+        import pandas as pd
         
         print(f"\n{'='*60}")
         print(f"📤 EXPORTING DRAWINGS TO SHAPEFILE")
@@ -138,7 +141,7 @@ def export_drawings_to_shapefile(app, output_path: str) -> bool:
                     coords_empty = (coords is None or 
                                 (isinstance(coords, list) and len(coords) == 0) or
                                 (hasattr(coords, '__len__') and len(coords) == 0))
-                except:
+                except Exception:
                     coords_empty = True
                 
                 if coords_empty:
@@ -160,7 +163,7 @@ def export_drawings_to_shapefile(app, output_path: str) -> bool:
                 elif not isinstance(coords, list):
                     try:
                         coords = list(coords)
-                    except:
+                    except Exception:
                         coords = []
                 
                 # ✅ Convert each coordinate from numpy array to list/tuple
@@ -587,7 +590,7 @@ def import_drawings_from_shapefile(app, input_path: str) -> bool:
                 try:
                     app.vtk_widget.GetRenderWindow().Render()
                     print(f"   ✅ VTK render triggered")
-                except:
+                except Exception:
                     pass
             
             # Try calling update method
@@ -595,7 +598,7 @@ def import_drawings_from_shapefile(app, input_path: str) -> bool:
                 try:
                     app.update_display()
                     print(f"   ✅ Display update called")
-                except:
+                except Exception:
                     pass
             
             # Try refresh method
@@ -603,7 +606,7 @@ def import_drawings_from_shapefile(app, input_path: str) -> bool:
                 try:
                     app.refresh()
                     print(f"   ✅ Refresh called")
-                except:
+                except Exception:
                     pass
             
             print(f"   ✅ Imported {imported_count} drawings")
@@ -2060,7 +2063,7 @@ def export_drawings_to_tiff(app, output_path: str) -> bool:
                     
                     if 0 <= row < height and 0 <= col < width:
                         raster[row, col] = 128  # Gray for point cloud
-                except:
+                except Exception:
                     continue
             
             print(f"   ✅ Point cloud rasterized")

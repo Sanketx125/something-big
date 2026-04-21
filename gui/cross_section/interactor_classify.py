@@ -1,4 +1,5 @@
-﻿from json import tool
+
+from json import tool
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage, vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper, vtkCoordinate
 from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray
@@ -6,10 +7,14 @@ from vtkmodules.vtkCommonCore import vtkPoints
 import vtk
 import numpy as np
 import time
+from gui.vtk_utils import force_vtk_pipeline_update
 # ✅ Shared helper — avoids triggering shading rebuild when no mesh exists yet
 from gui.classification_tools import _shading_mesh_exists
           
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+    QDoubleSpinBox, QPushButton, QSlider, QWidget
+)
 from PySide6.QtCore import QTimer
 from PySide6.QtCore import Qt, QPoint, QPointF, QLineF
 from PySide6.QtGui import QPainter, QColor, QPen
@@ -175,25 +180,58 @@ class ClassificationInteractor:
         self.is_drawing_freehand = False
         
         self._brush_grid_size = 50  # Grid cells for spatial lookup
-        self._brush_spatial_index = None
-        self._last_brush_build_time = 0
-        
+        self._brush_spatial_index      = None
+        self._brush_spatial_index_xyz_id = None  # id()-based cache key; rebuild only on new file
+        self._brush_sort_order         = None
+        self._brush_grid_params        = None
+
         # ✅ BRUSH OPTIMIZATION: Smooth interpolation
         self._brush_interpolation_step = 0.5  # Smaller = smoother
         self._brush_min_move_distance = 0.1  # Minimum movement to register
-        
+
         # ✅ BRUSH OPTIMIZATION: Render throttling
         self._brush_render_counter = 0
         self._brush_render_every = 3
-        
-        # ✅ TEST: Draw a test line to verify rendering works
-        self._draw_test_line()
+
+        # Brush stroke state (initialized here so cleanup() is always safe)
+        self._brush_accumulated_mask = None
+        self._brush_old_classes = {}
+        self._brush_frame_chunks = []
+        self._brush_stroke_positions = []
+        self._last_brush_center = None
+        self._brush_needs_render = False
+        self._brush_main_visible_classes = None
+        self._brush_main_visible_classes_arr = None
+        self.app._suppress_section_refresh = False
+        self.is_dragging = False
+
+        # Background worker (kept alive across strokes, stopped in cleanup())
+        self._brush_worker = None
+        self._brush_worker_active = False
+        self._roi_preview = None
         
         print("✅ ClassificationInteractor initialized with live previews")
         self.style.AddObserver("RightButtonPressEvent", self.on_right_press)
 
     def cleanup(self):
         """Clear transient preview state before this interactor is discarded."""
+        # Remove all observers added in __init__ to prevent accumulation across
+        # tool switches (each switch creates a new interactor, adding 6+ observers
+        # to the same VTK style; after 100+ switches this causes O(N) dispatch cost
+        # and holds references preventing GC).
+        try:
+            if self.style is not None:
+                for event in ("LeftButtonPressEvent", "LeftButtonReleaseEvent",
+                              "KeyPressEvent", "MouseMoveEvent",
+                              "MiddleButtonPressEvent", "MiddleButtonReleaseEvent",
+                              "LeftButtonDoubleClickEvent"):
+                    try:
+                        self.style.RemoveObservers(event)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         try:
             self._finalize_pending_main_brush_stroke()
         except Exception as e:
@@ -219,6 +257,7 @@ class ClassificationInteractor:
         self.is_drawing_freehand = False
         self._is_panning = False  # ✅ BUG FIX: Reset panning state on cleanup
         self._pan_render_pending = False
+
         self._hide_preview_overlay_for_pan()
         timer = getattr(self, "_deferred_left_release_timer", None)
         if timer is not None:
@@ -227,9 +266,44 @@ class ClassificationInteractor:
             except Exception:
                 pass
 
+        # ── Task-2/3: cleanup ROI preview and worker on interactor discard ──
+        try:
+            roi = getattr(self, "_roi_preview", None)
+            if roi is not None:
+                roi.destroy()
+                self._roi_preview = None
+        except Exception:
+            pass
+        try:
+            w = getattr(self, "_brush_worker", None)
+            if w is not None:
+                # 1. Disconnect signal FIRST — prevents queued results from
+                #    arriving on a partially-destroyed slot after stop().
+                try:
+                    w.result_ready.disconnect()
+                except Exception:
+                    pass
+                # 2. Signal the thread to stop.
+                w.stop()
+                # 3. Drain the input queue so the thread doesn't block on get().
+                try:
+                    import queue as _q
+                    while True:
+                        w._queue.get_nowait()
+                except Exception:
+                    pass
+                # 4. Wait for thread to finish; hard-kill if it hangs.
+                if not w.wait(3000):
+                    w.terminate()
+                    w.wait(500)
+                self._brush_worker = None
+                self._brush_worker_active = False
+        except Exception:
+            pass
+
     def _get_preview_actor_names(self):
         return [
-            "line_actor", "dotted_actor", "rect_actor", "circle_actor",
+            "line_actor", "dotted_actor", "rect_actor", "circle_actor", "circle_actor_main",
             "brush_actor", "polygon_actor", "freehand_actor", "poly_actor",
             "line_actor_cut", "dotted_actor_cut", "rect_actor_cut", "circle_actor_cut",
             "brush_actor_cut", "freehand_actor_cut", "poly_actor_cut",
@@ -244,7 +318,7 @@ class ClassificationInteractor:
             "above_line": [f"line_actor{suffix}", f"dotted_actor{suffix}"],
             "below_line": [f"line_actor{suffix}", f"dotted_actor{suffix}"],
             "rectangle": [f"rect_actor{suffix}"],
-            "circle": [f"circle_actor{suffix}"],
+            "circle": [f"circle_actor_main"] if suffix == "" and self._is_main_view() else [f"circle_actor{suffix}"],
             "freehand": [f"freehand_actor{suffix}"],
             "polygon": [f"poly_actor{suffix}"],
             "brush": [f"brush_actor{suffix}"],
@@ -818,6 +892,14 @@ class ClassificationInteractor:
             self._is_panning = True
             self._last_pan_pos = self.interactor.GetEventPosition()
 
+            # Interactive-mode rendering: skip expensive still-render steps
+            try:
+                rw = self.interactor.GetRenderWindow()
+                if rw is not None:
+                    rw.SetDesiredUpdateRate(30.0)
+            except Exception:
+                pass
+
             tool = getattr(self.app, "active_classify_tool", None)
             has_preview_gesture = bool(
                 self._has_active_drag_classification(tool)
@@ -830,7 +912,6 @@ class ClassificationInteractor:
                 # otherwise the preview appears frozen while the cloud moves.
                 self._hide_preview_overlay_for_pan()
                 self._start_deferred_left_release_watch()
-            print("🖱️ Middle button PRESSED - starting pan")
             
         except (RuntimeError, AttributeError):
             pass
@@ -843,6 +924,15 @@ class ClassificationInteractor:
         self._last_render_time = 0.0
         self._hide_preview_overlay_for_pan()
         self._start_deferred_left_release_watch()
+
+        # Restore still-render quality and force one full-quality frame
+        try:
+            rw = self.interactor.GetRenderWindow() if self.interactor else None
+            if rw is not None:
+                rw.SetDesiredUpdateRate(0.001)
+                rw.Render()
+        except Exception:
+            pass
 
     def _is_classification_paused_for_pan(self, tool=None):
         """
@@ -990,6 +1080,17 @@ class ClassificationInteractor:
         """Render on the Qt event loop (valid OpenGL context). Called by QTimer."""
         self._pan_render_pending = False
         try:
+            import time as _time
+            now = _time.perf_counter()
+            # Cap interactive pan renders to 60 fps (16 ms). If the last render
+            # finished too recently, re-schedule rather than saturating the GPU.
+            if now - getattr(self, '_last_pan_render_time', 0.0) < 0.016:
+                if not getattr(self, '_pan_render_pending', False):
+                    self._pan_render_pending = True
+                    QTimer.singleShot(8, self._execute_deferred_pan_render)
+                return
+            self._last_pan_render_time = now
+
             vtk_widget = self._get_active_vtk_widget()
             if vtk_widget is not None:
                 # ✅ Check widget is visible (Qt-level, safe)
@@ -1081,7 +1182,6 @@ class ClassificationInteractor:
                         perpendicular_coord = float(np.median(section_xyz[:, 1]))
             
             self._coord_cache[cache_key] = perpendicular_coord
-            print(f"✅ Cached {cache_key} = {perpendicular_coord:.2f}")
         
         perpendicular_coord = self._coord_cache[cache_key]
         
@@ -1094,7 +1194,6 @@ class ClassificationInteractor:
         """Clear coordinate cache when section changes"""
         if hasattr(self, '_coord_cache'):
             self._coord_cache.clear()
-            print("🔄 Coordinate cache cleared")
         
     def _get_view_coordinates(self, pt):
         """
@@ -1244,56 +1343,29 @@ class ClassificationInteractor:
             section_points_transformed = getattr(app, f"section_{view_idx}_points_transformed", None)
             
             if combined_mask is not None and section_points_transformed is not None:
-                num_points = combined_mask.sum() if hasattr(combined_mask, 'sum') else len([x for x in combined_mask if x])
-                print(f"   ✅ _get_section_context [Path 1]: Pre-computed combined_mask + transformed points")
-                print(f"      View: {view_idx}, Points: {num_points:,} (core + buffer)")
                 return combined_mask, section_points_transformed
-            
-            # ═══════════════════════════════════════════════════════════
-            # FALLBACK PATH 2: Build combined mask from separate core + buffer masks
-            # ═══════════════════════════════════════════════════════════
-            core_mask = getattr(app, f"section_{view_idx}_core_mask", None)
+
+            core_mask   = getattr(app, f"section_{view_idx}_core_mask",   None)
             buffer_mask = getattr(app, f"section_{view_idx}_buffer_mask", None)
-            
-            # Check if we have any masks at all
+
             if core_mask is None and buffer_mask is None:
-                print(f"   ⚠️ _get_section_context [Path 2]: No masks found for view {view_idx}")
                 return None, None
-            
-            # Build combined mask
+
             if core_mask is None:
                 combined_mask = buffer_mask
-                print(f"   ⚠️ _get_section_context [Path 2]: Only buffer_mask available (unusual)")
             elif buffer_mask is None:
                 combined_mask = core_mask
-                print(f"   ⚠️ _get_section_context [Path 2]: Only core_mask available (no buffer)")
             else:
-                combined_mask = (core_mask | buffer_mask)
-                core_count = core_mask.sum() if hasattr(core_mask, 'sum') else len([x for x in core_mask if x])
-                buffer_count = buffer_mask.sum() if hasattr(buffer_mask, 'sum') else len([x for x in buffer_mask if x])
-                total_count = combined_mask.sum() if hasattr(combined_mask, 'sum') else len([x for x in combined_mask if x])
-                print(f"   ✅ _get_section_context [Path 2]: Built combined mask")
-                print(f"      Core: {core_count:,}, Buffer: {buffer_count:,}, Total: {total_count:,}")
-            
-            # ═══════════════════════════════════════════════════════════
-            # SUB-PATH 2A: Try to use transformed points (preferred)
-            # ═══════════════════════════════════════════════════════════
+                combined_mask = core_mask | buffer_mask
+
             section_points_transformed = getattr(app, f"section_{view_idx}_points_transformed", None)
             if section_points_transformed is not None:
-                print(f"   ✅ _get_section_context [Path 2A]: Using transformed points")
                 return combined_mask, section_points_transformed
-            
-            # ═══════════════════════════════════════════════════════════
-            # SUB-PATH 2B: Fall back to raw xyz coordinates (last resort)
-            # ═══════════════════════════════════════════════════════════
-            # This is slower and less accurate but ensures backward compatibility
+
             section_points = app.data["xyz"][combined_mask]
-            print(f"   ⚠️ _get_section_context [Path 2B]: Using raw xyz (fallback)")
-            print(f"      Points shape: {section_points.shape if hasattr(section_points, 'shape') else 'unknown'}")
             return combined_mask, section_points
-            
+
         except Exception as e:
-            print(f"   ❌ _get_section_context_for_view FAILED for view {view_idx}: {e}")
             import traceback
             traceback.print_exc()
             return None, None
@@ -1369,7 +1441,7 @@ class ClassificationInteractor:
         try:
             self._preview_overlay.setGeometry(self.interactor.rect())
             self._widget_height = self.interactor.height()
-        except:
+        except Exception:
             pass
     
     def _should_update(self):
@@ -1423,7 +1495,7 @@ class ClassificationInteractor:
             pixel_radius = abs(edge_screen.x() - center_screen.x())
             return max(5, pixel_radius)  # Minimum 5 pixels
             
-        except:
+        except Exception:
             return 20  # Default radius
 
     def _display_to_world_same_depth(self, vtk_widget, center_world, dx_px=0.0, dy_px=0.0):
@@ -1593,7 +1665,7 @@ class ClassificationInteractor:
         cls_all = self.app.data["classification"]
         
         # indices of points that are in this section
-        section_idx = np.where(section_mask)[0]
+        section_idx = np.flatnonzero(section_mask)
         section_cls = cls_all[section_idx]
         
         # True only for section points whose class is visible in THIS view
@@ -1626,49 +1698,6 @@ class ClassificationInteractor:
         renderer = self.interactor.GetRenderWindow().GetRenderers().GetFirstRenderer()
         picker.Pick(x, y, 0, renderer)
         return picker.GetPickPosition()
-
-    # ---------------- TEST ----------------
-    def _draw_test_line(self):
-        """Draw a static test line to verify rendering works."""
-        try:
-            renderer = self.interactor.GetRenderWindow().GetRenderers().GetFirstRenderer()
-            
-            # Get camera bounds to place line in view
-            cam = renderer.GetActiveCamera()
-            fp = cam.GetFocalPoint()
-            
-            # Draw a diagonal test line
-            pts = vtkPoints()
-            pts.InsertNextPoint(fp[0] - 5, 0, fp[2] - 5)
-            pts.InsertNextPoint(fp[0] + 5, 0, fp[2] + 5)
-            
-            lines = vtkCellArray()
-            lines.InsertNextCell(2)
-            lines.InsertCellPoint(0)
-            lines.InsertCellPoint(1)
-            
-            poly = vtkPolyData()
-            poly.SetPoints(pts)
-            poly.SetLines(lines)
-            
-            mapper = vtkPolyDataMapper()
-            mapper.SetInputData(poly)
-            
-            test_actor = vtkActor()
-            test_actor.SetMapper(mapper)
-            
-            prop = test_actor.GetProperty()
-            prop.SetColor(1, 0, 0)  # RED
-            prop.SetLineWidth(10)
-            prop.SetDepthTest(False)
-            prop.SetLighting(False)
-            
-            renderer.AddActor(test_actor)
-            self._safe_render_interactor()
-            
-            print("✅ Test line drawn (RED diagonal) - if you see this, rendering works!")
-        except Exception as e:
-            print(f"⚠️ Test line failed: {e}")
 
     # ---------------- PREVIEWS ----------------
     def _draw_temp_line(self, P1, P2):
@@ -1758,26 +1787,48 @@ class ClassificationInteractor:
         win_h = renderer.GetRenderWindow().GetSize()[1]
 
         self.dotted_pts.Reset(); self.dotted_lines.Reset()
-        dash, gap, idx = 8, 6, 0
+        dash, gap = 8, 6
+        step = dash + gap
 
-        def fill(x, y_start):
-            nonlocal idx
-            y = y_start
-            step = (dash + gap) if tool == "above_line" else -(dash + gap)
-            limit = win_h if tool == "above_line" else 0
-            
-            while (y < limit if tool == "above_line" else y > limit):
-                y2 = min(y + dash, win_h) if tool == "above_line" else max(y - dash, 0)
-                self.dotted_pts.InsertNextPoint(x, y, 0)
-                self.dotted_pts.InsertNextPoint(x, y2, 0)
-                self.dotted_lines.InsertNextCell(2)
-                self.dotted_lines.InsertCellPoint(idx); self.dotted_lines.InsertCellPoint(idx + 1)
-                idx += 2; y += step
+        # ── VECTORIZED DASH GENERATION (no Python loop) ──────────────────────
+        all_pts_list = []
+        all_cells = []
+        idx = 0
+        for px, py_start in [(p1[0], p1[1]), (p2[0], p2[1])]:
+            if tool == "above_line":
+                y_starts = np.arange(py_start, win_h, step)
+                y_ends   = np.minimum(y_starts + dash, win_h)
+            else:
+                y_starts = np.arange(py_start, 0, -step)
+                y_ends   = np.maximum(y_starts - dash, 0.0)
+            n = len(y_starts)
+            if n == 0:
+                continue
+            col = np.full(n, float(px))
+            z   = np.zeros(n)
+            seg = np.column_stack([
+                np.column_stack([col, y_starts, z]),
+                np.column_stack([col, y_ends,   z]),
+            ]).reshape(-1, 3)          # shape (2n, 3) — start/end interleaved
+            all_pts_list.append(seg)
+            pairs = np.arange(idx, idx + 2 * n).reshape(n, 2)
+            all_cells.append(pairs)
+            idx += 2 * n
 
-        fill(p1[0], p1[1]); fill(p2[0], p2[1])
-        
         if idx > 0:
-            self.dotted_pts.Modified(); self.dotted_poly.Modified()
+            all_pts = np.vstack(all_pts_list)
+            from vtkmodules.util.numpy_support import numpy_to_vtk as _n2v
+            vtk_pts_data = _n2v(all_pts, deep=False)
+            self.dotted_pts.SetData(vtk_pts_data)
+            self.dotted_pts.Modified()
+
+            self.dotted_lines.Reset()
+            for pairs in all_cells:
+                for a, b in pairs:
+                    self.dotted_lines.InsertNextCell(2)
+                    self.dotted_lines.InsertCellPoint(int(a))
+                    self.dotted_lines.InsertCellPoint(int(b))
+            self.dotted_poly.Modified()
             self.dotted_actor.VisibilityOn()
         else:
             self.dotted_actor.VisibilityOff()
@@ -1828,7 +1879,8 @@ class ClassificationInteractor:
             self.rect_pts.SetPoint(i, d[0], d[1], 0)
 
         self.rect_pts.Modified()
-        self._safe_render(vtk_widget)
+        self.rect_poly.Modified()
+        # Render batched by caller
 
     def _draw_freehand_preview(self, live_point=None):
         """
@@ -2133,7 +2185,7 @@ class ClassificationInteractor:
         """
         # 1. Identify all potential actor names
         actor_names = [
-            "line_actor", "dotted_actor", "rect_actor", "circle_actor",
+            "line_actor", "dotted_actor", "rect_actor", "circle_actor", "circle_actor_main",
             "brush_actor", "polygon_actor", "freehand_actor", "poly_actor",
             "line_actor_cut", "dotted_actor_cut", "rect_actor_cut", "circle_actor_cut",
             "brush_actor_cut", "freehand_actor_cut", "poly_actor_cut",
@@ -2274,12 +2326,6 @@ class ClassificationInteractor:
                 self._last_rectangle_preview_P2 = P2
                 
                 if is_cut_section:
-                    if hasattr(self, "rect_actor_cut") and self.rect_actor_cut:
-                        try:
-                            vtk_widget.renderer.RemoveActor2D(self.rect_actor_cut)
-                        except Exception:
-                            pass
-                        self.rect_actor_cut = None
                     self._draw_rectangle_preview_cut(self.P1, P2)
                 else:
                     self._draw_rectangle_preview(self.P1, P2)
@@ -2312,9 +2358,7 @@ class ClassificationInteractor:
                             from ..classification_tools import _project_to_cut_view
                             P2_cut = _project_to_cut_view(self.app, np.array([P2]))[0]
                             center = (float(P2_cut[0]), float(P2_cut[1]))
-                            print(f"🖌️ Cut brush center (projected): ({center[0]:.2f}, {center[1]:.2f})")
-                        except Exception as e:
-                            print(f"⚠️ Cut projection failed: {e}, using fallback")
+                        except Exception:
                             center = self._get_view_coordinates(P2)
                     else:
                         # Cross-section or main view - existing logic works
@@ -2391,10 +2435,24 @@ class ClassificationInteractor:
                                 positions.append((cx, cy))
 
                         # PHASE 1: Spatial lookup + CPU classify (no GPU, no render)
+                        # Task-3: post to background worker for next-frame results;
+                        # also run the grid-based index synchronously for this frame
+                        # so classification is never one frame behind.
                         has_index = (
                             getattr(self, '_brush_spatial_index', None) is not None
                             and getattr(self, '_brush_grid_params', None) is not None
                         )
+
+                        # Task-3: post last position to KDTree worker (non-blocking)
+                        _bw = getattr(self, '_brush_worker', None)
+                        if _bw is not None and to_class is not None and positions:
+                            xyz = self.app.data["xyz"]
+                            classes_ref = self.app.data["classification"]
+                            _bw.post_query(
+                                positions[-1], float(radius_view),
+                                xyz, classes_ref, to_class,
+                                getattr(self.app, "from_classes", None),
+                            )
 
                         if has_index and to_class is not None:
                             classes = self.app.data["classification"]
@@ -2430,12 +2488,17 @@ class ClassificationInteractor:
                                     if len(fresh) == 0:
                                         continue
 
-                                # Save old classes for undo (vectorized)
+                                # Save old classes for undo — vectorized, no Python loop
                                 old_cls = classes[fresh]
-                                for i in range(len(fresh)):
-                                    idx = int(fresh[i])
-                                    if idx not in self._brush_old_classes:
-                                        self._brush_old_classes[idx] = int(old_cls[i])
+                                if self._brush_old_classes:
+                                    existing = np.array(list(self._brush_old_classes.keys()), dtype=np.int64)
+                                    new_only = fresh[~np.isin(fresh, existing, assume_unique=True)]
+                                    old_only = old_cls[~np.isin(fresh, existing, assume_unique=True)]
+                                else:
+                                    new_only = fresh
+                                    old_only = old_cls
+                                if len(new_only) > 0:
+                                    self._brush_old_classes.update(zip(new_only.tolist(), old_only.tolist()))
 
                                 # CPU classify immediately
                                 classes[fresh] = to_class
@@ -2481,7 +2544,7 @@ class ClassificationInteractor:
                                         if rgb_ptr is not None and rgb_ptr.flags.writeable:
                                             if gi is not None:
                                                 # Write ALL accumulated points (idempotent — same color re-write is free)
-                                                local = np.where(self._brush_accumulated_mask[gi])[0]
+                                                local = np.flatnonzero(self._brush_accumulated_mask[gi])
                                                 if len(local) > 0:
                                                     rgb_ptr[local] = color
                                             else:
@@ -2503,6 +2566,25 @@ class ClassificationInteractor:
                                                 print(f"⚠️ Brush shading refresh: {_se}")
                                         else:
                                             self._safe_render_pyvista(self.app.vtk_widget)
+
+                                    # ── Task-2: ROI preview — highlight points under cursor ──
+                                    _roi = getattr(self, '_roi_preview', None)
+                                    if _roi is not None and has_index:
+                                        try:
+                                            _hit = self._get_points_in_radius_fast(
+                                                float(center[0]), float(center[1]),
+                                                float(radius_view),
+                                            )
+                                            if len(_hit) > 0:
+                                                _xyz = self.app.data["xyz"]
+                                                _pal = self._get_main_view_palette() or {}
+                                                _e   = _pal.get(int(to_class), {})
+                                                _pc  = tuple(_e.get('color', (255, 200, 0)))
+                                                _roi.update(_xyz, _hit, _pc)
+                                            else:
+                                                _roi.hide()
+                                        except Exception:
+                                            pass
 
                                 except Exception as e:
                                     print(f"⚠️ Brush GPU inject: {e}")
@@ -2606,6 +2688,62 @@ class ClassificationInteractor:
             # ✅ SAFE PAN: Custom implementation — no VTK C++ Render()
             self._do_safe_pan()
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Task-3: BrushQueryWorker result slot (runs on main thread via Qt queued)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _on_brush_worker_result(self, indices: object, to_class: int) -> None:
+        """
+        Receive KDTree query results from the background worker.
+
+        Called on the MAIN thread (Qt auto-queued connection).
+        Applies any newly found points that the synchronous grid may have missed.
+        """
+        try:
+            hit = indices   # 1-D int64 ndarray
+            if hit is None or len(hit) == 0:
+                return
+
+            if not self.is_dragging:
+                return   # stroke already released — discard stale results
+
+            if not hasattr(self, '_brush_accumulated_mask') or self._brush_accumulated_mask is None:
+                return
+
+            # Discard results from a previous stroke's worker (to_class mismatch)
+            if to_class != getattr(self, '_brush_current_to_class', None):
+                return
+
+            classes = self.app.data.get("classification")
+            if classes is None:
+                return
+
+            # Only process points not yet accumulated (idempotent)
+            fresh = hit[~self._brush_accumulated_mask[hit]]
+            if len(fresh) == 0:
+                return
+
+            # Save old classes for undo — vectorized (no Python loop)
+            old_cls = classes[fresh].copy()
+            existing = np.array(list(self._brush_old_classes.keys()), dtype=np.int64) if self._brush_old_classes else np.empty(0, dtype=np.int64)
+            if len(existing) > 0:
+                new_mask = ~np.isin(fresh, existing, assume_unique=True)
+                fresh_new = fresh[new_mask]
+                old_new   = old_cls[new_mask]
+            else:
+                fresh_new = fresh
+                old_new   = old_cls
+            if len(fresh_new) > 0:
+                self._brush_old_classes.update(zip(fresh_new.tolist(), old_new.tolist()))
+
+            # CPU classify
+            classes[fresh] = classes.dtype.type(to_class)
+            self._brush_accumulated_mask[fresh] = True
+            self._brush_frame_chunks.append(fresh)
+            self._brush_needs_render = True
+
+        except Exception as e:
+            print(f"⚠️ _on_brush_worker_result: {e}")
+
     def on_left_press(self, obj, evt):
         """✅ Start drawing - sets P1 for preview rendering (FIXED for above/below line snapping)"""
 
@@ -2627,7 +2765,7 @@ class ClassificationInteractor:
                 if hasattr(optimizer, '_deferred_rebuild_timer'):
                     optimizer._deferred_rebuild_timer.stop()
                 # We do NOT clear data, so we can resume later if needed
-        except:
+        except Exception:
             pass
 
         is_cut_interaction = False
@@ -2650,13 +2788,10 @@ class ClassificationInteractor:
 
         if self._is_main_view():
             self.app.active_classify_target = "main"
-            print("🎯 MAIN VIEW classification ACTIVE - XY bounds")
         elif is_cut_interaction:
             self.app.active_classify_target = "cut"
-            print("🎯 CUT SECTION classification ACTIVE")
         else:
             self.app.active_classify_target = "section"
-            print("🎯 CROSS-SECTION classification ACTIVE")
 
         if not is_cut_interaction:
             v_idx = self._get_view_index_from_interactor()
@@ -2664,18 +2799,13 @@ class ClassificationInteractor:
                 try:
                     self.app.section_controller.active_view = v_idx
                     self.app.section_controller.current_vtk = self.app.section_vtks.get(v_idx)
-                    print(f"🎯 Active cross-section view set to {v_idx}")
                 except Exception:
                     pass
 
         tool = getattr(self.app, "active_classify_tool", None)
         self._gesture_tool = tool
-        print(f"🔍 DEBUG: is_main={self._is_main_view()}, target='{getattr(self.app, 'active_classify_target', 'NONE')}', tool={tool}")
 
-        # ❌ BLOCK Above/Below Line in MAIN VIEW ONLY
-        # ==========================================================
         if tool in ("above_line", "below_line") and self._is_main_view():
-            print("❌ Above/Below Line blocked in MAIN view")
 
             if hasattr(self.app, "statusBar"):
                 self.app.statusBar().showMessage(
@@ -2703,25 +2833,15 @@ class ClassificationInteractor:
 
         self.from_classes = getattr(self.app, "from_classes", None)
         self.to_class = getattr(self.app, "to_class", None)
-        print(f"🎯 SYNC LEFT_PRESS: from={self.from_classes}, to={self.to_class}")
-
         x, y = self.interactor.GetEventPosition()
-
-        print(f"\n{'='*60}")
-        print(f"🖱️ LEFT PRESS - Tool: {tool}")
-        print(f"   Mouse position: ({x}, {y})")
 
         try:
             if tool in ("above_line", "below_line") and (not self._is_main_view()):
                 dx, dy = self._get_display_point()
                 pt = self._display_to_world_fast(dx, dy)
-                print(f"   Picked NON-SNAP world point: ({pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f})")
             else:
                 pt = self._pick_world_point(x, y)
-                print(f"   Picked world point: ({pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f})")
-        except Exception as e:
-            print(f"⚠️ Pick failed on left press: {e}")
-            print(f"{'='*60}\n")
+        except Exception:
             return
 
         P = self._get_view_coordinates(pt)
@@ -2766,7 +2886,14 @@ class ClassificationInteractor:
 
         # ✅ MAIN VIEW brush init
         if tool == "brush" and self._is_main_view():
-            if self._brush_spatial_index is None:
+            xyz_now = self.app.data.get("xyz")
+            index_stale = (
+                self._brush_spatial_index is None
+                or getattr(self, '_brush_spatial_index_xyz_id', None) != id(xyz_now)
+            )
+            if index_stale:
+                # Build synchronously on first press — only happens once per file load.
+                # Subsequent presses are O(1) cache hits (id check above).
                 self._build_spatial_index_for_brush()
 
             import numpy as np
@@ -2792,6 +2919,31 @@ class ClassificationInteractor:
                 )
             # ✅ Only set suppress flag for BRUSH tool
             self.app._suppress_section_refresh = True
+            self._brush_current_to_class = getattr(self.app, "to_class", None)    ###
+  
+            # ── Task-3: start background KDTree worker (if not already running) ──
+            if not getattr(self, "_brush_worker_active", False):
+                try:
+                    from gui.brush_worker import BrushQueryWorker
+                    from PySide6.QtCore import Qt
+                    w = BrushQueryWorker(parent=None)
+                    w.result_ready.connect(
+                        self._on_brush_worker_result, Qt.QueuedConnection
+                    )
+                    w.start()
+                    self._brush_worker = w
+                    self._brush_worker_active = True
+                except Exception as _bwe:
+                    self._brush_worker = None
+                    self._brush_worker_active = False
+
+            # ── Task-2: create ROI preview actor ─────────────────────────────────
+            try:
+                from gui.brush_preview import NakshaROIPreview
+                vtk_w = self._get_active_vtk_widget() or getattr(self.app, "vtk_widget", None)
+                self._roi_preview = NakshaROIPreview(vtk_w)
+            except Exception:
+                self._roi_preview = None
                 
 
         if tool == "brush" and (not self._is_main_view()):
@@ -2807,80 +2959,62 @@ class ClassificationInteractor:
                 self._last_brush_center_uv = None
 
                 if is_cut_interaction:
-                    # ✅ CRITICAL FIX: Cut section initialization with PROJECTION
                     ctrl = getattr(self.app, "cut_section_controller", None)
                     if ctrl is not None:
                         cut_pts = getattr(ctrl, "cut_points", None)
                         cut_idx = getattr(ctrl, "_cut_index_map", None)
                         if cut_pts is not None and cut_idx is not None:
                             from ..classification_tools import _project_to_cut_view
-                        
                             idxs = np.asarray(cut_idx, dtype=np.int64)
-                        
-                            # ✅ KEY FIX: Project cut points to cut view 2D space
                             pts2d = _project_to_cut_view(self.app, cut_pts)
-                        
-                            self._brush_section_indices = idxs
-                            self._brush_section_pts2d = pts2d  # Now in cut view coordinates!
+                            self._brush_section_indices   = idxs
+                            self._brush_section_pts2d     = pts2d
                             self._brush_section_local_mask = np.zeros(len(idxs), dtype=bool)
-                        
-                            print(f"✅ Cut brush init: {len(idxs)} points")
-                            print(f"   2D bounds: u=[{pts2d[:,0].min():.1f},{pts2d[:,0].max():.1f}], z=[{pts2d[:,1].min():.1f},{pts2d[:,1].max():.1f}]")
                 else:
-                    # Cross-section - ✅ INCLUDE BUFFER POINTS
+                    # Cross-section brush init.
+                    # CRITICAL: idxs and pts2d MUST be in the same order.
+                    # _section_{v}_global_indices and section_{v}_points_transformed
+                    # are both stored in core-first order by build_section_unified_actor.
+                    # Using flatnonzero(combined_mask) for idxs but points_transformed for
+                    # pts3 is WRONG — flatnonzero gives scan-order, points_transformed is
+                    # core-first. They do not correspond element-by-element.
                     v_idx = self._get_view_index_from_interactor()
                     if v_idx is None:
                         v_idx = getattr(self.app.section_controller, "active_view", 0)
-    
-                    # ✅ FIX 1: Get transformed points (includes core + buffer)
+
+                    # PRIMARY: use pre-built aligned arrays (both core-first order)
+                    idxs = getattr(self.app, f"_section_{v_idx}_global_indices", None)
                     pts3 = getattr(self.app, f"section_{v_idx}_points_transformed", None)
-                    
-                    # ✅ FIX 2: ALWAYS use combined_mask (not section_indices)
-                    # This ensures we get BOTH core AND buffer indices
-                    combined_mask = getattr(self.app, f"section_{v_idx}_combined_mask", None)
-                    
-                    if combined_mask is not None:
-                        idxs = np.where(combined_mask)[0]
-                        print(f"✅ Brush init: Using COMBINED mask (core + buffer)")
-                        print(f"   Total indices: {len(idxs):,}")
+
+                    if idxs is not None and pts3 is not None and len(idxs) == len(pts3):
+                        # Aligned: index i of idxs ↔ index i of pts3
+                        pass
                     else:
-                        # Fallback: try to build from core + buffer masks
-                        core_mask = getattr(self.app, f"section_{v_idx}_core_mask", None)
+                        # FALLBACK: build core-first order manually from masks
+                        core_mask   = getattr(self.app, f"section_{v_idx}_core_mask",   None)
                         buffer_mask = getattr(self.app, f"section_{v_idx}_buffer_mask", None)
-                        
-                        if core_mask is not None and buffer_mask is not None:
-                            combined_mask = core_mask | buffer_mask
-                            idxs = np.where(combined_mask)[0]
-                            print(f"✅ Brush init: Built combined mask from core + buffer")
-                            print(f"   Core: {core_mask.sum():,}, Buffer: {(buffer_mask & ~core_mask).sum():,}")
-                        elif core_mask is not None:
-                            idxs = np.where(core_mask)[0]
-                            print(f"⚠️ Brush init: Using CORE ONLY (no buffer available)")
+                        if core_mask is not None:
+                            core_idx = np.flatnonzero(core_mask)
+                            if buffer_mask is not None:
+                                buf_idx = np.flatnonzero(buffer_mask & ~core_mask)
+                                idxs = np.concatenate([core_idx, buf_idx])
+                            else:
+                                idxs = core_idx
+                            pts3 = self.app.data["xyz"][idxs]   # aligned with idxs
                         else:
                             idxs = None
-                            print(f"❌ Brush init: No mask available")
-    
+                            pts3 = None
+
                     if pts3 is not None and idxs is not None:
                         view_mode = getattr(self.app, "cross_view_mode", "side")
-                        if view_mode == "front":
-                            pts2d = pts3[:, [1, 2]]
-                        else:
-                            pts2d = pts3[:, [0, 2]]
-    
-                        self._brush_section_indices = np.asarray(idxs, dtype=np.int64)
-                        self._brush_section_pts2d = np.asarray(pts2d, dtype=np.float64)
-                        self._brush_section_local_mask = np.zeros(len(self._brush_section_indices), dtype=bool)
-                        
-                        # ✅ Debug output
-                        print(f"   Points 2D shape: {pts2d.shape}")
-                        print(f"   2D bounds: u=[{pts2d[:,0].min():.1f}, {pts2d[:,0].max():.1f}], z=[{pts2d[:,1].min():.1f}, {pts2d[:,1].max():.1f}]")
+                        pts2d = pts3[:, [1, 2]] if view_mode == "front" else pts3[:, [0, 2]]
+                        self._brush_section_indices   = np.asarray(idxs, dtype=np.int64)
+                        self._brush_section_pts2d     = np.asarray(pts2d, dtype=np.float64)
+                        self._brush_section_local_mask = np.zeros(len(idxs), dtype=bool)
     
             except Exception as e:
                 print(f"⚠️ Section brush init skipped (safe): {e}")
                     
-        print(f"✅ is_dragging = True")
-        print(f"{'='*60}\n")
-    
     def on_left_release(self, obj, evt):
         """
         Execute classification on mouse release
@@ -2900,7 +3034,7 @@ class ClassificationInteractor:
             try:
                 if hasattr(self, 'style'):
                     self.style.OnLeftButtonUp()
-            except:
+            except Exception:
                 pass
             return
 
@@ -2914,9 +3048,9 @@ class ClassificationInteractor:
 
         from ..classification_tools import (
             classify_above_line, classify_below_line,
-            classify_rectangle, classify_circle,
+            classify_rectangle, classify_circle, classify_polygon,
             classify_freehand, classify_brush, classify_point,
-            _get_cut_section_or_default,
+            _get_cut_section_or_default, _get_visible_mask_from_viewport,
             _apply_classification
         )
 
@@ -2969,6 +3103,9 @@ class ClassificationInteractor:
                     elapsed = (time.time() - start) * 1000
                     print(f"✅ Main Brush stroke complete: {int(mask.sum()):,} points in {elapsed:.0f}ms")
 
+                # ── Save mask BEFORE nulling — needed for shading refresh below ──
+                _final_mask = self._brush_accumulated_mask
+
                 # Clean up brush state
                 self._brush_accumulated_mask = None
                 self._brush_old_classes = {}
@@ -2979,6 +3116,25 @@ class ClassificationInteractor:
                 self._brush_main_visible_classes = None
                 self._brush_main_visible_classes_arr = None
                 self.app._suppress_section_refresh = False
+                self.is_dragging = False
+
+                # ── Task-2: destroy ROI preview actor ────────────────────────────
+                try:
+                    roi = getattr(self, "_roi_preview", None)
+                    if roi is not None:
+                        roi.destroy()
+                        self._roi_preview = None
+                except Exception:
+                    pass
+
+                # ── Task-3: worker stays alive across strokes to avoid QThread
+                # teardown race (destroying the Python wrapper while the C++ thread
+                # is still mid-query on a 13M-point KDTree → segfault).
+                # The worker is stopped only in cleanup() when the tool is deactivated.
+                # Between strokes the queue is drained; stale results are discarded by
+                # the `if not self.is_dragging: return` guard in _on_brush_worker_result.
+                # ─────────────────────────────────────────────────────────────────────
+
                 # In shaded_class mode keep OptimizedRefresh alive — shading mesh needs its own rebuild
                 if getattr(self.app, "display_mode", "class") != "shaded_class":
                     self.app._gpu_sync_done = True
@@ -2987,7 +3143,7 @@ class ClassificationInteractor:
                         from gui.shading_display import refresh_shaded_after_classification_fast
                         refresh_shaded_after_classification_fast(
                             self.app,
-                            changed_mask=getattr(self, '_brush_accumulated_mask', None)
+                            changed_mask=_final_mask   # use saved mask, not the now-None attribute
                         )
                     except Exception as _se:
                         print(f"⚠️ Brush release shading refresh: {_se}")
@@ -3035,15 +3191,19 @@ class ClassificationInteractor:
                     print(f"   ⚠️ Cut section refresh failed: {e}")
 
                 self.is_dragging = False
-                try: self.style.OnLeftButtonUp()
-                except: pass
+                try:
+                    self.style.OnLeftButtonUp()
+                except Exception:
+                    pass
                 return
 
             # 3. Basic Validation
             if (not was_dragging) and (tool not in ("freehand", "polygon")):
                 print("⚠️ Release without drag - ignoring")
-                try: self.style.OnLeftButtonUp()
-                except: pass
+                try:
+                    self.style.OnLeftButtonUp()
+                except Exception:
+                    pass
                 return
 
             if self.P1 is None and tool not in ("freehand", "polygon"):
@@ -3097,7 +3257,7 @@ class ClassificationInteractor:
                     if idxs is not None and pts2d is not None and local_mask is not None:
                         idxs_arr = np.asarray(idxs)
                         if idxs_arr.dtype == bool:
-                            idxs_arr = np.where(idxs_arr)[0]
+                            idxs_arr = np.flatnonzero(idxs_arr)
                         idxs_arr = idxs_arr.astype(np.int64, copy=False)
 
                         # Final stamp at release position to close the gap
@@ -3115,7 +3275,8 @@ class ClassificationInteractor:
                         #     update_mask = np.zeros(len(self.app.data["xyz"]), dtype=bool)
                         #     update_mask[idxs_arr[local_mask]] = True
                         #     _apply_classification(self.app, update_mask, from_classes, to_class)
-                        #                             #     force_vtk_pipeline_update(self.app)
+                        #     from gui.vtk_utils import force_vtk_pipeline_update
+                        #     force_vtk_pipeline_update(self.app)
 
                         # self._refresh_all_views_after_classification(to_class)
                         # return
@@ -3123,21 +3284,6 @@ class ClassificationInteractor:
                         if np.any(local_mask):
                             update_mask = np.zeros(len(self.app.data["xyz"]), dtype=bool)
                             update_mask[idxs_arr[local_mask]] = True
- 
-                            # ✅ FIXED: Removed core-only clamp to allow buffer classification
-                            # Brush initialization uses combined_mask (core + buffer)
-                            # No need to filter here - buffer points should be classified!
-                            
-                            print(f"   📊 Brush classification: {np.sum(update_mask):,} points")
-                            if hasattr(self.app, 'section_controller'):
-                                v_idx = self._get_view_index_from_interactor()
-                                if v_idx is not None:
-                                    core_mask = getattr(self.app, f"section_{v_idx}_core_mask", None)
-                                    if core_mask is not None:
-                                        core_pts = (update_mask & core_mask).sum()
-                                        buffer_pts = (update_mask & ~core_mask).sum()
-                                        print(f"      Core: {core_pts:,}, Buffer: {buffer_pts:,}")
- 
                             _apply_classification(self.app, update_mask, from_classes, to_class)
                             
  
@@ -3164,6 +3310,7 @@ class ClassificationInteractor:
                 elif tool == "point":
                     u2, v2 = self._get_view_coordinates(P2)
                     self._classify_point_main((u2, v2), getattr(self.app, "point_radius", 0.5), to_class)
+                self._clear_all_previews()
                 return
 
             # --- BRANCH D: SECTION / CUT VIEW (NON-BRUSH) ---
@@ -3180,50 +3327,23 @@ class ClassificationInteractor:
             #     return
 
             if is_cut_section:
-                # Cut section uses its own stored mask/points
                 mask = getattr(self.app.section_controller, "last_mask", None)
                 section_points = getattr(self.app, "section_points", None)
-                print(f"   🔪 Cut section mode: mask={mask is not None}, points={section_points is not None}")
             else:
-                # Cross-section view - use integrated buffer logic
                 v_idx = self._get_view_index_from_interactor()
-                print(f"   📊 Cross-section view index: {v_idx}")
-                
-                # ═══════════════════════════════════════════════════════════
-                # KEY FIX: Use COMBINED mask (core + buffer) instead of just core
-                # ═══════════════════════════════════════════════════════════
                 if v_idx is not None:
-                    # Try direct access to combined mask first (fastest)
                     combined_mask = getattr(self.app, f"section_{v_idx}_combined_mask", None)
                     section_points_transformed = getattr(self.app, f"section_{v_idx}_points_transformed", None)
-                    
                     if combined_mask is not None and section_points_transformed is not None:
-                        # Best case: pre-computed combined data available
                         mask = combined_mask
                         section_points = section_points_transformed
-                        num_points = mask.sum() if hasattr(mask, 'sum') else len([x for x in mask if x])
-                        print(f"   ✅ Using COMBINED mask for classification (includes buffer points)")
-                        print(f"      Total points: {num_points:,} (core + buffer)")
-                        print(f"      Using transformed coordinates for accurate classification")
                     else:
-                        # Fallback: use helper method to build combined mask
-                        print(f"   🔄 Combined mask not available, using helper method...")
                         mask, section_points = self._get_section_context_for_view(v_idx)
-                        
-                        if mask is not None:
-                            num_points = mask.sum() if hasattr(mask, 'sum') else len([x for x in mask if x])
-                            print(f"   ✅ Helper method returned: {num_points:,} points")
-                        else:
-                            print(f"   ❌ Helper method failed to get mask/points")
                 else:
-                    print(f"   ❌ Could not determine view index")
                     mask, section_points = None, None
 
-            # Validate we have the data we need
             section_indices, section_points = _get_cut_section_or_default(self.app, mask, section_points)
             if section_indices is None or section_points is None:
-                print(f"   ❌ Classification aborted: missing section data")
-                print(f"{'='*60}\n")
                 return
 
             # Special case for Freehand completion
@@ -3240,14 +3360,6 @@ class ClassificationInteractor:
             else:
                 u1, z1 = self._get_view_coordinates(self.P1)
                 u2, z2 = self._get_view_coordinates(P2)
-
-            # ✅ DEBUG: Print rectangle bounds
-            if tool == "rectangle":
-                print(f"🔍 RECTANGLE CLASSIFICATION BOUNDS:")
-                print(f"   P1 world: {self.P1}")
-                print(f"   P2 world: {P2}")
-                print(f"   u_range: ({min(u1, u2):.2f}, {max(u1, u2):.2f})")
-                print(f"   z_range: ({min(z1, z2):.2f}, {max(z1, z2):.2f})")
 
             if tool == "above_line":
                 classify_above_line(self.app, [(u1, z1), (u2, z2)], from_classes, to_class, mask, section_points, None)
@@ -3304,7 +3416,7 @@ class ClassificationInteractor:
                 vtk_widget = self._get_active_vtk_widget()
                 if vtk_widget:
                     self._safe_render(vtk_widget)
-            except:
+            except Exception:
                 pass
             
             # 3. 🚀 CRITICAL: Force UI update to allow next mouse move to register IMMEDIATELY
@@ -3323,9 +3435,11 @@ class ClassificationInteractor:
             except Exception as e:
                 pass
             
-            try: self.style.OnLeftButtonUp()
-            except: pass
-            
+            try:
+                self.style.OnLeftButtonUp()
+            except Exception:
+                pass
+
     def _ensure_target_class_visible(self, to_class):
         """
         ✅ FINAL SENIOR FIX
@@ -3495,7 +3609,8 @@ class ClassificationInteractor:
                     border_pct   = float(getattr(app, 'point_border_percent', 0) or 0.0)
                     fast_classify_update(app, changed_mask=changed_mask,
                                          to_class=to_class, palette=palette,
-                                         border_percent=border_pct)
+                                         border_percent=border_pct,
+                                         skip_render=True)
                     try:
                         self._safe_render_pyvista(vtk_widget)
                     except Exception:
@@ -3560,7 +3675,8 @@ class ClassificationInteractor:
                     palette = getattr(app, 'class_palette', {})
                     if code in palette:
                         return palette[code].get("description", f"Class {code}")
-                except: pass
+                except Exception:
+                    pass
                 return f"Class {code}"
 
             to_name = _get_class_name(to_class)
@@ -3696,7 +3812,7 @@ class ClassificationInteractor:
             from gui.unified_actor_manager import fast_classify_update, is_unified_actor_ready
 
             classes    = self.app.data["classification"]
-            changed_indices  = np.where(changed_mask)[0]
+            changed_indices  = np.flatnonzero(changed_mask)
             changed_classes  = classes[changed_indices]
 
             print(f"   📍 Changed points by class:")
@@ -3711,7 +3827,8 @@ class ClassificationInteractor:
                                      changed_mask=changed_mask,
                                      to_class=to_class,
                                      palette=palette,
-                                     border_percent=border_pct)
+                                     border_percent=border_pct,
+                                     skip_render=True)
                 try:
                     self._safe_render_pyvista(self.app.vtk_widget)
                 except Exception:
@@ -3838,7 +3955,7 @@ class ClassificationInteractor:
                 try:
                     vtk_widget.renderer.SetBackground(*original_bg)
                     self._safe_render_pyvista(vtk_widget)
-                except:
+                except Exception:
                     pass
             
             # Flash duration: 150ms (very brief, not annoying)
@@ -3940,6 +4057,8 @@ class ClassificationInteractor:
             
             print("✅ Classification tool cancelled")
         
+        # ✅ NEW: 'F' key to fly to current mouse position
+        # 🚫 F key: fly-to removed — caused red sphere in main view
         elif key == "f":
             return
 
@@ -4210,7 +4329,8 @@ class ClassificationInteractor:
             palette = getattr(self.app, "class_palette", {})
             
             # 1. Main view: inject colors directly into GPU buffer (O(changed_points))
-            fast_classify_update(self.app, mask, to_class, palette=palette, border_percent=border_percent)
+            # skip_render=True — we issue a single batched render at step 4 below.
+            fast_classify_update(self.app, mask, to_class, skip_render=True, palette=palette, border_percent=border_percent)
             
             # 2. Cross-sections: shared memory slave update (O(1) - just render)
             if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
@@ -4227,7 +4347,8 @@ class ClassificationInteractor:
                     try:
                         target_actor = getattr(ctrl, 'cut_core_actor', None)
                         if target_actor and hasattr(target_actor, 'GetMapper'):
-                            polydata = target_actor.GetMapper().GetInput()
+                            _mapper = target_actor.GetMapper()
+                            polydata = _mapper.GetInput() if _mapper is not None else None
                             if polydata:
                                 vtk_colors = polydata.GetPointData().GetScalars()
                                 if vtk_colors:
@@ -4235,18 +4356,14 @@ class ClassificationInteractor:
                                     vtk_ptr = _ns.vtk_to_numpy(vtk_colors)
                                     
                                     cut_map = ctrl._cut_index_map
-                                    update_idx = np.where(mask)[0]
-                                    
-                                    # Build reverse lookup: global_idx → local_idx
-                                    # cut_map is NOT sorted, so searchsorted won't work
-                                    update_set = set(update_idx.tolist())
-                                    local_hits = []
-                                    for local_i in range(len(cut_map)):
-                                        if int(cut_map[local_i]) in update_set:
-                                            local_hits.append(local_i)
-                                    
-                                    if local_hits:
-                                        local_arr = np.array(local_hits, dtype=np.int64)
+                                    update_idx = np.flatnonzero(mask)
+
+                                    # Vectorized reverse lookup: which cut_map entries
+                                    # match a changed global index — O(k log k) via np.isin,
+                                    # replaces the O(N_cut) Python loop.
+                                    local_arr = np.flatnonzero(np.isin(cut_map, update_idx))
+
+                                    if local_arr.size > 0:
                                         new_color = palette.get(to_class, {}).get('color', (128, 128, 128))
                                         vtk_ptr[local_arr] = new_color
                                         vtk_colors.Modified()
@@ -4351,18 +4468,25 @@ class ClassificationInteractor:
         xmin, xmax = sorted([x1, x2])
         ymin, ymax = sorted([y1, y2])
         mask = (xyz[:, 0] >= xmin) & (xyz[:, 0] <= xmax) & (xyz[:, 1] >= ymin) & (xyz[:, 1] <= ymax)
-        mask = self._filter_from_classes(mask)
+        # _apply_mask_and_record calls _filter_from_classes internally — no need to call it here
         self._apply_mask_and_record(mask, to_class)
- 
+
     def _classify_circle_main(self, center, radius, to_class):
-        """Circle selection on plan view (XY)."""
+        """Circle selection on plan view (XY). Bounding-box pre-filter for large datasets."""
         xyz = self.app.data["xyz"]
         cx, cy = center
-        dx = xyz[:, 0] - cx
-        dy = xyz[:, 1] - cy
-        mask = (dx * dx + dy * dy) <= (radius * radius)
-        mask = self._filter_from_classes(mask)
-        self._apply_mask_and_record(mask, to_class)
+        r2 = radius * radius
+        # BB pre-filter eliminates ~75% of points before the distance check
+        bb = (xyz[:, 0] >= cx - radius) & (xyz[:, 0] <= cx + radius) & \
+             (xyz[:, 1] >= cy - radius) & (xyz[:, 1] <= cy + radius)
+        cands = np.flatnonzero(bb)
+        final_mask = np.zeros(len(xyz), dtype=bool)
+        if cands.size > 0:
+            dx = xyz[cands, 0] - cx
+            dy = xyz[cands, 1] - cy
+            final_mask[cands[(dx * dx + dy * dy) <= r2]] = True
+        # _apply_mask_and_record calls _filter_from_classes internally — no need to call it here
+        self._apply_mask_and_record(final_mask, to_class)
  
     def _classify_polygon_main(self, poly2d, to_class):
         """Polygon/freehand selection on plan view (XY)."""
@@ -4373,7 +4497,7 @@ class ClassificationInteractor:
  
         xy = self.app.data["xyz"][:, :2]
         bbmask = (xy[:, 0] >= xmin) & (xy[:, 0] <= xmax) & (xy[:, 1] >= ymin) & (xy[:, 1] <= ymax)
-        candidates = np.where(bbmask)[0]
+        candidates = np.flatnonzero(bbmask)
  
         if candidates.size == 0:
             self._apply_mask_and_record(bbmask, to_class)  # no points
@@ -4415,81 +4539,74 @@ class ClassificationInteractor:
         self._classify_circle_main(center, radius, to_class)
         
     def _draw_circle_preview_main(self, P1, P2):
-        """✅ Draw circle preview for MAIN VIEW (XY plane)"""
+        """✅ PERFORMANCE FIX: Circle preview for MAIN VIEW (XY plane). One-time VTK pipeline init."""
         renderWindow = self.interactor.GetRenderWindow()
         renderer = renderWindow.GetRenderers().GetFirstRenderer()
 
-        # Remove previous actor
-        if hasattr(self, "circle_actor") and self.circle_actor:
-            renderer.RemoveActor2D(self.circle_actor)
-            self.circle_actor = None
-
-        # Extract XY coordinates (plan view)
         x1, y1 = P1[0], P1[1]
         x2, y2 = P2[0], P2[1]
-
-        # Calculate circle parameters
         center_x = (x1 + x2) / 2.0
         center_y = (y1 + y2) / 2.0
-        radius = np.sqrt((x2 - x1)**2 + (y2 - y1)**2) / 2.0
+        radius = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) / 2.0
+        if radius < 0.01:
+            return
 
-        print(f"  Main view circle: center=({center_x:.2f}, {center_y:.2f}), radius={radius:.2f}")
-
-        # Generate circle points in XY plane
         num_segments = 64
-        theta = np.linspace(0, 2 * np.pi, num_segments)
+
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_circle_main_pts") or getattr(self, "circle_actor_main", None) is None:
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
+
+            self._circle_main_pts   = vtkPoints()
+            self._circle_main_lines = vtkCellArray()
+            self._circle_main_poly  = vtkPolyData()
+            self._circle_main_poly.SetPoints(self._circle_main_pts)
+            self._circle_main_poly.SetLines(self._circle_main_lines)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._circle_main_poly)
+            dc = _C(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.circle_actor_main = vtkActor2D()
+            self.circle_actor_main.SetMapper(mapper)
+            prop = self.circle_actor_main.GetProperty()
+            prop.SetColor(1.0, 1.0, 0.0)
+            prop.SetLineWidth(2)
+            prop.SetOpacity(1.0)
+
+            renderer.AddActor2D(self.circle_actor_main)
+
+        if not renderer.HasViewProp(self.circle_actor_main):
+            renderer.AddActor2D(self.circle_actor_main)
+        self.circle_actor_main.VisibilityOn()
+
+        # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
+        if not hasattr(self, "_circle_main_coord"):
+            from vtkmodules.vtkRenderingCore import vtkCoordinate as _C
+            self._circle_main_coord = _C()
+            self._circle_main_coord.SetCoordinateSystemToWorld()
+
+        coord = self._circle_main_coord
+        theta = np.linspace(0, 2 * np.pi, num_segments + 1)
         circle_x = center_x + radius * np.cos(theta)
         circle_y = center_y + radius * np.sin(theta)
 
-        # Build 3D coordinates (Z = 0 for plan view)
-        circle_points = np.column_stack([
-            circle_x,
-            circle_y,
-            np.zeros(num_segments)  # Z = 0 for plan view
-        ])
+        self._circle_main_pts.Reset()
+        self._circle_main_lines.Reset()
 
-        # Convert world coordinates to display coordinates
-        from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
-        pts = vtkPoints()
-        coord = vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
+        for i in range(num_segments + 1):
+            coord.SetValue(circle_x[i], circle_y[i], 0.0)
+            d = coord.GetComputedDisplayValue(renderer)
+            self._circle_main_pts.InsertNextPoint(d[0], d[1], 0)
+            if i > 0:
+                self._circle_main_lines.InsertNextCell(2)
+                self._circle_main_lines.InsertCellPoint(i - 1)
+                self._circle_main_lines.InsertCellPoint(i)
 
-        for pt in circle_points:
-            coord.SetValue(pt[0], pt[1], pt[2])
-            display_pos = coord.GetComputedDisplayValue(renderer)
-            pts.InsertNextPoint(display_pos[0], display_pos[1], 0)
-
-        # Create polyline
-        lines = vtkCellArray()
-        for i in range(num_segments):
-            lines.InsertNextCell(2)
-            lines.InsertCellPoint(i)
-            lines.InsertCellPoint((i + 1) % num_segments)
-
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        # Create 2D mapper
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-
-        coordinate = vtkCoordinate()
-        coordinate.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(coordinate)
-
-        # Create 2D actor (always on top)
-        self.circle_actor = vtkActor2D()
-        self.circle_actor.SetMapper(mapper)
-
-        # Set properties - Yellow like other tools
-        prop = self.circle_actor.GetProperty()
-        prop.SetColor(1.0, 1.0, 0.0)  # Yellow
-        prop.SetLineWidth(2)
-        prop.SetOpacity(1.0)
-
-        renderer.AddActor2D(self.circle_actor)
-        print("✅ Circle preview rendered (main view)")    
+        self._circle_main_pts.Modified()
+        self._circle_main_poly.Modified()
+        # Render batched by caller
 
     def _draw_circle_preview(self, P1, P2):
         """
@@ -4745,7 +4862,7 @@ class ClassificationInteractor:
 
             # Extract changed indices from the changed mask
             if hasattr(self.app, '_last_changed_mask') and self.app._last_changed_mask is not None:
-                changed_indices = np.where(self.app._last_changed_mask)[0]
+                changed_indices = np.flatnonzero(self.app._last_changed_mask)
             else:
                 changed_indices = np.array([], dtype=np.int64)
 
@@ -4777,7 +4894,7 @@ class ClassificationInteractor:
             return
 
         # Extract changed indices from the changed mask
-        changed_indices = np.where(changed_mask)[0]
+        changed_indices = np.flatnonzero(changed_mask)
 
         # All cross-section views
         for view_idx, vtk_view in self.app.section_vtks.items():
@@ -4839,8 +4956,9 @@ class ClassificationInteractor:
             
             # Get the first actor (main shaded mesh)
             actor = list(plotter.renderer.actors.values())[0]
-            mesh = actor.GetMapper().GetInput()
-            
+            _am = actor.GetMapper() if actor is not None else None
+            mesh = _am.GetInput() if _am is not None else None
+
             if mesh is None or mesh.GetNumberOfCells() == 0:
                 print("   ⚠️ No mesh cells - doing full refresh")
                 self._refresh_shaded_mode_after_classification()
@@ -4854,7 +4972,7 @@ class ClassificationInteractor:
             cells = np.asarray(mesh.faces).reshape(-1, 4)[:, 1:]  # Get triangle indices
             
             # Check which triangles have at least one changed vertex
-            changed_indices = np.where(changed_mask)[0]
+            changed_indices = np.flatnonzero(changed_mask)
             affected_triangles = np.isin(cells, changed_indices).any(axis=1)
             num_affected = np.sum(affected_triangles)
             
@@ -4886,7 +5004,7 @@ class ClassificationInteractor:
             current_colors = np.asarray(mesh.GetCellData().GetArray("RGB"))
             
             # Recompute ONLY affected triangles
-            affected_indices = np.where(affected_triangles)[0]
+            affected_indices = np.flatnonzero(affected_triangles)
             
             for idx in affected_indices:
                 face = cells[idx]
@@ -4939,245 +5057,83 @@ class ClassificationInteractor:
             print(f"{'='*60}\n")
 
     def _draw_circle_preview_cut(self, P1, P2):
-        """
-        ✅ FIXED: Circle preview for CUT SECTION using display coordinates
-        P1 and P2 are world coordinates (diameter endpoints)
-        """
-        from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
-        from vtkmodules.vtkCommonCore import vtkPoints
-        from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+        """✅ PERFORMANCE FIX: Circle preview for CUT SECTION. One-time VTK pipeline init, geometry update only."""
         import math
-        import numpy as np
-
-        print(f"\n🔵 _draw_circle_preview_cut called")
-        print(f"   P1 (world): ({P1[0]:.2f}, {P1[1]:.2f}, {P1[2]:.2f})")
-        print(f"   P2 (world): ({P2[0]:.2f}, {P1[1]:.2f}, {P2[2]:.2f})")
 
         vtk_widget = self._get_active_vtk_widget()
         if vtk_widget is None:
-            print("❌ No VTK widget for circle preview (cut section)")
             return
-
         renderer = vtk_widget.renderer
 
-        # Remove previous actor
-        if hasattr(self, "circle_actor_cut") and self.circle_actor_cut:
-            try:
-                renderer.RemoveActor2D(self.circle_actor_cut)
-                print("   🧹 Removed old circle_actor_cut")
-            except Exception as e:
-                print(f"   ⚠️ Could not remove old circle_actor_cut: {e}")
-            self.circle_actor_cut = None
-
-        # ✅ CRITICAL FIX: Ensure P1 and P2 are tuples/lists, not nested
         P1 = tuple(P1) if not isinstance(P1[0], (list, tuple)) else tuple(P1[0])
         P2 = tuple(P2) if not isinstance(P2[0], (list, tuple)) else tuple(P2[0])
 
-        # ✅ CRITICAL FIX: Convert world coordinates to display coordinates
-        coord = vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
+        num_segments = 64
 
-        # Get P1 in display space
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_circle_cut_pts") or getattr(self, "circle_actor_cut", None) is None:
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
+
+            self._circle_cut_pts   = vtkPoints()
+            self._circle_cut_lines = vtkCellArray()
+            self._circle_cut_poly  = vtkPolyData()
+            self._circle_cut_poly.SetPoints(self._circle_cut_pts)
+            self._circle_cut_poly.SetLines(self._circle_cut_lines)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._circle_cut_poly)
+            dc = _C(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.circle_actor_cut = vtkActor2D()
+            self.circle_actor_cut.SetMapper(mapper)
+            prop = self.circle_actor_cut.GetProperty()
+            prop.SetColor(1.0, 1.0, 0.0)
+            prop.SetLineWidth(2)
+            prop.SetOpacity(1.0)
+
+            renderer.AddActor2D(self.circle_actor_cut)
+
+        if not renderer.HasViewProp(self.circle_actor_cut):
+            renderer.AddActor2D(self.circle_actor_cut)
+        self.circle_actor_cut.VisibilityOn()
+
+        # ── FAST GEOMETRY UPDATE (world → display coords) ────────────────────
+        if not hasattr(self, "_circle_cut_coord"):
+            from vtkmodules.vtkRenderingCore import vtkCoordinate as _C
+            self._circle_cut_coord = _C()
+            self._circle_cut_coord.SetCoordinateSystemToWorld()
+
+        coord = self._circle_cut_coord
         coord.SetValue(float(P1[0]), float(P1[1]), float(P1[2]))
         display_p1 = coord.GetComputedDisplayValue(renderer)
-
-        # Get P2 in display space
         coord.SetValue(float(P2[0]), float(P2[1]), float(P2[2]))
         display_p2 = coord.GetComputedDisplayValue(renderer)
 
-        print(f"   📐 Display coords: P1=({display_p1[0]:.1f}, {display_p1[1]:.1f}), P2=({display_p2[0]:.1f}, {display_p2[1]:.1f})")
-
-        # Calculate center and radius in DISPLAY space (pixels)
         cx = (display_p1[0] + display_p2[0]) / 2.0
         cy = (display_p1[1] + display_p2[1]) / 2.0
         dx = display_p2[0] - display_p1[0]
         dy = display_p2[1] - display_p1[1]
-        radius_display = math.sqrt(dx*dx + dy*dy) / 2.0  # ✅ This is now a float
+        radius_display = max(5.0, math.sqrt(dx * dx + dy * dy) / 2.0)
 
-        # Minimum visible radius
-        if radius_display < 5.0:
-            radius_display = 5.0
-
-        print(f"   ⭕ Circle: center=({cx:.1f}, {cy:.1f}), radius={radius_display:.1f}px")
-
-        # Build circle in DISPLAY coordinates
-        num_segments = 64
-        pts = vtkPoints()
-        lines = vtkCellArray()
+        self._circle_cut_pts.Reset()
+        self._circle_cut_lines.Reset()
 
         for i in range(num_segments + 1):
             angle = 2.0 * math.pi * i / num_segments
-            px = cx + radius_display * math.cos(angle)
-            py = cy + radius_display * math.sin(angle)
-            pts.InsertNextPoint(px, py, 0.0)
-
+            self._circle_cut_pts.InsertNextPoint(
+                cx + radius_display * math.cos(angle),
+                cy + radius_display * math.sin(angle),
+                0.0)
             if i > 0:
-                lines.InsertNextCell(2)
-                lines.InsertCellPoint(i - 1)
-                lines.InsertCellPoint(i)
+                self._circle_cut_lines.InsertNextCell(2)
+                self._circle_cut_lines.InsertCellPoint(i - 1)
+                self._circle_cut_lines.InsertCellPoint(i)
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
+        self._circle_cut_pts.Modified()
+        self._circle_cut_poly.Modified()
+        # Render batched by caller
 
-        # Create 2D mapper
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-
-        # Use display coordinate system
-        coordinate = vtkCoordinate()
-        coordinate.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(coordinate)
-
-        # Create 2D actor (always on top)
-        self.circle_actor_cut = vtkActor2D()
-        self.circle_actor_cut.SetMapper(mapper)
-
-        # Set properties - Yellow like other tools
-        prop = self.circle_actor_cut.GetProperty()
-        prop.SetColor(1.0, 1.0, 0.0)  # Yellow
-        prop.SetLineWidth(2)
-        prop.SetOpacity(1.0)
-
-        renderer.AddActor2D(self.circle_actor_cut)
-        print(f"   ✅ Added circle_actor_cut to renderer")
-
-        # Force render
-        try:
-            self._safe_render(vtk_widget)
-            print("   ✅ Circle preview rendered")
-        except Exception as e:
-            print(f"   ⚠️ Render failed: {e}")
-
-
-
-    def _draw_rectangle_preview_cut(self, P1, P2):
-        """✅ Rectangle preview for CUT SECTION – uses DISPLAY coords like before."""
-        from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D
-        from vtkmodules.vtkCommonCore import vtkPoints
-        from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
-
-        vtk_widget = self._get_active_vtk_widget()
-        if vtk_widget is None:
-            return
-        renderer = vtk_widget.renderer
-
-        # Remove previous cut-rectangle actor
-        if hasattr(self, "rect_actor_cut") and self.rect_actor_cut:
-            try:
-                renderer.RemoveActor2D(self.rect_actor_cut)
-            except Exception:
-                pass
-            self.rect_actor_cut = None
-
-        # Corner 1 in DISPLAY coords = where mouse was pressed
-        if not hasattr(self, "P1_display_cut"):
-            x1, y1 = self.interactor.GetEventPosition()
-        else:
-            x1, y1 = self.P1_display_cut
-
-        # Corner 2 in DISPLAY coords = current mouse position
-        x2, y2 = self.interactor.GetEventPosition()
-
-        x_min, x_max = sorted((x1, x2))
-        y_min, y_max = sorted((y1, y2))
-
-        # Build rectangle in DISPLAY coordinates
-        pts = vtkPoints()
-        corners = [
-            (x_min, y_min, 0.0),
-            (x_max, y_min, 0.0),
-            (x_max, y_max, 0.0),
-            (x_min, y_max, 0.0),
-            (x_min, y_min, 0.0),
-        ]
-        for c in corners:
-            pts.InsertNextPoint(*c)
-
-        lines = vtkCellArray()
-        for i in range(1, len(corners)):
-            lines.InsertNextCell(2)
-            lines.InsertCellPoint(i - 1)
-            lines.InsertCellPoint(i)
-
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-
-        self.rect_actor_cut = vtkActor2D()
-        self.rect_actor_cut.SetMapper(mapper)
-
-        prop = self.rect_actor_cut.GetProperty()
-        prop.SetColor(1, 1, 0)   # same yellow as cross-section
-        prop.SetLineWidth(2)     # same thickness as cross-section
-        prop.SetOpacity(1.0)
-
-        renderer.AddActor2D(self.rect_actor_cut)
-        try:
-            self._safe_render(vtk_widget)
-        except Exception:
-            pass
-
-
-    def _draw_freehand_preview_cut(self, live_point=None):
-        """Freehand preview for CUT SECTION – smooth flowing line in display coords."""
-        from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D
-
-        if len(self.drawing_points) < 1:
-            return
-
-        vtk_widget = self._get_active_vtk_widget()
-        if vtk_widget is None:
-            return
-        renderer = vtk_widget.renderer
-
-        # Remove previous cut-freehand actor
-        if hasattr(self, "freehand_actor_cut") and self.freehand_actor_cut:
-            try:
-                renderer.RemoveActor2D(self.freehand_actor_cut)
-            except Exception:
-                pass
-            self.freehand_actor_cut = None
-
-        # Collect all points in display space
-        # drawing_points are stored as (u, z) world; convert to display or store display directly
-        # For simplicity, store display points on left press/mouse move for freehand in cut mode
-        all_pts = list(self.drawing_points_display_cut) if hasattr(self, "drawing_points_display_cut") else []
-        if live_point:
-            all_pts.append(live_point)
-
-        if len(all_pts) < 2:
-            return
-
-        pts = vtkPoints()
-        for pt in all_pts:
-            pts.InsertNextPoint(pt[0], pt[1], 0.0)
-
-        lines = vtkCellArray()
-        for i in range(len(all_pts) - 1):
-            lines.InsertNextCell(2)
-            lines.InsertCellPoint(i)
-            lines.InsertCellPoint(i + 1)
-
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-
-        self.freehand_actor_cut = vtkActor2D()
-        self.freehand_actor_cut.SetMapper(mapper)
-        prop = self.freehand_actor_cut.GetProperty()
-        prop.SetColor(1, 0.8, 0)   # Orange-yellow
-        prop.SetLineWidth(2)       # Match thin look like cross-section
-        prop.SetOpacity(0.8)       # Semi-transparent
-
-        renderer.AddActor2D(self.freehand_actor_cut)
-        self._safe_render(vtk_widget)
 
 
     def _draw_line_preview_cut(self, P1, P2):
@@ -5336,71 +5292,65 @@ class ClassificationInteractor:
         # Render batched by caller
 
     def _draw_rectangle_preview_cut(self, P1, P2):
-        """Rectangle preview for CUT SECTION."""
-        from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
-        from vtkmodules.vtkCommonDataModel import vtkPolyData
-        from vtkmodules.vtkCommonCore import vtkPoints
-        from vtkmodules.vtkCommonDataModel import vtkCellArray
-        
+        """✅ PERFORMANCE FIX: Rectangle preview for CUT SECTION. One-time VTK pipeline init."""
         vtk_widget = self._get_active_vtk_widget()
         if vtk_widget is None:
             return
-        
         renderer = vtk_widget.renderer
-        
-        # Remove previous actor
-        if hasattr(self, "rect_actor_cut") and self.rect_actor_cut:
-            try:
-                renderer.RemoveActor2D(self.rect_actor_cut)
-            except:
-                pass
-            self.rect_actor_cut = None
-        
-        # World → display
-        coord = vtkCoordinate()
-        coord.SetCoordinateSystemToWorld()
-        
+
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_rect_cut_pts") or getattr(self, "rect_actor_cut", None) is None:
+            from vtkmodules.vtkRenderingCore import vtkCoordinate, vtkPolyDataMapper2D, vtkActor2D
+
+            self._rect_cut_pts = vtkPoints()
+            self._rect_cut_pts.SetNumberOfPoints(5)
+            _lines = vtkCellArray()
+            _lines.InsertNextCell(5)
+            for i in range(5):
+                _lines.InsertCellPoint(i)
+            self._rect_cut_poly = vtkPolyData()
+            self._rect_cut_poly.SetPoints(self._rect_cut_pts)
+            self._rect_cut_poly.SetLines(_lines)
+
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._rect_cut_poly)
+            dc = vtkCoordinate(); dc.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(dc)
+
+            self.rect_actor_cut = vtkActor2D()
+            self.rect_actor_cut.SetMapper(mapper)
+            prop = self.rect_actor_cut.GetProperty()
+            prop.SetColor(1, 1, 0)
+            prop.SetLineWidth(2)
+            prop.SetOpacity(1.0)
+
+            renderer.AddActor2D(self.rect_actor_cut)
+
+        if not renderer.HasViewProp(self.rect_actor_cut):
+            renderer.AddActor2D(self.rect_actor_cut)
+        self.rect_actor_cut.VisibilityOn()
+
+        # ── FAST COORDINATE UPDATE (world → display) ─────────────────────────
+        if not hasattr(self, "_rect_cut_coord"):
+            from vtkmodules.vtkRenderingCore import vtkCoordinate
+            self._rect_cut_coord = vtkCoordinate()
+            self._rect_cut_coord.SetCoordinateSystemToWorld()
+
+        coord = self._rect_cut_coord
         coord.SetValue(P1[0], P1[1], P1[2])
         d1 = coord.GetComputedDisplayValue(renderer)
-        
         coord.SetValue(P2[0], P2[1], P2[2])
         d2 = coord.GetComputedDisplayValue(renderer)
-        
+
         x1, y1 = d1[0], d1[1]
         x2, y2 = d2[0], d2[1]
-        
-        # Build rectangle in display coords
-        pts = vtkPoints()
-        pts.InsertNextPoint(x1, y1, 0)
-        pts.InsertNextPoint(x2, y1, 0)
-        pts.InsertNextPoint(x2, y2, 0)
-        pts.InsertNextPoint(x1, y2, 0)
-        pts.InsertNextPoint(x1, y1, 0)  # close
-        
-        lines = vtkCellArray()
-        lines.InsertNextCell(5)
-        for i in range(5):
-            lines.InsertCellPoint(i)
-        
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-        
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-        
-        coordinate = vtkCoordinate()
-        coordinate.SetCoordinateSystemToDisplay()
-        mapper.SetTransformCoordinate(coordinate)
-        
-        self.rect_actor_cut = vtkActor2D()
-        self.rect_actor_cut.SetMapper(mapper)
-        self.rect_actor_cut.GetProperty().SetColor(1, 1, 0)
-        self.rect_actor_cut.GetProperty().SetLineWidth(2)
-        
-        renderer.AddActor2D(self.rect_actor_cut)
-        self._safe_render_from_renderer(renderer)
-        print(f"📦 Rectangle preview (cut section) drawn")
+        corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)]
+        for i, (cx, cy) in enumerate(corners):
+            self._rect_cut_pts.SetPoint(i, cx, cy, 0)
+
+        self._rect_cut_pts.Modified()
+        self._rect_cut_poly.Modified()
+        # Render batched by caller
 
 
     def _draw_brush_preview_cut(self, center, radius_world):
@@ -5410,10 +5360,14 @@ class ClassificationInteractor:
 
     
     def _draw_freehand_preview_cut(self, live_point=None):
-        """Freehand preview for CUT SECTION – smooth flowing line in display coords."""
-        from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D
-
+        """✅ PERFORMANCE FIX: Freehand preview for CUT SECTION. One-time init, Reset per frame."""
         if len(self.drawing_points) < 1:
+            return
+
+        all_pts = list(self.drawing_points_display_cut) if hasattr(self, "drawing_points_display_cut") else []
+        if live_point:
+            all_pts.append(live_point)
+        if len(all_pts) < 2:
             return
 
         vtk_widget = self._get_active_vtk_widget()
@@ -5421,49 +5375,49 @@ class ClassificationInteractor:
             return
         renderer = vtk_widget.renderer
 
-        # Remove previous cut-freehand actor
-        if hasattr(self, "freehand_actor_cut") and self.freehand_actor_cut:
-            try:
-                renderer.RemoveActor2D(self.freehand_actor_cut)
-            except Exception:
-                pass
-            self.freehand_actor_cut = None
+        n = len(all_pts)
 
-        # Collect all points in display space
-        # drawing_points are stored as (u, z) world; convert to display or store display directly
-        # For simplicity, store display points on left press/mouse move for freehand in cut mode
-        all_pts = list(self.drawing_points_display_cut) if hasattr(self, "drawing_points_display_cut") else []
-        if live_point:
-            all_pts.append(live_point)
+        # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
+        if not hasattr(self, "_freehand_cut_pts") or getattr(self, "freehand_actor_cut", None) is None:
+            from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D
 
-        if len(all_pts) < 2:
-            return
+            self._freehand_cut_pts   = vtkPoints()
+            self._freehand_cut_lines = vtkCellArray()
+            self._freehand_cut_poly  = vtkPolyData()
+            self._freehand_cut_poly.SetPoints(self._freehand_cut_pts)
+            self._freehand_cut_poly.SetLines(self._freehand_cut_lines)
 
-        pts = vtkPoints()
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(self._freehand_cut_poly)
+
+            self.freehand_actor_cut = vtkActor2D()
+            self.freehand_actor_cut.SetMapper(mapper)
+            prop = self.freehand_actor_cut.GetProperty()
+            prop.SetColor(1, 0.8, 0)
+            prop.SetLineWidth(2)
+            prop.SetOpacity(0.8)
+
+            renderer.AddActor2D(self.freehand_actor_cut)
+
+        if not renderer.HasViewProp(self.freehand_actor_cut):
+            renderer.AddActor2D(self.freehand_actor_cut)
+        self.freehand_actor_cut.VisibilityOn()
+
+        # ── FAST GEOMETRY UPDATE (display coords — no world conversion) ──────
+        pts   = self._freehand_cut_pts
+        lines = self._freehand_cut_lines
+        pts.Reset()
+        lines.Reset()
+
         for pt in all_pts:
             pts.InsertNextPoint(pt[0], pt[1], 0.0)
-
-        lines = vtkCellArray()
-        for i in range(len(all_pts) - 1):
+        for i in range(n - 1):
             lines.InsertNextCell(2)
             lines.InsertCellPoint(i)
             lines.InsertCellPoint(i + 1)
 
-        poly = vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-
-        mapper = vtkPolyDataMapper2D()
-        mapper.SetInputData(poly)
-
-        self.freehand_actor_cut = vtkActor2D()
-        self.freehand_actor_cut.SetMapper(mapper)
-        prop = self.freehand_actor_cut.GetProperty()
-        prop.SetColor(1, 0.8, 0)   # Orange-yellow
-        prop.SetLineWidth(2)       # Match thin look like cross-section
-        prop.SetOpacity(0.8)       # Semi-transparent
-
-        renderer.AddActor2D(self.freehand_actor_cut)
+        pts.Modified()
+        self._freehand_cut_poly.Modified()
         self._safe_render(vtk_widget)
 
 
@@ -6240,9 +6194,9 @@ class ClassificationInteractor:
             # rgb_ptr only has len(_main_global_indices) entries, not len(xyz)
             global_indices = getattr(self.app, '_main_global_indices', None)
             if global_indices is not None:
-                local_changed = np.where(self._brush_accumulated_mask[global_indices])[0]
+                local_changed = np.flatnonzero(self._brush_accumulated_mask[global_indices])
             else:
-                local_changed = np.where(self._brush_accumulated_mask)[0]
+                local_changed = np.flatnonzero(self._brush_accumulated_mask)
 
             if len(local_changed) == 0:
                 return
@@ -6268,12 +6222,18 @@ class ClassificationInteractor:
         """
         ✅ MICROSTATION GRID INDEX: Vectorized build for O(1) brush lookup.
         Uses numpy sorting instead of Python dict append loop.
-        Builds in ~200ms instead of 5400ms.
+        Cached by array identity (id()) — rebuilds only on new file load,
+        not every 60 seconds.  Builds in ~200ms for 13M pts.
         """
         import time
         start = time.time()
-        
+
         xyz = self.app.data["xyz"]
+        # Skip if the same xyz array is already indexed
+        if (self._brush_spatial_index is not None
+                and getattr(self, '_brush_spatial_index_xyz_id', None) == id(xyz)):
+            return
+
         n_pts = len(xyz)
         
         # Calculate grid bounds
@@ -6319,9 +6279,11 @@ class ClassificationInteractor:
         }
         self._brush_grid_size = grid_size
         
+        # Cache the array identity so we skip rebuild when same file is open
+        self._brush_spatial_index_xyz_id = id(xyz)
+
         build_time = (time.time() - start) * 1000
         print(f"   ⚡ Spatial index built in {build_time:.0f}ms ({grid_size}x{grid_size} grid, {n_pts:,} pts)")
-        self._last_brush_build_time = time.time()
         
         
     def _get_points_in_radius_fast(self, center_x, center_y, radius):
@@ -6330,7 +6292,9 @@ class ClassificationInteractor:
         Uses sort-order slicing — zero Python loops for candidate collection.
         Typical: 0.1-0.5ms per stamp (vs 10-50ms for full scan).
         """
-        if self._brush_spatial_index is None or time.time() - self._last_brush_build_time > 60:
+        xyz = self.app.data["xyz"]
+        if (self._brush_spatial_index is None
+                or getattr(self, '_brush_spatial_index_xyz_id', None) != id(xyz)):
             self._build_spatial_index_for_brush()
         
         params = self._brush_grid_params
@@ -6396,14 +6360,15 @@ class ClassificationInteractor:
         """
         ✅ FAST: Get points in rectangle using spatial index
         """
-        # Rebuild index if needed
-        if (self._brush_spatial_index is None or 
-            time.time() - self._last_brush_build_time > 60):
+        # Rebuild index if array identity changed (new file loaded)
+        _xyz_now = self.app.data.get("xyz")
+        if (self._brush_spatial_index is None
+                or getattr(self, '_brush_spatial_index_xyz_id', None) != id(_xyz_now)):
             self._build_spatial_index_for_brush()
-        
+
         params = self._brush_grid_params
         grid_size = params['grid_size']
-        
+
         # Calculate overlapping grid cells
         cell_x_min = int((x_min - params['x_min']) / params['x_step'])
         cell_x_max = int((x_max - params['x_min']) / params['x_step'])
@@ -6416,20 +6381,22 @@ class ClassificationInteractor:
         cell_y_min = max(0, cell_y_min)
         cell_y_max = min(grid_size - 1, cell_y_max)
         
-        # Collect candidates
-        candidate_indices = []
+        # Collect candidates via sort_order slices (no Python list append)
+        sort_order = self._brush_sort_order
+        slices = []
         for cx in range(cell_x_min, cell_x_max + 1):
             for cy in range(cell_y_min, cell_y_max + 1):
-                cell = (cx, cy)
-                if cell in self._brush_spatial_index:
-                    candidate_indices.extend(self._brush_spatial_index[cell])
-        
-        if not candidate_indices:
+                cell_range = self._brush_spatial_index.get((cx, cy))
+                if cell_range is not None:
+                    s, e = cell_range
+                    slices.append(sort_order[s:e])
+
+        if not slices:
             return np.array([], dtype=np.int64)
-        
+
         # Precise box check on candidates
         xyz = self.app.data["xyz"]
-        candidates = np.array(candidate_indices, dtype=np.int64)
+        candidates = np.concatenate(slices).astype(np.int64)
         pts = xyz[candidates]
         
         in_box = (
@@ -6444,7 +6411,7 @@ class ClassificationInteractor:
         if self._is_main_view():
             try:
                 self.style.OnRightButtonDown()
-            except:
+            except Exception:
                 pass
             return
         
@@ -6714,7 +6681,7 @@ class ClassificationInteractor:
                 cam.SetFocalPoint(new_focal.tolist())
                 if hasattr(plotter, 'render'):
                     self._safe_render_pyvista(plotter)
-            except:
+            except Exception:
                 pass
 
     def _show_target_indicator(self, world_point):
@@ -6889,14 +6856,20 @@ class ClassificationInteractor:
                 import traceback
                 traceback.print_exc()
         
+        # Store timer as instance variable to prevent garbage collection
         self._indicator_timer = timer
         animate_step()
 
-    def _verify_buffer_classification(self, view_idx):
 
+    def _verify_buffer_classification(self, view_idx):
+        """
+        Debug helper to verify buffer points are being included in classification.
+        Call this after classification to confirm buffer points were modified.
+        """
         try:
             app = self.app
             
+            # Get masks
             core_mask = getattr(app, f"section_{view_idx}_core_mask", None)
             buffer_mask = getattr(app, f"section_{view_idx}_buffer_mask", None)
             combined_mask = getattr(app, f"section_{view_idx}_combined_mask", None)
@@ -6993,6 +6966,8 @@ class ClassificationInteractor:
         
         print(f"{'='*60}\n")
 
+
+    # In interactor_classify.py — wherever classification is committed:
     def _commit_classification(self, mask, from_classes, to_class):
         """Apply classification and maintain undo/redo stacks correctly."""
         import numpy as np
@@ -7011,6 +6986,8 @@ class ClassificationInteractor:
         }
         self.app.undo_stack.append(step)
 
+        # *** CRITICAL: Always clear redo when new classification is committed ***
+        # Without this, stale redo steps pollute subsequent undo/redo cycles.
         self.app.redo_stack.clear()
 
         # Cap undo stack
@@ -7019,8 +6996,11 @@ class ClassificationInteractor:
             from gui.memory_manager import _free_undo_entry
             _free_undo_entry(self.app.undo_stack.pop(0))
 
+        # Invalidate section mirrors BEFORE emitting so _on_classification_finished
+        # gets clean mirrors to work with
         if hasattr(self.app, 'section_vtks'):
             for view_idx in self.app.section_vtks.keys():
                 self.app._sync_section_mirror_from_data(view_idx)
 
+        # Emit signal — triggers cross-section refresh via _on_classification_finished
         self.app.classification_finished.emit(mask)

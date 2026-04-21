@@ -1,3 +1,4 @@
+
 from PySide6.QtCore import QObject, QEvent, Qt, QTimer, QElapsedTimer
 from PySide6.QtGui import QKeySequence
 from flask import views
@@ -173,19 +174,81 @@ class GlobalShortcutFilter(QObject):
                     return True
                 
                 return False
-            
 
             # ====================================================================
             # PRIORITY 1: Undo/Redo (Ctrl+Z/Y)
+            # 
+            # ✅ TOOL EXCLUSIVITY RULES:
+            # 1. Measurement Tool Active → Measurement undo/redo ONLY
+            # 2. Curve Tool ACTIVELY Drawing → Curve point undo/redo ONLY
+            # 3. ANY other tool active (classification, cross-section, cut-section) 
+            #    → That tool's undo/redo (classification is default)
+            # 4. Curve tool NOT drawing + Ribbon='curve' + NO other tool 
+            #    → Completed curve undo/redo
+            # 5. Digitizer active + Ribbon='draw' + NO other tool 
+            #    → Digitizer undo/redo
+            # 6. Default (no tool owns it) → Classification undo/redo
             # ====================================================================
             if event.modifiers() & Qt.ControlModifier:
 
+                # ═══════════════════════════════════════════════════════════════════
+                # ✅ LEVEL 1: MEASUREMENT TOOL (HIGHEST PRIORITY)
+                # When measurement tool is active OR has measurements,
+                # Ctrl+Z/Y ONLY affects measurements
+                # ═══════════════════════════════════════════════════════════════════
+                if hasattr(self.app_window, 'measurement_tool') and \
+                   self.app_window.measurement_tool is not None:
+                   
+                    mt = self.app_window.measurement_tool
+                    # ✅ FIX: ONLY check mt.active - NOT mt.measurements
+                    # Once tool is deactivated, even if measurements exist on screen,
+                    # Ctrl+Z/Y should go to classification
+                    measurement_active = getattr(mt, 'active', False)
+                    
+                    if measurement_active:
+                        if event.key() == Qt.Key_Z:
+                            print("📏 Ctrl+Z → Measurement Undo (EXCLUSIVE)")
+                            try:
+                                mt.undo()
+                            except Exception as e:
+                                print(f"⚠️ Measurement undo failed: {e}")
+                            return True
+
+                        elif event.key() == Qt.Key_Y:
+                            print("📏 Ctrl+Y → Measurement Redo (EXCLUSIVE)")
+                            try:
+                                mt.redo()
+                            except Exception as e:
+                                print(f"⚠️ Measurement redo failed: {e}")
+                            return True
+                        
+                        if event.key() in (Qt.Key_Z, Qt.Key_Y):
+                            return True
+
+                # ═══════════════════════════════════════════════════════════════════
+                # ✅ PRE-CHECK: Is ANY "other" tool active that owns undo/redo?
+                # If yes, curve/digitizer completed undo should be BLOCKED
+                # ═══════════════════════════════════════════════════════════════════
+                classification_active = bool(getattr(self.app_window, 'active_classify_tool', None))
+                cross_section_active = getattr(self.app_window, 'cross_section_active', False)
+                cut_section_waiting = False
+                if hasattr(self.app_window, 'cut_section_controller'):
+                    cut_ctrl = self.app_window.cut_section_controller
+                    cut_section_waiting = getattr(cut_ctrl, '_state', 0) != 0
+                
+                # If ANY other tool is active, curve/digitizer completed undo is blocked
+                other_tool_active = classification_active or cross_section_active or cut_section_waiting
+
+                # ═══════════════════════════════════════════════════════════════════
+                # ✅ LEVEL 2: CURVE TOOL - ACTIVE DRAWING ONLY
+                # Point-by-point undo while user is actively drawing
+                # ═══════════════════════════════════════════════════════════════════
                 if hasattr(self.app_window, 'curve_tool') and \
-                hasattr(self.app_window.curve_tool, 'active') and \
-                self.app_window.curve_tool.active:
+                   hasattr(self.app_window.curve_tool, 'active') and \
+                   self.app_window.curve_tool.active:
                     
                     if event.key() == Qt.Key_Z:
-                        print("🎨 Ctrl+Z → Curve Tool Undo Point")
+                        print("🎨 Ctrl+Z → Curve Tool Undo Point (ACTIVE DRAWING)")
                         try:
                             self.app_window.curve_tool._undo_last_point()
                         except Exception as e:
@@ -193,20 +256,27 @@ class GlobalShortcutFilter(QObject):
                         return True
                     
                     elif event.key() == Qt.Key_Y:
-                        print("🎨 Ctrl+Y → Curve Tool Redo Point")
+                        print("🎨 Ctrl+Y → Curve Tool Redo Point (ACTIVE DRAWING)")
                         try:
                             self.app_window.curve_tool._redo_last_point()
                         except Exception as e:
                             print(f"⚠️ Curve redo failed: {e}")
                         return True
 
-                elif hasattr(self.app_window, 'curve_tool') and \
-                    not getattr(self.app_window.curve_tool, 'active', False) and \
-                    (getattr(self.app_window.curve_tool, 'history_stack', []) or
-                    getattr(self.app_window.curve_tool, 'history_redo_stack', [])):
+                # ═══════════════════════════════════════════════════════════════════
+                # ✅ LEVEL 3: COMPLETED CURVE UNDO (STRICT CONDITIONS)
+                # ONLY if: curve NOT drawing + ribbon='curve' + NO other tool active
+                # ═══════════════════════════════════════════════════════════════════
+                elif not other_tool_active and \
+                     hasattr(self.app_window, 'curve_tool') and \
+                     not getattr(self.app_window.curve_tool, 'active', False) and \
+                     not getattr(self.app_window.curve_tool, '_select_mode', False) and \
+                     getattr(getattr(self.app_window, 'ribbon_manager', None), 'current_ribbon', None) == 'curve' and \
+                     (getattr(self.app_window.curve_tool, 'history_stack', []) or
+                      getattr(self.app_window.curve_tool, 'history_redo_stack', [])):
 
                     if event.key() == Qt.Key_Z:
-                        print("🎨 Ctrl+Z → Curve Tool Undo Completed Curve")
+                        print("🎨 Ctrl+Z → Curve Tool Undo Completed Curve (CURVE CONTEXT ONLY)")
                         try:
                             self.app_window.curve_tool.undo_curve()
                         except Exception as e:
@@ -214,62 +284,23 @@ class GlobalShortcutFilter(QObject):
                         return True
 
                     elif event.key() == Qt.Key_Y:
-                        print("🎨 Ctrl+Y → Curve Tool Redo Completed Curve")
+                        print("🎨 Ctrl+Y → Curve Tool Redo Completed Curve (CURVE CONTEXT ONLY)")
                         try:
                             self.app_window.curve_tool.redo_curve()
                         except Exception as e:
                             print(f"⚠️ Curve redo failed: {e}")
                         return True
 
-                elif hasattr(self.app_window, 'measurement_tool') and \
-                    hasattr(self.app_window.measurement_tool, 'active') and \
-                    self.app_window.measurement_tool.active and \
-                    not getattr(self.app_window, 'active_classify_tool', None):
-
-                    measurement_tool = self.app_window.measurement_tool
-
-                    if event.key() == Qt.Key_Z:
-                        print("📏 Ctrl+Z → Measurement Undo")
-                        try:
-                            measurement_tool.undo()
-                        except Exception as e:
-                            print(f"⚠️ Measurement undo failed: {e}")
-                        return True
-
-                    elif event.key() == Qt.Key_Y:
-                        print("📏 Ctrl+Y → Measurement Redo")
-                        try:
-                            measurement_tool.redo()
-                        except Exception as e:
-                            print(f"⚠️ Measurement redo failed: {e}")
-                        return True
-                
-                elif hasattr(self.app_window, 'curve_tool') and \
-                    not getattr(self.app_window.curve_tool, 'active', False) and \
-                    getattr(getattr(self.app_window, 'ribbon_manager', None), 'current_ribbon', None) == 'curve' and \
-                    (getattr(self.app_window.curve_tool, 'history_stack', []) or
-                    getattr(self.app_window.curve_tool, 'history_redo_stack', [])):
-
-                    if event.key() == Qt.Key_Z:
-                        print("🎨 Ctrl+Z → Curve Tool Undo Completed Curve")
-                        try:
-                            self.app_window.curve_tool.undo_curve()
-                        except Exception as e:
-                            print(f"⚠️ Curve undo failed: {e}")
-                        return True
-
-                    elif event.key() == Qt.Key_Y:
-                        print("🎨 Ctrl+Y → Curve Tool Redo Completed Curve")
-                        try:
-                            self.app_window.curve_tool.redo_curve()
-                        except Exception as e:
-                            print(f"⚠️ Curve redo failed: {e}")
-                        return True
-
-                elif hasattr(self.app_window, 'digitizer') and \
-                    self.app_window.digitizer.enabled and \
-                    (getattr(self.app_window.digitizer, 'active_tool', None) or
-                    getattr(getattr(self.app_window, 'ribbon_manager', None), 'current_ribbon', None) == 'draw'):
+                # ═══════════════════════════════════════════════════════════════════
+                # ✅ LEVEL 4: DIGITIZER UNDO (STRICT CONDITIONS)
+                # ONLY if: digitizer enabled + ribbon='draw' + NO other tool active
+                # ═══════════════════════════════════════════════════════════════════
+                elif not other_tool_active and \
+                     hasattr(self.app_window, 'digitizer') and \
+                     self.app_window.digitizer.enabled and \
+                     (getattr(self.app_window.digitizer, 'active_tool', None) or
+                      getattr(getattr(self.app_window, 'ribbon_manager', None), 'current_ribbon', None) == 'draw'):
+                    
                     digitizer = self.app_window.digitizer
                     
                     if event.key() == Qt.Key_Z:
@@ -288,6 +319,10 @@ class GlobalShortcutFilter(QObject):
                             print(f"⚠️ Digitizer redo failed: {e}")
                         return True
                 
+                # ═══════════════════════════════════════════════════════════════════
+                # ✅ LEVEL 5: CLASSIFICATION UNDO/REDO (DEFAULT)
+                # This is the fallback when no other tool owns undo/redo
+                # ═══════════════════════════════════════════════════════════════════
                 else:
                     if event.key() == Qt.Key_Z:
                         print("🟢 Ctrl+Z → Undo Classification")
@@ -2423,3 +2458,4 @@ class GlobalShortcutFilter(QObject):
             print(f"   ✅ Main view unlocked")
         except Exception as e:
             print(f"   ⚠️ Error unlocking main view: {e}")
+

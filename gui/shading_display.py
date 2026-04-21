@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
     QProgressDialog, QApplication
 )
 from PySide6.QtCore import Qt, QTimer
+from typing import Optional, Set
 import time
 from vtkmodules.util import numpy_support
 import vtk
@@ -22,6 +23,8 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 
 _LARGE_MESH_THRESHOLD = 50_000_000
 _MAX_STORED_SHADING_CACHES = 2
@@ -163,7 +166,8 @@ if HAS_NUMBA:
             _gf = np.array([[0,1,2]], dtype=np.int32)
             _numba_edge_filter(_gf, _xy, 100.)
             _numba_degenerate_filter(_gf, _xy, 1e-6, 0.001)
-        except: pass
+        except Exception:
+            pass
     import threading
     threading.Thread(target=_warmup_numba_jit, daemon=True).start()
 
@@ -178,7 +182,8 @@ def triangulate_scipy_direct(xy):
 def _do_triangulate(xy):
     if HAS_TRIANGLE:
         try: return triangulate_with_triangle(xy)
-        except: pass
+        except Exception:
+            pass
     return triangulate_scipy_direct(xy)
 
 def _filter_edges_by_absolute(faces, xy, max_edge_length):
@@ -293,7 +298,8 @@ def _remove_shaded_edge_overlay(app):
     p = getattr(app, 'vtk_widget', None)
     if p:
         try: p.remove_actor("shaded_mesh_edges", render=False)
-        except: pass
+        except Exception:
+            pass
     app._shaded_mesh_edge_actor = None; app._shaded_mesh_edge_polydata = None
 
 def _setup_microstation_lighting(renderer, azimuth=45., angle=45.):
@@ -354,7 +360,8 @@ class ShadingGeometryCache:
             vc = m.GetPointData().GetScalars()
             if vc is None: vc = m.GetCellData().GetScalars()
             if vc: self._vtk_colors_ptr = numpy_support.vtk_to_numpy(vc); return self._vtk_colors_ptr
-        except: pass
+        except Exception:
+            pass
         return None
     def build_global_to_unique(self, total):
         if self._global_to_unique is not None and len(self._global_to_unique) == total: return self._global_to_unique
@@ -468,14 +475,15 @@ def _restore_camera(app, c):
             cam = app.vtk_widget.renderer.GetActiveCamera()
             cam.SetPosition(c['pos']); cam.SetFocalPoint(c['fp']); cam.SetViewUp(c['up'])
             cam.SetParallelProjection(c['parallel']); cam.SetParallelScale(c['scale'])
-        except: pass
-
+        except Exception:
+            pass
 def _queue_deferred_rebuild(app, reason="", newly_visible_indices=None):
     global _rebuild_timer, _rebuild_reason, _rebuild_changed_indices
     _rebuild_reason = reason; _rebuild_changed_indices = newly_visible_indices
     if _rebuild_timer is not None:
         try: _rebuild_timer.stop(); _rebuild_timer.deleteLater()
-        except: pass
+        except Exception:
+            pass
         _rebuild_timer = None
     def do_rebuild():
         global _rebuild_timer, _rebuild_changed_indices
@@ -508,7 +516,8 @@ def _queue_incremental_patch(app, sci):
     _rebuild_reason = "single-class patch"
     if _rebuild_timer is not None:
         try: _rebuild_timer.stop(); _rebuild_timer.deleteLater()
-        except: pass
+        except Exception:
+            pass
         _rebuild_timer = None
     def do_patch():
         global _rebuild_timer
@@ -548,7 +557,8 @@ def update_shaded_class(app, azimuth=45., angle=45., ambient=0.25,
                 cache.single_class_id = list(vc)[0] if len(vc) == 1 else None
                 app.last_shade_azimuth = azimuth; app.last_shade_angle = angle; app.shade_ambient = ambient
                 return
-        except: pass
+        except Exception:
+            pass
     for c in app.class_palette: app.class_palette[c]["show"] = (int(c) in vc)
     app._shading_visible_classes = vc.copy() if vc else set()
     if not vc:
@@ -606,11 +616,12 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
         vl = np.zeros(mc, dtype=bool)
         for v in visible_classes:
             if v < mc: vl[v] = True
-        vm = vl[classes]; vi = np.where(vm)[0]
+        vm = vl[classes]; vi = np.flatnonzero(vm)
         if len(vi) < 3:
             if hasattr(app, '_shaded_mesh_actor') and app._shaded_mesh_actor:
                 try: app.vtk_widget.remove_actor("shaded_mesh", render=False)
-                except: pass
+                except Exception:
+                    pass
                 app._shaded_mesh_actor = None
             if hasattr(app, '_shaded_mesh_polydata'): app._shaded_mesh_polydata = None
             _set_rendered_cache_key(app, cache_key=None)
@@ -823,7 +834,8 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
                     numpy_support.vtk_to_numpy(vtc)[:] = fc; vtc.Modified(); em.Modified(); ea.GetMapper().Modified()
                     _set_rendered_cache_key(app, cache)
                     _restore_camera(app, saved_camera); app.vtk_widget.render(); return
-            except: pass
+            except Exception:
+                pass
             cache._vtk_colors_ptr = None
         fv = np.empty(nf*4, dtype=np.int32); fv[0::4] = 3
         fv[1::4] = cache.faces[:,0]; fv[2::4] = cache.faces[:,1]; fv[3::4] = cache.faces[:,2]
@@ -841,7 +853,8 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
                     numpy_support.vtk_to_numpy(vtc)[:] = vco; vtc.Modified(); em.Modified(); ea.GetMapper().Modified()
                     _set_rendered_cache_key(app, cache)
                     _restore_camera(app, saved_camera); app.vtk_widget.render(); return
-            except: pass
+            except Exception:
+                pass
             cache._vtk_colors_ptr = None
         fv = np.empty(nf*4, dtype=np.int32); fv[0::4] = 3
         fv[1::4] = cache.faces[:,0]; fv[2::4] = cache.faces[:,1]; fv[3::4] = cache.faces[:,2]
@@ -859,7 +872,8 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
         try:
             a = plotter.actors[name]
             if _prot(name, a): protected[name] = (a, bool(a.GetVisibility()))
-        except: pass
+        except Exception:
+            pass
     for name in list(plotter.actors.keys()):
         if name in protected: continue
         ns = str(name).lower()
@@ -890,21 +904,24 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
         try:
             if wv: a.SetVisibility(True)
             if not renderer.HasViewProp(a): renderer.AddActor(a); nr += 1
-        except: pass
+        except Exception:
+            pass
     for sn in ("dxf_actors", "snt_actors"):
         for entry in getattr(app, sn, []):
             for a in entry.get("actors", []):
                 try:
                     if not renderer.HasViewProp(a): renderer.AddActor(a); nr += 1
                     a.SetVisibility(True)
-                except: pass
+                except Exception:
+                    pass
     if nr > 0: print(f"   ✅ Restored {nr} DXF/SNT actors")
     _restore_camera(app, saved_camera); plotter.set_background("black")
     plotter.renderer.ResetCameraClippingRange()
     try:
         m = app._shaded_mesh_actor.GetMapper()
         if m: m.StaticOn(); m.SetResolveCoincidentTopologyToPolygonOffset(); m.InterpolateScalarsBeforeMappingOff()
-    except: pass
+    except Exception:
+        pass
     plotter.render()
     ms = "FLAT/FACETED (single-class)" if isc else "FLAT (multi-class)"
     print(f"   🎨 Shaded Mesh [{ms}]: {nf:,} faces in {(time.time()-t0)*1000:.0f}ms")
@@ -935,7 +952,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
         return True
     
     cls = app.data.get("classification").astype(np.int32)
-    ci = np.where(changed_mask)[0]
+    ci = np.flatnonzero(changed_mask)
     cc = cls[ci]
     nh = ~np.isin(cc, va)  # Points now hidden (classified away from visible class)
     nvis = np.isin(cc, va)  # Points now visible
@@ -961,7 +978,8 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
                         a = getattr(app, '_shaded_mesh_actor', None)
                         if a: a.GetMapper().Modified()
                         app.vtk_widget.render()
-                except: pass
+                except Exception:
+                    pass
                 _queue_incremental_patch(app, sci)
                 return True
     
@@ -995,7 +1013,8 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
                             old = (stk[-1].get('old_classes') or stk[-1].get('oldclasses'))
                             if old is not None:
                                 pwh = not set(int(x) for x in np.unique(np.asarray(old))).issubset(set(int(c) for c in vc))
-                        except: pass
+                        except Exception:
+                            pass
                         break
             if pwh:
                 _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=nvg[g2u[nvg] < 0])
@@ -1064,7 +1083,7 @@ def _incremental_visibility_patch(app, cgi, vcs):
     vf = cache.faces[vfm]
     vn = cache.face_normals[vfm] if cache.face_normals is not None else None
     
-    hvi = np.where(vnh)[0]; ifa = cache.faces[ifm]
+    hvi = np.flatnonzero(vnh); ifa = cache.faces[ifm]
     ihf = np.zeros(len(cache.unique_indices), dtype=bool)
     if len(hvi) > 0: ihf[hvi] = True
     avi = ifa.ravel(); bv = np.unique(avi[~ihf[avi]]).astype(np.int32)
@@ -1087,7 +1106,7 @@ def _incremental_visibility_patch(app, cgi, vcs):
     bxy = cache.xyz_unique[bv, :2]
     try:
         lf = _do_triangulate(bxy)
-    except:
+    except Exception:
         cache.faces = vf; cache.face_normals = vn
         cache.shade = _compute_face_shade_global_z(
             cache.xyz_unique, vf, az, an, am, face_normals=vn)
@@ -1182,7 +1201,7 @@ def _multi_class_region_undo_patch(app, changed_mask, vcs):
     xyz = app.data.get("xyz"); cr = app.data.get("classification")
     if xyz is None or cr is None: return False
     cls = cr.astype(np.int32); va = np.array(sorted(vcs), dtype=np.int32)
-    ci = np.where(changed_mask)[0]; cx = xyz[ci]
+    ci = np.flatnonzero(changed_mask); cx = xyz[ci]
     xn, yn = cx[:,0].min(), cx[:,1].min()
     xx, yx = cx[:,0].max(), cx[:,1].max()
     mg = max(cache.spacing * 5, 1.) if cache.spacing > 0 else 10.
@@ -1195,7 +1214,7 @@ def _multi_class_region_undo_patch(app, changed_mask, vcs):
     fo = cache.faces[~fir]
     no = cache.face_normals[~fir] if cache.face_normals is not None else None
     
-    vm = np.isin(cls, va); vi = np.where(vm)[0]; vx = xyz[vi]
+    vm = np.isin(cls, va); vi = np.flatnonzero(vm); vx = xyz[vi]
     irv = ((vx[:,0] >= xn) & (vx[:,0] <= xx) &
            (vx[:,1] >= yn) & (vx[:,1] <= yx))
     lgi = vi[irv]; lx = vx[irv]; nl = len(lx)
@@ -1241,7 +1260,7 @@ def _multi_class_region_undo_patch(app, changed_mask, vcs):
     xy = ux[:,:2]
     try:
         lf = _do_triangulate(xy)
-    except:
+    except Exception:
         cache.faces = fo; cache.face_normals = no
         cache.shade = _compute_face_shade_global_z(
             cache.xyz_unique, fo, az, an, am, face_normals=no)
@@ -1343,7 +1362,7 @@ def _rebuild_single_class(app, sci):
         _do_full_rebuild(app, sci)
         return
     
-    rva = np.where(vl)[0].astype(np.int32)
+    rva = np.flatnonzero(vl).astype(np.int32)
     ifa = cache.faces[ifm]
     irf = np.zeros(len(cache.unique_indices), dtype=bool)
     if len(rva) > 0:
@@ -1368,7 +1387,7 @@ def _rebuild_single_class(app, sci):
                         cache.spacing * 1000))
             if len(lf) > 0:
                 npf = bv[lf]
-        except:
+        except Exception:
             pass
     
     if len(npf) > 0:
@@ -1424,7 +1443,7 @@ def refresh_shaded_after_undo_fast(app, changed_mask=None):
     if cls is None or xyz is None:
         return False
     cls = cls.astype(np.int32)
-    ci = np.where(changed_mask)[0]
+    ci = np.flatnonzero(changed_mask)
     if len(ci) == 0:
         return True
     
@@ -1437,7 +1456,8 @@ def refresh_shaded_after_undo_fast(app, changed_mask=None):
             global _rebuild_timer
             if _rebuild_timer:
                 try: _rebuild_timer.stop()
-                except: pass
+                except Exception:
+                    pass
             return True
     
     g2u = cache.build_global_to_unique(len(xyz))
@@ -1450,7 +1470,7 @@ def refresh_shaded_after_undo_fast(app, changed_mask=None):
         uv[np.unique(cache.faces.ravel())] = True
     
     aim = np.zeros(len(ci), dtype=bool)
-    vp = np.where(ic)[0]
+    vp = np.flatnonzero(ic)
     if len(vp) > 0:
         aim[vp] = uv[cu[vp]]
     
@@ -1518,7 +1538,7 @@ def _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=None
         vcl = np.clip(cm, 0, mc-1)
         if changed_mask is not None and np.any(changed_mask):
             g2u = cache.build_global_to_unique(len(app.data["xyz"]))
-            cu = g2u[np.where(changed_mask)[0]]; cu = cu[(cu >= 0) & (cu < nv2)]
+            cu = g2u[np.flatnonzero(changed_mask)]; cu = cu[(cu >= 0) & (cu < nv2)]
             if len(cu) > 0:
                 vp[cu] = np.clip(lut[vcl[cu]] * sh[cu, None], 0, 255).astype(np.uint8); pc.Modified()
                 if _defer_render or len(cu) < 500:
@@ -1546,7 +1566,7 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
     xyz = app.data.get("xyz")
     if cls is None or xyz is None: return
 
-    ci = np.where(changed_mask)[0]
+    ci = np.flatnonzero(changed_mask)
     rgi = ci[cls[ci] == sci]
     if len(rgi) == 0: return
 
@@ -1561,7 +1581,7 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
     mg = cache.spacing * 5 if cache.spacing > 0 else 1000.
     xn -= mg; yn -= mg; xx += mg; yx += mg
 
-    avi = np.where(cls == sci)[0]
+    avi = np.flatnonzero(cls == sci)
     avx = xyz[avi]
     ir = (avx[:,0] >= xn) & (avx[:,0] <= xx) & (avx[:,1] >= yn) & (avx[:,1] <= yx)
     lgi = avi[ir]; lx = avx[ir]
@@ -1571,7 +1591,7 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
     irm = (cf[:,0] >= xn) & (cf[:,0] <= xx) & (cf[:,1] >= yn) & (cf[:,1] <= yx)
 
     # Step 1: identify stale unique vertices
-    region_ui = np.where(irm)[0]
+    region_ui = np.flatnonzero(irm)
     stale_ui_set = np.array([], dtype=np.int32)
     if len(region_ui) > 0:
         region_gi = cache.unique_indices[region_ui]
@@ -1637,7 +1657,7 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
         
     xy = ulx[:,:2]
     try: lf = _do_triangulate(xy)
-    except:
+    except Exception:
         cache.faces = fo; cache.face_normals = no; cache.shade = so
         cache._vtk_colors_ptr = None
         _render_mesh_fast_update(app, cache, n_removed, 0)
@@ -1735,7 +1755,7 @@ def _render_mesh_fast_update(app, cache, n_removed, n_added):
         mesh.Modified()
         actor.GetMapper().Modified()
         app.vtk_widget.render()
-    except:
+    except Exception:
         _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
 
 def _fast_incremental_add_points(app, ngi):
@@ -1757,7 +1777,7 @@ def _fast_incremental_add_points(app, ngi):
     
     eib = ((cache.xyz_unique[:,0] >= xn) & (cache.xyz_unique[:,0] <= xx) &
            (cache.xyz_unique[:,1] >= yn) & (cache.xyz_unique[:,1] <= yx))
-    ei = np.where(eib)[0]; onv = len(cache.xyz_unique)
+    ei = np.flatnonzero(eib); onv = len(cache.xyz_unique)
     
     cache.unique_indices = np.concatenate([cache.unique_indices, mg])
     cache.xyz_unique = np.vstack([cache.xyz_unique, nxl])
@@ -1789,7 +1809,7 @@ def _fast_incremental_add_points(app, ngi):
     
     try:
         lf = _do_triangulate(lxy)
-    except:
+    except Exception:
         cache.faces = fo; cache.face_normals = no
         cache.shade = _compute_face_shade_global_z(
             cache.xyz_unique, fo,
@@ -1855,7 +1875,10 @@ def handle_shaded_view_change(app, view_name):
     try:
         a = getattr(app, '_shaded_mesh_actor', None)
         if not a: return
-        b = a.GetMapper().GetInput().GetBounds()
+        _m = a.GetMapper()
+        _inp = _m.GetInput() if _m else None
+        if _inp is None: return
+        b = _inp.GetBounds()
         cx, cy, cz = (b[0]+b[1])/2, (b[2]+b[3])/2, (b[4]+b[5])/2
         ex, ey, ez = b[1]-b[0], b[3]-b[2], b[5]-b[4]; d = max(ex, ey, ez)*2
         cam = app.vtk_widget.renderer.GetActiveCamera()
@@ -1869,8 +1892,8 @@ def handle_shaded_view_change(app, view_name):
         else:
             cam.SetPosition(cx-d*.7, cy-d*.7, cz+d*.7); cam.SetFocalPoint(cx, cy, cz); cam.SetViewUp(0,0,1); cam.SetParallelProjection(False)
         app.vtk_widget.renderer.ResetCameraClippingRange(); app.vtk_widget.render()
-    except: pass
-
+    except Exception:
+        pass
 class ShadingControlPanel(QWidget):
     def __init__(self, app):
         super().__init__(); self.app = app; self.setWindowTitle("Shading")

@@ -1,7 +1,19 @@
+
+"""
+Grid Tool for Point Cloud Viewer
+Similar to MicroStation's grid functionality
+✅ Draw rectangle to define area
+✅ Configure grid: rows × columns OR spacing in meters
+✅ Creates matrix of grid lines
+✅ FIXED: Left-click starts, right-click finishes (same as select rectangle tool)
+"""
+
 import numpy as np
 import vtk
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                               QSpinBox, QDoubleSpinBox, QPushButton, QGroupBox, QMessageBox)
+                               QSpinBox, QDoubleSpinBox, QRadioButton, 
+                               QButtonGroup, QPushButton, QGroupBox, QMessageBox)
+from PySide6.QtCore import Qt
 
 
 class GridConfigDialog(QDialog):
@@ -276,7 +288,7 @@ class GridTool:
             for obs_id in self.observer_ids:
                 try:
                     interactor.RemoveObserver(obs_id)
-                except:
+                except Exception:
                     pass
         
         self.observer_ids = []
@@ -304,7 +316,7 @@ class GridTool:
         # ✅ FIXED: Abort event properly
         try:
             interactor.GetInteractorStyle().OnLeftButtonDown()
-        except:
+        except Exception:
             pass
         
     def on_mouse_move(self, obj, event):
@@ -366,7 +378,7 @@ class GridTool:
         # ✅ FIXED: Abort event properly
         try:
             interactor.GetInteractorStyle().OnRightButtonDown()
-        except:
+        except Exception:
             pass
         
     def _screen_to_world(self, screen_pos):
@@ -641,7 +653,7 @@ class GridTool:
             try:
                 self.app.vtk_widget.renderer.RemoveActor2D(self.rubber_band_actor)
                 self.app.vtk_widget.render()
-            except:
+            except Exception:
                 pass
             self.rubber_band_actor = None
     
@@ -654,7 +666,7 @@ class GridTool:
         for actor in self.grid_actors:
             try:
                 renderer.RemoveActor(actor)
-            except:
+            except Exception:
                 pass
         
         self.grid_actors = []

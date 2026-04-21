@@ -56,6 +56,17 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         
         print("✅ CurveTool initialized")
     
+    def clear_history(self):
+        """
+        Clear completed curve history stacks.
+        Called when switching to another tool context to prevent
+        stale curve undo/redo from intercepting Ctrl+Z/Y.
+        """
+        if self.history_stack or self.history_redo_stack:
+            print(f"   🎨 Clearing curve history: {len(self.history_stack)} items")
+        self.history_stack = []
+        self.history_redo_stack = []
+
     def activate(self):
         """Activate the curve drawing tool"""
         if self.active:
@@ -93,13 +104,13 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         except Exception as e:
             print(f"   ⚠️ Could not enable line stippling: {e}")
     
-    def deactivate(self):
+    def deactivate(self, clear_history=False):
         """Deactivate the curve drawing tool"""
         if not self.active:
             return
         
         self.active = False
-        self._select_mode = False          # ◀◀◀ ADD THIS
+        self._select_mode = False
        
         # ✅ Disable mouse tracking
         digitizer = getattr(self.app, 'digitizer', None)
@@ -112,7 +123,12 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         # Clear preview
         self._clear_preview()
         
-        print("⏹️ Curve Point tool DEACTIVATED (selection still enabled)")
+        # ✅ Clear history if switching to another tool context
+        if clear_history:
+            self.clear_history()
+        
+        print("⏹️ Curve Point tool DEACTIVATED" + 
+              (" (history cleared)" if clear_history else " (selection still enabled)"))
         
         if hasattr(self.app, 'statusBar'):
             self.app.statusBar().showMessage(
@@ -981,6 +997,53 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         
         return actor
     
+    def get_curves_as_fences(self):
+        """
+        Return finalized curves in a format compatible with FenceSelectorWidget.
+        Each curve is returned as a dict similar to digitizer drawings:
+        {
+            'type': 'curve',
+            'coords': [[x,y,z], ...],  # interpolated points
+            'source': 'curve_tool',
+            'curve_data': <original curve_data dict>,
+            'curve_index': <int>  # index in finalized_actors
+        }
+        """
+        fences = []
+        for idx, curve_data in enumerate(self.finalized_actors):
+            if isinstance(curve_data, dict) and 'interpolated' in curve_data:
+                interpolated = curve_data['interpolated']
+                # Convert numpy array to list of [x, y, z]
+                if hasattr(interpolated, 'tolist'):
+                    coords = interpolated.tolist()
+                else:
+                    coords = [list(pt) for pt in interpolated]
+                
+                fences.append({
+                    'type': 'curve',
+                    'coords': coords,
+                    'source': 'curve_tool',
+                    'curve_data': curve_data,
+                    'curve_index': idx,
+                    'color': curve_data.get('color', (0, 1, 0))
+                })
+        return fences
+
+
+    def is_curve_fence(self, fence_data):
+        """Check if a fence dict came from the curve tool."""
+        return isinstance(fence_data, dict) and fence_data.get('source') == 'curve_tool'
+
+
+    def get_curve_actor_for_fence(self, fence_data):
+        """Get the VTK actor for a curve fence (for highlighting)."""
+        if not self.is_curve_fence(fence_data):
+            return None
+        curve_data = fence_data.get('curve_data')
+        if curve_data and isinstance(curve_data, dict):
+            return curve_data.get('actor')
+        return None
+
     def clear_all_curves(self):
         """Clear EVERYTHING related to curves (final + preview + dynamic)"""
 

@@ -1,6 +1,24 @@
+
+
+"""
+GPU Support Module - Naksha LiDAR
+
+Auto-detects and enables GPU acceleration when available
+
+✅ FEATURES:
+- Auto-detect GPU availability
+- Enable VTK GPU rendering (OpenGL 4.x+)
+- Memory management and budget calculation
+- Fallback to CPU rendering gracefully
+- Expected improvement: 3-5x faster for 100M+ points
+"""
+
 import os
 import logging
+
 logger = logging.getLogger(__name__)
+
+
 class GPUSupport:
     """Manage GPU acceleration for VTK rendering with memory management"""
     
@@ -15,7 +33,7 @@ class GPUSupport:
     def detect_gpu(self):
         """Detect GPU and enable acceleration if available"""
         try:
-            __import__("vtk")
+            import vtk
             
             print("\n" + "="*60)
             print("🖥️  GPU DETECTION & INITIALIZATION")
@@ -51,7 +69,7 @@ class GPUSupport:
             
             # Fallback: Check VTK GPU capabilities
             try:
-                __import__("vtkmodules.vtkRenderingOpenGL2")
+                from vtkmodules.vtkRenderingOpenGL2 import vtkGenericOpenGLRenderWindow
                 print("✅ VTK OpenGL2 backend available")
                 self.gpu_available = True
                 

@@ -3,6 +3,7 @@ import pyvista as pv
 from scipy.spatial import Delaunay
 from .views import set_view
 from PySide6.QtCore import QObject, QThread, Signal, QTimer
+import vtk
 
 
 # ─────────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 import vtk
-from PySide6.QtWidgets import QMessageBox, QFileDialog
+from PySide6.QtWidgets import QMessageBox, QFileDialog,QHBoxLayout
 from PySide6.QtCore import QSettings
 import numpy as np
 
@@ -776,7 +776,7 @@ class GridLabelManager:
                     if hasattr(vtk_widget, 'actors'):
                         vtk_widget.actors.clear()
                     vtk_widget.render()
-                except:
+                except Exception:
                     pass
             print(f"   ✅ Cross-sections cleared")
         
@@ -1002,7 +1002,7 @@ class GridLabelManager:
                     from pyproj import CRS
                     self.app.crs = CRS.from_epsg(tile_data["crs_epsg"])
                     print(f"   📐 CRS: {self.app.crs.name}")
-                except:
+                except Exception:
                     pass
             
             # Store as layer - SAME AS MENU BAR
@@ -1033,7 +1033,7 @@ class GridLabelManager:
             try:
                 from gui.shading_display import build_base_dem_mesh
                 build_base_dem_mesh(self.app, percentile_filter=99.9, downsample=2)
-            except:
+            except Exception:
                 pass
             
             # ============================================================================
@@ -1060,7 +1060,7 @@ class GridLabelManager:
             try:
                 from gui.display_mode import restore_display_settings_for_file
                 restore_display_settings_for_file(self.app, str(las_file))
-            except:
+            except Exception:
                 pass
             
             # ============================================================================
@@ -1095,7 +1095,7 @@ class GridLabelManager:
                 update_progress(85, "Building palette...", force=True)
                 
                 try:
-                    from gui.class_display import build_class_palette
+                    from gui.class_display import build_class_palette, update_class_mode
                     self.app.class_palette = build_class_palette(tile_data['classification'])
                     print(f"   ✅ Built palette: {len(self.app.class_palette)} classes")
                     
@@ -1136,7 +1136,7 @@ class GridLabelManager:
             try:
                 from gui.pointcloud_display import force_interactor_ready
                 force_interactor_ready(self.app, delay_ms=300)
-            except:
+            except Exception:
                 pass
             
             # Toggle view mode - BUT DON'T RESET CAMERA IF WE SAVED STATE
@@ -1204,7 +1204,7 @@ class GridLabelManager:
             if hasattr(self.app, "digitizer") and self.app.digitizer:
                 try:
                     self.app.digitizer.auto_load_drawings(str(las_file))
-                except:
+                except Exception:
                     pass
             
             # ============================================================================
@@ -1214,7 +1214,7 @@ class GridLabelManager:
                 try:
                     from gui.point_count_widget import refresh_point_statistics
                     refresh_point_statistics(self.app)
-                except:
+                except Exception:
                     pass
             
             # ============================================================================

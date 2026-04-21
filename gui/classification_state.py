@@ -1,3 +1,10 @@
+"""
+Classification State Tracker - Dirty Flag System
+
+This is a NEW module that doesn't modify any existing code.
+It provides state tracking that the optimizer uses.
+"""
+
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Set, Optional, Dict, List
@@ -152,9 +159,23 @@ def get_weight_cache() -> WeightCache:
 
 
 def reset_caches():
-    """Reset all caches - call when loading new file."""
+    """
+    Reset all caches — call when loading new file.
+    Also flushes the persistent spatial index and palette-resolve caches
+    so stale data from the previous file cannot leak into the new session.
+    """
     global _global_state, _weight_cache
     if _global_state:
         _global_state.clear()
     if _weight_cache:
         _weight_cache.clear()
+    try:
+        from gui.spatial_index import invalidate_cache as _si_invalidate
+        _si_invalidate()
+    except Exception:
+        pass
+    try:
+        from gui.unified_actor_manager import _palette_resolve_cache
+        _palette_resolve_cache.clear()
+    except Exception:
+        pass

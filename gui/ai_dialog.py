@@ -1,3 +1,4 @@
+
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QProgressBar, QPushButton, QMessageBox,
@@ -10,7 +11,10 @@ from PySide6.QtGui import QFont
 from pathlib import Path
 import numpy as np
 
-from gui.ai_inference import InferenceConfig
+from gui.ai_inference import (
+    InferenceConfig,
+    DEFAULT_POWER_MAPPING,
+)
 
 # ═══════════════════════════════════════════════════════════════
 # TerraScan MAC PARSER

@@ -151,7 +151,7 @@ class OptimizedRefreshPipeline:
                     for view_idx in sorted(self._pending_renders):
                         try:
                             self._render_view(view_idx)
-                        except:
+                        except Exception:
                             pass
                 
                 self._pending_renders.clear()
@@ -184,7 +184,7 @@ class OptimizedRefreshPipeline:
                 # Cross-section view
                 if hasattr(self.app, 'section_vtks') and 1 in self.app.section_vtks:
                     pass 
-        except:
+        except Exception:
             pass      
 
     def _force_border_reapplication(self):
@@ -277,7 +277,7 @@ class OptimizedRefreshPipeline:
                             point_size = max(1.0, min(new_weight * 2.5, 30.0))
                             actor.GetProperty().SetPointSize(point_size)
                             self._pending_renders.add(0)
-                        except:
+                        except Exception:
                             pass
         weight_cache.update_cache(dialog.view_palettes)
 
@@ -331,6 +331,7 @@ class OptimizedRefreshPipeline:
         Optimized single cross-section refresh.
         ✅ FIXED: Detects view mode changes and delegates to _plot_section for full rebuild
         """
+        import pyvista as pv
         import numpy as np
 
         if not hasattr(self.app, 'section_vtks') or view_idx not in self.app.section_vtks:
@@ -488,7 +489,7 @@ class OptimizedRefreshPipeline:
                                     actor = test_actor
                                     print(f"   🎯 Found actor: '{name}'")
                                     break
-                            except:
+                            except Exception:
                                 continue
 
                 if actor is None:
@@ -516,7 +517,7 @@ class OptimizedRefreshPipeline:
                                 actor = test_actor
                                 max_points = n_points
                                 print(f"   🎯 Auto-detected unified cloud: '{name}' ({n_points:,}/{total_points:,} points)")
-                        except:
+                        except Exception:
                             continue
 
                     if not actor:
@@ -528,9 +529,10 @@ class OptimizedRefreshPipeline:
                     if global_mask is not None and np.any(global_mask):
                         
                         # Get memory pointer to the RGB colors
-                        polydata = actor.GetMapper().GetInput()
-                        vtk_colors = polydata.GetPointData().GetScalars()
-                        
+                        _om = actor.GetMapper()
+                        polydata = _om.GetInput() if _om is not None else None
+                        vtk_colors = polydata.GetPointData().GetScalars() if polydata is not None else None
+
                         if vtk_colors:
                             vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
                             
@@ -554,7 +556,7 @@ class OptimizedRefreshPipeline:
                                 # Check if LOD is active
                                 if gpu_buffer_size == total_points:
                                     # No LOD - direct mapping
-                                    local_indices = np.where(effective_mask)[0]
+                                    local_indices = np.flatnonzero(effective_mask)
                                     print(f"      ✅ Direct mapping (no LOD): {len(local_indices):,} points")
                                     
                                 elif hasattr(app, 'current_gpu_indices') and app.current_gpu_indices is not None:
@@ -564,7 +566,7 @@ class OptimizedRefreshPipeline:
                                     if len(gpu_indices) != gpu_buffer_size:
                                         print(f"      ⚠️ GPU indices size mismatch: {len(gpu_indices)} != {gpu_buffer_size}")
                                         # Direct with clipping
-                                        local_indices = np.where(effective_mask)[0]
+                                        local_indices = np.flatnonzero(effective_mask)
                                         local_indices = local_indices[local_indices < gpu_buffer_size]
                                     else:
                                         # Build local mask by checking which GPU indices are in changed mask
@@ -575,11 +577,11 @@ class OptimizedRefreshPipeline:
                                             if global_idx < len(effective_mask) and effective_mask[global_idx]:
                                                 local_mask[i] = True
                                         
-                                        local_indices = np.where(local_mask)[0]
+                                        local_indices = np.flatnonzero(local_mask)
                                         print(f"      ✅ LOD mapping: {len(local_indices):,} points")
                                 else:
                                     # No GPU indices but buffer smaller - clip direct
-                                    local_indices = np.where(effective_mask)[0]
+                                    local_indices = np.flatnonzero(effective_mask)
                                     local_indices = local_indices[local_indices < gpu_buffer_size]
                                     print(f"      ⚠️ LOD active but no GPU indices, clipped: {len(local_indices):,} points")
                                 
@@ -596,7 +598,7 @@ class OptimizedRefreshPipeline:
                                 import traceback
                                 traceback.print_exc()
                                 # Ultimate fallback
-                                local_indices = np.where(global_mask)[0]
+                                local_indices = np.flatnonzero(global_mask)
                                 local_indices = local_indices[local_indices < gpu_buffer_size]
                                 print(f"      🆘 Fallback: {len(local_indices):,} points")
 
@@ -623,8 +625,8 @@ class OptimizedRefreshPipeline:
             try:
                 if hasattr(vtk_widget, 'camera_position') and vtk_widget.camera_position is not None:
                     saved_camera = vtk_widget.camera_position
-            except: pass
-        
+            except Exception:
+                pass
         if display_mode == "class":
             self._refresh_main_view_class_mode(to_class, state)
         elif display_mode == "shaded_class":
@@ -636,13 +638,14 @@ class OptimizedRefreshPipeline:
         if saved_camera is not None and vtk_widget is not None:
             try:
                 vtk_widget.camera_position = saved_camera
-            except: pass
-    
+            except Exception:
+                pass
     def _refresh_main_view_class_mode(self, to_class, state):
         """
         ✅ FIXED: Properly refresh main view with GUARANTEED border preservation
         🚀 OPTIMIZED: Uses Direct GPU Pointer injection with LOD and Visibility mapping.
         """
+        import pyvista as pv
         import numpy as np
         from vtkmodules.util import numpy_support
         app = self.app
@@ -698,13 +701,13 @@ class OptimizedRefreshPipeline:
                     if 'old_classes' in last_undo and last_undo['old_classes'] is not None:
                         old_unique = np.unique(last_undo['old_classes']).astype(int)
                         dirty_classes = dirty_classes.union(set(old_unique))
-                except:
+                except Exception:
                     pass
             
             # Cache it
             if not hasattr(self, '_cached_dirty_classes'):
                 self._cached_dirty_classes = {}
-            self._cached_dirty_classes = {'value': dirty_classes}
+            self._cached_dirty_classes = {'key': cache_key, 'value': dirty_classes}
             if ENABLE_PERFORMANCE_LOGGING:
                 print(f"      ⚡ Calculated and cached dirty_classes")
 
@@ -726,13 +729,14 @@ class OptimizedRefreshPipeline:
                             if test_actor.GetMapper() and test_actor.GetMapper().GetInput():
                                 main_actor = test_actor
                                 break
-                        except:
+                        except Exception:
                             continue
 
             if main_actor is not None:
-                mesh = main_actor.GetMapper().GetInput()
-                vtk_colors = mesh.GetPointData().GetScalars()
-                
+                _mm = main_actor.GetMapper()
+                mesh = _mm.GetInput() if _mm is not None else None
+                vtk_colors = mesh.GetPointData().GetScalars() if mesh is not None else None
+
                 if vtk_colors is not None:
                     # Only use fast update if no affected class needs to be hidden
                     can_use_fast_update = True
@@ -752,10 +756,10 @@ class OptimizedRefreshPipeline:
                             actor_classes = classes
 
                         if hasattr(app, 'current_gpu_indices'):
-                            local_indices = np.where(effective_mask[app.current_gpu_indices])[0]
+                            local_indices = np.flatnonzero(effective_mask[app.current_gpu_indices])
                             actor_classes = actor_classes[app.current_gpu_indices]
                         else:
-                            local_indices = np.where(effective_mask)[0]
+                            local_indices = np.flatnonzero(effective_mask)
 
                         if len(local_indices) > 0:
                             # Build Fast LUT for colors
@@ -827,6 +831,9 @@ class OptimizedRefreshPipeline:
             self._deferred_rebuild_timer.timeout.connect(self._execute_deferred_rebuild)
 
         self._deferred_rebuild_timer.stop()
+        # Clear previous data before rescheduling to prevent stale references
+        # accumulating across rapid classification operations.
+        # Fresh data was just stored in _deferred_rebuild_data above.
         self._deferred_rebuild_timer.start(500)
 
     def _execute_deferred_rebuild(self):
@@ -915,6 +922,12 @@ class OptimizedRefreshPipeline:
                 get_cache,
                 clear_shading_cache,
                 update_shaded_class,
+                _do_triangulate,
+                _filter_edges_by_absolute,
+                _compute_face_normals,
+                _compute_shading,
+                _render_mesh,
+                _save_camera,
             )
 
             cache = get_cache()
@@ -930,7 +943,7 @@ class OptimizedRefreshPipeline:
                     and np.any(changed_mask)):
 
                 classes = self.app.data.get("classification").astype(np.int32)
-                changed_indices = np.where(changed_mask)[0]
+                changed_indices = np.flatnonzero(changed_mask)
                 changed_now_classes = classes[changed_indices]
 
                 # Points that are NOW in the visible single class
@@ -1013,7 +1026,7 @@ class OptimizedRefreshPipeline:
                     still_valid = (cached_vertex_classes == single_class_id)
                     has_new_points_in_class = False
                     if changed_mask is not None and np.any(changed_mask):
-                        changed_now = classes[np.where(changed_mask)[0]]
+                        changed_now = classes[np.flatnonzero(changed_mask)]
                         has_new_points_in_class = bool(
                             np.any(changed_now == single_class_id))
                     if not np.all(still_valid) or has_new_points_in_class:
@@ -1230,7 +1243,7 @@ class OptimizedRefreshPipeline:
         try:
             from gui.point_count_widget import refresh_point_statistics
             refresh_point_statistics(self.app)
-        except:
+        except Exception:
             pass
         
     def _apply_border_shader_safe(self, actor, border_percent):
@@ -1274,7 +1287,7 @@ class OptimizedRefreshPipeline:
                     f"✅ {num_changed:,} points classified to {class_name}",
                     3000
                 )
-        except:
+        except Exception:
             pass
 
 # Singleton instance

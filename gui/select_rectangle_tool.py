@@ -1,7 +1,7 @@
 import numpy as np
 import vtk
 from PySide6.QtWidgets import QMessageBox, QProgressDialog
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 
 class SelectRectangleTool:
@@ -81,7 +81,7 @@ class SelectRectangleTool:
             for obs_id in self.observer_ids:
                 try:
                     interactor.RemoveObserver(obs_id)
-                except:
+                except Exception:
                     pass
             
             self.observer_ids = []
@@ -110,7 +110,7 @@ class SelectRectangleTool:
         # ✅ FIXED: Abort event properly
         try:
             interactor.GetInteractorStyle().OnLeftButtonDown()
-        except:
+        except Exception:
             pass
         
     def on_mouse_move(self, obj, event):
@@ -199,7 +199,7 @@ class SelectRectangleTool:
             # Abort event properly
             try:
                 interactor.GetInteractorStyle().OnRightButtonDown()
-            except:
+            except Exception:
                 pass
         
         finally:
@@ -585,7 +585,7 @@ class SelectRectangleTool:
             try:
                 self.app.vtk_widget.renderer.RemoveActor2D(self.rubber_band_actor)
                 self.app.vtk_widget.render()
-            except:
+            except Exception:
                 pass
             self.rubber_band_actor = None
     
@@ -595,14 +595,14 @@ class SelectRectangleTool:
         if hasattr(self.app.vtk_widget, 'actors') and 'selection_highlight' in self.app.vtk_widget.actors:
             try:
                 self.app.vtk_widget.remove_actor('selection_highlight', render=False)
-            except:
+            except Exception:
                 pass
         
         # ✅ Clear DXF highlight overlays
         if hasattr(self.app.vtk_widget, 'actors') and 'dxf_selection_highlight' in self.app.vtk_widget.actors:
             try:
                 self.app.vtk_widget.remove_actor('dxf_selection_highlight', render=False)
-            except:
+            except Exception:
                 pass
             
     def _highlight_selected_points(self):
@@ -641,7 +641,7 @@ class SelectRectangleTool:
                 actor.GetProperty().SetColor(1.0, 0.5, 0.0)  # Orange
                 actor.GetProperty().SetLineWidth(5)  # Thicker
                 actor.GetProperty().SetOpacity(1.0)
-            except:
+            except Exception:
                 pass
         
         self.app.vtk_widget.render()
@@ -724,7 +724,7 @@ class SelectRectangleTool:
         # Force render to show restored colors
         try:
             self.app.vtk_widget.render()
-        except:
+        except Exception:
             pass
         
         # Clear selection state
@@ -843,7 +843,7 @@ class SelectRectangleTool:
                     # Remove actor from renderer
                     try:
                         renderer.RemoveActor(actor)
-                    except:
+                    except Exception:
                         pass
                     
                     dxf_to_remove.add(id(dxf_data))
@@ -1136,7 +1136,7 @@ class SelectRectangleTool:
                 try:
                     bounds = actor.GetBounds()
                     print(f"         Bounds: {bounds}")
-                except:
+                except Exception:
                     print(f"         ⚠️ Could not get bounds")
                 
                 # Check if any part of this actor is in the rectangle

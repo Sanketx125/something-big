@@ -112,6 +112,7 @@ def update_pointcloud_optimized(app, mode):
     """
     import numpy as np
     import pyvista as pv
+    import matplotlib.pyplot as plt
 
     if app.data is None or "xyz" not in app.data:
         print("⚠️ No data to display")
@@ -285,15 +286,19 @@ def fast_update_colors_optimized(app, changed_mask=None):
         a = ac.GetNextActor()
         if not a:
             break
-        pd = a.GetMapper().GetInput()
+        _am = a.GetMapper()
+        pd = _am.GetInput() if _am is not None else None
         if pd and pd.GetNumberOfPoints() > max_pts:
             max_pts = pd.GetNumberOfPoints()
             actor = a
-    
+
     if actor is None:
         return
 
-    poly = actor.GetMapper().GetInput()
+    _pm = actor.GetMapper()
+    poly = _pm.GetInput() if _pm is not None else None
+    if poly is None:
+        return
     
     # ============================================
     # OPTIMIZATION: Only update changed points
