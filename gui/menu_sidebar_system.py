@@ -1,4 +1,5 @@
 
+
 """
 Menu-Based Ribbon System for NakshaAI
 Displays all menu options horizontally in a ribbon layout
@@ -22,7 +23,6 @@ from .curve_ribbon import CurveRibbon
 from .digitize_tools import LineArrowSettingsDialog, PolylineSettingsDialog
 from .draw_settings_dialog import DrawToolSettingsDialog
 from .icon_provider import get_button_icon
-from gui.undo_context_manager import get_undo_context_manager
 
 # from gui.menu_sidebar_system import InsideFenceDialog
 RIBBON_TOOLTIP_META = {
@@ -8239,147 +8239,59 @@ class InsideFenceDialog(QDialog):
         """
         ✅ CRITICAL: Intercept keyboard events BEFORE they reach Digitizer
         Installed on QApplication for global capture when dialog is visible
-        
-        ✅ FIXED: Now respects undo context priority - classification gets
-        priority when active, draw tool only gets undo when classification is NOT active.
         """
         from PySide6.QtCore import QEvent
         
         if event.type() == QEvent.KeyPress:
-            key = event.key()
-            modifiers = event.modifiers()
-            
-            # Check for Ctrl+Z (Undo)
-            if key == Qt.Key_Z and modifiers == Qt.ControlModifier:
-                # ✅ CRITICAL FIX: Check undo context BEFORE passing to digitizer
-                # Classification tool should ALWAYS get priority when active
-                try:
-                    ctx_mgr = get_undo_context_manager(self.app)
-                    
-                    if ctx_mgr.is_classification_active():
-                        print("🔵 InsideFenceDialog: Classification active — NOT intercepting Ctrl+Z")
-                        # Let event propagate to classification undo handler
-                        return False
-                except Exception as e:
-                    print(f"⚠️ Undo context check failed: {e}")
+            # ✅ CHANGED: Only check if dialog is visible (not isActiveWindow)
+            # if self.isVisible():
+                key = event.key()
+                modifiers = event.modifiers()
                 
-                # Only pass to digitizer if draw tool OWNS the undo context
-                digitizer = getattr(self.app, 'digitizer', None)
-                if digitizer and getattr(digitizer, 'enabled', False):
-                    undo_stack = getattr(digitizer, 'undo_stack', None)
-                    if undo_stack and len(undo_stack) > 0:
-                        # Double-check that draw tool owns the context
-                        try:
-                            ctx_mgr = get_undo_context_manager(self.app)
-                            if ctx_mgr._current_context == ctx_mgr.DRAW:
-                                print("🔵 InsideFenceDialog: Draw tool owns undo — passing Ctrl+Z to digitizer")
-                                digitizer.undo()
-                                event.accept()
-                                return True
-                        except Exception:
-                            pass
-                
-                # Don't intercept - let classification or global shortcut handle it
-                return False
+                # Check for Ctrl+Z (Undo)
 
-            # Check for Ctrl+Y (Redo)
-            elif key == Qt.Key_Y and modifiers == Qt.ControlModifier:
-                # ✅ CRITICAL FIX: Check undo context BEFORE passing to digitizer
-                try:
-                    ctx_mgr = get_undo_context_manager(self.app)
-                    
-                    if ctx_mgr.is_classification_active():
-                        print("🔵 InsideFenceDialog: Classification active — NOT intercepting Ctrl+Y")
-                        return False
-                except Exception as e:
-                    print(f"⚠️ Undo context check failed: {e}")
-                
-                # Only pass to digitizer if draw tool OWNS the undo context
-                digitizer = getattr(self.app, 'digitizer', None)
-                if digitizer and getattr(digitizer, 'enabled', False):
-                    redo_stack = getattr(digitizer, 'redo_stack', None)
-                    if redo_stack and len(redo_stack) > 0:
-                        try:
-                            ctx_mgr = get_undo_context_manager(self.app)
-                            if ctx_mgr._current_context == ctx_mgr.DRAW:
-                                print("🔵 InsideFenceDialog: Draw tool owns redo — passing Ctrl+Y to digitizer")
-                                digitizer.redo()
-                                event.accept()
-                                return True
-                        except Exception:
-                            pass
-                
-                return False
+                if key == Qt.Key_Z and modifiers == Qt.ControlModifier:
+                    # ✅ If digitizer tool is active, let IT handle undo — not classification
+                    digitizer = getattr(self.app, 'digitizer', None)
+                    if digitizer and getattr(digitizer, 'active_tool', None):
+                        print("🔵 InsideFenceDialog: Digitizer active — passing Ctrl+Z to digitizer")
+                        digitizer.undo()
+                        event.accept()
+                        return True
+                    print("🔵 InsideFenceDialog: Intercepted Ctrl+Z via event filter")
+                    self.perform_undo()
+                    event.accept()
+                    return True
+
+                elif key == Qt.Key_Y and modifiers == Qt.ControlModifier:
+                    # ✅ Same for redo
+                    digitizer = getattr(self.app, 'digitizer', None)
+                    if digitizer and getattr(digitizer, 'active_tool', None):
+                        print("🔵 InsideFenceDialog: Digitizer active — passing Ctrl+Y to digitizer")
+                        digitizer.redo()
+                        event.accept()
+                        return True
+                    print("🔵 InsideFenceDialog: Intercepted Ctrl+Y via event filter")
+                    self.perform_redo()
+                    event.accept()
+                    return True
         
         # Pass other events through
         return super().eventFilter(obj, event)
 
 
     def keyPressEvent(self, event):
-        """Fallback: Handle keyboard shortcuts directly on dialog
-        
-        ✅ FIXED: Now respects undo context priority - classification gets
-        priority when active, draw tool only gets undo when classification is NOT active.
-        """
+        """Fallback: Handle keyboard shortcuts directly on dialog"""
         if event.modifiers() == Qt.ControlModifier:
             if event.key() == Qt.Key_Z:
-                # ✅ CRITICAL FIX: Check undo context BEFORE handling
-                try:
-                    ctx_mgr = get_undo_context_manager(self.app)
-                    
-                    if ctx_mgr.is_classification_active():
-                        print("🔵 InsideFenceDialog: Classification active — ignoring Ctrl+Z (fallback)")
-                        event.ignore()  # Let it propagate
-                        return
-                except Exception:
-                    pass
-                
-                # Only handle if draw tool owns undo context
-                digitizer = getattr(self.app, 'digitizer', None)
-                if digitizer and getattr(digitizer, 'enabled', False):
-                    undo_stack = getattr(digitizer, 'undo_stack', None)
-                    if undo_stack and len(undo_stack) > 0:
-                        try:
-                            ctx_mgr = get_undo_context_manager(self.app)
-                            if ctx_mgr._current_context == ctx_mgr.DRAW:
-                                print("🔵 InsideFenceDialog: Draw tool owns undo — Ctrl+Z (fallback)")
-                                digitizer.undo()
-                                event.accept()
-                                return
-                        except Exception:
-                            pass
-                
-                event.ignore()
+                print("🔵 InsideFenceDialog: Ctrl+Z via keyPressEvent (fallback)")
+                self.perform_undo()
+                event.accept()
                 return
-                
             elif event.key() == Qt.Key_Y:
-                # ✅ CRITICAL FIX: Check undo context BEFORE handling
-                try:
-                    ctx_mgr = get_undo_context_manager(self.app)
-                    
-                    if ctx_mgr.is_classification_active():
-                        print("🔵 InsideFenceDialog: Classification active — ignoring Ctrl+Y (fallback)")
-                        event.ignore()
-                        return
-                except Exception:
-                    pass
-                
-                # Only handle if draw tool owns undo context
-                digitizer = getattr(self.app, 'digitizer', None)
-                if digitizer and getattr(digitizer, 'enabled', False):
-                    redo_stack = getattr(digitizer, 'redo_stack', None)
-                    if redo_stack and len(redo_stack) > 0:
-                        try:
-                            ctx_mgr = get_undo_context_manager(self.app)
-                            if ctx_mgr._current_context == ctx_mgr.DRAW:
-                                print("🔵 InsideFenceDialog: Draw tool owns redo — Ctrl+Y (fallback)")
-                                digitizer.redo()
-                                event.accept()
-                                return
-                        except Exception:
-                            pass
-                
-                event.ignore()
+                print("🔵 InsideFenceDialog: Ctrl+Y via keyPressEvent (fallback)")
+                self.perform_redo()
+                event.accept()
                 return
         
         super().keyPressEvent(event)
@@ -10746,14 +10658,32 @@ class InsideFenceDialog(QDialog):
             self._clear_fence_highlights()
             # ✅ Re-highlight fences in a distinct color (cyan) to show classified area
             self._highlight_classified_fences()
-
+ 
             if hasattr(self.app, 'digitizer') and self.app.digitizer:
                 try:
                     self.app.digitizer.rebind_drawings()
                     print("   🖊️ Drawing actors rebound to overlay after shading rebuild")
                 except Exception as _rb_err:
                     print(f"   ⚠️ rebind_drawings failed: {_rb_err}")
-
+ 
+            # ✅ FIX: ALWAYS clear selected_fences after classification (both modes).
+            # Without this, showEvent → _restore_highlights_from_data() re-draws the
+            # blue selection box the moment the QMessageBox closes or the dialog
+            # regains focus, making it look like the fence was never cleared.
+            #
+            # The cyan outline (_highlight_classified_fences) stays visible because
+            # it uses the actor stored on the drawing dict, not selected_fences.
+            # For temp mode, drawings were already deleted inside _calculate_conversion.
+            self.selected_fences = []            # ← ADD (mirrors ByClassHeightDialog)
+            self.update_fence_display()          # ← ADD (resets badge to "0")
+            self.fence_status.setText("✅ Classified — select a fence again for next run")
+            self.fence_status.setStyleSheet("""
+                QLabel {
+                    padding: 6px; background-color: #1b3a20;
+                    border-radius: 3px; color: #81c784; font-size: 9px;
+                }
+            """)                                 # ← ADD (green "done" style, matches ByClassHeightDialog)
+ 
             if self.ribbon_parent:
                 self.ribbon_parent.update_status(f"Converted {converted_count:,} points", "success")
 
