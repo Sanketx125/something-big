@@ -44,4 +44,27 @@ class CurveRibbon(QWidget):
         )
         layout.addWidget(actions)
 
+        # ◀◀◀ NEW SECTION: Curve Settings
+        settings_section = RibbonSection("Settings", self)
+        settings_section.add_button(
+            "Settings", "⚙️",
+            lambda: self._show_curve_settings(),
+            toggleable=False
+        )
+        layout.addWidget(settings_section)
+
         layout.addStretch()
+
+    def _show_curve_settings(self):
+        """Open the Curve Tool Settings dialog."""
+        try:
+            main_window = self.window()
+            from gui.curve_settings_dialog import CurveToolSettingsDialog
+            dialog = CurveToolSettingsDialog(main_window, parent=main_window)
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        except Exception as e:
+            print(f"⚠️ Failed to open Curve Settings: {e}")
+            import traceback
+            traceback.print_exc()

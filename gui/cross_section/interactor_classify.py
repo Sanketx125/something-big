@@ -200,10 +200,8 @@ class ClassificationInteractor:
         self._brush_stroke_positions = []
         self._last_brush_center = None
         self._brush_needs_render = False
-        self._brush_main_visible_classes = None
-        self._brush_main_visible_classes_arr = None
-        self.app._suppress_section_refresh = False
-        self.is_dragging = False
+        self._brush_last_render_time = 0.0
+        self._brush_current_to_class = None
 
         # Background worker (kept alive across strokes, stopped in cleanup())
         self._brush_worker = None
@@ -728,8 +726,6 @@ class ClassificationInteractor:
         self._brush_stroke_positions = []
         self._last_brush_center = None
         self._brush_needs_render = False
-        self._brush_main_visible_classes = None
-        self._brush_main_visible_classes_arr = None
         self.app._suppress_section_refresh = False
         self.is_dragging = False
 
@@ -2457,8 +2453,6 @@ class ClassificationInteractor:
                         if has_index and to_class is not None:
                             classes = self.app.data["classification"]
                             from_classes = getattr(self.app, "from_classes", None)
-                            visible_classes = getattr(self, "_brush_main_visible_classes", None)
-                            visible_classes_arr = getattr(self, "_brush_main_visible_classes_arr", None)
 
                             for pos in positions:
                                 hit = self._get_points_in_radius_fast(
@@ -2471,15 +2465,6 @@ class ClassificationInteractor:
                                 fresh = hit[~self._brush_accumulated_mask[hit]]
                                 if len(fresh) == 0:
                                     continue
-
-                                # Filter by Main View visibility (slot 0): hidden classes are protected.
-                                if visible_classes == []:
-                                    continue
-                                if visible_classes_arr is not None:
-                                    vis_mask = np.isin(classes[fresh], visible_classes_arr)
-                                    fresh = fresh[vis_mask]
-                                    if len(fresh) == 0:
-                                        continue
 
                                 # Filter from_classes
                                 if from_classes:
@@ -2905,22 +2890,12 @@ class ClassificationInteractor:
             self._brush_render_counter = 0
             self._brush_last_render_time = 0.0
             self._brush_needs_render = False
-            self._brush_main_visible_classes = self._get_visible_classes_for_slot(0)
-            self._brush_main_visible_classes_arr = None
-            if self._brush_main_visible_classes not in (None, []):
-                self._brush_main_visible_classes_arr = np.asarray(
-                    self._brush_main_visible_classes,
-                    dtype=self.app.data["classification"].dtype,
-                )
-            elif self._brush_main_visible_classes == [] and hasattr(self.app, "statusBar"):
-                self.app.statusBar().showMessage(
-                    "No visible classes selected in Display Mode.",
-                    2000,
-                )
+            # Track current stroke's target class so _on_brush_worker_result can
+            # discard stale results from a previous stroke's still-running worker.
+            self._brush_current_to_class = getattr(self.app, "to_class", None)
             # ✅ Only set suppress flag for BRUSH tool
             self.app._suppress_section_refresh = True
-            self._brush_current_to_class = getattr(self.app, "to_class", None)    ###
-  
+
             # ── Task-3: start background KDTree worker (if not already running) ──
             if not getattr(self, "_brush_worker_active", False):
                 try:
@@ -3113,10 +3088,7 @@ class ClassificationInteractor:
                 self._brush_stroke_positions = []
                 self._last_brush_center = None
                 self._brush_needs_render = False
-                self._brush_main_visible_classes = None
-                self._brush_main_visible_classes_arr = None
                 self.app._suppress_section_refresh = False
-                self.is_dragging = False
 
                 # ── Task-2: destroy ROI preview actor ────────────────────────────
                 try:
@@ -3402,7 +3374,6 @@ class ClassificationInteractor:
 
             # Clean stroke buffers
             for attr in ("_brush_accumulated_mask", "_brush_stroke_positions", 
-                        "_brush_main_visible_classes", "_brush_main_visible_classes_arr",
                         "_brush_section_indices", "_brush_section_pts2d", 
                         "_brush_section_local_mask", "_last_brush_center_uv"):
                 if hasattr(self, attr):
@@ -4058,9 +4029,15 @@ class ClassificationInteractor:
             print("✅ Classification tool cancelled")
         
         # ✅ NEW: 'F' key to fly to current mouse position
-        # 🚫 F key: fly-to removed — caused red sphere in main view
         elif key == "f":
-            return
+            if not self._is_main_view():
+                try:
+                    x, y = self.interactor.GetEventPosition()
+                    pt = self._pick_world_point(x, y)
+                    self._fly_to_main_view(pt)
+                    print("✈️ 'F' key: Flying to cursor position")
+                except Exception as e:
+                    print(f"⚠️ 'F' key fly-to failed: {e}")
 
     def handle_escape(self):
         """Handle ESC key inside classification context safely."""

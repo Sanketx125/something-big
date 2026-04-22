@@ -49,7 +49,9 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         self.selected_curve = None     # Currently selected curve actor
         self.selected_curve_data = None # Store curve info for editing
         
-        # Settings
+        from gui.curve_settings_dialog import load_curve_settings
+        self.curve_style = load_curve_settings()
+        
         self.tension = 0.5             # Catmull-Rom tension (0 = tight, 1 = loose)
         self.samples = 100             # Number of interpolation points
         self.app.vtk_widget.installEventFilter(self)
@@ -448,8 +450,7 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         if num_points == 0:
             return
         
-        # Draw point markers at clicked locations
-        self._draw_point_markers()
+        # Point markers are no longer drawn per user request
         
         # ✅ ONLY draw the smooth curve if we have 3+ points
         # Do NOT draw line preview for 2 points - let dynamic line handle that
@@ -459,41 +460,7 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         # Render
         self.app.vtk_widget.render()
     
-    def _draw_point_markers(self):
-        for i, point in enumerate(self.points):
-
-            pixel_source = vtk.vtkRegularPolygonSource()
-            pixel_source.SetNumberOfSides(20)
-
-            # 🎯 Different styling
-            if i == 0:
-                pixel_source.SetRadius(3.0)  # smaller start point
-            else:
-                pixel_source.SetRadius(5.0)
-
-            pixel_source.GeneratePolygonOn()
-
-            coordinate = vtk.vtkCoordinate()
-            coordinate.SetCoordinateSystemToWorld()
-            coordinate.SetValue(point[0], point[1], point[2])
-
-            mapper = vtk.vtkPolyDataMapper2D()
-            mapper.SetInputConnection(pixel_source.GetOutputPort())
-            mapper.SetTransformCoordinate(coordinate)
-
-            actor = vtk.vtkActor2D()
-            actor.SetMapper(mapper)
-
-            # 🎯 Color logic
-            if i == 0:
-                actor.GetProperty().SetColor(1, 1, 0)  # yellow start point
-            else:
-                actor.GetProperty().SetColor(1, 0, 0)  # red others
-
-            actor.GetProperty().SetDisplayLocationToForeground()
-
-            self.app.vtk_widget.renderer.AddViewProp(actor)
-            self.point_actors.append(actor)
+    # Point marker logic removed per user request
    
     def _draw_curve_preview(self):
         """Draw smooth Catmull-Rom spline preview (Actor2D)"""
@@ -532,9 +499,11 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         self.preview_actor = vtk.vtkActor2D()
         self.preview_actor.SetMapper(mapper)
         
-        # Cyan solid curve, render on top
-        self.preview_actor.GetProperty().SetColor(0, 1, 1)  # Cyan
-        self.preview_actor.GetProperty().SetLineWidth(2)
+        # solid curve, render on top using user settings
+        color = self.curve_style.get('color', (0, 1, 1))
+        width = self.curve_style.get('width', 2)
+        self.preview_actor.GetProperty().SetColor(*color) 
+        self.preview_actor.GetProperty().SetLineWidth(width)
         self.preview_actor.GetProperty().SetDisplayLocationToForeground()
         
         # Use AddViewProp for 2D actors
@@ -623,18 +592,20 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
         # ✅ Clear points IMMEDIATELY to prevent re-entry
         self.points = []
         
-        # Create final curve actor (green)
+        # Create final curve actor using settings
         curve_points = self._interpolate_catmull_rom(points_to_save)
         
         if curve_points is not None:
-            actor = self._create_curve_actor(curve_points, color=(0, 1, 0))  # Green
+            color = self.curve_style.get('color', (0, 1, 0))
+            width = self.curve_style.get('width', 2)
+            actor = self._create_curve_actor(curve_points, color=color, width=width)
             
             # ✅ Store curve data with actor for later editing
             curve_data = {
                 'actor': actor,
                 'control_points': points_to_save.copy(),
                 'interpolated': curve_points.copy(),
-                'color': (0, 1, 0)  # Default green
+                'color': color  # Default or custom color
             }
             
             self.finalized_actors.append(curve_data)
