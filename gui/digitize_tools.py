@@ -2984,6 +2984,11 @@ class DigitizeManager:
     def undo(self):
         """Undo last drawing operation (Ctrl+Z)."""
 
+        if self.active_tool == "orthopolygon":
+            ortho_tool = getattr(self, "_ortho_polygon_tool", None)
+            if ortho_tool and ortho_tool.undo():
+                return
+
         # Per-vertex undo during active drawing
         if self.active_tool in ("smartline", "line", "polyline") and self.temp_points:
             if not hasattr(self, '_temp_redo_stack'):
@@ -3019,6 +3024,10 @@ class DigitizeManager:
 
     def redo(self):
         """Redo previously undone operation (Ctrl+Y)."""
+        if self.active_tool == "orthopolygon":
+            ortho_tool = getattr(self, "_ortho_polygon_tool", None)
+            if ortho_tool and ortho_tool.redo():
+                return
         if self.active_tool in ("smartline", "line", "polyline") and getattr(self, "_temp_redo_stack", None):
             if not hasattr(self, "_temp_vertex_stack"):
                 self._temp_vertex_stack = []
@@ -3027,6 +3036,7 @@ class DigitizeManager:
             self._rebuild_active_vertex_markers()
             self._rebuild_active_preview()
             return
+            
         if not self.redo_stack:
             print("⚠️ Nothing to redo")
             return

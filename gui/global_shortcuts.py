@@ -2612,22 +2612,13 @@ class GlobalShortcutFilter(QObject):
                 cut_section_waiting = False
                 if hasattr(self.app_window, 'cut_section_controller'):
                     cut_ctrl = self.app_window.cut_section_controller
-                    cut_section_waiting = getattr(cut_ctrl, '_state', 0) != 0
-
-                # ✅ FIX: Digitizer (Draw tab) takes priority over cut_section_waiting.
-                # cut_section_waiting=True only means the cut dock is open in the background.
-                # It must NOT block digitizer undo when the user is actively drawing.
-                digitizer_drawing = (
-                    hasattr(self.app_window, 'digitizer') and
-                    self.app_window.digitizer.enabled and
-                    (getattr(self.app_window.digitizer, 'active_tool', None) or
-                        getattr(getattr(self.app_window, 'ribbon_manager', None), 'current_ribbon', None) in ('draw', 'Draw'))
-                )
+                    _cut_state = getattr(cut_ctrl, '_state', 0)
+                    # Only block when actively drawing the cut line (WAITING_CENTER=1 or WAITING_DEPTH=2)
+                    # FINALIZED=3 means cut dock is open but user may have moved to Draw tab
+                    cut_section_waiting = _cut_state in (1, 2)  # WAITING_CENTER or WAITING_DEPTH only
 
                 # If ANY other tool is active, curve/digitizer completed undo is blocked
-                # EXCEPT: digitizer_drawing overrides cut_section_waiting
-                effective_cut_waiting = cut_section_waiting and not digitizer_drawing
-                other_tool_active = classification_active or cross_section_active or effective_cut_waiting
+                other_tool_active = classification_active or cross_section_active or cut_section_waiting
 
                 # ═══════════════════════════════════════════════════════════════════
                 # ✅ LEVEL 2: CURVE TOOL - ACTIVE DRAWING ONLY

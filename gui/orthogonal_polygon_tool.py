@@ -278,6 +278,10 @@ class OrthogonalPolygonTool:
         # VTK observer IDs (only the ones we add, so we can remove only ours)
         self._obs_ids: list[int] = []
 
+        # In-progress Ctrl+Z / Ctrl+Y history for active Ortho editing
+        self._undo_states: list[dict] = []
+        self._redo_states: list[dict] = []
+
     # ─────────────────────────────────────────────────────────────────────────
     # Activation / Deactivation
     # ─────────────────────────────────────────────────────────────────────────
@@ -290,7 +294,7 @@ class OrthogonalPolygonTool:
         # Let the digitizer know we are the active tool so its generic
         # handlers (set_tool guard, _deactivate_active_tool_keep_drawings) work.
         self.dig.active_tool = self.TOOL_NAME
-        self.dig.temp_points = self.points   # share list for undo compatibility
+        self._sync_digitizer_temp_points()
 
         obs = self.interactor.AddObserver
         self._obs_ids = [
@@ -322,7 +326,7 @@ class OrthogonalPolygonTool:
 
         self._clear_preview()
         self._clear_vertex_markers()
-        self.points = []
+        self._clear_edit_history()
         self._reset_state()
 
         if self.dig.active_tool == self.TOOL_NAME:
@@ -451,6 +455,7 @@ class OrthogonalPolygonTool:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _left_click(self, cursor: tuple):
+        self._push_undo_state()
         if self._mode == MODE_ORTHO:
             self._add_ortho_point(cursor)
         elif self._mode == MODE_FREEHAND:
@@ -704,6 +709,7 @@ class OrthogonalPolygonTool:
         print(f"✅ OrthoPoly finalized: {n_verts} vertices, mode={self._mode}")
 
         # ── Reset for next polygon (permanent mode keeps tool active) ─────────
+        self._clear_edit_history()
         self._reset_state()
         self._clear_vertex_markers()   # safety: clears anything left
 
@@ -715,6 +721,7 @@ class OrthogonalPolygonTool:
         """Escape: discard the in-progress polygon (mirrors _cancel())."""
         self._clear_preview()
         self._clear_vertex_markers()
+        self._clear_edit_history()
         self._reset_state()
         self._show_status("❌ Ortho-polygon cancelled — polygon discarded")
         print("❌ OrthogonalPolygonTool: polygon cancelled")
@@ -730,11 +737,100 @@ class OrthogonalPolygonTool:
         self._mode         = MODE_ORTHO
         self._prev_mode    = MODE_ORTHO
         self._reset_curve_state()
+        self._sync_digitizer_temp_points()
         # Keep the tool active (observers remain), only state is cleared.
 
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _sync_digitizer_temp_points(self):
+        """Keep the shared digitizer temp_points reference aligned with this tool."""
+        self.dig.temp_points = self.points
+
+    def _capture_edit_state(self) -> dict:
+        """Capture the active Ortho tool edit state for Ctrl+Z / Ctrl+Y."""
+        return {
+            "points": list(self.points),
+            "mode": self._mode,
+            "prev_mode": self._prev_mode,
+            "ortho_angle": self._ortho_angle,
+            "curve_step": self._curve_step,
+            "curve_start": self._curve_start,
+            "curve_mid": self._curve_mid,
+        }
+
+    def _restore_edit_state(self, state: dict):
+        """Restore an in-progress Ortho polygon after point-level undo/redo."""
+        self.points = list(state.get("points", []))
+        self._mode = state.get("mode", MODE_ORTHO)
+        self._prev_mode = state.get("prev_mode", MODE_ORTHO)
+        self._ortho_angle = state.get("ortho_angle")
+        self._curve_step = state.get("curve_step", 0)
+        self._curve_start = state.get("curve_start")
+        self._curve_mid = state.get("curve_mid")
+        self._sync_digitizer_temp_points()
+
+        self._clear_preview()
+        self._clear_vertex_markers()
+        for pt in self.points:
+            self._add_vertex_marker(pt)
+
+        if self.points:
+            self._update_preview(self._pick_world())
+
+        self._show_status(self._current_status_text())
+        try:
+            self.dig.app.vtk_widget.render()
+        except Exception:
+            pass
+
+    def _push_undo_state(self):
+        """Store the current edit before a new click mutates the polygon."""
+        self._undo_states.append(self._capture_edit_state())
+        max_steps = max(1, int(getattr(self.dig, "max_undo_levels", 50) or 50))
+        if len(self._undo_states) > max_steps:
+            self._undo_states.pop(0)
+        self._redo_states = []
+
+    def _clear_edit_history(self):
+        """Drop temporary point-level undo/redo history for the current polygon."""
+        self._undo_states = []
+        self._redo_states = []
+
+    def _current_status_text(self) -> str:
+        """Return the correct status message for the current sub-mode."""
+        if self._mode == MODE_CURVE and self._curve_step == 1:
+            return "Curve: now click the arc END-POINT"
+        return _MODE_LABELS.get(self._mode, _MODE_LABELS[MODE_ORTHO])
+
+    def undo(self) -> bool:
+        """Undo the last active Ortho-tool edit. Returns True when handled."""
+        if not self._undo_states:
+            return False
+
+        self._redo_states.append(self._capture_edit_state())
+        max_steps = max(1, int(getattr(self.dig, "max_undo_levels", 50) or 50))
+        if len(self._redo_states) > max_steps:
+            self._redo_states.pop(0)
+
+        self._restore_edit_state(self._undo_states.pop())
+        print(f"Ortho undo ({len(self.points)} active points)")
+        return True
+
+    def redo(self) -> bool:
+        """Redo the last active Ortho-tool edit. Returns True when handled."""
+        if not self._redo_states:
+            return False
+
+        self._undo_states.append(self._capture_edit_state())
+        max_steps = max(1, int(getattr(self.dig, "max_undo_levels", 50) or 50))
+        if len(self._undo_states) > max_steps:
+            self._undo_states.pop(0)
+
+        self._restore_edit_state(self._redo_states.pop())
+        print(f"Ortho redo ({len(self.points)} active points)")
+        return True
 
     def _pick_world(self) -> tuple:
         """
