@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from PySide6.QtCore import (
-    QCoreApplication, Qt, QThread, Signal,
+    QCoreApplication, Qt, QThread, Signal, QEvent,
 )
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
@@ -27,9 +27,6 @@ from gui.theme_manager import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
 
 _LEGACY_MAGIC_V0: bytes = b"SNT\x00"
 _LEGACY_MAGIC_V1: bytes = b"SNT\x01"
@@ -72,9 +69,9 @@ _ARC_SEGMENTS:    int = 32
 _CIRCLE_SEGMENTS: int = 36
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # COLOUR HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _aci_to_rgb(aci: int, cycle_idx: int = 0) -> Tuple[int, int, int]:
     if aci in _INVISIBLE_ACI:
@@ -88,19 +85,19 @@ def _normalise_vtk_color(color: Tuple[int, int, int]) -> List[float]:
     return [c / 255.0 for c in color]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX-G1 HELPER: Smart label scoring — mirrors DXF candidate_labels logic
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# FIX-G1 HELPER: Smart label scoring â€” mirrors DXF candidate_labels logic
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _score_label(text: str) -> int:
     """
     Return a priority score for a text string that mirrors the logic in
-    DXF process_entity → INSERT → candidate_labels.
+    DXF process_entity â†’ INSERT â†’ candidate_labels.
 
     Score  100 : looks like a grid ID  (e.g. "DW2039017_000347", "GR_0012_005")
     Score   50 : has underscore + 3+ digits  (e.g. "BLOCK_ABC_123")
     Score   10 : has any digit (generic label)
-    Score    0 : skip — not a useful label
+    Score    0 : skip â€” not a useful label
     """
     t = text.strip()
     if len(t) < 5:
@@ -108,11 +105,9 @@ def _score_label(text: str) -> int:
     # Must contain at least one digit OR underscore to be a label
     has_digit      = any(c.isdigit() for c in t)
     has_underscore = '_' in t
-    # if not has_digit and not has_underscore:
-    #     return 0
 
     if not has_digit and not has_underscore:
-        return 10  ##
+        return 10
 
     # HIGH: starts with a letter prefix, then digits, then underscore + digits
     # Covers "DW2039017_000347", "GR0012_005", "SRV_001_XYZ" etc.
@@ -131,21 +126,21 @@ def _label_color_and_height(
     text: str,
 ) -> Tuple[Tuple[int, int, int], float]:
     """
-    Return (vtk_color, text_height) for a label — mirrors DXF smart colour
+    Return (vtk_color, text_height) for a label â€” mirrors DXF smart colour
     selection in process_entity INSERT block.
 
     The DXF code uses:
-      • Cyan   (0,255,255) + height 3.0  →  grid IDs  (underscore + many digits)
-      • Yellow (255,255,0) + height 2.5  →  feature names  (everything else)
+      â€¢ Cyan   (0,255,255) + height 3.0  â†’  grid IDs  (underscore + many digits)
+      â€¢ Yellow (255,255,0) + height 2.5  â†’  feature names  (everything else)
 
     We apply the same split so SNT labels look identical to DXF labels.
     """
     score = _score_label(text)
     if score >= 100:
-        # High-confidence grid ID → cyan
+        # High-confidence grid ID â†’ cyan
         return (0, 255, 255), 3.0
     else:
-        # Feature / generic label → yellow
+        # Feature / generic label â†’ yellow
         return (255, 255, 0), 2.5
     
 
@@ -153,10 +148,6 @@ def _snt_enable_gl_point_size(app) -> bool:
     """
     Synchronously enable GL_PROGRAM_POINT_SIZE (0x8642) and install the
     persistent StartEvent observer so it stays enabled across future renders.
-
-    Called from restore_snt_actors() which fires BEFORE the 500ms deferred
-    init in build_unified_actor. Without this, gl_PointSize writes are ignored
-    and points render at 1px — no border ring pixels, border invisible.
     """
     try:
         rw = app.vtk_widget.GetRenderWindow()
@@ -166,8 +157,6 @@ def _snt_enable_gl_point_size(app) -> bool:
         if state and hasattr(state, 'vtkglEnable'):
             state.vtkglEnable(0x8642)
 
-            # Also install/refresh the persistent StartEvent observer
-            # so VTK's state machine can't clear the flag between renders.
             try:
                 from gui.unified_actor_manager import (
                     _install_program_point_size_observer,
@@ -182,7 +171,7 @@ def _snt_enable_gl_point_size(app) -> bool:
 
             return True
     except Exception as e:
-        print(f"  ⚠️ _snt_enable_gl_point_size: {e}")
+        print(f"  âš ï¸ _snt_enable_gl_point_size: {e}")
     return False
 
 
@@ -190,10 +179,6 @@ def _snt_push_border_uniforms(app) -> None:
     """
     Push weight_lut / visibility_lut / border_ring_val uniforms to the
     unified point-cloud actor right now, before the impending render.
-
-    The deferred GPU init (500ms) would do this later, but restore_snt_actors
-    renders immediately. If uniforms aren't pushed first, border_ring_val = 0
-    in the shader → border condition never triggers → invisible border.
     """
     try:
         from gui.unified_actor_manager import _push_uniforms_direct
@@ -205,32 +190,21 @@ def _snt_push_border_uniforms(app) -> None:
             return
         _push_uniforms_direct(ua, ctx)
     except Exception as e:
-        print(f"  ⚠️ _snt_push_border_uniforms: {e}")
+        print(f"  âš ï¸ _snt_push_border_uniforms: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Z-OFFSET APPROACH: SNT actors rendered above point cloud in same renderer
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_snt_z_offset(app):
-    """
-    Calculate Z offset to position SNT actors ABOVE the entire point cloud.
-
-    SNT entities are typically at Z≈0 (2D CAD files).
-    Point cloud Z values can be 100s or 1000s (e.g. elevation 928m).
-    Camera looks DOWN in plan view → higher Z = closer to camera = on top.
-
-    So offset = z_max + margin → moves SNT from Z≈0 to above point cloud.
-    """
     try:
         if hasattr(app, 'data') and app.data is not None and 'xyz' in app.data:
             z_vals = app.data['xyz'][:, 2]
             z_max = float(z_vals.max())
             z_min = float(z_vals.min())
             z_range = z_max - z_min
-            # Offset must place SNT ABOVE z_max, not just above z_range
-            # SNT is at Z≈0, so offset = z_max + margin
             offset = z_max + max(z_range * 0.5, 50.0)
-            print(f"  📐 SNT Z-offset: {offset:.1f} (z_min={z_min:.1f}, z_max={z_max:.1f})")
+            print(f"  ðŸ“ SNT Z-offset: {offset:.1f} (z_min={z_min:.1f}, z_max={z_max:.1f})")
             return offset
     except Exception:
         pass
@@ -238,19 +212,15 @@ def _get_snt_z_offset(app):
 
 
 def _apply_z_offset_to_actor(actor, new_offset: float):
-    """
-    Apply (or update) the Z-position offset on an SNT actor.
-    Tracks the current offset to avoid cumulative drift from repeated calls.
-    """
     old_offset = getattr(actor, '_snt_z_offset', 0.0)
     delta = new_offset - old_offset
     if abs(delta) > 0.001:
         actor.AddPosition(0, 0, delta)
         actor._snt_z_offset = new_offset
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SNT v1.1 BODY DECODERS  (unchanged from v2.0)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# SNT v1.1 BODY DECODERS
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _decode_point_body(body, layer, color):
     if len(body) < 12:
@@ -383,14 +353,13 @@ def _decode_face3d_body(body, layer, color):
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SNT BINARY FILE READER  (unchanged from v2.0)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# SNT BINARY FILE READER
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _read_snt_file(filepath: str) -> Dict:
     result: Dict = {"version": (1, 0), "layers": [], "entities": []}
 
-    # ── Strategy 1: snt_core v1.1 reader ────────────────────────────────
     try:
         from snt_core.snt_reader import SntReader
         from snt_core.snt_format import ColorMode, EntityType
@@ -451,27 +420,27 @@ def _read_snt_file(filepath: str) -> Dict:
             return result
 
     except ImportError:
-        print("  ⚠️ snt_core not on PYTHONPATH — using legacy inline reader")
+        print("  âš ï¸ snt_core not on PYTHONPATH â€” using legacy inline reader")
     except Exception as exc:
-        print(f"  ⚠️ SntReader failed ({type(exc).__name__}): {exc}")
+        print(f"  âš ï¸ SntReader failed ({type(exc).__name__}): {exc}")
         traceback.print_exc()
         return result
 
-    # ── Strategy 2: Legacy inline parser ────────────────────────────────
+    # â”€â”€ Legacy inline parser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
         with open(filepath, "rb") as f:
             raw: bytes = f.read()
     except OSError as exc:
-        print(f"  ❌ Cannot read SNT file: {exc}")
+        print(f"  âŒ Cannot read SNT file: {exc}")
         return result
 
     if len(raw) < 24:
-        print("  ❌ File too small to be a valid SNT file")
+        print("  âŒ File too small to be a valid SNT file")
         return result
 
     magic = raw[:4]
     if magic not in (_LEGACY_MAGIC_V0, _LEGACY_MAGIC_V1):
-        print(f"  ❌ Unrecognised magic {magic!r} — not an SNT file")
+        print(f"  âŒ Unrecognised magic {magic!r} â€” not an SNT file")
         return result
 
     pos = 4
@@ -547,19 +516,17 @@ def _read_snt_file(filepath: str) -> Dict:
                     "type": "3DFACE", "layer": lname, "color": lcolor,
                     "vertices": verts})
             else:
-                print(f"  ⚠️ [legacy] Unknown entity type={etype} — stopping")
                 break
-        except struct.error as exc:
-            print(f"  ⚠️ [legacy] Parse error at pos={pos}: {exc}")
+        except struct.error:
             break
 
     result["entities"] = legacy_entities
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BACKGROUND LOAD WORKER  (unchanged from v2.0)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# BACKGROUND LOAD WORKER
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class SNTLoadWorker(QThread):
     progress    = Signal(int, str, bool)
@@ -576,50 +543,48 @@ class SNTLoadWorker(QThread):
         self._cancelled = True
 
     def run(self) -> None:
-            try:
-                total = len(self.file_paths)
-                indeterminate = (total == 1)
-                for idx, fp in enumerate(self.file_paths):
-                    if self._cancelled:
-                        print("  🛑 SNT load cancelled by user")
-                        return
+        try:
+            total = len(self.file_paths)
+            indeterminate = (total == 1)
+            for idx, fp in enumerate(self.file_paths):
+                if self._cancelled:
+                    return
+                
+                QCoreApplication.processEvents()
+                if self._cancelled:
+                    return
                     
-                    # Check cancellation more frequently
-                    QCoreApplication.processEvents()
+                snt_path = Path(fp)
+                self.progress.emit(
+                    0 if indeterminate else idx,
+                    f"ðŸ“‚ Reading {snt_path.name}...",
+                    indeterminate,
+                )
+                item_data = {"snt_path": snt_path}
+                try:
+                    parsed = _read_snt_file(str(snt_path))
                     if self._cancelled:
                         return
-                        
-                    snt_path = Path(fp)
-                    self.progress.emit(
-                        0 if indeterminate else idx,
-                        f"📂 Reading {snt_path.name}...",
-                        indeterminate,
-                    )
-                    item_data = {"snt_path": snt_path}
-                    try:
-                        parsed = _read_snt_file(str(snt_path))
-                        if self._cancelled:  # Check after long operation
-                            return
-                        item_data["parsed"] = parsed
-                        item_data["entity_count"] = len(parsed["entities"])
-                        item_data["layer_count"] = len(parsed["layers"])
-                    except Exception as exc:
-                        if not self._cancelled:
-                            item_data["error"] = str(exc)
-                    
+                    item_data["parsed"] = parsed
+                    item_data["entity_count"] = len(parsed["entities"])
+                    item_data["layer_count"] = len(parsed["layers"])
+                except Exception as exc:
                     if not self._cancelled:
-                        self.file_loaded.emit(item_data, None)
+                        item_data["error"] = str(exc)
                 
                 if not self._cancelled:
-                    self.finished.emit()
-            except Exception as exc:
-                if not self._cancelled:
-                    self.error.emit(f"SNT loading failed: {exc}\n{traceback.format_exc()}")
+                    self.file_loaded.emit(item_data, None)
+            
+            if not self._cancelled:
+                self.finished.emit()
+        except Exception as exc:
+            if not self._cancelled:
+                self.error.emit(f"SNT loading failed: {exc}\n{traceback.format_exc()}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DISPLAY OPTIONS DIALOG  (unchanged from v2.0)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# DISPLAY OPTIONS DIALOG
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class SNTDisplayOptionsDialog(QDialog):
     _COLOR_PRESETS: List[Tuple[str, QColor]] = [
@@ -687,16 +652,16 @@ class SNTDisplayOptionsDialog(QDialog):
         return mode, enabled, (qc.red(), qc.green(), qc.blue())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LAYER SELECTION DIALOG  (unchanged from v2.0)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# LAYER SELECTION DIALOG
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class SNTLayerSelectionDialog(QDialog):
     def __init__(self, snt_path: Path, parent_item=None):
         super().__init__(parent_item)
         self.snt_path    = snt_path
         self.parent_item = parent_item
-        self.setWindowTitle(f"Layer Display — {snt_path.name}")
+        self.setWindowTitle(f"Layer Display â€” {snt_path.name}")
         self.setModal(True)
         self.resize(400, 550)
         self._init_ui()
@@ -732,7 +697,6 @@ class SNTLayerSelectionDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         ok_btn = QPushButton("OK")
-        ok_btn.setDefault(True)  # Fix: Enter triggers OK
         ok_btn.setObjectName("primaryBtn")
         ok_btn.setAutoDefault(False)
         ok_btn.setDefault(False)
@@ -758,8 +722,8 @@ class SNTLayerSelectionDialog(QDialog):
                 parsed = _read_snt_file(str(self.snt_path))
                 if self.parent_item is not None:
                     self.parent_item.cached_parsed = parsed
-            except Exception as exc:
-                print(f"❌ Layer load failed: {exc}")
+            except Exception:
+                pass
 
         layers_info: List[Tuple[str, int, Tuple[int, int, int]]] = []
         if parsed:
@@ -808,9 +772,9 @@ class SNTLayerSelectionDialog(QDialog):
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FILE ITEM WIDGET  (unchanged from v2.0)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# FILE ITEM WIDGET
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class SNTFileItem(QWidget):
     remove_requested = Signal(object)
@@ -829,47 +793,107 @@ class SNTFileItem(QWidget):
         self._init_ui()
 
     def _init_ui(self):
+        self.setObjectName("sntFileItemRow")
+        self.setFixedHeight(34)
+        
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setContentsMargins(10, 0, 10, 0)
         layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignVCenter)
 
+        # 1. Checkbox
         self.checkbox = QCheckBox(f"{self.snt_path.name}")
         self.checkbox.setChecked(True)
-        self.checkbox.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-weight:bold; font-size:10px;")
+        self.checkbox.setObjectName("sntItemCheckbox")
+        self.checkbox.setFixedHeight(26)
         self.checkbox.stateChanged.connect(self._on_checkbox_changed)
         layout.addWidget(self.checkbox, 1)
 
-        badge = QLabel("SNT")
-        badge.setStyleSheet(get_badge_style("success"))
-        layout.addWidget(badge)
+        # 2. SNT Badge
+        self.snt_badge = QLabel("SNT")
+        self.snt_badge.setObjectName("sntBadge")
+        self.snt_badge.setFixedSize(35, 20)
+        self.snt_badge.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.snt_badge)
 
+        # 3. Entity Count
         self.count_label = QLabel("...")
-        self.count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:9px;")
+        self.count_label.setObjectName("sntCountBadge")
+        self.count_label.setFixedSize(85, 20)
+        self.count_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.count_label)
 
-        for icon, tip, slot, role in [
-            ("📋", "Select layers",   self._open_layer_selection, "default"),
-            ("⚙",  "Display options", self._open_display_options, "settings"),
-        ]:
-            btn = QPushButton(icon)
-            btn.setFixedSize(26, 26)
-            btn.setToolTip(tip)
-            btn.setStyleSheet(get_icon_button_style(role))
-            btn.clicked.connect(slot)
-            layout.addWidget(btn)
+        # 4. Layers Button
+        self.layers_btn = QPushButton(" 📋 Layers")
+        self.layers_btn.setObjectName("secondaryBtn")
+        self.layers_btn.setFixedSize(75, 24)
+        self.layers_btn.clicked.connect(self._open_layer_selection)
+        layout.addWidget(self.layers_btn)
 
-        rm_btn = QPushButton("✖")
-        rm_btn.setFixedSize(26, 26)
-        rm_btn.setStyleSheet(get_icon_button_style("danger"))
-        rm_btn.clicked.connect(lambda: self.remove_requested.emit(self))
-        layout.addWidget(rm_btn)
+        # 5. Settings Button
+        self.settings_btn = QPushButton(" ⚙ Settings")
+        self.settings_btn.setObjectName("secondaryBtn")
+        self.settings_btn.setFixedSize(85, 24)
+        self.settings_btn.clicked.connect(self._open_display_options)
+        layout.addWidget(self.settings_btn)
 
-        self.setStyleSheet(get_file_item_row_style())
+        # 6. Remove Button
+        self.rm_btn = QPushButton("X")
+        self.rm_btn.setObjectName("dangerBtn")
+        self.rm_btn.setFixedSize(24, 24)
+        self.rm_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        layout.addWidget(self.rm_btn)
+
+        self.refresh_theme()
+
+    def refresh_theme(self):
+        """Re-apply styles based on current theme."""
+        c = ThemeColors
+        accent = c.get('accent')
+        
+        self.setStyleSheet(f"""
+            QWidget#sntFileItemRow {{
+                background: {c.get('bg_secondary')};
+                border: 1px solid {c.get('border_light')};
+                border-radius: 8px;
+            }}
+            QWidget#sntFileItemRow:hover {{
+                border-color: {accent};
+            }}
+            QCheckBox#sntItemCheckbox {{
+                color: {accent};
+                font-weight: bold;
+                font-size: 10px;
+                background: {c.get('bg_input')};
+                border: 1px solid {c.get('border_light')};
+                border-radius: 13px;
+                padding: 0px 10px;
+            }}
+            QLabel#sntBadge {{
+                background: {c.get('success')};
+                color: white;
+                border-radius: 4px;
+                font-size: 9px;
+                font-weight: bold;
+            }}
+            QLabel#sntCountBadge {{
+                background: {c.get('bg_input')};
+                color: {accent};
+                border: 1px solid {c.get('border_light')};
+                border-radius: 10px;
+                font-size: 9px;
+                font-weight: bold;
+            }}
+            QPushButton#secondaryBtn, QPushButton#dangerBtn {{
+                font-size: 9px;
+                font-weight: bold;
+                padding: 0px;
+            }}
+        """)
 
     def update_entity_count(self, count: int):
         self.entity_count = count
-        self.count_label.setText(f"{count} entities")
-        self.count_label.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:7px; font-weight:bold;")
+        self.count_label.setText(f"{count:,} entities")
 
     def is_checked(self) -> bool:
         return self.checkbox.isChecked()
@@ -893,18 +917,13 @@ class SNTFileItem(QWidget):
                                 or layer_name in self.selected_layers)
                     vis = is_visible and layer_ok
                     for actor in actors:
-                        # Re-add actor to renderer if classification removed it
-                        # (GetVisibility returning 0 after being removed from
-                        # the renderer is the symptom of the bug).
                         if is_visible and renderer is not None:
                             try:
-                                # AddActor is idempotent — safe to call again
                                 renderer.AddActor(actor)
                             except Exception:
                                 pass
                         actor.SetVisibility(1 if vis else 0)
             else:
-                # Fallback: check both snt_actors and dxf_actors
                 target = self.snt_path.name
                 for store in ['snt_actors', 'dxf_actors']:
                     for snt_data in getattr(parent_dlg.app, store, []):
@@ -919,7 +938,7 @@ class SNTFileItem(QWidget):
 
             self._force_render(parent_dlg)
         except Exception as exc:
-            print(f"  ⚠️ SNT checkbox toggle failed: {exc}")
+            print(f"  âš ï¸ SNT checkbox toggle failed: {exc}")
 
     def _open_display_options(self):
         dlg = SNTDisplayOptionsDialog(
@@ -976,7 +995,7 @@ class SNTFileItem(QWidget):
             if parent_dlg:
                 self._force_render(parent_dlg)
         except Exception as exc:
-            print(f"❌ Layer selection failed: {exc}")
+            print(f"âŒ Layer selection failed: {exc}")
             traceback.print_exc()
 
     def _find_parent_dialog(self):
@@ -1007,9 +1026,6 @@ class SNTFileItem(QWidget):
 class MultiSNTAttachmentDialog(QDialog):
     """
     Dialog for attaching multiple SNT overlay files.
-    All actors are dual-registered in both app.snt_actors AND app.dxf_actors
-    so that every downstream system (grid-click → LAZ load, Grid Label Manager,
-    classification refresh) works identically for SNT and DXF.
     """
 
     snt_attached = Signal(list)
@@ -1032,47 +1048,51 @@ class MultiSNTAttachmentDialog(QDialog):
 
         self.setWindowTitle("Attach SNT Files  —  NakshaApp Native Format")
         self.setStyleSheet(get_dialog_stylesheet())
-        self.setGeometry(150, 150, 700, 780)
+        self.setGeometry(150, 150, 720, 800)
         self._init_ui()
-
-    # ── UI ────────────────────────────────────────────────────────────────
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(12)
 
-        title = QLabel("Attach SNT Files (NakshaApp Native Format)")
-        title.setStyleSheet(get_title_banner_style())
-        title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
+        # 1. Main Title
+        self.title_label = QLabel("Attach SNT Files (NakshaApp Native Format)")
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setStyleSheet(get_title_banner_style())
+        layout.addWidget(self.title_label)
 
-        info = QLabel(
+        # 2. Info Banner
+        self.info_label = QLabel(
             "SNT loads 10-50x faster than DXF  |  "
             "Colours & layers preserved  |  Grid pipeline fully compatible")
-        info.setStyleSheet(get_notice_banner_style("info"))
-        info.setAlignment(Qt.AlignCenter)
-        layout.addWidget(info)
+        self.info_label.setAlignment(Qt.AlignCenter)
+        self.info_label.setStyleSheet(get_notice_banner_style("info"))
+        layout.addWidget(self.info_label)
 
+        # 3. File Selection Group
         file_group = QGroupBox("Select SNT Files")
         file_layout = QVBoxLayout()
-        browse_btn  = QPushButton("Browse and Add SNT Files...")
-        browse_btn.setObjectName("secondaryBtn")
-        browse_btn.setAutoDefault(False)
-        browse_btn.setDefault(False)
-        browse_btn.setFocusPolicy(Qt.NoFocus)
-        browse_btn.clicked.connect(self._select_snt_files)
-        file_layout.addWidget(browse_btn)
+        self.browse_btn  = QPushButton(" 📂 Browse and Add SNT Files...")
+        self.browse_btn.setObjectName("secondaryBtn")
+        self.browse_btn.setMinimumHeight(45)
+        self.browse_btn.setAutoDefault(False)
+        self.browse_btn.setDefault(False)
+        self.browse_btn.setFocusPolicy(Qt.NoFocus)
+        self.browse_btn.clicked.connect(self._select_snt_files)
+        file_layout.addWidget(self.browse_btn)
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
 
-        list_group = QGroupBox("Selected SNT Files  (click X to remove)")
+        # 4. List Group
+        list_group = QGroupBox("Selected SNT Files (click ✖ to remove)")
         list_layout = QVBoxLayout()
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setMinimumHeight(200)
-        scroll.setMaximumHeight(320)
+        scroll.setMaximumHeight(350)
+        
         self.file_list_widget = QWidget()
         self.file_list_layout = QVBoxLayout(self.file_list_widget)
         self.file_list_layout.setSpacing(5)
@@ -1082,49 +1102,76 @@ class MultiSNTAttachmentDialog(QDialog):
         list_layout.addWidget(scroll)
 
         self.file_count_label = QLabel("No files selected")
-        self.file_count_label.setStyleSheet(f"color:{ThemeColors.get('text_muted')}; font-size:10px; padding:5px;")
+        self.file_count_label.setStyleSheet(f"color: {ThemeColors.get('text_muted')}; font-size: 10px; padding: 5px;")
         list_layout.addWidget(self.file_count_label)
         list_group.setLayout(list_layout)
         layout.addWidget(list_group)
 
         btn_row = QHBoxLayout()
-        clear_btn = QPushButton("Clear All")
+        clear_btn = QPushButton(" 🗑 Clear All")
         clear_btn.setObjectName("dangerBtn")
+        clear_btn.setMinimumHeight(40)
         clear_btn.setAutoDefault(False)
         clear_btn.setDefault(False)
         clear_btn.setFocusPolicy(Qt.NoFocus)
         clear_btn.clicked.connect(self._clear_all)
         btn_row.addWidget(clear_btn)
+
         btn_row.addStretch()
-        attach_btn = QPushButton("Attach All SNT Files")
-        attach_btn.setObjectName("primaryBtn")
-        attach_btn.setAutoDefault(False)
-        attach_btn.setDefault(False)
-        attach_btn.setFocusPolicy(Qt.NoFocus)
-        attach_btn.clicked.connect(self._attach_all)
-        btn_row.addWidget(attach_btn)
+
+        self.attach_btn = QPushButton(" ✅ Attach All SNT Files")
+        self.attach_btn.setObjectName("primaryBtn")
+        self.attach_btn.setMinimumHeight(40)
+        self.attach_btn.setAutoDefault(False)
+        self.attach_btn.setDefault(False)
+        self.attach_btn.setFocusPolicy(Qt.NoFocus)
+        self.attach_btn.clicked.connect(self._attach_all)
+        btn_row.addWidget(self.attach_btn)
         layout.addLayout(btn_row)
 
-    # ── File selection ────────────────────────────────────────────────────
+    def refresh_theme(self):
+        """Re-apply styles to the entire dialog and all items."""
+        self.setStyleSheet(get_dialog_stylesheet())
+        self.title_label.setStyleSheet(get_title_banner_style())
+        self.info_label.setStyleSheet(get_notice_banner_style("info"))
+        self.browse_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {ThemeColors.get('bg_secondary')};
+                color: {ThemeColors.get('accent')};
+                border: 1px solid {ThemeColors.get('border_light')};
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background: {ThemeColors.get('bg_input')};
+                border: 1px solid {ThemeColors.get('accent')};
+            }}
+        """)
+        for item in self.snt_items:
+            item.refresh_theme()
+
+    def changeEvent(self, event):
+        """Detect theme property changes and refresh."""
+        if event.type() == QEvent.DynamicPropertyChange:
+            if event.propertyName() == "themeStyledDialog":
+                self.refresh_theme()
+        super().changeEvent(event)
 
     def _select_snt_files(self):
-        """Select and load SNT files with improved worker management."""
         file_paths, _ = QFileDialog.getOpenFileNames(
             self, "Select SNT Files", "", "SNT Files (*.snt);;All Files (*)")
         if not file_paths:
             return
 
-        # Improved worker cancellation
         if self._load_worker is not None:
             if self._load_worker.isRunning():
                 self._load_worker.cancel()
-                self._load_worker.wait(5000)  # Wait up to 5 seconds
+                self._load_worker.wait(5000)
                 if self._load_worker.isRunning():
-                    self._load_worker.terminate()  # Force terminate
-                    self._load_worker.wait(1000)
+                    self._load_worker.terminate()
             self._load_worker = None
         
-        # Process events to ensure cleanup
         QCoreApplication.processEvents()
         
         total = len(file_paths)
@@ -1150,7 +1197,7 @@ class MultiSNTAttachmentDialog(QDialog):
                     if not is_indet:
                         progress.setValue(value)
             except RuntimeError:
-                pass  # Dialog deleted
+                pass
 
         def on_file_loaded(item_data, _):
             try:
@@ -1169,7 +1216,7 @@ class MultiSNTAttachmentDialog(QDialog):
                     item.count_label.setStyleSheet(
                         f"color:{ThemeColors.get('danger')}; font-size:9px;")
             except RuntimeError:
-                pass  # Item deleted
+                pass
 
         def on_finished():
             try:
@@ -1204,104 +1251,66 @@ class MultiSNTAttachmentDialog(QDialog):
         self._load_worker.start()
 
     def closeEvent(self, event):
-        """Override closeEvent to ensure proper cleanup."""
-        # Cancel worker thread
         if self._load_worker is not None and self._load_worker.isRunning():
             self._load_worker.cancel()
             self._load_worker.wait(3000)
             if self._load_worker.isRunning():
                 self._load_worker.terminate()
-        
         event.accept()
 
-    # ── Item management ───────────────────────────────────────────────────
-
     def _remove_item(self, item: SNTFileItem):
-        """Safely remove an SNT item with proper cleanup."""
         if item not in self.snt_items:
             return
-        
         try:
-            # Store needed data before removal
             filename = str(item.snt_path.name)
-            
-            # Remove from list first
             self.snt_items.remove(item)
-            
-            # Remove from layout
             self.file_list_layout.removeWidget(item)
-            
-            # Clear actor cache to break circular references
             if hasattr(item, 'actor_cache'):
                 item.actor_cache.clear()
-            
-            # Remove from VTK
             self._remove_from_vtk(filename)
-            
-            # Disconnect signals before deletion
             try:
                 item.remove_requested.disconnect()
             except Exception:
                 pass
-            
-            # Schedule deletion
             item.setParent(None)
             item.deleteLater()
-            
-            # Update UI
             self._update_file_count()
-            
         except Exception as exc:
-            print(f"⚠️ Error in _remove_item: {exc}")
-            traceback.print_exc()
+            print(f"âš ï¸ Error in _remove_item: {exc}")
 
     def _remove_from_vtk(self, filename: str):
-        """Safely remove VTK actors with extensive error handling."""
         try:
             target = os.path.basename(filename)
-            
-            # Safely get renderer
             renderer = None
             try:
                 if (hasattr(self.app, 'vtk_widget') and 
                     self.app.vtk_widget is not None and
                     hasattr(self.app.vtk_widget, 'renderer')):
                     renderer = self.app.vtk_widget.renderer
-            except (RuntimeError, AttributeError) as e:
-                print(f"  ⚠️ Cannot access renderer: {e}")
+            except Exception:
                 renderer = None
             
-            # Remove from both actor stores
             for store_name in ['snt_actors', 'dxf_actors']:
                 if not hasattr(self.app, store_name):
                     continue
-                    
                 store = getattr(self.app, store_name, [])
                 indices_to_remove = []
-                
-                # Find indices to remove
                 for i, snt_data in enumerate(store):
                     if os.path.basename(snt_data.get("filename", "")) == target:
                         indices_to_remove.append(i)
-                        
-                        # Remove actors from renderer if available
                         if renderer is not None:
                             for actor in snt_data.get("actors", []):
                                 try:
-                                    # Check if actor is still valid
                                     if actor is not None:
                                         renderer.RemoveActor(actor)
-                                except (RuntimeError, AttributeError) as e:
-                                    print(f"  ⚠️ Error removing actor: {e}")
-                
-                # Remove in reverse order to maintain indices
+                                except Exception:
+                                    pass
                 for i in reversed(indices_to_remove):
                     try:
                         store.pop(i)
                     except IndexError:
                         pass
             
-            # Remove from attachment lists
             for list_name in ['snt_attachments', 'dxf_attachments']:
                 if hasattr(self.app, list_name):
                     try:
@@ -1310,46 +1319,35 @@ class MultiSNTAttachmentDialog(QDialog):
                             a for a in current_list
                             if os.path.basename(a.get("filename", "")) != target
                         ])
-                    except Exception as e:
-                        print(f"  ⚠️ Error cleaning {list_name}: {e}")
+                    except Exception:
+                        pass
             
-            # Safely render
             if renderer is not None:
                 try:
                     rw = self.app.vtk_widget.GetRenderWindow()
                     if rw is not None:
                         rw.Render()
-                except (RuntimeError, AttributeError) as e:
-                    print(f"  ⚠️ Render failed: {e}")
-            
+                except Exception:
+                    pass
         except Exception as exc:
-            print(f"  ⚠️ _remove_from_vtk failed: {exc}")
-            traceback.print_exc()
+            print(f"  âš ï¸ _remove_from_vtk failed: {exc}")
 
     def _clear_all(self):
-        """Safely clear all SNT items with proper cleanup."""
-        # Cancel any running worker first
         if self._load_worker is not None and self._load_worker.isRunning():
             self._load_worker.cancel()
-            self._load_worker.wait(5000)  # Longer wait
+            self._load_worker.wait(5000)
             if self._load_worker.isRunning():
-                self._load_worker.terminate()  # Force terminate if still running
+                self._load_worker.terminate()
             self._load_worker = None
         
-        # Process pending events to ensure worker cleanup
         QCoreApplication.processEvents()
-        
-        # Copy list to avoid modification during iteration
         items_to_remove = list(self.snt_items)
         for item in items_to_remove:
             try:
                 self._remove_item(item)
-            except Exception as e:
-                print(f"⚠️ Error removing item: {e}")
-        
+            except Exception:
+                pass
         self._update_file_count()
-        
-        # Force garbage collection
         import gc
         gc.collect()
 
@@ -1392,32 +1390,15 @@ class MultiSNTAttachmentDialog(QDialog):
                                     pass
 
         if restored:
-            # FIX 1: No manual SetClippingRange — ResetCameraClippingRange already correct.
             renderer.ResetCameraClippingRange()
-
-            # FIX 2: Explicitly enable GL_PROGRAM_POINT_SIZE RIGHT NOW.
-            # restore_snt_actors() fires in the same callstack as build_unified_actor,
-            # BEFORE the 500ms deferred timer. Without this, gl_PointSize writes in the
-            # vertex shader are silently ignored → all points render at 1px → no border
-            # ring pixels exist → border "applies" in data but is completely invisible.
-            # This is why DXF works (attached later, GL already warm) but SNT doesn't.
             _snt_enable_gl_point_size(self.app)
-
-            # FIX 3: Push border uniforms before the render that follows.
-            # The 500ms deferred init would push them later, but we need them NOW.
             _snt_push_border_uniforms(self.app)
-
-            print(f"  🔄 restore_snt_actors: re-added {restored} actors "
-                f"(z_offset={z_offset:.1f})")
             try:
                 rw = self.app.vtk_widget.GetRenderWindow()
                 if rw:
                     rw.Render()
             except Exception:
-                try:
-                    self.app.vtk_widget.render()
-                except Exception:
-                    pass
+                pass
 
     def _update_file_count(self):
         count = len(self.snt_items)
@@ -1431,18 +1412,11 @@ class MultiSNTAttachmentDialog(QDialog):
             self.file_count_label.setStyleSheet(
                 f"color:{ThemeColors.get('accent')}; font-size:10px; font-weight:bold; padding:5px;")
 
-    # ── Attach all ────────────────────────────────────────────────────────
-
     def _attach_all(self):
         selected_items = [it for it in self.snt_items if it.is_checked()]
         if not selected_items:
             QMessageBox.warning(self, "No Files", "Please select SNT files first.")
             return
-
-        # ── Auto-save current LAZ ─────────────────────────────────────────
-        print(f"\n{'='*60}")
-        print(f"💾 AUTO-SAVING CURRENT FILE BEFORE SNT ATTACHMENT")
-        print(f"{'='*60}")
 
         if hasattr(self.app, 'data') and self.app.data is not None:
             save_path = (getattr(self.app, 'last_save_path', None)
@@ -1451,13 +1425,7 @@ class MultiSNTAttachmentDialog(QDialog):
                 try:
                     from gui.save_pointcloud import save_pointcloud_quick
                     save_pointcloud_quick(self.app, save_path)
-                    print(f"✅ Current file saved successfully")
-                    if hasattr(self.app, "statusBar"):
-                        self.app.statusBar().showMessage(
-                            f"Saved: {os.path.basename(save_path)}", 2000)
-                        QCoreApplication.processEvents()
                 except Exception as e:
-                    print(f"⚠️ Failed to auto-save: {e}")
                     reply = QMessageBox.warning(
                         self, "Save Failed",
                         f"Failed to auto-save current file:\n\n{e}\n\n"
@@ -1466,7 +1434,6 @@ class MultiSNTAttachmentDialog(QDialog):
                     if reply == QMessageBox.No:
                         return
 
-        # ── Confirmation ───────────────────────────────────────────────────
         msg = f"Attach {len(selected_items)} SNT file(s)?\n\n"
         if hasattr(self.app, "data") and self.app.data is not None:
             msg += "WARNING: Current point cloud will be CLEARED\n"
@@ -1475,13 +1442,10 @@ class MultiSNTAttachmentDialog(QDialog):
         if QMessageBox.question(
                         self, "Confirm SNT Attachment", msg,
                         QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.Yes,  # Fix: Enter triggers Yes
+                        QMessageBox.Yes,
                     ) != QMessageBox.Yes:
-        
             return
 
-        # ── Clear current project ──────────────────────────────────────────
-        print(f"\n🧹 CLEARING CURRENT PROJECT...")
         if hasattr(self.app, 'data') and self.app.data is not None:
             if hasattr(self.app, "vtk_widget") and self.app.vtk_widget:
                 renderer = self.app.vtk_widget.renderer
@@ -1508,16 +1472,13 @@ class MultiSNTAttachmentDialog(QDialog):
             if hasattr(self.app, "view_palettes"):
                 self.app.view_palettes.clear()
 
-            # Clear both SNT and DXF lists — full reset
             for attr in ['snt_actors', 'snt_attachments',
                          'dxf_actors', 'dxf_attachments']:
                 if hasattr(self.app, attr):
                     getattr(self.app, attr).clear()
 
-            print(f"✅ Project cleared\n")
             QCoreApplication.processEvents()
 
-        # ── Process and render ─────────────────────────────────────────────
         progress = QProgressDialog(
             "Processing SNT files...", "Cancel",
             0, len(selected_items) * 2, self)
@@ -1527,17 +1488,14 @@ class MultiSNTAttachmentDialog(QDialog):
         progress.setValue(0)
         progress.setStyleSheet(get_progress_dialog_stylesheet())
         progress.show()
-        progress.forceShow()
         QCoreApplication.processEvents()
 
-        # Ensure storage lists exist
         for attr in ['snt_attachments', 'snt_actors',
                      'dxf_attachments', 'dxf_actors']:
             if not hasattr(self.app, attr):
                 setattr(self.app, attr, [])
 
         all_attachments: List[Dict] = []
-
         try:
             for idx, item in enumerate(selected_items):
                 if progress.wasCanceled():
@@ -1553,15 +1511,11 @@ class MultiSNTAttachmentDialog(QDialog):
 
             if not all_attachments:
                 progress.close()
-                QMessageBox.information(
-                    self, "No Data",
-                    "No entities found in selected SNT file(s).\n"
-                    "The files may be empty or use an unsupported format.")
+                QMessageBox.information(self, "No Data", "No entities found.")
                 return
 
-            # Register in BOTH attachment lists so all consumers find them
             self.app.snt_attachments.extend(all_attachments)
-            self.app.dxf_attachments.extend(all_attachments)  # ← bridge
+            self.app.dxf_attachments.extend(all_attachments)
             self.snt_attached.emit(all_attachments)
 
             for idx, attachment in enumerate(all_attachments):
@@ -1570,7 +1524,6 @@ class MultiSNTAttachmentDialog(QDialog):
                 progress.setLabelText(f"Rendering {attachment['filename']}...")
                 progress.setValue(len(selected_items) + idx)
                 QCoreApplication.processEvents()
-                # _render_snt_in_vtk registers actors in BOTH snt_actors and dxf_actors
                 self._render_snt_in_vtk(attachment)
 
             progress.setValue(len(selected_items) * 2)
@@ -1580,28 +1533,16 @@ class MultiSNTAttachmentDialog(QDialog):
             QMessageBox.information(
                 self, "SNT Attached",
                 f"Attached {len(all_attachments)} SNT file(s)\n"
-                f"Total entities: {total_ent:,}\n\n"
-                f"You can now load LAZ files for the grids.")
-            try:
-                self.app._update_window_title(
-                    f"SNT Grid ({len(all_attachments)} files)", None)
-            except Exception:
-                pass
-
+                f"Total entities: {total_ent:,}")
         except Exception as exc:
             progress.close()
             QMessageBox.critical(self, "Attachment Failed", str(exc))
-            traceback.print_exc()
-
-    # ── Process one SNT file ──────────────────────────────────────────────
 
     def _process_snt_file(self, item: SNTFileItem) -> Optional[Dict]:
         try:
             if item.cached_parsed:
                 parsed = item.cached_parsed
-                print(f"  ⚡ Using cached SNT data for {item.snt_path.name}")
             else:
-                print(f"  📂 Reading SNT file {item.snt_path.name}...")
                 parsed = _read_snt_file(str(item.snt_path))
                 item.cached_parsed = parsed
 
@@ -1620,45 +1561,22 @@ class MultiSNTAttachmentDialog(QDialog):
             render_entities = self._convert_entities(filtered)
             item.update_entity_count(len(raw_entities))
 
-            print(f"  ✅ {item.snt_path.name}: "
-                  f"{len(raw_entities)} total → "
-                  f"{len(render_entities)} after filter")
-
             return {
                 "filename":  item.snt_path.name,
                 "full_path": str(item.snt_path.resolve()),
                 "mode":      item.display_mode,
                 "entities":  render_entities,
             }
-
-        except Exception as exc:
-            print(f"⚠️ Failed to process {item.snt_path.name}: {exc}")
-            traceback.print_exc()
+        except Exception:
             return None
 
-    # ── FIX-G1: Entity conversion with smart label scoring ────────────────
-
     def _convert_entities(self, entities: List[Dict]) -> List[Dict]:
-        """
-        Convert parsed SNT entity dicts → VTK-renderable dicts.
-
-        TEXT handling mirrors DXF process_entity INSERT candidate_labels logic:
-          • Score each label with _score_label() (priority 0-100)
-          • Skip score-0 strings (metadata, attribute tags, etc.)
-          • Score ≥ 100  →  grid ID  (cyan, height 3.0)
-          • Score 10-99  →  feature label  (yellow, height 2.5)
-
-        This replaces the previous hardcoded 'DW'/'MURAGLIONE' filter so the
-        dialog works correctly for ANY project, not just the original test data.
-        """
         out: List[Dict] = []
-
         for ent in entities:
             etype = ent.get("type", "")
             color = ent.get("color", _DEFAULT_COLOR)
             layer = ent.get("layer", "0")
 
-            # ── POLYLINE (includes arcs, circles, lines after decode) ──────
             if etype == "POLYLINE":
                 verts = ent.get("vertices", [])
                 if len(verts) < 2:
@@ -1670,8 +1588,6 @@ class MultiSNTAttachmentDialog(QDialog):
                     "color":  color,
                     "layer":  layer,
                 })
-
-            # ── 3DFACE (grid squares) ──────────────────────────────────────
             elif etype == "3DFACE":
                 verts = ent.get("vertices", [])
                 if len(verts) < 3:
@@ -1687,25 +1603,14 @@ class MultiSNTAttachmentDialog(QDialog):
                     "color":       color,
                     "layer":       layer,
                 })
-
-            # ── TEXT — smart scoring, project-agnostic ─────────────────────
             elif etype == "TEXT":
                 text = str(ent.get("text", "")).strip()
-
-                # Score the label using the same priority logic as DXF
                 score = _score_label(text)
                 if score == 0:
-                    # Zero score = metadata / noise — skip exactly as DXF does
                     continue
-
-                # Derive colour and height from score (mirrors DXF smart colour)
                 label_color, label_height = _label_color_and_height(text)
-
-                # If the SNT entity already has an explicit non-default colour
-                # and we're not overriding, respect it for feature labels
                 if score < 100 and color != _DEFAULT_COLOR:
                     label_color = color
-
                 pos = ent.get("position", (0.0, 0.0, 0.0))
                 out.append({
                     "type":     "text",
@@ -1716,8 +1621,6 @@ class MultiSNTAttachmentDialog(QDialog):
                     "color":    label_color,
                     "layer":    layer,
                 })
-
-            # ── POINT ─────────────────────────────────────────────────────
             elif etype == "POINT":
                 pos = ent.get("position", (0.0, 0.0, 0.0))
                 out.append({
@@ -1726,32 +1629,16 @@ class MultiSNTAttachmentDialog(QDialog):
                     "color":    color,
                     "layer":    layer,
                 })
-
         return out
 
     def _render_snt_in_vtk(self, attachment: Dict) -> None:
-        """
-        ULTIMATE FIX: Forces 'Resolve Coincident Topology' ON and uses
-        the Translucent Pass Hack to match MicroStation behavior.
-
-        BUG FIX (visibility regression after repeated classification):
-          - Populates SNTFileItem.actor_cache so the checkbox handler uses
-            direct actor references instead of the fragile fallback path.
-          - Stores actors back on the attachment dict so restore_snt_actors()
-            can re-add them to the renderer after a classification pass wipes
-            RemoveAllViewProps().
-        """
         try:
             import vtk
-            from pathlib import Path
-            from collections import defaultdict
-
             if not hasattr(self.app, "vtk_widget"):
                 return
-            renderer = self.app.vtk_widget.renderer  # ← FIX: same renderer, no overlay
+            renderer = self.app.vtk_widget.renderer
             actors: List = []
-            z_offset = _get_snt_z_offset(self.app)  # ← FIX: calculate Z offset
-            # Retrieve the SNTFileItem so we can populate its actor_cache
+            z_offset = _get_snt_z_offset(self.app)
             item: Optional[SNTFileItem] = attachment.get("_snt_item")
             entities = attachment.get("entities", [])
             bounds_points = vtk.vtkPoints()
@@ -1765,22 +1652,17 @@ class MultiSNTAttachmentDialog(QDialog):
                 elif etype == "text":
                     text_ents.append(e)
 
-            # ── Helper: register actor in item.actor_cache ─────────────────
             def _cache(actor, layer_name: str) -> None:
                 if item is not None:
                     item.actor_cache.setdefault(layer_name, []).append(actor)
 
-            # Tag helper — marks actors so optimized_refresh freeze/unfreeze
-            # and _rebuild_dxf_actor_cache recognise them as overlay actors.
             def _tag_snt(actor) -> None:
                 try:
                     from gui.optimized_refresh import tag_actor_as_dxf
                     tag_actor_as_dxf(actor)
                 except Exception:
-                    # Fallback: set the attribute directly
                     setattr(actor, '_is_dxf_actor', True)
 
-            # ── Lines / Polylines ──────────────────────────────────────────
             for (color, layer_name), group in line_groups.items():
                 appender = vtk.vtkAppendPolyData()
                 for e in group:
@@ -1802,11 +1684,8 @@ class MultiSNTAttachmentDialog(QDialog):
                 appender.Update()
                 mapper = vtk.vtkPolyDataMapper()
                 mapper.SetInputData(appender.GetOutput())
-
-                # Force polygon-offset ON (was missing in new render path)
                 mapper.SetResolveCoincidentTopologyToPolygonOffset()
-                mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(
-                    -10000.0, -10000.0)
+                mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-10000.0, -10000.0)
 
                 actor = vtk.vtkActor()
                 actor.SetMapper(mapper)
@@ -1814,39 +1693,32 @@ class MultiSNTAttachmentDialog(QDialog):
                 actor.GetProperty().SetLineWidth(4.0)
                 actor.GetProperty().SetLighting(False)
                 actor.GetProperty().SetAmbient(1.0)
-                # 0.99 opacity forces translucent render pass → renders on top
                 actor.GetProperty().SetOpacity(1.0)
-                actor._original_color = color   # kept for display-options override
-                _tag_snt(actor)       
-                
-                _apply_z_offset_to_actor(actor, z_offset)           # marks as overlay for freeze/unfreeze
-
+                actor._original_color = color
+                _tag_snt(actor)
+                _apply_z_offset_to_actor(actor, z_offset)
                 renderer.AddActor(actor)
                 actors.append(actor)
-                _cache(actor, layer_name)       # ← FIX: populate actor_cache
+                _cache(actor, layer_name)
 
-            # ── Text labels ────────────────────────────────────────────────
             for e in text_ents:
                 a = self._create_text_actor(e)
                 if a:
                     bounds_points.InsertNextPoint(e["position"])
                     if a.GetMapper():
                         a.GetMapper().SetResolveCoincidentTopologyToPolygonOffset()
-                        a.GetMapper().SetRelativeCoincidentTopologyPolygonOffsetParameters(
-                            -20000.0, -20000.0)
+                        a.GetMapper().SetRelativeCoincidentTopologyPolygonOffsetParameters(-20000.0, -20000.0)
                     a.GetProperty().SetOpacity(1.0)
                     a.GetProperty().SetLighting(False)
                     if "color" in e:
                         a._original_color = e["color"]
-                    _tag_snt(a)                     # marks as overlay for freeze/unfreeze
+                    _tag_snt(a)
                     _apply_z_offset_to_actor(a, z_offset)
                     renderer.AddActor(a)
                     actors.append(a)
-                    _cache(a, e.get("layer", "0"))  # ← FIX: populate actor_cache
+                    _cache(a, e.get("layer", "0"))
 
-            # ── Dual registration in snt_actors + dxf_actors ──────────────
-            fpath = str(Path(
-                attachment.get("full_path", attachment["filename"])).resolve())
+            fpath = str(Path(attachment.get("full_path", attachment["filename"])).resolve())
             actor_entry = {
                 "filename":  attachment["filename"],
                 "full_path": fpath,
@@ -1855,73 +1727,48 @@ class MultiSNTAttachmentDialog(QDialog):
             self.app.snt_actors.append(actor_entry)
             self.app.dxf_actors.append(actor_entry)
 
-            # Invalidate the optimized_refresh actor cache so it rebuilds
-            # on the next classification pass and includes these SNT actors.
             try:
                 from gui.optimized_refresh import invalidate_dxf_actor_cache
                 invalidate_dxf_actor_cache()
             except Exception:
                 pass
 
-            # Store actors back on the attachment so restore_snt_actors() can
-            # re-add them after a classification pass wipes the renderer.
             attachment["actors"] = actors
 
-            # ── Camera fit ────────────────────────────────────────────────
-            # ── Camera fit ────────────────────────────────────────────────
             if bounds_points.GetNumberOfPoints() > 0:
                 temp_pd = vtk.vtkPolyData()
                 temp_pd.SetPoints(bounds_points)
                 renderer.ResetCamera(temp_pd.GetBounds())
-            # Always reset clipping to include Z-offset actors
             renderer.ResetCameraClippingRange()
-
             self.app.vtk_widget.render()
-            print(f"  ✅ Rendered {len(actors)} SNT actors, "
-                  f"actor_cache layers={len(item.actor_cache) if item else 'N/A'}")
-
         except Exception as e:
-            print(f"❌ Render Error: {e}")
-            traceback.print_exc()
-
-    # ── Text actor (unchanged from v2.0) ──────────────────────────────────
+            print(f"âŒ Render Error: {e}")
 
     def _create_text_actor(self, entity: Dict):
         import vtk
-
         text_content = str(entity.get("text", "")).strip()
         if not text_content:
             return None
-
         text_source = vtk.vtkVectorText()
         text_source.SetText(text_content)
         text_source.Update()
-
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(text_source.GetOutputPort())
-
         actor = vtk.vtkFollower()
         actor.SetMapper(mapper)
         actor.text_content = text_content
         actor.is_grid_label = True
         actor.grid_name     = text_content
         actor.PickableOn()
-
         bounds      = text_source.GetOutput().GetBounds()
         text_width  = bounds[1] - bounds[0]
         text_height = bounds[3] - bounds[2]
-
         pos = entity["position"]
         mag = abs(pos[0]) + abs(pos[1])
-        if   mag > 100_000:
-            desired_w, desired_h = 80.0, 20.0
-        elif mag > 10_000:
-            desired_w, desired_h = 40.0, 10.0
-        elif mag > 1_000:
-            desired_w, desired_h = 16.0,  4.0
-        else:
-            desired_w, desired_h =  4.0,  1.0
-
+        if   mag > 100_000: desired_w, desired_h = 80.0, 20.0
+        elif mag > 10_000:  desired_w, desired_h = 40.0, 10.0
+        elif mag > 1_000:   desired_w, desired_h = 16.0,  4.0
+        else:               desired_w, desired_h =  4.0,  1.0
         scale = (min(desired_w / text_width, desired_h / text_height)
                  if text_width > 0 and text_height > 0 else 1.0)
         actor.SetScale(scale, scale, scale)
@@ -1930,25 +1777,17 @@ class MultiSNTAttachmentDialog(QDialog):
         actor.GetProperty().SetOpacity(1.0)
         actor.GetProperty().SetAmbient(0.6)
         actor.GetProperty().SetDiffuse(0.9)
-
         try:
             actor.SetCamera(self.app.vtk_widget.renderer.GetActiveCamera())
         except Exception:
             pass
-
         half_w = (text_width  * scale) / 2.0
         half_h = (text_height * scale) / 2.0
-        actor.SetPosition(
-            pos[0] - half_w,
-            pos[1] - half_h,
-            pos[2] if len(pos) > 2 else 0.0)
+        actor.SetPosition(pos[0] - half_w, pos[1] - half_h, pos[2] if len(pos) > 2 else 0.0)
         return actor
-
-    # ── Point actor ────────────────────────────────────────────────────────
 
     def _create_point_actor(self, entity: Dict):
         import vtk
-
         pts = vtk.vtkPoints()
         pts.InsertNextPoint(entity["position"])
         verts = vtk.vtkCellArray()
@@ -1965,60 +1804,13 @@ class MultiSNTAttachmentDialog(QDialog):
         actor.GetProperty().SetPointSize(5.0)
         return actor
 
-    # ── Theme helpers ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def _naksha_dark_theme() -> str:
-        return """
-        QWidget { background:#121212; color:#e0e0e0;
-                  font-family:"Segoe UI"; font-size:10pt; }
-        QLabel  { color:#e0e0e0; }
-        QGroupBox { border:1px solid #3a3a3a; border-radius:5px;
-                    margin-top:10px; padding-top:10px; }
-        QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 5px; }
-        QComboBox, QSpinBox {
-            background:#1e1e1e; border:1px solid #3a3a3a;
-            border-radius:4px; padding:5px; color:#eee; }
-        QPushButton { background:#333; border:1px solid #555;
-                      border-radius:5px; padding:8px 12px; color:#ddd; }
-        QPushButton:hover { background:#444; border-color:#007acc; }
-        QRadioButton, QCheckBox { spacing:6px; color:#ccc; }
-        QRadioButton::indicator, QCheckBox::indicator {
-            width:16px; height:16px; border:2px solid #555;
-            background:#1e1e1e; border-radius:8px; }
-        QRadioButton::indicator:checked, QCheckBox::indicator:checked {
-            background:#007acc; border-color:#007acc; }
-        """
-
-    @staticmethod
-    def _progress_style() -> str:
-        return """
-        QProgressDialog { background:#1e1e1e; color:#e0e0e0; min-width:420px; }
-        QLabel { color:#00ff50; font-size:11pt; padding:10px; }
-        QProgressBar { border:2px solid #3a3a3a; border-radius:5px;
-                       text-align:center; background:#121212; color:#fff;
-                       min-height:25px; font-size:10pt; }
-        QProgressBar::chunk { background:#2e7d32; border-radius:3px; }
-        QPushButton { background:#d32f2f; color:white; padding:8px 16px;
-                      border-radius:4px; }
-        """
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC API
-# ─────────────────────────────────────────────────────────────────────────────
 
 def show_snt_attachment_dialog(app) -> MultiSNTAttachmentDialog:
-    """
-    Show (or raise) the SNT attachment dialog.
-    Mirrors show_multi_dxf_attachment_dialog() exactly.
-    """
     if hasattr(app, "snt_dialog") and app.snt_dialog is not None:
         try:
             dlg = app.snt_dialog
             if dlg.isVisible():
-                dlg.setWindowState(
-                    dlg.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
+                dlg.setWindowState(dlg.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
                 dlg.raise_()
                 dlg.activateWindow()
             else:
