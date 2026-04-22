@@ -150,9 +150,12 @@ class BrushQueryWorker(QThread):
         z_half  = float(xyz[:, 2].max() - xyz[:, 2].min()) * 0.5 + radius   # covers full Z range
         r3d     = float(np.hypot(radius, z_half))
 
-        # GIL released here in scipy's C layer — main thread runs freely
+        # Use the SpatialIndex public API instead of assuming a KD-tree backend.
         candidates = np.asarray(
-            idx_obj.tree.query_ball_point([cx, cy, float(xyz[:, 2].mean())], r3d),
+            idx_obj.query_ball_point(
+                np.array([cx, cy, float(xyz[:, 2].mean())], dtype=np.float64),
+                r3d,
+            ),
             dtype=np.int64,
         )
 

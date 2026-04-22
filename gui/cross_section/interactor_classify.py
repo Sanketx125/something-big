@@ -202,6 +202,7 @@ class ClassificationInteractor:
         self._brush_needs_render = False
         self._brush_last_render_time = 0.0
         self._brush_current_to_class = None
+        self._brush_visible_classes = None
 
         # Background worker (kept alive across strokes, stopped in cleanup())
         self._brush_worker = None
@@ -726,6 +727,7 @@ class ClassificationInteractor:
         self._brush_stroke_positions = []
         self._last_brush_center = None
         self._brush_needs_render = False
+        self._brush_visible_classes = None
         self.app._suppress_section_refresh = False
         self.is_dragging = False
 
@@ -2058,6 +2060,13 @@ class ClassificationInteractor:
         if not hasattr(self, "_brush_pts") or self.brush_actor is None:
             from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
 
+            if getattr(self, "brush_actor", None) is not None:
+                try:
+                    renderer.RemoveActor2D(self.brush_actor)
+                except Exception:
+                    pass
+                self.brush_actor = None
+
             self._brush_pts   = vtkPoints()
             self._brush_lines = vtkCellArray()
             self._brush_poly  = vtkPolyData()
@@ -2346,6 +2355,14 @@ class ClassificationInteractor:
             # ✅ Brush tool
             elif tool == "brush":
                 if self.is_dragging:
+                    active_actor_names = self._get_active_tool_preview_actor_names("brush")
+                    non_active_actor_names = [
+                        name for name in self._get_preview_actor_names()
+                        if name not in active_actor_names
+                    ]
+                    if non_active_actor_names:
+                        self._set_preview_visibility(False, non_active_actor_names)
+
                     self._last_brush_preview_P2 = P2  # ✅ non-snapping endpoint used for preview
                     # ✅ FIX 1: Calculate center differently for cut section
                     if is_cut_section:
@@ -2453,6 +2470,25 @@ class ClassificationInteractor:
                         if has_index and to_class is not None:
                             classes = self.app.data["classification"]
                             from_classes = getattr(self.app, "from_classes", None)
+                            visible_classes = getattr(self, "_brush_visible_classes", None)
+                            visible_classes_arr = None
+
+                            if visible_classes == []:
+                                self._brush_needs_render = False
+                                self._last_brush_center = center
+                                self._brush_stroke_positions.append(center)
+                                if hasattr(self.app, "statusBar"):
+                                    self.app.statusBar().showMessage(
+                                        "No visible classes selected in Display Mode.",
+                                        1200,
+                                    )
+                                return
+
+                            if visible_classes is not None:
+                                visible_classes_arr = np.asarray(
+                                    visible_classes,
+                                    dtype=classes.dtype,
+                                )
 
                             for pos in positions:
                                 hit = self._get_points_in_radius_fast(
@@ -2468,8 +2504,21 @@ class ClassificationInteractor:
 
                                 # Filter from_classes
                                 if from_classes:
-                                    fc_mask = np.isin(classes[fresh], from_classes)
+                                    fc_arr = np.asarray(from_classes, dtype=classes.dtype)
+                                    if visible_classes_arr is not None:
+                                        # INTERSECT: only classify classes in BOTH sets
+                                        effective_fc = fc_arr[np.isin(fc_arr, visible_classes_arr)]
+                                        if len(effective_fc) == 0:
+                                            continue  # All from_classes are hidden
+                                        fc_mask = np.isin(classes[fresh], effective_fc)
+                                    else:
+                                        fc_mask = np.isin(classes[fresh], fc_arr)
                                     fresh = fresh[fc_mask]
+                                    if len(fresh) == 0:
+                                        continue
+                                elif visible_classes_arr is not None:
+                                    vis_mask = np.isin(classes[fresh], visible_classes_arr)
+                                    fresh = fresh[vis_mask]
                                     if len(fresh) == 0:
                                         continue
 
@@ -2525,8 +2574,11 @@ class ClassificationInteractor:
                                     actor = _get_unified_actor(self.app)
                                     if actor is not None:
                                         rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
+                                        class_ptr = getattr(actor, '_naksha_section_class', None)
+                                        mesh = getattr(actor, '_naksha_mesh', None)
                                         gi = getattr(self.app, '_main_global_indices', None)
                                         if rgb_ptr is not None and rgb_ptr.flags.writeable:
+                                            local = None
                                             if gi is not None:
                                                 # Write ALL accumulated points (idempotent — same color re-write is free)
                                                 local = np.flatnonzero(self._brush_accumulated_mask[gi])
@@ -2538,6 +2590,17 @@ class ClassificationInteractor:
                                             vtk_ca = getattr(actor, '_naksha_vtk_array', None)
                                             if vtk_ca:
                                                 vtk_ca.Modified()
+
+                                            if local is not None and len(local) > 0:
+                                                if class_ptr is not None and len(class_ptr) > local[-1]:
+                                                    class_ptr[local] = class_ptr.dtype.type(to_class)
+                                                elif mesh is not None:
+                                                    class_vtk_arr = mesh.GetPointData().GetArray("Classification")
+                                                    if class_vtk_arr is not None:
+                                                        from vtkmodules.util import numpy_support
+                                                        cls_np = numpy_support.vtk_to_numpy(class_vtk_arr)
+                                                        cls_np[local] = cls_np.dtype.type(to_class)
+                                                        class_vtk_arr.Modified()
                                             _mark_actor_dirty(actor)
                                   
                                         # ✅ MAIN VIEW ONLY during drag — sections update on release
@@ -2551,25 +2614,6 @@ class ClassificationInteractor:
                                                 print(f"⚠️ Brush shading refresh: {_se}")
                                         else:
                                             self._safe_render_pyvista(self.app.vtk_widget)
-
-                                    # ── Task-2: ROI preview — highlight points under cursor ──
-                                    _roi = getattr(self, '_roi_preview', None)
-                                    if _roi is not None and has_index:
-                                        try:
-                                            _hit = self._get_points_in_radius_fast(
-                                                float(center[0]), float(center[1]),
-                                                float(radius_view),
-                                            )
-                                            if len(_hit) > 0:
-                                                _xyz = self.app.data["xyz"]
-                                                _pal = self._get_main_view_palette() or {}
-                                                _e   = _pal.get(int(to_class), {})
-                                                _pc  = tuple(_e.get('color', (255, 200, 0)))
-                                                _roi.update(_xyz, _hit, _pc)
-                                            else:
-                                                _roi.hide()
-                                        except Exception:
-                                            pass
 
                                 except Exception as e:
                                     print(f"⚠️ Brush GPU inject: {e}")
@@ -2706,6 +2750,34 @@ class ClassificationInteractor:
             fresh = hit[~self._brush_accumulated_mask[hit]]
             if len(fresh) == 0:
                 return
+
+            from_classes = getattr(self.app, "from_classes", None)
+            visible_classes = getattr(self, "_brush_visible_classes", None)
+            visible_classes_arr = None
+
+            if visible_classes == []:
+                return
+
+            if visible_classes is not None:
+                visible_classes_arr = np.asarray(visible_classes, dtype=classes.dtype)
+
+            if from_classes:
+                fc_arr = np.asarray(from_classes, dtype=classes.dtype)
+                if visible_classes_arr is not None:
+                    effective_fc = fc_arr[np.isin(fc_arr, visible_classes_arr)]
+                    if len(effective_fc) == 0:
+                        return
+                    fc_mask = np.isin(classes[fresh], effective_fc)
+                else:
+                    fc_mask = np.isin(classes[fresh], fc_arr)
+                fresh = fresh[fc_mask]
+                if len(fresh) == 0:
+                    return
+            elif visible_classes_arr is not None:
+                vis_mask = np.isin(classes[fresh], visible_classes_arr)
+                fresh = fresh[vis_mask]
+                if len(fresh) == 0:
+                    return
 
             # Save old classes for undo — vectorized (no Python loop)
             old_cls = classes[fresh].copy()
@@ -2890,6 +2962,7 @@ class ClassificationInteractor:
             self._brush_render_counter = 0
             self._brush_last_render_time = 0.0
             self._brush_needs_render = False
+            self._brush_visible_classes = self._get_visible_classes_for_slot(0)
             # Track current stroke's target class so _on_brush_worker_result can
             # discard stale results from a previous stroke's still-running worker.
             self._brush_current_to_class = getattr(self.app, "to_class", None)
@@ -2912,13 +2985,8 @@ class ClassificationInteractor:
                     self._brush_worker = None
                     self._brush_worker_active = False
 
-            # ── Task-2: create ROI preview actor ─────────────────────────────────
-            try:
-                from gui.brush_preview import NakshaROIPreview
-                vtk_w = self._get_active_vtk_widget() or getattr(self.app, "vtk_widget", None)
-                self._roi_preview = NakshaROIPreview(vtk_w)
-            except Exception:
-                self._roi_preview = None
+            # Disable ROI point overlay during brush drag; keep only the cursor.
+            self._roi_preview = None
                 
 
         if tool == "brush" and (not self._is_main_view()):
@@ -3088,6 +3156,7 @@ class ClassificationInteractor:
                 self._brush_stroke_positions = []
                 self._last_brush_center = None
                 self._brush_needs_render = False
+                self._brush_visible_classes = None
                 self.app._suppress_section_refresh = False
 
                 # ── Task-2: destroy ROI preview actor ────────────────────────────
@@ -5581,6 +5650,13 @@ class ClassificationInteractor:
 
         # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
         if not hasattr(self, "_brush_cut_pts") or self.brush_actor_cut is None:
+            if getattr(self, "brush_actor_cut", None) is not None:
+                try:
+                    renderer.RemoveActor2D(self.brush_actor_cut)
+                except Exception:
+                    pass
+                self.brush_actor_cut = None
+
             self._brush_cut_pts   = vtkPoints()
             self._brush_cut_lines = vtkCellArray()
             self._brush_cut_poly  = vtkPolyData()
@@ -5662,6 +5738,13 @@ class ClassificationInteractor:
 
         # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
         if not hasattr(self, "_rect_cut_pts") or self.brush_actor_cut is None:
+            if getattr(self, "brush_actor_cut", None) is not None:
+                try:
+                    renderer.RemoveActor2D(self.brush_actor_cut)
+                except Exception:
+                    pass
+                self.brush_actor_cut = None
+
             self._rect_cut_pts   = vtkPoints()
             self._rect_cut_lines = vtkCellArray()
             self._rect_cut_poly  = vtkPolyData()
@@ -5895,6 +5978,13 @@ class ClassificationInteractor:
         # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
         if not hasattr(self, "_rect_cursor_pts") or self.brush_actor is None:
             from vtkmodules.vtkRenderingCore import vtkPolyDataMapper2D, vtkActor2D, vtkCoordinate as _C
+
+            if getattr(self, "brush_actor", None) is not None:
+                try:
+                    renderer.RemoveActor2D(self.brush_actor)
+                except Exception:
+                    pass
+                self.brush_actor = None
 
             self._rect_cursor_pts   = vtkPoints()
             self._rect_cursor_lines = vtkCellArray()
