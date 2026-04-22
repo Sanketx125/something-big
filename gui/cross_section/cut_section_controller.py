@@ -1940,40 +1940,13 @@ class CutSectionController:
         self._view_observer_ids.clear()
         print("   ✅ All observers detached")
         
-        # ========== STEP 3: Restore interactor styles (CRITICAL!) ==========
+        # ========== STEP 3: Restore interaction after observer cleanup ==========
+        # Always rebind styles because RemoveObservers(MouseMoveEvent) can
+        # detach current style callbacks and leave pan inactive.
+        self._restore_cross_section_pan_zoom_styles()
         if hasattr(self, '_saved_interactor_styles') and self._saved_interactor_styles:
-            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
-            restored_count = 0
-            for view_index in list(self._saved_interactor_styles.keys()):
-                if view_index in getattr(self.app, 'section_vtks', {}):
-                    try:
-                        vtk_widget = self.app.section_vtks[view_index]
-                        # Always restore to plain pan/zoom — never to the old
-                        # CutSectionInteractorStyle or a stale ClassificationInteractor.
-                        style = vtkInteractorStyleImage()
-                        vtk_widget.interactor.SetInteractorStyle(style)
-                        restored_count += 1
-                        print(f"   ✅ Pan/zoom style restored for View {view_index + 1}")
-                    except Exception as e:
-                        print(f"   ⚠️ Style restore for view {view_index}: {e}")
             self._saved_interactor_styles.clear()
-            print(f"   ✅ Restored {restored_count} interactor styles, cleared saved styles dict")
-            
-            # ✅ Re-install camera sync observers
-            if hasattr(self.app, 'view_sync_map') and self.app.view_sync_map:
-                try:
-                    if hasattr(self.app, '_camera_observers'):
-                        self.app._camera_observers.clear()
-                    for v_idx, vw in getattr(self.app, 'section_vtks', {}).items():
-                        is_synced = (
-                            v_idx in self.app.view_sync_map or
-                            any(src == v_idx for src in self.app.view_sync_map.values())
-                        )
-                        if is_synced and hasattr(self.app, '_install_realtime_camera_observer'):
-                            self.app._install_realtime_camera_observer(v_idx, vw)
-                    print("   🔗 Camera sync re-installed after style restore")
-                except Exception as e:
-                    print(f"   ⚠️ Camera sync re-install failed: {e}")
+            print("   🧹 Cleared saved interactor styles dictionary")
         
         # ========== STEP 4: Reset state machine ==========
         self._state = CutSectionState.IDLE
@@ -2297,33 +2270,11 @@ class CutSectionController:
                     except Exception as e:
                         pass
             
-            # Restore original interactor styles in cross-section views
+            # Always rebind a fresh pan/zoom style after nuclear observer cleanup.
+            # This keeps panning alive even when no saved-style snapshot exists.
+            self._restore_cross_section_pan_zoom_styles()
             if hasattr(self, '_saved_interactor_styles') and self._saved_interactor_styles:
-                from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
-                for view_index in list(self._saved_interactor_styles.keys()):
-                    if view_index in getattr(self.app, 'section_vtks', {}):
-                        try:
-                            vtk_widget = self.app.section_vtks[view_index]
-                            vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleImage())
-                        except Exception as e:
-                            print(f"   ⚠️ Failed to restore interactor style: {e}")
                 self._saved_interactor_styles.clear()
-                
-                # ✅ Re-install camera sync observers
-                if hasattr(self.app, 'view_sync_map') and self.app.view_sync_map:
-                    try:
-                        if hasattr(self.app, '_camera_observers'):
-                            self.app._camera_observers.clear()
-                        for v_idx, vw in self.app.section_vtks.items():
-                            is_synced = (
-                                v_idx in self.app.view_sync_map or
-                                any(src == v_idx for src in self.app.view_sync_map.values())
-                            )
-                            if is_synced and hasattr(self.app, '_install_realtime_camera_observer'):
-                                self.app._install_realtime_camera_observer(v_idx, vw)
-                        print("   🔗 Camera sync re-installed")
-                    except Exception as e:
-                        print(f"   ⚠️ Camera sync re-install failed: {e}")
             
             # Reset state to IDLE
             self._state = CutSectionState.IDLE
@@ -3024,6 +2975,68 @@ class CutSectionController:
             except Exception:
                 pass
         self._view_observer_ids.clear()
+
+    def _restore_cross_section_pan_zoom_styles(self, view_indices=None, reinstall_camera_sync=True):
+        """
+        Rebind cross-section interactors to a fresh pan/zoom style after observer cleanup.
+        Why: RemoveObservers("MouseMoveEvent") can detach style callbacks from the
+        interactor; rebinding guarantees panning works immediately.
+        """
+        try:
+            section_vtks = getattr(self.app, "section_vtks", {}) or {}
+            if not section_vtks:
+                return 0
+
+            if view_indices is None:
+                target_views = set(section_vtks.keys())
+            else:
+                target_views = {int(v) for v in view_indices if isinstance(v, (int, np.integer))}
+                if not target_views:
+                    target_views = set(section_vtks.keys())
+
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+
+            restored = 0
+            for view_idx, vtk_widget in section_vtks.items():
+                if view_idx not in target_views:
+                    continue
+                try:
+                    if vtk_widget is None or not hasattr(vtk_widget, "interactor"):
+                        continue
+                    iren = vtk_widget.interactor
+                    if iren is None:
+                        continue
+
+                    style = vtkInteractorStyleImage()
+                    try:
+                        style.SetInteractionModeToImageSlicing()
+                    except Exception:
+                        pass
+                    iren.SetInteractorStyle(style)
+                    restored += 1
+                except Exception as e:
+                    print(f"   ⚠️ Failed to restore pan/zoom style for View {view_idx + 1}: {e}")
+
+            if reinstall_camera_sync and hasattr(self.app, "view_sync_map") and self.app.view_sync_map:
+                try:
+                    if hasattr(self.app, "_camera_observers"):
+                        self.app._camera_observers.clear()
+                    for v_idx, vw in section_vtks.items():
+                        is_synced = (
+                            v_idx in self.app.view_sync_map or
+                            any(src == v_idx for src in self.app.view_sync_map.values())
+                        )
+                        if is_synced and hasattr(self.app, "_install_realtime_camera_observer"):
+                            self.app._install_realtime_camera_observer(v_idx, vw)
+                except Exception as e:
+                    print(f"   ⚠️ Camera sync re-install failed: {e}")
+
+            if restored > 0:
+                print(f"   ✅ Pan/zoom interactor rebound for {restored} cross-section view(s)")
+            return restored
+        except Exception as e:
+            print(f"   ⚠️ Pan/zoom style restore failed: {e}")
+            return 0
 
 
     # def _clear_preview_actors(self):
