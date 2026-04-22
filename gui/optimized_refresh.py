@@ -707,7 +707,7 @@ class OptimizedRefreshPipeline:
             # Cache it
             if not hasattr(self, '_cached_dirty_classes'):
                 self._cached_dirty_classes = {}
-            self._cached_dirty_classes = {'key': cache_key, 'value': dirty_classes}
+            self._cached_dirty_classes = {'value': dirty_classes}
             if ENABLE_PERFORMANCE_LOGGING:
                 print(f"      ⚡ Calculated and cached dirty_classes")
 

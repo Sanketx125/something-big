@@ -1,4 +1,4 @@
-﻿import os
+import os
 import random
 import vtk
 import time
@@ -6996,7 +6996,17 @@ class NakshaApp(QMainWindow):
             for view_idx in self.section_vtks.keys():
                 fast_cross_section_update(self, view_idx, mask)
 
-        # 4. Refresh shaded mesh if in shaded mode
+        # 4. ⚡ CRITICAL FIX: Refresh Cut Section (Slot 5) if active
+        if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
+            ctrl = self.cut_section_controller
+            if getattr(ctrl, 'is_cut_view_active', False):
+                try:
+                    print("   🔪 Refreshing Cut Section (Slot 5) after Undo")
+                    ctrl._refresh_cut_colors_fast()
+                except Exception as e:
+                    print(f"   ⚠️ Cut section refresh failed: {e}")
+
+        # 5. Refresh shaded mesh if in shaded mode
         if getattr(self, "display_mode", None) == "shaded_class":
             try:
                 from gui.shading_display import refresh_shaded_after_undo_fast
@@ -7040,7 +7050,17 @@ class NakshaApp(QMainWindow):
             for view_idx in self.section_vtks.keys():
                 self._sync_section_mirror_from_data(view_idx)
 
-        # 4. Refresh shaded mesh if needed
+        # 4. ⚡ CRITICAL FIX: Refresh Cut Section (Slot 5) if active
+        if hasattr(self, 'cut_section_controller') and self.cut_section_controller:
+            ctrl = self.cut_section_controller
+            if getattr(ctrl, 'is_cut_view_active', False):
+                try:
+                    print("   🔪 Refreshing Cut Section (Slot 5) after Redo")
+                    ctrl._refresh_cut_colors_fast()
+                except Exception as e:
+                    print(f"   ⚠️ Cut section refresh failed: {e}")
+
+        # 5. Refresh shaded mesh if needed
         if getattr(self, "display_mode", None) == "shaded_class":
             try:
                 from gui.shading_display import refresh_shaded_after_undo_fast
@@ -7818,8 +7838,8 @@ class NakshaApp(QMainWindow):
                 if getattr(self.cut_section_controller, 'is_cut_view_active', False):
                     print(f"\n🔄 Refreshing Cut Section view...")
                     try:
-                        if hasattr(self.cut_section_controller, 'on_classification_changed'):
-                            self.cut_section_controller.on_classification_changed()
+                        if hasattr(self.cut_section_controller, 'onclassificationchanged'):
+                            self.cut_section_controller.onclassificationchanged()
                             print(f"   ✅ Cut Section refreshed")
                     except Exception as e:
                         print(f"   ⚠️ Cut Section refresh failed: {e}")
@@ -8819,19 +8839,6 @@ class NakshaApp(QMainWindow):
             self._shutdown_in_progress = False
 
         super().closeEvent(event)
-    # ------------------------------------------------------------
-    # BORDER CONTROL POPUP
-    # ------------------------------------------------------------
-    def open_border_control(self):
-        """Open the TerraScan-style border control popup."""
-        try:
-            from .border_popup import BorderControlDialog
-            dlg = BorderControlDialog(self)
-            dlg.setModal(False)
-            dlg.show()
-        except Exception as e:
-            print(f"⚠️ Failed to open Border Control dialog: {e}")
-
 
     def deactivate_all_tools(self):
         """Disable all interactor observers and reset to default."""

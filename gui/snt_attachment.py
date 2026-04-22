@@ -204,7 +204,6 @@ def _get_snt_z_offset(app):
             z_min = float(z_vals.min())
             z_range = z_max - z_min
             offset = z_max + max(z_range * 0.5, 50.0)
-            print(f"  ðŸ“ SNT Z-offset: {offset:.1f} (z_min={z_min:.1f}, z_max={z_max:.1f})")
             return offset
     except Exception:
         pass
@@ -217,10 +216,6 @@ def _apply_z_offset_to_actor(actor, new_offset: float):
     if abs(delta) > 0.001:
         actor.AddPosition(0, 0, delta)
         actor._snt_z_offset = new_offset
-
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# SNT v1.1 BODY DECODERS
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _decode_point_body(body, layer, color):
     if len(body) < 12:

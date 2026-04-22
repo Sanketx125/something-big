@@ -591,186 +591,6 @@ def classify_with_stats_update(classify_func):
  
     return wrapper
 
-# In your classification tool functions (e.g., classify_as_building, classify_as_ground, etc.)
-
-# def _apply_classification(app, update_mask, from_classes, to_class):
-#     """
-#     Apply classification to selected points.
-    
-#     ✅ FIXED: Protects hidden classes from classification
-#     ✅ Works in: Main View, Cross-Section Views, Cut Section View
-#     ✅ SYNC: Updates GPU color buffers in milliseconds (no actor rebuild)
-#     """
-    
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # STEP 1: Safety checks
-#     # ═══════════════════════════════════════════════════════════════════════
-#     if app.data is None or app.data.get("classification") is None:
-#         print("⚠️ No classification data available")
-#         return
-    
-#     if to_class is None:
-#         print("⚠️ No target class specified")
-#         return
-    
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # STEP 2: Apply cut section restriction (if locked)
-#     # ═══════════════════════════════════════════════════════════════════════
-#     is_cut_locked = False
-#     if hasattr(app, 'cut_section_controller') and app.cut_section_controller is not None:
-#         is_cut_locked = getattr(app.cut_section_controller, 'is_locked', False)
-#         if is_cut_locked and app.cut_section_controller._cut_index_map is not None:
-#             cut_idx = app.cut_section_controller._cut_index_map
-#             # Direct intersection to avoid large mask creation
-#             current_true_indices = np.flatnonzero(update_mask)
-#             update_mask = np.zeros_like(update_mask)
-#             valid_indices = np.intersect1d(current_true_indices, cut_idx, assume_unique=True)
-#             update_mask[valid_indices] = True
-
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # STEP 3: Filter indices
-#     # ═══════════════════════════════════════════════════════════════════════
-#     classes = app.data["classification"]
-#     update_idx = np.flatnonzero(update_mask)
-    
-#     if update_idx.size == 0:
-#         return
-
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # STEP 4: Visibility protection
-#     # ═══════════════════════════════════════════════════════════════════════
-#     from .classification_tools import _get_visible_classes_for_current_view
-#     visible_classes = _get_visible_classes_for_current_view(app)
-    
-#     if visible_classes is not None:
-#         visible_mask = np.isin(classes[update_idx], visible_classes)
-#         update_idx = update_idx[visible_mask]
-#         if update_idx.size == 0: return
-
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # STEP 5: from_classes filter
-#     # ═══════════════════════════════════════════════════════════════════════
-#     if from_classes:
-#         class_mask = np.isin(classes[update_idx], from_classes)
-#         update_idx = update_idx[class_mask]
-#         if update_idx.size == 0: return
-
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # STEP 6 & 7: Apply & Store for Undo
-#     # ═══════════════════════════════════════════════════════════════════════
-#     old_classes = classes[update_idx].copy()
-    
-#     # Generate final boolean mask for undo and fast_classify_update
-#     final_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
-#     final_mask[update_idx] = True
-
-#     new_classes = np.full(old_classes.shape, to_class, dtype=classes.dtype)
-#     app.undo_stack.append({
-#         "mask": final_mask,
-#         "old_classes": old_classes,
-#         "new_classes": new_classes
-#     })
-#     app.redo_stack.clear()
-
-#     classes[update_idx] = to_class
-    
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # STEP 11: 🚀 MILLISECOND SYNC (GPU SCALAR UPDATE)
-#     # ═══════════════════════════════════════════════════════════════════════
-    
-#     try:
-#         from gui.unified_actor_manager import fast_classify_update
-#         border_percent = float(getattr(app, "point_border_percent", 0.0))
-#         fast_classify_update(app, final_mask, to_class, border_percent=border_percent)
-        
-#         # 2. Update Cut Section View (if active)
-#         if is_cut_locked and hasattr(app, 'cut_section_controller'):
-#             ctrl = app.cut_section_controller
-#             if ctrl.is_cut_view_active and hasattr(ctrl, 'cut_mesh'):
-#                 # Map global update_idx to local cut_mesh indices
-#                 local_indices = np.searchsorted(ctrl._cut_index_map, update_idx)
-#                 valid = ctrl._cut_index_map[local_indices] == update_idx
-#                 local_indices = local_indices[valid]
-                
-#                 if local_indices.size > 0:
-#                     cut_colors = ctrl.cut_mesh.point_data.get('colors')
-#                     if cut_colors is not None:
-#                         new_color_rgb = app.class_palette.get(to_class, {}).get('color', (128, 128, 128))
-#                         cut_colors[local_indices] = new_color_rgb
-#                         ctrl.cut_vtk.render()
-        
-#     except Exception as e:
-#         print(f"⚠️ Fast sync failed, falling back to slow refresh: {e}")
-#         if is_cut_locked and hasattr(app.cut_section_controller, '_refresh_cut_colors_fast'):
-#             app.cut_section_controller._refresh_cut_colors_fast()
-
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # STEP 9: Undo Logic
-#     # ═══════════════════════════════════════════════════════════════════════
-#     if not hasattr(app, "undo_stack"): app.undo_stack = []
-    
-#     app.undo_stack.append({
-#         "mask": final_mask,
-#         "old_classes": old_classes,
-#         "new_classes": np.full(len(update_idx), to_class, dtype=old_classes.dtype),
-#         "is_cut_locked": is_cut_locked
-#     })
-    
-#     app._last_changed_mask = final_mask
-#     print(f"✅ Fast-Classified {len(update_idx)} points")
-
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # FIX 1: Reactive Signal Injection — force GPU LUT reload for active slot
-#     # ═══════════════════════════════════════════════════════════════════════
-#     try:
-#         # Determine the active classification slot
-#         is_cut = (getattr(app, "active_classify_target", None) == "cut")
-#         if is_cut:
-#             active_slot = 5
-#         elif hasattr(app, 'section_controller'):
-#             av = getattr(app.section_controller, 'active_view', None)
-#             active_slot = (av + 1) if av is not None and 0 <= av <= 3 else 0
-#         else:
-#             active_slot = 0
-
-#         # Emit palette_changed to poke GPU uniforms
-#         if hasattr(app, 'display_mode_dialog') and app.display_mode_dialog:
-#             if hasattr(app.display_mode_dialog, 'palette_changed'):
-#                 app.display_mode_dialog.palette_changed.emit(active_slot)
-#                 print(f"   ⚡ palette_changed.emit({active_slot}) — GPU LUT refreshed")
-#         # Also emit classification_finished for global view sync
-#         if hasattr(app, 'classification_finished'):
-#             app.classification_finished.emit(final_mask)
-#     except Exception as e:
-#         print(f"   ⚠️ Reactive signal injection failed: {e}")
-#     # ═══════════════════════════════════════════════════════════════════════
-#     # ✅ SYNC: Update view_palettes with new class color
-#     # ═══════════════════════════════════════════════════════════════════════
-#     if hasattr(app, 'class_palette') and hasattr(app, 'view_palettes'):
-#         to_class_info = app.class_palette.get(to_class, {})
-#         new_color = to_class_info.get("color", (128, 128, 128))
-        
-#         # Update ALL view_palettes with the new color
-#         for view_idx in app.view_palettes.keys():
-#             if to_class in app.view_palettes[view_idx]:
-#                 app.view_palettes[view_idx][to_class]["color"] = new_color
-        
-#         print(f"   🔄 Synced Class {to_class} color to all view_palettes: {new_color}")
-#          # ═══════════════════════════════════════════════════════════════════════
-#         print(f"\n{'='*60}")
-#         print(f"🔍 DEBUG: Checking app.class_palette after classification")
-#         print(f"{'='*60}")
-#         if hasattr(app, 'class_palette'):
-#             print(f"Total classes in palette: {len(app.class_palette)}")
-#             for code in sorted(app.class_palette.keys())[:5]:  # Show first 5
-#                 info = app.class_palette[code]
-#                 color = info.get("color", "NO COLOR")
-#                 show = info.get("show", False)
-#                 print(f"   Class {code}: color={color}, show={show}")
-#         else:
-#             print("   ⚠️ app.class_palette DOES NOT EXIST!")
-#         print(f"{'='*60}\n")
-
 
 def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: int) -> bool:
     """
@@ -877,7 +697,7 @@ def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: 
                 except Exception:
                     pass
 
-        # 7c. Cut section — vectorized intersect1d, zero Python loop
+        # 7c. Cut section — vectorized update of BOTH Colors and Classification ID
         if hasattr(app, 'cut_section_controller') and app.cut_section_controller:
             ctrl = app.cut_section_controller
             if getattr(ctrl, 'is_cut_view_active', False) and ctrl._cut_index_map is not None:
@@ -887,28 +707,48 @@ def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: 
                         _mapper = target_actor.GetMapper()
                         polydata = _mapper.GetInput() if _mapper is not None else None
                         if polydata:
-                            vtk_colors = polydata.GetPointData().GetScalars()
-                            if vtk_colors:
-                                from vtkmodules.util import numpy_support as _ns
-                                cut_map = ctrl._cut_index_map   # sorted global indices
+                            # 1. Resolve which palette to use for color lookup (Slot 5)
+                            from gui.unified_actor_manager import _get_slot_palette, _push_uniforms_direct
+                            view_palette = _get_slot_palette(app, 5)
+                            new_color = view_palette.get(to_class, {}).get('color', (128, 128, 128))
 
-                                # O(k log k) vectorized intersect — replaces O(n) Python loop
-                                _, _, local_arr = np.intersect1d(
-                                    update_idx, cut_map,
-                                    return_indices=True,
-                                    assume_unique=True,          # both arrays are unique
-                                )
-                                if local_arr.size > 0:
-                                    new_color = palette.get(to_class, {}).get(
-                                        'color', (128, 128, 128))
-                                    vtk_ptr             = _ns.vtk_to_numpy(vtk_colors)
-                                    vtk_ptr[local_arr]  = new_color   # vectorized broadcast
+                            # 2. Map global indices to cut-local indices
+                            cut_map = ctrl._cut_index_map
+                            _, _, local_arr = np.intersect1d(
+                                update_idx, cut_map,
+                                return_indices=True,
+                                assume_unique=True,
+                            )
+                            
+                            if local_arr.size > 0:
+                                # 3. Update Colors (Scalars)
+                                vtk_colors = polydata.GetPointData().GetScalars()
+                                if vtk_colors:
+                                    vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
+                                    vtk_ptr[local_arr] = new_color
                                     vtk_colors.Modified()
-                                    polydata.Modified()
-                                if hasattr(ctrl, 'cut_vtk') and ctrl.cut_vtk:
-                                    ctrl.cut_vtk.render()
-                except Exception:
-                    pass
+
+                                # 4. Update Classification ID (Used by shader for weight lookup)
+                                class_arr = polydata.GetPointData().GetArray("Classification")
+                                if class_arr:
+                                    cls_ptr = numpy_support.vtk_to_numpy(class_arr)
+                                    cls_ptr[local_arr] = cls_ptr.dtype.type(to_class)
+                                    class_arr.Modified()
+                                
+                                polydata.Modified()
+
+                                # 5. Sync Uniforms (Ensure weight_lut is fresh)
+                                ctx = getattr(target_actor, '_naksha_shader_ctx', None)
+                                if ctx:
+                                    ctx.force_reload()
+                                    _bsz = float(getattr(app, 'point_size', 2.5))
+                                    ctx.load_from_palette(view_palette, 0, _bsz)
+                                    _push_uniforms_direct(target_actor, ctx)
+
+                            if hasattr(ctrl, 'cut_vtk') and ctrl.cut_vtk:
+                                ctrl.cut_vtk.render()
+                except Exception as ce:
+                    print(f"   ⚠️ Cut Section GPU sync failed: {ce}")
 
         # 7d. Section view renders — one pass, bbox-culled, no duplicate calls
         if hasattr(app, 'section_vtks'):
@@ -2001,10 +1841,7 @@ def classify_in_section(app, mask, new_class, view_idx):
     # Proceed with classification...
     app.data["classification"][mask] = new_class
 
-
-# ✅ ADD to CutSectionController class:
-
-def on_classification_changed(self, changed_indices=None):
+def onclassificationchanged(self, changed_indices=None):
     """Sync classification changes back to UI."""
     # Refresh cut colors
     self._refresh_cut_colors_fast()

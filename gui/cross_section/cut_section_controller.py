@@ -801,12 +801,12 @@ class CutSectionController:
             
             # ✅ NUCLEAR CLEANUP: Remove ALL LeftButton/MouseMove observers
             # This prevents ghost observers from stacking up
-            # try:
-            #     iren.RemoveObservers("LeftButtonPressEvent")
-            #     iren.RemoveObservers("MouseMoveEvent")
-            #     print(f"  🧹 Cleared all LeftButton/MouseMove observers (nuclear cleanup)")
-            # except Exception as e:
-            #     print(f"  ⚠️ Nuclear cleanup warning: {e}")
+            try:
+                iren.RemoveObservers("LeftButtonPressEvent")
+                iren.RemoveObservers("MouseMoveEvent")
+                print(f"  🧹 Cleared all LeftButton/MouseMove observers (nuclear cleanup)")
+            except Exception as e:
+                print(f"  ⚠️ Nuclear cleanup warning: {e}")
             
             def on_left_click(obj, evt):
                 print(f"🖱️ Left click in cut dock (state={self._state})")
@@ -1596,15 +1596,15 @@ class CutSectionController:
         #    state flips to WAITING_CENTER these ghosts would draw
         #    preview lines inside the cut dock.
         # ═══════════════════════════════════════════════════════════════
-        # if self.cut_vtk is not None:
-        #     try:
-        #         iren_cut = self.cut_vtk.interactor
-        #         iren_cut.RemoveObservers("LeftButtonPressEvent")
-        #         iren_cut.RemoveObservers("MouseMoveEvent")
-        #         print("  🧹 Nuclear cleanup: ALL LeftButton/MouseMove "
-        #             "observers removed from cut dock")
-        #     except Exception as e:
-        #         print(f"  ⚠️ Cut dock nuclear cleanup warning: {e}")
+        if self.cut_vtk is not None:
+            try:
+                iren_cut = self.cut_vtk.interactor
+                iren_cut.RemoveObservers("LeftButtonPressEvent")
+                iren_cut.RemoveObservers("MouseMoveEvent")
+                print("  🧹 Nuclear cleanup: ALL LeftButton/MouseMove "
+                    "observers removed from cut dock")
+            except Exception as e:
+                print(f"  ⚠️ Cut dock nuclear cleanup warning: {e}")
         # ═══════════════════════════════════════════════════════════════
 
         # ✅ STEP 2: Clear ALL preview actors from cut dock
@@ -1919,23 +1919,23 @@ class CutSectionController:
                 print(f"   ⚠️ Observer detach for {v_idx}: {e}")
         
         # Nuclear cleanup: Remove ALL LeftButton/MouseMove observers from ALL views
-        # if hasattr(self.app, 'section_vtks'):
-        #     for view_idx, vtk_widget in self.app.section_vtks.items():
-        #         try:
-        #             iren = vtk_widget.interactor
-        #             iren.RemoveObservers("LeftButtonPressEvent")
-        #             iren.RemoveObservers("MouseMoveEvent")
-        #         except Exception:
-        #             pass
+        if hasattr(self.app, 'section_vtks'):
+            for view_idx, vtk_widget in self.app.section_vtks.items():
+                try:
+                    iren = vtk_widget.interactor
+                    iren.RemoveObservers("LeftButtonPressEvent")
+                    iren.RemoveObservers("MouseMoveEvent")
+                except Exception:
+                    pass
         
-        # # Also nuclear cleanup cut dock
-        # if self.cut_vtk is not None:
-        #     try:
-        #         iren = self.cut_vtk.interactor
-        #         iren.RemoveObservers("LeftButtonPressEvent")
-        #         iren.RemoveObservers("MouseMoveEvent")
-        #     except Exception:
-        #         pass
+        # Also nuclear cleanup cut dock
+        if self.cut_vtk is not None:
+            try:
+                iren = self.cut_vtk.interactor
+                iren.RemoveObservers("LeftButtonPressEvent")
+                iren.RemoveObservers("MouseMoveEvent")
+            except Exception:
+                pass
         
         self._view_observer_ids.clear()
         print("   ✅ All observers detached")
@@ -4022,12 +4022,12 @@ class CutSectionController:
         return self.cut_points, self._cut_index_map
 
     def onclassificationchanged(self, changedoriginalindices=None):
-        # CRITICAL MicroStation-style refresh after classification
+        """🚀 MICROSTATION-STYLE REFRESH: Signal handler for classification changes."""
         if self._is_refreshing or not self.is_cut_view_active or self.cut_vtk is None:
             return
         self._is_refreshing = True
         try:
-            print("CUT SECTION CLASSIFICATION CHANGED")
+            print(f"🔪 CUT SECTION SYNC: Classification changed...")
 
             # Refresh cut section view IN-PLACE
             print("Refreshing cut section view preserving state")
@@ -4059,93 +4059,6 @@ class CutSectionController:
         finally:
             self._is_refreshing = False
 
-    def _refresh_cut_colors_fast(self):
-        """
-        🚀 MILLISECOND REFRESH: Directly modifies GPU color buffers.
-        ✅ NO LAG: Stops the 3-4 second actor recreation cycle.
-        ✅ ZERO-COPY: Uses np.copyto for direct VTK pointer manipulation.
-        ✅ STABLE: Preserves camera and secondary actors.
-        """
-        if not self.is_cut_view_active or self.cut_points is None or self._cut_index_map is None:
-            return
-        
-        if self.cut_vtk is None or not hasattr(self.app, 'data'):
-            return
-
-        try:
-            import numpy as np
-            from vtkmodules.util import numpy_support
-
-            # 1. Prepare Classification Data
-            # Map global classification indices to the local cut view subset
-            classes = self.app.data["classification"][self._cut_index_map].astype(int)
-            palette = getattr(self, 'cut_palette', getattr(self.app, "class_palette", {}))
-            
-            # 2. Optimized Lookup Table (LUT) Construction
-            # We determine the size based on the palette keys to prevent index errors
-            max_class_val = int(classes.max()) if classes.size > 0 else 0
-            palette_max = max(palette.keys()) if palette else 0
-            lut_size = max(max_class_val, palette_max) + 1
-            
-            lut = np.zeros((lut_size, 3), dtype=np.uint8)
-            for code, info in palette.items():
-                if info.get('show', True):
-                    lut[code] = info.get('color', (128, 128, 128))
-                else:
-                    lut[code] = (0, 0, 0) # Hidden points set to black
-
-            # 3. Fast Path: GPU Buffer Update
-            target_actor = getattr(self, 'cut_core_actor', None)
-            if target_actor and hasattr(target_actor, 'GetMapper'):
-                _mapper = target_actor.GetMapper()
-                polydata = _mapper.GetInput() if _mapper is not None else None
-                if polydata:
-                    vtk_colors = polydata.GetPointData().GetScalars()
-
-                    # Ensure the existing VTK scalar array is compatible
-                    if vtk_colors and vtk_colors.GetNumberOfTuples() == len(classes):
-                        # Vectorized mapping: Map classes to RGB via LUT
-                        # new_rgb = lut[classes]
-
-                        new_rgb = safe_lut_indexing(lut, classes)
-
-                        # Direct Memory Access: Copy numpy data into VTK's existing memory pointer
-                        vtk_ptr = numpy_support.vtk_to_numpy(vtk_colors)
-                        np.copyto(vtk_ptr, new_rgb)
-                        
-                        # Trigger VTK pipeline update without rebuilding the actor
-                        vtk_colors.Modified()
-                        _safe_vtk_render(self.cut_vtk)
-                        return  # 🔥 Performance Success: Exit immediately
-
-            # 4. Fallback Path: Initial Actor Creation
-            # This only runs once or if the point count changed.
-            cloud = pv.PolyData(self.cut_points)
-            # cloud["RGB"] = lut[classes]
-
-            cloud["RGB"] = safe_lut_indexing(lut, classes)
-
-            # Avoid clear() if possible to prevent flickering; remove only the core actor
-            if hasattr(self, 'cut_core_actor') and self.cut_core_actor in self.cut_vtk.renderer.GetActors():
-                self.cut_vtk.remove_actor(self.cut_core_actor)
-            
-            self.cut_core_actor = self.cut_vtk.add_points(
-                cloud, 
-                scalars="RGB", 
-                rgb=True, 
-                point_size=3, 
-                render_points_as_spheres=False,
-                name="cut_core_points" # Named for easy retrieval
-            )
-            
-            _safe_vtk_render(self.cut_vtk)
-
-        except Exception as e:
-            print(f"❌ Cut color refresh failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-
     def _build_cut_unified_actor(self, points, classes, point_size=3):
         """Build cut-section actor with the same shader contract as section views."""
         if points is None or len(points) == 0 or self.cut_vtk is None:
@@ -4163,7 +4076,10 @@ class CutSectionController:
             )
 
             actor_name = "_cut_section_unified"
-            palette = getattr(self, "cut_palette", None) or getattr(self.app, "class_palette", {}) or {}
+            palette = getattr(self, "cut_palette", None)
+            if not palette:
+                palette = getattr(self.app, "class_palette", {})
+            
             border_pct = float(getattr(self.app, "view_borders", {}).get(5, 0.0))
             actual_pt_size = max(1.0, float(point_size or _BASE_POINT_SIZE))
 
@@ -4262,7 +4178,9 @@ class CutSectionController:
             from vtkmodules.util import numpy_support
 
             classes = self.app.data["classification"][self._cut_index_map].astype(int)
-            palette = getattr(self, 'cut_palette', getattr(self.app, "class_palette", {}))
+            palette = getattr(self, 'cut_palette', None)
+            if not palette:
+                palette = getattr(self.app, "class_palette", {})
 
             max_class_val = int(classes.max()) if classes.size > 0 else 0
             palette_max = max(palette.keys()) if palette else 0
@@ -4296,6 +4214,30 @@ class CutSectionController:
                         try:
                             from gui.unified_actor_manager import _mark_actor_dirty
                             _mark_actor_dirty(target_actor)
+                        except Exception:
+                            pass
+                        # Push weight_lut uniform so class weights are applied.
+                        # Without this the GPU shader uses the stale weight_lut
+                        # from actor build time and ignores any inherited weights.
+                        try:
+                            from gui.unified_actor_manager import _push_uniforms_direct
+                            ctx = getattr(target_actor, '_naksha_shader_ctx', None)
+                            if ctx is not None:
+                                _pal = getattr(self, 'cut_palette', None)
+                                if not _pal:
+                                    _pal = getattr(self.app, 'class_palette', {})
+                                    
+                                _bdr = float(getattr(self.app, 'view_borders', {}).get(5, 0.0))
+                                
+                                # ✅ FIX: Use global app point size instead of stale actor attribute
+                                _bsz = float(getattr(self.app, 'point_size', 2.5))
+                                
+                                ctx.force_reload()
+                                ctx.load_from_palette(_pal, _bdr, _bsz)
+                                _push_uniforms_direct(target_actor, ctx)
+                                
+                                # ✅ Update actor's cached base size to keep it in sync
+                                target_actor._naksha_base_point_size = _bsz
                         except Exception:
                             pass
                         _safe_vtk_render(self.cut_vtk)

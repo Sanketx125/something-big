@@ -2559,9 +2559,9 @@ class ClassificationInteractor:
                                 try:
                                     from gui.unified_actor_manager import (
                                         _get_unified_actor, _mark_actor_dirty,
-                                        fast_cross_section_update
+                                        fast_cross_section_update, _push_uniforms_direct
                                     )
-                                    palette = self._get_main_view_palette() or {}
+                                    palette = self._get_active_palette()
                                     entry = palette.get(int(to_class), {})
                                     color = np.array(
                                         entry.get('color', (128, 128, 128))
@@ -2602,6 +2602,44 @@ class ClassificationInteractor:
                                                         cls_np[local] = cls_np.dtype.type(to_class)
                                                         class_vtk_arr.Modified()
                                             _mark_actor_dirty(actor)
+
+                                        # ✅ CUT SECTION REAL-TIME UPDATE
+                                        if is_cut_section:
+                                            try:
+                                                cut_ctrl = self.app.cut_section_controller
+                                                cut_actor = cut_ctrl.cut_vtk.actors.get("_cut_section_unified")
+                                                if cut_actor:
+                                                    # Inject classification into cut actor's mesh/ptr
+                                                    c_ptr = getattr(cut_actor, '_naksha_section_class', None)
+                                                    if c_ptr is not None:
+                                                        # Resolve which indices in the cut were hit
+                                                        # (This is a bit slow for real-time but small enough for cut sections)
+                                                        cut_idx = cut_ctrl._cut_index_map
+                                                        # find which 'fresh' indices are in 'cut_idx'
+                                                        # Actually, it's easier to just re-read the whole thing if it's small
+                                                        # but for real-time we want to be fast.
+                                                        # Let's use the same 'local' logic if possible.
+                                                        mask_in_cut = np.isin(cut_idx, frame_fresh)
+                                                        if np.any(mask_in_cut):
+                                                            c_ptr[mask_in_cut] = c_ptr.dtype.type(to_class)
+                                                            
+                                                            # Update colors too
+                                                            rgb_ptr = getattr(cut_actor, '_naksha_rgb_ptr', None)
+                                                            if rgb_ptr is not None:
+                                                                rgb_ptr[mask_in_cut] = color
+                                                                
+                                                            # Force uniform sync if weights might have changed
+                                                            ctx = getattr(cut_actor, '_naksha_shader_ctx', None)
+                                                            if ctx:
+                                                                _bsz = float(getattr(self.app, 'point_size', 2.5))
+                                                                ctx.force_reload()
+                                                                ctx.load_from_palette(palette, 0, _bsz)
+                                                                _push_uniforms_direct(cut_actor, ctx)
+                                                            
+                                                            _mark_actor_dirty(cut_actor)
+                                                            self._safe_render_pyvista(cut_ctrl.cut_vtk)
+                                            except Exception as _ce:
+                                                print(f"⚠️ Real-time cut refresh failed: {_ce}")
                                   
                                         # ✅ MAIN VIEW ONLY during drag — sections update on release
                                         if (getattr(self.app, "display_mode", "class") == "shaded_class"
@@ -3692,15 +3730,18 @@ class ClassificationInteractor:
             #     except Exception:
             #         pass
             # STEP 4: CUT SECTION
-            if (hasattr(app, "cut_section_controller") and app.cut_section_controller is not None
-                    and not getattr(app, "_optimized_refresh_active", False)):
+            if (hasattr(app, "cut_section_controller") and app.cut_section_controller is not None):
                 try:
                     cut_ctrl = app.cut_section_controller
-                    if hasattr(cut_ctrl, 'onclassificationchanged'):
-                        cut_ctrl.onclassificationchanged()
-                    print("   ✅ Cut Section refreshed")
-                except Exception:
-                    pass  ###
+                    if getattr(cut_ctrl, 'is_cut_view_active', False):
+                        if hasattr(cut_ctrl, 'onclassificationchanged'):
+                            cut_ctrl.onclassificationchanged()
+                        else:
+                            # Fallback if method is missing
+                            cut_ctrl._refresh_cut_colors_fast()
+                        print("   ✅ Cut Section refreshed")
+                except Exception as e:
+                    print(f"   ⚠️ Cut section refresh failed: {e}")
 
             # STEP 5: POINT STATISTICS
             try:
@@ -4386,39 +4427,15 @@ class ClassificationInteractor:
                     except Exception:
                         pass
             
-            # 3. Cut section: direct RGB poke (MicroStation style — changed points only)
             if hasattr(self.app, 'cut_section_controller') and self.app.cut_section_controller:
                 ctrl = self.app.cut_section_controller
                 if getattr(ctrl, 'is_cut_view_active', False) and ctrl._cut_index_map is not None:
                     try:
-                        target_actor = getattr(ctrl, 'cut_core_actor', None)
-                        if target_actor and hasattr(target_actor, 'GetMapper'):
-                            _mapper = target_actor.GetMapper()
-                            polydata = _mapper.GetInput() if _mapper is not None else None
-                            if polydata:
-                                vtk_colors = polydata.GetPointData().GetScalars()
-                                if vtk_colors:
-                                    from vtkmodules.util import numpy_support as _ns
-                                    vtk_ptr = _ns.vtk_to_numpy(vtk_colors)
-                                    
-                                    cut_map = ctrl._cut_index_map
-                                    update_idx = np.flatnonzero(mask)
-
-                                    # Vectorized reverse lookup: which cut_map entries
-                                    # match a changed global index — O(k log k) via np.isin,
-                                    # replaces the O(N_cut) Python loop.
-                                    local_arr = np.flatnonzero(np.isin(cut_map, update_idx))
-
-                                    if local_arr.size > 0:
-                                        new_color = palette.get(to_class, {}).get('color', (128, 128, 128))
-                                        vtk_ptr[local_arr] = new_color
-                                        vtk_colors.Modified()
-                                        polydata.Modified()
-                                    
-                                    if hasattr(ctrl, 'cut_vtk') and ctrl.cut_vtk:
-                                        self._safe_render_pyvista(ctrl.cut_vtk)
+                        ctrl._refresh_cut_colors_fast()
+                        if hasattr(ctrl, 'cut_vtk') and ctrl.cut_vtk:
+                            self._safe_render_pyvista(ctrl.cut_vtk)
                     except Exception as _ce:
-                        print(f"⚠️ Cut section poke failed: {_ce}")
+                        print(f"⚠️ Cut section refresh failed: {_ce}")
             
             # 4. SINGLE BATCHED RENDER (replaces per-function render calls)
             try:

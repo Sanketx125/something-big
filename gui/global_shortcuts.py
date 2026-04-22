@@ -2616,9 +2616,10 @@ class GlobalShortcutFilter(QObject):
                     # Only block when actively drawing the cut line (WAITING_CENTER=1 or WAITING_DEPTH=2)
                     # FINALIZED=3 means cut dock is open but user may have moved to Draw tab
                     cut_section_waiting = _cut_state in (1, 2)  # WAITING_CENTER or WAITING_DEPTH only
-
+ 
                 # If ANY other tool is active, curve/digitizer completed undo is blocked
                 other_tool_active = classification_active or cross_section_active or cut_section_waiting
+ 
 
                 # ═══════════════════════════════════════════════════════════════════
                 # ✅ LEVEL 2: CURVE TOOL - ACTIVE DRAWING ONLY

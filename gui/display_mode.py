@@ -18,13 +18,16 @@ from gui.theme_manager import get_dialog_stylesheet
 # ─────────────────────────────────────────────────────────────────────────────
 # unified_actor_manager import resolver
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# unified_actor_manager import resolver
+# ─────────────────────────────────────────────────────────────────────────────
 def _register_uam_aliases(module):
     """Keep legacy and package import paths pointing at the same module."""
     _sys.modules.setdefault('gui.unified_actor_manager', module)
     _sys.modules.setdefault('unified_actor_manager', module)
     return module
-
-
+ 
+ 
 def _resolve_uam():
     for _module_name in ('gui.unified_actor_manager', 'unified_actor_manager'):
         try:
@@ -53,7 +56,12 @@ def _resolve_uam():
         "unified_actor_manager.py not found. "
         "Expected gui/unified_actor_manager.py or a legacy top-level copy."
     )
-
+ 
+ 
+# ═══════════════════════════════════════════════════════════════════════════
+# ACTUALLY RESOLVE AND CACHE THE MODULE  ← ADD THIS LINE
+# ═══════════════════════════════════════════════════════════════════════════
+_uam = _resolve_uam()
 
 # --- Helper Aliases at the top of display_mode.py ---
 

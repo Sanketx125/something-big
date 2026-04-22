@@ -3036,7 +3036,6 @@ class DigitizeManager:
             self._rebuild_active_vertex_markers()
             self._rebuild_active_preview()
             return
-            
         if not self.redo_stack:
             print("⚠️ Nothing to redo")
             return
