@@ -740,10 +740,13 @@ def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: 
                                 # 5. Sync Uniforms (Ensure weight_lut is fresh)
                                 ctx = getattr(target_actor, '_naksha_shader_ctx', None)
                                 if ctx:
-                                    ctx.force_reload()
-                                    _bsz = float(getattr(app, 'point_size', 2.5))
-                                    ctx.load_from_palette(view_palette, 0, _bsz)
-                                    _push_uniforms_direct(target_actor, ctx)
+                                    last_gen = getattr(target_actor, '_last_uniform_gen', -1)
+                                    if ctx._generation != last_gen:
+                                        ctx.force_reload()
+                                        _bsz = float(getattr(app, 'point_size', 2.5))
+                                        ctx.load_from_palette(view_palette, 0, _bsz)
+                                        _push_uniforms_direct(target_actor, ctx)
+                                        target_actor._last_uniform_gen = ctx._generation
 
                             if hasattr(ctrl, 'cut_vtk') and ctrl.cut_vtk:
                                 ctrl.cut_vtk.render()

@@ -398,10 +398,14 @@ class HyperFastCrossSectionController:
         setattr(self.app, f'section_{view_index}_core_mask', core_mask)
         setattr(self.app, f'section_{view_index}_buffer_mask', buffer_mask)
         
+        # ⚡ CRITICAL FIX: Populate global indices for undo/redo GPU patching
+        # This connects the HyperFast controller to the optimized undo engine.
+        global_idx = np.where(buffer_mask)[0]
+        setattr(self.app, f'_section_{view_index}_global_indices', global_idx)
+        
         # Global state
-        self.app.section_core_points = core_pts
-        self.app.section_buffer_points = buffer_pts
         self.app.section_core_mask = core_mask
+        self.app.section_buffer_points = buffer_pts
         self.last_mask = buffer_mask
         self.app.section_points = self.app.data["xyz"][buffer_mask]
         
@@ -500,7 +504,8 @@ class HyperFastCrossSectionController:
                     scalars="RGB",
                     rgb=True,
                     point_size=3,
-                    render_points_as_spheres=True
+                    render_points_as_spheres=True,
+                    name=f"_section_{self.active_view}_unified"  # ⚡ Unified name for patching
                 )
                 
                 elapsed = (time.time() - start) * 1000

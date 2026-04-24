@@ -155,10 +155,6 @@ RIBBON_TOOLTIP_META = {
         "description": "Create a cut section from the current view.",
         "shortcut_tools": ("CutSectionRect", "CutFromCross", "CutFromCut"),
     },
-    ("ToolsRibbon", "Sections", "Width"): {
-        "title": "Section Width",
-        "description": "Set the buffer width used for cross and cut sections.",
-    },
     ("ToolsRibbon", "Sync", "Views"): {
         "title": "Synchronize Views",
         "description": "Open view synchronization controls for linked navigation.",
@@ -371,8 +367,8 @@ class RibbonSection(QWidget):
     """A single section in the ribbon with toggle-capable buttons"""
 
     _POINT_SYNC_EXCLUSIVE_BUTTONS = {
-        "ToolsRibbon": {"Cross", "Cut", "Width"},
-        "DrawRibbon": {"Smart", "Line", "Polyline", "Rect", "Circle", "Free", "Text", "Move V", "Vertex", "Grid", "Select"},
+        "ToolsRibbon": {"Cross", "Cut"},
+        "DrawRibbon": {"Smart", "Line", "Polyline", "Rect", "Circle", "Free", "Text", "Move V", "Vertex", "Select"},
         "ClassifyRibbon": {"Above", "Below", "Rect", "Circle", "Free", "Brush", "Point"},
         "MeasurementRibbon": {"Line", "Path"},
         "IdentificationRibbon": {"Identify", "Zoom", "Select"},
@@ -1072,8 +1068,6 @@ class ToolsRibbon(QWidget):
                             lambda: self.tool_activated.emit("cross_section"))
         sections.add_button("Cut", "🔪",
                             lambda: self.tool_activated.emit("cut_section"))
-        sections.add_button("Width", "📏",
-                            lambda: self.tool_activated.emit("set_cut_width"))
         layout.addWidget(sections)
         
         # ------------------------
@@ -1275,7 +1269,6 @@ class DrawRibbon(QWidget):
    
     draw_tool_selected = Signal(str)
     clear_requested = Signal()
-    grid_requested = Signal()
    
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1301,7 +1294,6 @@ class DrawRibbon(QWidget):
     #     tools.add_button("Move\nVertex", "🔄", lambda: self._handle_move_vertex_click())
        
     #     tools.add_button("Vertex", "🔵", lambda: self._handle_vertex_click())
-    #     tools.add_button("Grid", "⊞", self.grid_requested.emit)
     #     layout.addWidget(tools)
  
     #     # Actions
@@ -1332,7 +1324,6 @@ class DrawRibbon(QWidget):
         tools.add_button("Move V", "🔄", lambda: self._handle_move_vertex_click())
         
         tools.add_button("Vertex", "🔵", lambda: self._handle_vertex_click())
-        tools.add_button("Grid", "⊞", self.grid_requested.emit)
         layout.addWidget(tools)
 
         # ══════════════════════════════════════════════════════════

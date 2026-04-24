@@ -197,11 +197,22 @@ def _snt_push_border_uniforms(app) -> None:
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_snt_z_offset(app):
+    """
+    🚀 OPTIMIZED: Uses cached bounds if available to avoid O(N) max() 
+    on every SNT attachment event.
+    """
     try:
         if hasattr(app, 'data') and app.data is not None and 'xyz' in app.data:
-            z_vals = app.data['xyz'][:, 2]
-            z_max = float(z_vals.max())
-            z_min = float(z_vals.min())
+            # Try to get from app cache first (populated during load)
+            bounds = getattr(app, 'data_bounds', None)
+            if bounds is not None:
+                z_min, z_max = bounds[4], bounds[5]
+            else:
+                # One-time fallback if bounds missing
+                z_vals = app.data['xyz'][:, 2]
+                z_min, z_max = float(z_vals.min()), float(z_vals.max())
+                app.data_bounds = [0,0,0,0, z_min, z_max] # Partial cache
+                
             z_range = z_max - z_min
             offset = z_max + max(z_range * 0.5, 50.0)
             return offset
@@ -407,6 +418,19 @@ def _read_snt_file(filepath: str) -> Dict:
                     ent = _decode_face3d_body(body, layer_name, color)
 
                 if ent is not None:
+                    # ✅ HIGH-PRIORITY SPLIT: If this is a high-confidence label (Grid ID)
+                    # currently on 'FeatureAttribs', move it to a dedicated 'FileNames' layer.
+                    # This allows independent toggling of file names vs block names.
+                    if etype in (EntityType.TEXT, EntityType.MTEXT, EntityType.DIMENSION, EntityType.LEADER) and ent.get("text"):
+                        text_val = ent["text"]
+                        # ⚡ PERFORMANCE: Only score if we are on the heavy FeatureAttribs layer
+                        if layer_name == "FeatureAttribs" and _score_label(text_val) >= 100:
+                            new_lname = "FileNames"
+                            ent["layer"] = new_lname
+                            # Ensure 'FileNames' exists in the layer list for the UI
+                            if not any(L["name"] == new_lname for L in layers_out):
+                                layers_out.append({"name": new_lname, "color": (0, 255, 255)}) # Cyan
+                    
                     entities_out.append(ent)
 
             result["entities"] = entities_out
@@ -499,9 +523,19 @@ def _read_snt_file(filepath: str) -> Dict:
                 height = (struct.unpack_from("<d", raw, pos)[0]
                           if pos + 8 <= len(raw) else 1.0)
                 pos += 8
-                legacy_entities.append({
+                
+                ent = {
                     "type": "TEXT", "layer": lname, "color": lcolor,
-                    "text": text, "position": (x, y, z), "height": height})
+                    "text": text, "position": (x, y, z), "height": height}
+                
+                # ✅ HIGH-PRIORITY SPLIT (Legacy)
+                if _score_label(text) >= 100 and lname == "FeatureAttribs":
+                    new_lname = "FileNames"
+                    ent["layer"] = new_lname
+                    if not any(L["name"] == new_lname for L in legacy_layers):
+                        legacy_layers.append({"name": new_lname, "color": (0, 255, 255)})
+                
+                legacy_entities.append(ent)
             elif etype == _LEGACY_ETYPE_3DFACE:
                 verts = []
                 for _ in range(4):
@@ -778,14 +812,39 @@ class SNTFileItem(QWidget):
         super().__init__(parent)
         self.snt_path:         Path               = Path(snt_path)
         self.cached_parsed:    Optional[Dict]     = None
-        self.actor_cache:      Dict[str, List]    = {}
+        self.actor_cache:      Dict[str, List]    = {}  # Local cache, will be linked to app state
         self.entity_layers:    Dict[int, str]     = {}
         self.entity_count:     int                = 0
         self.display_mode:     str                = "overlay"
         self.override_enabled: bool               = False
         self.override_color:   Tuple[int,int,int] = (0, 255, 80)
         self.selected_layers:  Optional[Set[str]] = None
+        
+        # ⚡ PERSISTENCE FIX: Link to existing attachment data in app if available
+        self._link_to_app_state()
+        
         self._init_ui()
+
+    def _link_to_app_state(self):
+        """Link this UI item to the persistent actor data in NakshaApp."""
+        try:
+            parent_dlg = self._find_parent_dialog()
+            if not parent_dlg or not hasattr(parent_dlg.app, 'snt_attachments'):
+                return
+            
+            fname = self.snt_path.name
+            for attachment in parent_dlg.app.snt_attachments:
+                if attachment.get("filename") == fname:
+                    # Sync state from persistent storage
+                    self.actor_cache = attachment.setdefault("actor_cache_map", {})
+                    self.selected_layers = attachment.get("selected_layers")
+                    self.display_mode = attachment.get("mode", "overlay")
+                    self.override_enabled = attachment.get("override_enabled", False)
+                    self.override_color = attachment.get("override_color", (0, 255, 80))
+                    self.cached_parsed = attachment.get("parsed")
+                    break
+        except Exception:
+            pass
 
     def _init_ui(self):
         self.setObjectName("sntFileItemRow")
@@ -947,12 +1006,18 @@ class SNTFileItem(QWidget):
         for _layer, actors in self.actor_cache.items():
             for actor in actors:
                 if self.override_enabled:
-                    actor.GetProperty().SetColor(_normalise_vtk_color(self.override_color))
+                    if hasattr(actor, "GetProperty"):
+                        actor.GetProperty().SetColor(_normalise_vtk_color(self.override_color))
+                    elif hasattr(actor, "GetTextProperty"):
+                        actor.GetTextProperty().SetColor(_normalise_vtk_color(self.override_color))
                 elif hasattr(actor, "_original_color"):
-                    actor.GetProperty().SetColor(_normalise_vtk_color(actor._original_color))
+                    if hasattr(actor, "GetProperty"):
+                        actor.GetProperty().SetColor(_normalise_vtk_color(actor._original_color))
+                    elif hasattr(actor, "GetTextProperty"):
+                        actor.GetTextProperty().SetColor(_normalise_vtk_color(actor._original_color))
                 if old_mode != self.display_mode:
-                    actor.GetProperty().SetOpacity(
-                        0.5 if self.display_mode == "underlay" else 1.0)
+                    if hasattr(actor, "GetProperty"):
+                        actor.GetProperty().SetOpacity(0.5 if self.display_mode == "underlay" else 1.0)
         parent_dlg = self._find_parent_dialog()
         if parent_dlg:
             self._force_render(parent_dlg)
@@ -978,6 +1043,15 @@ class SNTFileItem(QWidget):
                 self.count_label.setText(
                     f"{self.entity_count} entities ({len(selected)} layers)")
                 self.count_label.setStyleSheet(f"color:{ThemeColors.get('text_secondary')}; font-size:7px; font-weight:bold;")
+
+            # ⚡ PERSISTENCE: Save selection back to app state
+            parent_dlg = self._find_parent_dialog()
+            if parent_dlg:
+                fname = self.snt_path.name
+                for attachment in parent_dlg.app.snt_attachments:
+                    if attachment.get("filename") == fname:
+                        attachment["selected_layers"] = self.selected_layers
+                        break
 
             if self.actor_cache and self.checkbox.isChecked():
                 for layer_name, actors in self.actor_cache.items():
@@ -1463,9 +1537,14 @@ class MultiSNTAttachmentDialog(QDialog):
             self.app.data           = None
             self.app.loaded_file    = None
             self.app.last_save_path = None
-            self.app.class_palette  = {}
-            if hasattr(self.app, "view_palettes"):
-                self.app.view_palettes.clear()
+            
+            # ✅ BUG-FIX: Preserve user settings across SNT attachments if they have been manually set.
+            if not getattr(self.app, '_display_mode_locked', False):
+                self.app.class_palette = {}
+                if hasattr(self.app, "view_palettes"):
+                    self.app.view_palettes.clear()
+            else:
+                print("📎 Preserving existing Display Mode settings for SNT attachment")
 
             for attr in ['snt_actors', 'snt_attachments',
                          'dxf_actors', 'dxf_attachments']:
@@ -1561,6 +1640,11 @@ class MultiSNTAttachmentDialog(QDialog):
                 "full_path": str(item.snt_path.resolve()),
                 "mode":      item.display_mode,
                 "entities":  render_entities,
+                "actor_cache_map": item.actor_cache,
+                "selected_layers": item.selected_layers,
+                "override_enabled": item.override_enabled,
+                "override_color": item.override_color,
+                "parsed": item.cached_parsed
             }
         except Exception:
             return None
@@ -1640,12 +1724,16 @@ class MultiSNTAttachmentDialog(QDialog):
 
             line_groups: Dict = defaultdict(list)
             text_ents:   List = []
+            point_groups: Dict = defaultdict(list)
+            
             for e in entities:
                 etype = e.get("type", "").lower()
                 if etype in ("line", "polyline"):
                     line_groups[(tuple(e["color"]), e["layer"])].append(e)
                 elif etype == "text":
                     text_ents.append(e)
+                elif etype == "point":
+                    point_groups[(tuple(e["color"]), e["layer"])].append(e)
 
             def _cache(actor, layer_name: str) -> None:
                 if item is not None:
@@ -1658,30 +1746,52 @@ class MultiSNTAttachmentDialog(QDialog):
                 except Exception:
                     setattr(actor, '_is_dxf_actor', True)
 
+            from vtkmodules.util import numpy_support
             for (color, layer_name), group in line_groups.items():
-                appender = vtk.vtkAppendPolyData()
+                # 🚀 SENIOR OPTIMIZATION: Build one massive PolyData for all lines in the group
+                all_pts_list = []
+                all_cells_list = []
+                current_offset = 0
+                
                 for e in group:
-                    pts = vtk.vtkPoints()
+                    pts_np = np.array(e["points"], dtype=np.float32)
+                    n_p = len(pts_np)
+                    all_pts_list.append(pts_np)
+                    
+                    # Update global bounds
                     for pt in e["points"]:
-                        pts.InsertNextPoint(pt)
                         bounds_points.InsertNextPoint(pt)
-                    pline = vtk.vtkPolyLine()
-                    pline.GetPointIds().SetNumberOfIds(pts.GetNumberOfPoints())
-                    for i in range(pts.GetNumberOfPoints()):
-                        pline.GetPointIds().SetId(i, i)
-                    pd = vtk.vtkPolyData()
-                    pd.SetPoints(pts)
-                    cells = vtk.vtkCellArray()
-                    cells.InsertNextCell(pline)
-                    pd.SetLines(cells)
-                    appender.AddInputData(pd)
-
-                appender.Update()
+                    
+                    # Build cell for this polyline: [N, id0, id1, ..., idN-1]
+                    cell = np.empty(n_p + 1, dtype=np.int64)
+                    cell[0] = n_p
+                    cell[1:] = np.arange(n_p) + current_offset
+                    all_cells_list.append(cell)
+                    current_offset += n_p
+                
+                if not all_pts_list:
+                    continue
+                
+                # Combine all NumPy arrays
+                combined_pts = np.concatenate(all_pts_list)
+                combined_cells = np.concatenate(all_cells_list)
+                
+                # Create VTK objects at lightning speed
+                pts = vtk.vtkPoints()
+                pts.SetData(numpy_support.numpy_to_vtk(combined_pts))
+                
+                cells = vtk.vtkCellArray()
+                cells.ImportLegacyFormat(numpy_support.numpy_to_vtkIdTypeArray(combined_cells))
+                
+                pd = vtk.vtkPolyData()
+                pd.SetPoints(pts)
+                pd.SetLines(cells)
+                
                 mapper = vtk.vtkPolyDataMapper()
-                mapper.SetInputData(appender.GetOutput())
+                mapper.SetInputData(pd)
                 mapper.SetResolveCoincidentTopologyToPolygonOffset()
                 mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-10000.0, -10000.0)
-
+                
                 actor = vtk.vtkActor()
                 actor.SetMapper(mapper)
                 actor.GetProperty().SetColor([c / 255.0 for c in color])
@@ -1689,7 +1799,47 @@ class MultiSNTAttachmentDialog(QDialog):
                 actor.GetProperty().SetLighting(False)
                 actor.GetProperty().SetAmbient(1.0)
                 actor.GetProperty().SetOpacity(1.0)
+                
                 actor._original_color = color
+                _tag_snt(actor)
+                _apply_z_offset_to_actor(actor, z_offset)
+                renderer.AddActor(actor)
+                actors.append(actor)
+                _cache(actor, layer_name)
+            
+            # --- 🚀 SENIOR FIX: HIGH-SPEED BATCH POINTS ---
+            for (color, layer_name), group in point_groups.items():
+                pts_data = np.array([e["position"] for e in group], dtype=np.float32)
+                pts = vtk.vtkPoints()
+                pts.SetData(numpy_support.numpy_to_vtk(pts_data))
+                
+                # Fast bounds update
+                for pos in pts_data:
+                    bounds_points.InsertNextPoint(pos)
+                
+                # Fast cell creation using NumPy
+                n_pts = len(group)
+                cells_data = np.empty(n_pts * 2, dtype=np.int64)
+                cells_data[0::2] = 1
+                cells_data[1::2] = np.arange(n_pts)
+                
+                verts = vtk.vtkCellArray()
+                # ImportLegacyFormat is the fastest way to build cell arrays from NumPy
+                verts.ImportLegacyFormat(numpy_support.numpy_to_vtkIdTypeArray(cells_data))
+                
+                pd = vtk.vtkPolyData()
+                pd.SetPoints(pts)
+                pd.SetVerts(verts)
+                
+                mapper = vtk.vtkPolyDataMapper()
+                mapper.SetInputData(pd)
+                
+                actor = vtk.vtkActor()
+                actor.SetMapper(mapper)
+                actor.GetProperty().SetColor([c / 255.0 for c in color])
+                actor.GetProperty().SetPointSize(5.0)
+                actor.GetProperty().SetLighting(False)
+                
                 _tag_snt(actor)
                 _apply_z_offset_to_actor(actor, z_offset)
                 renderer.AddActor(actor)
@@ -1703,8 +1853,7 @@ class MultiSNTAttachmentDialog(QDialog):
                     if a.GetMapper():
                         a.GetMapper().SetResolveCoincidentTopologyToPolygonOffset()
                         a.GetMapper().SetRelativeCoincidentTopologyPolygonOffsetParameters(-20000.0, -20000.0)
-                    a.GetProperty().SetOpacity(1.0)
-                    a.GetProperty().SetLighting(False)
+                    
                     if "color" in e:
                         a._original_color = e["color"]
                     _tag_snt(a)
@@ -1721,6 +1870,12 @@ class MultiSNTAttachmentDialog(QDialog):
             }
             self.app.snt_actors.append(actor_entry)
             self.app.dxf_actors.append(actor_entry)
+            
+            # 🔬 DIAGNOSTIC: Count total actors to confirm "Heaviness" cause
+            n_total = len(actors)
+            print(f"🔬 SNT LOADED: {n_total} actors added ({len(text_ents)} labels, {len(line_groups)} line batches)")
+            if n_total > 500:
+                print(f"⚠️ HIGH ACTOR COUNT: {n_total} actors detected. This is the root cause of 'Heaviness'. VTK performance degrades significantly above 500 actors.")
 
             try:
                 from gui.optimized_refresh import invalidate_dxf_actor_cache
@@ -1740,45 +1895,62 @@ class MultiSNTAttachmentDialog(QDialog):
             print(f"âŒ Render Error: {e}")
 
     def _create_text_actor(self, entity: Dict):
+        """
+        🚀 REVERTED: Using vtkFollower to ensure 'No Loss' in visual look and scaling.
+        We keep the Point Batching for performance, but restore VectorText for labels.
+        """
         import vtk
         text_content = str(entity.get("text", "")).strip()
         if not text_content:
             return None
+        
         text_source = vtk.vtkVectorText()
         text_source.SetText(text_content)
         text_source.Update()
+        
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(text_source.GetOutputPort())
+        
         actor = vtk.vtkFollower()
         actor.SetMapper(mapper)
         actor.text_content = text_content
         actor.is_grid_label = True
         actor.grid_name     = text_content
         actor.PickableOn()
+        
+        # Original scaling logic
         bounds      = text_source.GetOutput().GetBounds()
         text_width  = bounds[1] - bounds[0]
         text_height = bounds[3] - bounds[2]
         pos = entity["position"]
         mag = abs(pos[0]) + abs(pos[1])
+        
         if   mag > 100_000: desired_w, desired_h = 80.0, 20.0
         elif mag > 10_000:  desired_w, desired_h = 40.0, 10.0
         elif mag > 1_000:   desired_w, desired_h = 16.0,  4.0
         else:               desired_w, desired_h =  4.0,  1.0
+        
         scale = (min(desired_w / text_width, desired_h / text_height)
                  if text_width > 0 and text_height > 0 else 1.0)
         actor.SetScale(scale, scale, scale)
-        actor.GetProperty().SetColor(_normalise_vtk_color(entity["color"]))
-        actor.GetProperty().SetLineWidth(3.0)
-        actor.GetProperty().SetOpacity(1.0)
-        actor.GetProperty().SetAmbient(0.6)
-        actor.GetProperty().SetDiffuse(0.9)
+        
+        prop = actor.GetProperty()
+        prop.SetColor(_normalise_vtk_color(entity["color"]))
+        prop.SetLineWidth(3.0)
+        prop.SetOpacity(1.0)
+        prop.SetAmbient(0.6)
+        prop.SetDiffuse(0.9)
+        prop.SetLighting(False)
+        
         try:
             actor.SetCamera(self.app.vtk_widget.renderer.GetActiveCamera())
         except Exception:
             pass
+            
         half_w = (text_width  * scale) / 2.0
         half_h = (text_height * scale) / 2.0
         actor.SetPosition(pos[0] - half_w, pos[1] - half_h, pos[2] if len(pos) > 2 else 0.0)
+        
         return actor
 
     def _create_point_actor(self, entity: Dict):

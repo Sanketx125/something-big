@@ -2093,6 +2093,8 @@ Vertex-to-vertex distance measurement with live display
 """
 
 import time
+from pathlib import Path
+
 import vtk
 import numpy as np
 
@@ -2140,6 +2142,9 @@ class MeasurementTool:
         self._preview_polydata = None          # reusable vtkPolyData for preview
         self._preview_actor_in_scene = False   # track whether actor was added
         self._last_cursor_pos = None           # last known world cursor position
+        self._label_offset_pixels = 12.0
+        self._render_observer_tag = None
+        self._refreshing_label_positions = False
         
         # Selection
         # Selection
@@ -2158,6 +2163,10 @@ class MeasurementTool:
         self.redo_stack = []
         self.max_undo_levels = 50
         self._temp_vertex_stack = []
+        self._block_boundary_cache = {}
+        self._block_boundary_index = []
+
+        self._ensure_render_observer()
 
     def _ensure_overlay_renderer(self):
         """
@@ -2235,20 +2244,45 @@ class MeasurementTool:
             return
         ren = self._ensure_overlay_renderer()
         self._prepare_overlay_actor(actor)
+        try:
+            if actor.IsA("vtkActor2D"):
+                ren.AddActor2D(actor)
+                return
+        except Exception:
+            pass
         ren.AddActor(actor)
 
     def _scene_remove(self, actor):
         """Remove a measurement actor from the overlay renderer."""
         if actor is None:
             return
+        is_actor_2d = False
+        try:
+            is_actor_2d = actor.IsA("vtkActor2D")
+        except Exception:
+            pass
         if self._overlay_renderer is not None:
             try:
-                self._overlay_renderer.RemoveActor(actor)
+                if is_actor_2d:
+                    self._overlay_renderer.RemoveActor2D(actor)
+                else:
+                    self._overlay_renderer.RemoveActor(actor)
+            except Exception:
+                pass
+            try:
+                self._overlay_renderer.RemoveViewProp(actor)
             except Exception:
                 pass
         # Fallback: also try main renderer in case actor ended up there
         try:
-            self.renderer.RemoveActor(actor)
+            if is_actor_2d:
+                self.renderer.RemoveActor2D(actor)
+            else:
+                self.renderer.RemoveActor(actor)
+        except Exception:
+            pass
+        try:
+            self.renderer.RemoveViewProp(actor)
         except Exception:
             pass
         
@@ -2261,6 +2295,162 @@ class MeasurementTool:
                 self.app.vtk_widget.GetRenderWindow().Render()
             except Exception:
                 pass
+
+    def _ensure_render_observer(self):
+        """
+        🚀 SENIOR REFACTOR: Use Camera ModifiedEvent instead of Window StartEvent.
+        This ensures we only recompute label offsets when the camera actually moves,
+        saving significant CPU cycles during idle or classification.
+        """
+        if self._render_observer_tag is not None:
+            return
+        try:
+            cam = self.renderer.GetActiveCamera()
+            if cam is not None:
+                # ModifiedEvent fires when camera panned/zoomed/rotated
+                self._render_observer_tag = cam.AddObserver("ModifiedEvent", self._on_render_update_labels)
+        except Exception:
+            self._render_observer_tag = None
+
+    def _on_render_update_labels(self, obj, evt):
+        """Refresh 2D measurement label positions only when camera moves."""
+        if self._refreshing_label_positions:
+            return
+        if not self.measurements and not self.distance_labels:
+            return
+        
+        # Throttling check (optional but recommended for ultra-smoothness)
+        now = time.time()
+        if (now - getattr(self, '_last_label_update', 0)) < 0.016: # 60fps cap
+             return
+        self._last_label_update = now
+
+        self._refreshing_label_positions = True
+        try:
+            self._refresh_label_positions(self.distance_labels)
+            for measurement in self.measurements:
+                self._refresh_label_positions(measurement.get('labels', []))
+        finally:
+            self._refreshing_label_positions = False
+
+    def _world_to_display_point(self, world_point):
+        """Project a world point into display coordinates."""
+        helper = getattr(self.app, "_world_to_display", None)
+        if callable(helper):
+            try:
+                return helper(self.renderer, world_point)
+            except Exception:
+                pass
+
+        try:
+            self.renderer.SetWorldPoint(world_point[0], world_point[1], world_point[2], 1.0)
+            self.renderer.WorldToDisplay()
+            display_point = self.renderer.GetDisplayPoint()
+            if display_point is None or len(display_point) < 3:
+                return None
+            return (
+                float(display_point[0]),
+                float(display_point[1]),
+                float(display_point[2]),
+            )
+        except Exception:
+            return None
+
+    def _display_to_world_point(self, display_x, display_y, display_z):
+        """Project display coordinates back into world coordinates."""
+        helper = getattr(self.app, "_display_to_world", None)
+        if callable(helper):
+            try:
+                return helper(self.renderer, display_x, display_y, display_z)
+            except Exception:
+                pass
+
+        try:
+            self.renderer.SetDisplayPoint(float(display_x), float(display_y), float(display_z))
+            self.renderer.DisplayToWorld()
+            world_point = self.renderer.GetWorldPoint()
+            if world_point is None or len(world_point) < 4:
+                return None
+            w = world_point[3]
+            if abs(w) < 1e-9:
+                return None
+            return (
+                float(world_point[0] / w),
+                float(world_point[1] / w),
+                float(world_point[2] / w),
+            )
+        except Exception:
+            return None
+
+    def _get_label_position_above_segment(self, p1, p2):
+        """Return a world-space anchor a few screen pixels above a segment."""
+        if not self._is_valid_world_point(p1) or not self._is_valid_world_point(p2):
+            return p2 if self._is_valid_world_point(p2) else p1
+
+        p1_arr = np.asarray(p1, dtype=np.float64)[:3]
+        p2_arr = np.asarray(p2, dtype=np.float64)[:3]
+        midpoint = ((p1_arr + p2_arr) * 0.5).tolist()
+
+        d1 = self._world_to_display_point(p1_arr)
+        d2 = self._world_to_display_point(p2_arr)
+        dmid = self._world_to_display_point(midpoint)
+        if d1 is None or d2 is None or dmid is None:
+            return (float(midpoint[0]), float(midpoint[1]), float(midpoint[2]))
+
+        tangent = np.array([d2[0] - d1[0], d2[1] - d1[1]], dtype=np.float64)
+        tangent_len = np.linalg.norm(tangent)
+        if tangent_len < 1e-6:
+            normal = np.array([0.0, 1.0], dtype=np.float64)
+        else:
+            normal = np.array([-tangent[1], tangent[0]], dtype=np.float64) / tangent_len
+            if normal[1] < 0.0:
+                normal *= -1.0
+
+        world_anchor = self._display_to_world_point(
+            dmid[0] + normal[0] * self._label_offset_pixels,
+            dmid[1] + normal[1] * self._label_offset_pixels,
+            dmid[2],
+        )
+        if self._is_valid_world_point(world_anchor):
+            return (
+                float(world_anchor[0]),
+                float(world_anchor[1]),
+                float(world_anchor[2]),
+            )
+        return (float(midpoint[0]), float(midpoint[1]), float(midpoint[2]))
+
+    def _set_label_actor_position(self, actor, world_position):
+        """Update a 2D text actor's world anchor."""
+        if actor is None or not self._is_valid_world_point(world_position):
+            return
+        try:
+            if not actor.IsA("vtkActor2D"):
+                return
+            coord = actor.GetActualPositionCoordinate()
+            coord.SetCoordinateSystemToWorld()
+            coord.SetValue(world_position[0], world_position[1], world_position[2])
+            actor.Modified()
+        except Exception:
+            pass
+
+    def _refresh_label_positions(self, label_entries):
+        """Recompute segment label anchors for the current camera."""
+        for label_data in label_entries or []:
+            actor = label_data.get('label')
+            if actor is None:
+                continue
+
+            p1 = label_data.get('p1')
+            p2 = label_data.get('p2')
+            if self._is_valid_world_point(p1) and self._is_valid_world_point(p2):
+                p1_arr = np.asarray(p1, dtype=np.float64)[:3]
+                p2_arr = np.asarray(p2, dtype=np.float64)[:3]
+                if np.linalg.norm(p2_arr - p1_arr) > 1e-9:
+                    self._set_label_actor_position(actor, self._get_label_position_above_segment(p1, p2))
+                    continue
+
+            if self._is_valid_world_point(p1):
+                self._set_label_actor_position(actor, (float(p1[0]), float(p1[1]), float(p1[2])))
 
     def _update_preview_line(self, p1, p2):
         """
@@ -2354,6 +2544,394 @@ class MeasurementTool:
             return False
         return arr.size >= 3 and np.all(np.isfinite(arr[:3]))
 
+    def _normalize_block_label(self, label):
+        """Normalize labels so PRJ block names and DXF text labels can be matched."""
+        return "".join(ch.lower() for ch in str(label or "") if ch.isalnum())
+
+    def _normalize_block_polygon(self, coords):
+        """Drop duplicate closing vertices and malformed points from a block polygon."""
+        normalized = []
+        for coord in coords or []:
+            try:
+                x = float(coord[0])
+                y = float(coord[1])
+            except Exception:
+                continue
+            if normalized and abs(normalized[-1][0] - x) < 1e-9 and abs(normalized[-1][1] - y) < 1e-9:
+                continue
+            normalized.append((x, y))
+
+        if len(normalized) >= 2:
+            first_x, first_y = normalized[0]
+            last_x, last_y = normalized[-1]
+            if abs(first_x - last_x) < 1e-9 and abs(first_y - last_y) < 1e-9:
+                normalized.pop()
+        return normalized
+
+    def _calculate_polygon_area_2d(self, points):
+        """Calculate polygon area from XY coordinates."""
+        if len(points) < 3:
+            return 0.0
+
+        area = 0.0
+        for i in range(len(points)):
+            j = (i + 1) % len(points)
+            area += points[i][0] * points[j][1]
+            area -= points[j][0] * points[i][1]
+        return abs(area) / 2.0
+
+    def _calculate_polygon_centroid_2d(self, points):
+        """Return a stable centroid for a 2D polygon."""
+        if not points:
+            return (0.0, 0.0)
+        if len(points) < 3:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            return (float(sum(xs) / len(xs)), float(sum(ys) / len(ys)))
+
+        signed_area = 0.0
+        cx = 0.0
+        cy = 0.0
+        for i in range(len(points)):
+            j = (i + 1) % len(points)
+            cross = points[i][0] * points[j][1] - points[j][0] * points[i][1]
+            signed_area += cross
+            cx += (points[i][0] + points[j][0]) * cross
+            cy += (points[i][1] + points[j][1]) * cross
+
+        if abs(signed_area) < 1e-9:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            return (float(sum(xs) / len(xs)), float(sum(ys) / len(ys)))
+
+        signed_area *= 0.5
+        scale = 1.0 / (6.0 * signed_area)
+        return (float(cx * scale), float(cy * scale))
+
+    def _point_in_polygon_2d(self, point_xy, polygon):
+        """Return True when the XY point lies inside or very near the polygon."""
+        if len(polygon) < 3:
+            return False
+
+        x = float(point_xy[0])
+        y = float(point_xy[1])
+        inside = False
+        n = len(polygon)
+        for i in range(n):
+            x1, y1 = polygon[i]
+            x2, y2 = polygon[(i + 1) % n]
+
+            edge_dx = x2 - x1
+            edge_dy = y2 - y1
+            edge_len_sq = edge_dx * edge_dx + edge_dy * edge_dy
+            if edge_len_sq > 1e-12:
+                t = ((x - x1) * edge_dx + (y - y1) * edge_dy) / edge_len_sq
+                t = max(0.0, min(1.0, t))
+                nearest_x = x1 + t * edge_dx
+                nearest_y = y1 + t * edge_dy
+                if (nearest_x - x) ** 2 + (nearest_y - y) ** 2 < 1e-6:
+                    return True
+
+            intersects = ((y1 > y) != (y2 > y))
+            if intersects:
+                cross_x = (x2 - x1) * (y - y1) / ((y2 - y1) or 1e-12) + x1
+                if x <= cross_x:
+                    inside = not inside
+        return inside
+
+    def _iter_block_project_files(self):
+        """Yield PRJ files that can describe block boundaries for attached overlays."""
+        candidates = []
+        seen = set()
+
+        loaded_file = getattr(self.app, "loaded_file", None)
+        if loaded_file:
+            loaded_path = Path(str(loaded_file))
+            if loaded_path.suffix.lower() == ".prj" and loaded_path.exists():
+                key = str(loaded_path.resolve()).lower()
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(loaded_path)
+
+        for store_name in ("dxf_actors", "dwg_actors"):
+            for overlay in getattr(self.app, store_name, []) or []:
+                full_path = overlay.get("full_path") or overlay.get("filename")
+                if not full_path:
+                    continue
+                base_path = Path(str(full_path))
+                for suffix in (".prj", ".PRJ"):
+                    prj_path = base_path.with_suffix(suffix)
+                    if not prj_path.exists():
+                        continue
+                    try:
+                        key = str(prj_path.resolve()).lower()
+                    except Exception:
+                        key = str(prj_path).lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(prj_path)
+
+        return candidates
+
+    def _parse_terrascan_prj_blocks(self, prj_path):
+        """Parse TerraScan PRJ block boundaries into searchable polygons."""
+        blocks = []
+        try:
+            lines = Path(prj_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception as exc:
+            print(f"⚠️ Failed to read PRJ block file {prj_path}: {exc}")
+            return blocks
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line.startswith("Block "):
+                i += 1
+                continue
+
+            block_file = line.replace("Block ", "", 1).strip()
+            block_label = Path(block_file).stem or block_file
+            coords = []
+            j = i + 1
+            while j < len(lines):
+                coord_line = lines[j].strip()
+                if not coord_line:
+                    j += 1
+                    continue
+                if coord_line.startswith("Block "):
+                    break
+
+                parts = coord_line.split()
+                if len(parts) >= 2:
+                    try:
+                        coords.append((float(parts[0]), float(parts[1])))
+                    except ValueError:
+                        pass
+                j += 1
+
+            polygon = self._normalize_block_polygon(coords)
+            if len(polygon) >= 3:
+                area = self._calculate_polygon_area_2d(polygon)
+                centroid = self._calculate_polygon_centroid_2d(polygon)
+                xs = [pt[0] for pt in polygon]
+                ys = [pt[1] for pt in polygon]
+                blocks.append({
+                    "label": block_label,
+                    "label_key": self._normalize_block_label(block_label),
+                    "points": polygon,
+                    "area": area,
+                    "centroid": centroid,
+                    "bbox": (min(xs), max(xs), min(ys), max(ys)),
+                    "source_prj": str(prj_path),
+                })
+
+            i = j
+
+        return blocks
+
+    def _load_block_boundaries(self, force=False):
+        """Load block polygons from visible project PRJ files."""
+        if self._block_boundary_index and not force:
+            return self._block_boundary_index
+
+        if force:
+            self._block_boundary_cache = {}
+            self._block_boundary_index = []
+
+        blocks = []
+        for prj_path in self._iter_block_project_files():
+            cache_key = str(prj_path)
+            if cache_key not in self._block_boundary_cache:
+                self._block_boundary_cache[cache_key] = self._parse_terrascan_prj_blocks(prj_path)
+            blocks.extend(self._block_boundary_cache.get(cache_key, []))
+
+        self._block_boundary_index = blocks
+        return self._block_boundary_index
+
+    def _find_block_by_label(self, label):
+        """Find a parsed block whose label matches the clicked grid label."""
+        label_key = self._normalize_block_label(label)
+        if not label_key:
+            return None
+
+        for block in self._load_block_boundaries():
+            block_key = block.get("label_key", "")
+            if not block_key:
+                continue
+            if block_key == label_key or block_key in label_key or label_key in block_key:
+                return block
+        return None
+
+    def _find_block_at_world_point(self, world_point):
+        """Find the block polygon containing the clicked world XY location."""
+        if not self._is_valid_world_point(world_point):
+            return None
+
+        x = float(world_point[0])
+        y = float(world_point[1])
+
+        for block in self._load_block_boundaries():
+            xmin, xmax, ymin, ymax = block["bbox"]
+            if x < xmin or x > xmax or y < ymin or y > ymax:
+                continue
+            if self._point_in_polygon_2d((x, y), block["points"]):
+                return block
+        return None
+
+    def _pick_grid_label_name(self, display_pos=None):
+        """Return the clicked DXF/SNT grid label when the cursor is over one."""
+        if display_pos is None:
+            display_pos = self.interactor.GetEventPosition()
+        x, y = display_pos
+
+        try:
+            render_window = self.app.vtk_widget.GetRenderWindow()
+            window_size = render_window.GetSize()
+            vtk_y = window_size[1] - y
+        except Exception:
+            return None
+
+        try:
+            area_picker = vtk.vtkAreaPicker()
+            area_picker.AreaPick(x - 12, vtk_y - 12, x + 12, vtk_y + 12, self.renderer)
+            for prop in area_picker.GetProp3Ds():
+                if getattr(prop, "is_grid_label", False):
+                    grid_name = getattr(prop, "grid_name", "")
+                    if grid_name:
+                        return grid_name
+        except Exception:
+            pass
+
+        try:
+            prop_picker = vtk.vtkPropPicker()
+            prop_picker.Pick(x, vtk_y, 0, self.renderer)
+            picked = prop_picker.GetActor()
+        except Exception:
+            picked = None
+
+        if picked is None:
+            return None
+
+        if getattr(picked, "is_grid_label", False):
+            grid_name = getattr(picked, "grid_name", "")
+            if grid_name:
+                return grid_name
+
+        try:
+            picked_pos = picked.GetPosition()
+            picked_bounds = picked.GetBounds()
+        except Exception:
+            return None
+
+        for store_name in ("snt_actors", "dxf_actors"):
+            for data in getattr(self.app, store_name, []) or []:
+                for actor in data.get("actors", []):
+                    if not getattr(actor, "is_grid_label", False):
+                        continue
+                    try:
+                        if actor.GetPosition() == picked_pos and actor.GetBounds() == picked_bounds:
+                            grid_name = getattr(actor, "grid_name", "")
+                            if grid_name:
+                                return grid_name
+                    except Exception:
+                        pass
+        return None
+
+    def _create_block_outline_actor(self, polygon_points, z_value):
+        """Create a highlighted outline actor for the selected block polygon."""
+        if len(polygon_points) < 3:
+            return None
+
+        points = vtk.vtkPoints()
+        for x, y in polygon_points:
+            points.InsertNextPoint(float(x), float(y), float(z_value))
+        points.InsertNextPoint(float(polygon_points[0][0]), float(polygon_points[0][1]), float(z_value))
+
+        polyline = vtk.vtkPolyLine()
+        polyline.GetPointIds().SetNumberOfIds(points.GetNumberOfPoints())
+        for idx in range(points.GetNumberOfPoints()):
+            polyline.GetPointIds().SetId(idx, idx)
+
+        cells = vtk.vtkCellArray()
+        cells.InsertNextCell(polyline)
+
+        polydata = vtk.vtkPolyData()
+        polydata.SetPoints(points)
+        polydata.SetLines(cells)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(1.0, 0.55, 0.0)
+        actor.GetProperty().SetLineWidth(4.0)
+        actor.GetProperty().SetOpacity(1.0)
+        actor.GetProperty().SetLighting(False)
+        return actor
+
+    def _measure_block_area_at_click(self, display_pos=None):
+        """Resolve the clicked block and add an area label measurement."""
+        blocks = self._load_block_boundaries()
+        if not blocks:
+            self.app.statusBar().showMessage("⚠️ No PRJ block boundaries found for the attached overlays", 4000)
+            return
+
+        grid_name = self._pick_grid_label_name(display_pos)
+        block = self._find_block_by_label(grid_name) if grid_name else None
+
+        world_point = self._get_measurement_world_point(display_pos)
+        if world_point is None:
+            try:
+                world_point = self._screen_to_world_fast()
+            except Exception:
+                world_point = None
+
+        if block is None and world_point is not None:
+            block = self._find_block_at_world_point(world_point)
+
+        if block is None:
+            self.app.statusBar().showMessage("⚠️ No block found at this location", 2500)
+            return
+
+        z_value = float(world_point[2]) if self._is_valid_world_point(world_point) else float(self._last_z)
+        centroid_x, centroid_y = block["centroid"]
+        label_position = (float(centroid_x), float(centroid_y), z_value)
+
+        outline_actor = self._create_block_outline_actor(block["points"], z_value)
+        label_actor = self._create_area_label(label_position, block["area"])
+
+        self._scene_add(outline_actor)
+        self._scene_add(label_actor)
+
+        self.measurements.append({
+            "type": "measure_block_area",
+            "block_name": block["label"],
+            "points": [(float(x), float(y), z_value) for x, y in block["points"]],
+            "labels": [{
+                "line": outline_actor,
+                "label": label_actor,
+                "p1": label_position,
+                "p2": label_position,
+                "distance": 0.0,
+            }],
+            "vertices": [],
+            "continuous_line": None,
+            "total_distance": 0.0,
+            "area": float(block["area"]),
+            "source_prj": block.get("source_prj"),
+        })
+
+        self.app.statusBar().showMessage(
+            f"▦ {block['label']} area: {block['area']:.2f} m²",
+            5000,
+        )
+        try:
+            self.app.vtk_widget.GetRenderWindow().Render()
+        except Exception:
+            self.app.vtk_widget.render()
+
     def _get_measurement_world_point(self, display_pos=None, allow_focal_fallback=True):
         """
         Resolve the clicked world point robustly across point-cloud and shading modes.
@@ -2433,10 +3011,15 @@ class MeasurementTool:
         """Capture measurement data (without VTK actors) for undo/redo."""
         state = []
         for measurement in self.measurements:
-            state.append({
+            entry = {
                 'type': measurement.get('type', 'measure_line'),
                 'points': [tuple(p) for p in measurement.get('points', [])],
-            })
+            }
+            if measurement.get('type') == 'measure_block_area':
+                entry['block_name'] = measurement.get('block_name')
+                entry['area'] = float(measurement.get('area', 0.0))
+                entry['source_prj'] = measurement.get('source_prj')
+            state.append(entry)
         return state
 
     def _save_state(self):
@@ -2543,11 +3126,47 @@ class MeasurementTool:
     def _recreate_measurement_from_state(self, measurement_state):
         """Recreate one finalized measurement from captured state."""
         points = measurement_state.get('points', [])
+        measurement_type = measurement_state.get('type', 'measure_line')
+
+        if measurement_type == 'measure_block_area':
+            if len(points) < 3:
+                return
+
+            polygon_points = [(float(p[0]), float(p[1])) for p in points]
+            z_value = float(points[0][2]) if points and len(points[0]) >= 3 else float(self._last_z)
+            area = float(measurement_state.get('area', self._calculate_polygon_area_2d(polygon_points)))
+            centroid_x, centroid_y = self._calculate_polygon_centroid_2d(polygon_points)
+            label_position = (float(centroid_x), float(centroid_y), z_value)
+
+            outline_actor = self._create_block_outline_actor(polygon_points, z_value)
+            label_actor = self._create_area_label(label_position, area)
+            self._scene_add(outline_actor)
+            self._scene_add(label_actor)
+
+            self.measurements.append({
+                'type': 'measure_block_area',
+                'block_name': measurement_state.get('block_name'),
+                'points': [(float(x), float(y), z_value) for x, y in polygon_points],
+                'labels': [{
+                    'line': outline_actor,
+                    'label': label_actor,
+                    'p1': label_position,
+                    'p2': label_position,
+                    'distance': 0.0,
+                }],
+                'vertices': [],
+                'continuous_line': None,
+                'total_distance': 0.0,
+                'area': area,
+                'source_prj': measurement_state.get('source_prj'),
+            })
+            return
+
         if len(points) < 2:
             return
 
         prev_mode = getattr(self, "mode", "measure_line")
-        self.mode = measurement_state.get('type', 'measure_line')
+        self.mode = measurement_type
         self._rebuild_active_measurement(points, render=False)
         self._finalize_measurement(push_undo=False)
         self.mode = prev_mode
@@ -2710,6 +3329,10 @@ class MeasurementTool:
         except Exception:
             pass
 
+        if self.mode == "measure_block_area":
+            self._measure_block_area_at_click()
+            return
+
         self._temp_vertex_stack.append(list(self.measurement_points))
 
         pos = self._get_measurement_world_point()
@@ -2865,8 +3488,8 @@ class MeasurementTool:
         if self.mode == "measure_line":
             label_actor = None
         else:
-            midpoint = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2, (p1[2] + p2[2]) / 2)
-            label_actor = self._create_distance_label(midpoint, distance)
+            label_position = self._get_label_position_above_segment(p1, p2)
+            label_actor = self._create_distance_label(label_position, distance)
             self._scene_add(label_actor)
         
         # Store for later removal
@@ -2916,12 +3539,8 @@ class MeasurementTool:
                 self._scene_add(closing_line_actor)
             
             # Create distance label for closing segment
-            midpoint = (
-                (first_point[0] + last_point[0]) / 2,
-                (first_point[1] + last_point[1]) / 2,
-                (first_point[2] + last_point[2]) / 2
-            )
-            closing_label_actor = self._create_distance_label(midpoint, closing_distance)
+            label_position = self._get_label_position_above_segment(last_point, first_point)
+            closing_label_actor = self._create_distance_label(label_position, closing_distance)
             if closing_label_actor:
                 self._scene_add(closing_label_actor)
             
@@ -2994,29 +3613,16 @@ class MeasurementTool:
         elif self.mode == "measure_line" and len(self.measurement_points) >= 2:
             print(f"📏 Line distance: {total_distance:.3f} m")
             self.app.statusBar().showMessage(f"📏 Total Distance: {total_distance:.2f} m", 5000)
-            # Create single total distance label at midpoint of the full line
-            # Place label near the last point, slightly offset
             last_pt = self.measurement_points[-1]
             second_last_pt = self.measurement_points[-2]
-            seg_dir = np.array(last_pt) - np.array(second_last_pt)
-            seg_len = np.linalg.norm(seg_dir[:2])
-            if seg_len > 0:
-                perp = np.array([-seg_dir[1], seg_dir[0], 0]) / seg_len
-            else:
-                perp = np.array([0, 1, 0])
-            offset_amount = total_distance * 0.02
-            offset_pt = (
-                last_pt[0] + perp[0] * offset_amount,
-                last_pt[1] + perp[1] * offset_amount,
-                last_pt[2]
-            )
-            total_label = self._create_distance_label(offset_pt, total_distance)
+            label_position = self._get_label_position_above_segment(second_last_pt, last_pt)
+            total_label = self._create_distance_label(label_position, total_distance)
             if total_label:
                 self._scene_add(total_label)
                 self.distance_labels.append({
                     'line': None,
                     'label': total_label,
-                    'p1': last_pt,
+                    'p1': second_last_pt,
                     'p2': last_pt,
                     'distance': total_distance
                 })
@@ -3224,6 +3830,15 @@ class MeasurementTool:
         for i, measurement in enumerate(self.measurements, 1):
             output.append(f"\nMeasurement {i} ({measurement['type']}):")
             output.append("-" * 40)
+
+            if measurement.get('type') == 'measure_block_area':
+                if measurement.get('block_name'):
+                    output.append(f"  Block: {measurement['block_name']}")
+                if measurement.get('area', 0) > 0:
+                    output.append(f"  Block Area: {measurement['area']:.3f} m²")
+                if measurement.get('source_prj'):
+                    output.append(f"  Source PRJ: {measurement['source_prj']}")
+                continue
             
             for j, label_data in enumerate(measurement['labels'], 1):
                 p1 = label_data['p1']
@@ -3868,9 +4483,74 @@ class MeasurementTool:
         area = abs(area) / 2.0
         return area
     
+    def _create_world_text_label(
+        self,
+        text,
+        position,
+        color=(1.0, 1.0, 1.0),
+        font_size=16,
+        bold=True,
+        background_color=None,
+        background_opacity=0.0,
+        frame_color=None,
+        frame_width=1,
+    ):
+        """Create fixed-size overlay text anchored to a world position."""
+        text_actor = vtk.vtkTextActor()
+        text_actor.SetInput(text)
+
+        prop = text_actor.GetTextProperty()
+        prop.SetColor(*color)
+        prop.SetFontSize(font_size)
+        if bold:
+            prop.BoldOn()
+        else:
+            prop.BoldOff()
+        prop.SetJustificationToCentered()
+        prop.SetVerticalJustificationToCentered()
+
+        if background_color is not None:
+            prop.SetBackgroundColor(*background_color)
+        prop.SetBackgroundOpacity(background_opacity)
+
+        if frame_color is not None:
+            prop.SetFrame(True)
+            prop.SetFrameColor(*frame_color)
+            prop.SetFrameWidth(frame_width)
+        else:
+            prop.SetFrame(False)
+
+        coord = text_actor.GetActualPositionCoordinate()
+        coord.SetCoordinateSystemToWorld()
+        coord.SetValue(
+            float(position[0]),
+            float(position[1]),
+            float(position[2] if len(position) > 2 else 0.0),
+        )
+
+        text_actor.GetProperty().SetDisplayLocationToForeground()
+        text_actor.PickableOff()
+        return text_actor
+
 
     def _create_area_label(self, position, area):
-        """Create a 3D text label showing area."""
+        """Create a fixed-size text label showing area."""
+        if area >= 1000000:
+            text = f"Area: {area/1000000:.2f} km^2"
+        elif area >= 1:
+            text = f"Area: {area:.2f} m^2"
+        else:
+            text = f"Area: {area*10000:.1f} cm^2"
+
+        return self._create_world_text_label(
+            text=text,
+            position=position,
+            color=(0.0, 1.0, 0.5),
+            font_size=24,
+            bold=True,
+            background_color=(0.0, 0.0, 0.0),
+            background_opacity=0.8,
+        )
         # Format area string
         if area >= 1000000:
             text = f"Area: {area/1000000:.2f} km²"
@@ -3899,7 +4579,18 @@ class MeasurementTool:
 
 
     def _create_polygon_summary_label(self, position, perimeter, area):
-        """Create an ultra-modern premium label for polygon measurements."""
+        """Create the summary label for polygon measurements."""
+        return self._create_world_text_label(
+            text=f"{perimeter:.1f} m | {area:.2f} m^2",
+            position=position,
+            color=(0.2, 1.0, 0.8),
+            font_size=12,
+            bold=True,
+            background_color=(0.0, 0.05, 0.1),
+            background_opacity=0.9,
+            frame_color=(0.0, 0.8, 1.0),
+            frame_width=3,
+        )
         # Format with consistent meters
         perim_text = f"{perimeter:.1f}"
         area_text = f"{area:.2f}"
@@ -3963,7 +4654,15 @@ class MeasurementTool:
 
 
     def _create_distance_label(self, position, distance):
-        """Create an ultra-modern premium distance label."""
+        """Create a distance label that stays anchored during zoom."""
+        return self._create_world_text_label(
+            text=f"{distance:.2f} m",
+            position=position,
+            color=(1.0, 1.0, 1.0),
+            font_size=16,
+            bold=True,
+            background_opacity=0.0,
+        )
         # Sleek minimal format
         text = f"— {distance:.2f}m —"
         
@@ -3988,7 +4687,23 @@ class MeasurementTool:
 
 
     def _create_total_distance_label(self, position, total_distance):
-        """Create a 3D text label showing total distance/perimeter."""
+        """Create a fixed-size text label showing total distance/perimeter."""
+        if total_distance >= 1000:
+            text = f"Total: {total_distance/1000:.2f} km"
+        elif total_distance >= 1:
+            text = f"Total: {total_distance:.2f} m"
+        else:
+            text = f"Total: {total_distance*100:.1f} cm"
+
+        return self._create_world_text_label(
+            text=text,
+            position=position,
+            color=(1.0, 0.5, 0.0),
+            font_size=28,
+            bold=True,
+            background_color=(0.0, 0.0, 0.0),
+            background_opacity=0.9,
+        )
         # Format distance string
         if total_distance >= 1000:
             text = f"Total: {total_distance/1000:.2f} km"
@@ -4018,7 +4733,18 @@ class MeasurementTool:
     
 
     def _create_path_summary_label(self, position, total_distance, area):
-        """Create a beautiful modern text label for path measurements."""
+        """Create the summary label for path measurements."""
+        return self._create_world_text_label(
+            text=f"{total_distance:.1f} m | {area:.2f} m^2",
+            position=position,
+            color=(1.0, 0.9, 0.4),
+            font_size=13,
+            bold=True,
+            background_color=(0.2, 0.12, 0.05),
+            background_opacity=0.85,
+            frame_color=(1.0, 0.7, 0.2),
+            frame_width=2,
+        )
         # Format with consistent meters
         dist_text = f"{total_distance:.1f}m"
         area_text = f"{area:.2f}m²"
@@ -4163,6 +4889,16 @@ class MeasurementTool:
                 except:
                     pass
             self._observer_tags = []
+        
+        # ✅ FIX: Remove camera observer to prevent crash on destruction
+        if self._render_observer_tag is not None:
+            try:
+                cam = self.renderer.GetActiveCamera()
+                if cam:
+                    cam.RemoveObserver(self._render_observer_tag)
+            except Exception:
+                pass
+            self._render_observer_tag = None
         
         # Clear temp visuals — hide reusable preview, don't destroy
         self._hide_preview_line()

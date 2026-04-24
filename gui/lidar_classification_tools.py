@@ -714,7 +714,7 @@ def _w(layout):
 # CLASS SELECTOR POPUP
 # ═══════════════════════════════════════════════════════════════════════
 class ClassSelectorDialog(QDialog):
-    def __init__(self, current_codes, app, multi=True, parent=None):
+    def __init__(self, current_codes, app, multi=True, extended=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Select Classes")
         self.setStyleSheet(_get_dialog_style())
@@ -725,9 +725,14 @@ class ClassSelectorDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Select class(es):"))
         self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(
-            QAbstractItemView.MultiSelection if multi
-            else QAbstractItemView.SingleSelection)
+        
+        if multi:
+            if extended:
+                self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            else:
+                self.list_widget.setSelectionMode(QAbstractItemView.MultiSelection)
+        else:
+            self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
         
         las_classes = _get_las_classes(self.app)
         colors = _get_class_colors(self.app)
@@ -743,6 +748,11 @@ class ClassSelectorDialog(QDialog):
             if code in current_codes:
                 item.setSelected(True)
         layout.addWidget(self.list_widget)
+        
+        if multi and extended:
+            hint = QLabel("Ctrl+click = multi-select  •  Shift+click = range")
+            hint.setStyleSheet(_note_text_style())
+            layout.addWidget(hint)
         btn_row = QHBoxLayout()
         ok = QPushButton("OK"); ok.setObjectName("okButton")
         ok.clicked.connect(self.accept)
@@ -781,7 +791,7 @@ def _multi_class_label(codes):
 
 
 def _make_class_row(app, default_codes, multi=True, single_default=None,
-                    persist_key=None):
+                    persist_key=None, extended=False):
     """
     Build a class-selector row with color patches from loaded PTC.
     If persist_key is given, the selection is loaded from / saved to
@@ -840,7 +850,7 @@ def _make_class_row(app, default_codes, multi=True, single_default=None,
         holder = [list(initial_codes)]
 
         def _open():
-            dlg = ClassSelectorDialog(holder[0], app, multi=True,
+            dlg = ClassSelectorDialog(holder[0], app, multi=True, extended=extended,
                                       parent=display.window())
             if dlg.exec():
                 holder[0] = dlg.selected_codes()
@@ -2653,14 +2663,14 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
         f.setLabelAlignment(Qt.AlignRight)
 
         r1, self._get_from = _make_class_row(
-            self.app, [1], multi=False, single_default=1,
-            persist_key=self._pk("from_class"))
+            self.app, [1], multi=True,
+            persist_key=self._pk("from_class"), extended=True)
         r2, self._get_to = _make_class_row(
             self.app, [7], multi=False, single_default=7,
             persist_key=self._pk("to_class"))
         r3, self._get_ground_ref = _make_class_row(
             self.app, [2], multi=True,
-            persist_key=self._pk("ground_ref_class"))
+            persist_key=self._pk("ground_ref_class"), extended=True)
 
         f.addRow("From class:",     _w(r1))
         f.addRow("To class:",       _w(r2))

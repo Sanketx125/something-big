@@ -989,7 +989,32 @@ def update_pointcloud(app, mode="rgb"):
     # ─────────────────────────────────────────────────────────
     # PYVISTA-BASED MODES: RGB / INTENSITY / ELEVATION / DEPTH
     # ─────────────────────────────────────────────────────────
-    colors = compute_colors(app)
+
+    # Build a class-visibility mask so only checked classes are rendered.
+    # This applies to depth / intensity / elevation / rgb — matching the
+    # behaviour users expect from the Display Mode dialog checkboxes.
+    vis_mask = np.ones(len(xyz), dtype=bool)
+    _classes = app.data.get("classification")
+    _palette = getattr(app, "class_palette", None)
+    if _classes is not None and _palette:
+        vis_mask = np.zeros(len(xyz), dtype=bool)
+        for _code in np.unique(_classes):
+            _entry = _palette.get(int(_code), {"show": True})
+            if _entry.get("show", True):
+                vis_mask |= (_classes == _code)
+        _vis_count = int(vis_mask.sum())
+        _total = len(xyz)
+        print(f"🎯 Class visibility mask: {_vis_count:,}/{_total:,} points visible ({mode} mode)")
+
+    xyz = xyz[vis_mask]
+
+    if len(xyz) == 0:
+        print("⚠️ No visible points after class filter — check Display Mode checkboxes")
+        app.vtk_widget.clear()
+        app.vtk_widget.render()
+        return
+
+    colors = compute_colors(app, mask=vis_mask)
 
     # ✅ CRITICAL VALIDATION
     if len(colors) == 0:
@@ -1060,8 +1085,10 @@ def update_pointcloud(app, mode="rgb"):
     app.vtk_widget.clear()
 
     # Dynamic class-weighted point size
+    # Note: computed on full original-length arrays before vis_mask is applied.
     base_point_size = 2.0
     classes = app.data.get("classification")
+    _orig_xyz_len = app.data["xyz"].shape[0]   # full length before vis_mask filtering
 
     if not hasattr(app, "class_weights"):
         app.class_weights = {}
@@ -1072,10 +1099,13 @@ def update_pointcloud(app, mode="rgb"):
             weights[classes == cls_code] = w
         point_sizes = np.clip(base_point_size * weights, 1.0, 8.0)
     else:
-        point_sizes = np.ones(xyz.shape[0], dtype=float) * base_point_size
+        point_sizes = np.ones(_orig_xyz_len, dtype=float) * base_point_size
 
     app.data["point_size"] = point_sizes
     print(f"📏 Point sizes: min={point_sizes.min():.1f}, max={point_sizes.max():.1f}")
+
+    # Apply the visibility mask to point_sizes to match filtered xyz/colors length
+    point_sizes = point_sizes[vis_mask]
 
     border_pct = getattr(app, "point_border_percent", 0)
     halo_add = min(1 + int(border_pct / 4), 5)

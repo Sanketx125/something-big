@@ -15,7 +15,7 @@ _BASE_POINT_SIZE = 2.5
 _BORDER_GROWTH_SCALE_PX = 4.0
 _BORDER_GROWTH_CUBIC_PX = 8.0
 _MAX_BORDER_GROWTH_PX = 3.0
-_BORDER_DEPTH_BIAS = 0.001
+_BORDER_DEPTH_BIAS = 0.00005
 # Fixed pixel-width for structured (object-edge) borders — stays constant at any zoom
 _STRUCTURED_BORDER_PX = 2.0
  
@@ -150,14 +150,31 @@ def _mark_actor_dirty(actor) -> None:
  
 def _rewrite_rgb_from_palette(rgb_ptr: np.ndarray, classification: np.ndarray,
                                palette: dict):
+    """Full buffer re-write (O(N)). Use only for initial load or full palette shifts."""
     max_c = max(int(classification.max()) + 1, 256)
+    lut = _get_lut_array(palette, max_c)
+    np.copyto(rgb_ptr, lut[classification.clip(0, max_c - 1).astype(np.intp)])
+
+def _rewrite_rgb_partial(rgb_ptr: np.ndarray, classes_to_apply: np.ndarray, 
+                         palette: dict, local_indices: np.ndarray):
+    """Partial buffer update (O(M) where M is changed points). Critical for 48M+ point sets."""
+    if local_indices is None or len(local_indices) == 0:
+        return
+    max_c = max(int(classes_to_apply.max()) + 1, 256)
+    lut = _get_lut_array(palette, max_c)
+    # Only map and copy the points that actually changed
+    changed_classes = classes_to_apply.clip(0, max_c - 1).astype(np.intp)
+    rgb_ptr[local_indices] = lut[changed_classes]
+
+def _get_lut_array(palette: dict, max_c: int) -> np.ndarray:
+    """Helper to build color lookup table."""
     lut = np.full((max_c, 3), 128, dtype=np.uint8)
     for code, info in palette.items():
         idx = int(code)
         if 0 <= idx < max_c:
             lut[idx] = (info.get("color", (128, 128, 128))
                         if info.get("show", True) else (0, 0, 0))
-    np.copyto(rgb_ptr, lut[classification.clip(0, max_c - 1).astype(np.intp)])
+    return lut
  
  
 def _touch_vtk_arrays(actor):
@@ -285,8 +302,8 @@ def _install_program_point_size_observer(actor, render_window) -> bool:
 
     Safe to call multiple times — the guard flag prevents duplicate observers.
     """
-    if render_window is None or getattr(actor, '_naksha_pps_observer_installed', False):
-        return getattr(actor, '_naksha_pps_observer_installed', False)
+    if render_window is None or getattr(render_window, '_naksha_pps_observer_installed', False):
+        return getattr(render_window, '_naksha_pps_observer_installed', False)
 
     def _pps_start_event(caller, event):
         try:
@@ -298,9 +315,9 @@ def _install_program_point_size_observer(actor, render_window) -> bool:
 
     try:
         obs_id = render_window.AddObserver('StartEvent', _pps_start_event)
-        actor._naksha_pps_observer_installed = True
-        actor._naksha_pps_observer_id        = obs_id
-        print("      ✅ GL_PROGRAM_POINT_SIZE StartEvent observer installed")
+        render_window._naksha_pps_observer_installed = True
+        render_window._naksha_pps_observer_id        = obs_id
+        print("      ✅ GL_PROGRAM_POINT_SIZE StartEvent observer installed ON WINDOW")
         return True
     except Exception as e:
         print(f"      ⚠️ PPS observer install failed: {e}")
@@ -371,7 +388,7 @@ def _push_uniforms_direct(actor, ctx: 'ViewShaderContext') -> bool:
         # This is the critical fix: previously it only tried once and gave up
         # if the state wasn't ready, leaving gl_PointSize writes ignored.
         if rw:
-            if not getattr(actor, '_naksha_pps_observer_installed', False):
+            if not getattr(rw, '_naksha_pps_observer_installed', False):
                 # Observer not yet installed — try to enable immediately and
                 # install observer so it persists across future renders.
                 if _try_enable_program_point_size(rw):
@@ -482,7 +499,14 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "    v_core_size  = 0.0;\n"
             "  } else {\n"
             "    float ps = max(1.0, weight_lut[c_idx]);\n"
-            "    if (structured_border_mode > 0.5) {\n"
+            "    if (structured_border_mode > 1.5) {\n"
+            "      // Hybrid mode\n"
+            f"      float border_growth = clamp((border_ring_val * {_BORDER_GROWTH_SCALE_PX:.1f}) + (border_ring_val * border_ring_val * border_ring_val * {_BORDER_GROWTH_CUBIC_PX:.1f}), 0.0, {_MAX_BORDER_GROWTH_PX:.1f});\n"
+            "      float total_ps = ps + border_growth;\n"
+            "      gl_PointSize = total_ps;\n"
+            "      v_point_size = total_ps;\n"
+            "      v_core_size  = ps;\n"
+            "    } else if (structured_border_mode > 0.5) {\n"
             "      // Structured mode: only boundary points grow, and growth\n"
             "      // is driven by border_ring_val so the % slider is live.\n"
             f"      float border_growth = (boundary_flag > 0.5)\n"
@@ -524,7 +548,15 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "if (dist_px > v_point_size * 0.5) discard;\n"
             "\n"
             "if (border_ring_val > 0.001) {\n"
-            "  if (structured_border_mode > 0.5) {\n"
+            "  if (structured_border_mode > 1.5) {\n"
+            "    if (dist_px >= v_core_size * 0.5) {\n"
+            "      diffuseColor = vec3(0.0);\n"
+            "      ambientColor = vec3(0.0);\n"
+            f"      gl_FragDepth = clamp(gl_FragCoord.z + {_BORDER_DEPTH_BIAS:.4f}, 0.0, 1.0);\n"
+            "    } else {\n"
+            "      gl_FragDepth = gl_FragCoord.z;\n"
+            "    }\n"
+            "  } else if (structured_border_mode > 0.5) {\n"
             "    if (v_boundary > 0.5) {\n"
             "      // boundary point: draw black ring outside core radius\n"
             "      if (dist_px >= v_core_size * 0.5) {\n"
@@ -642,8 +674,11 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
     # Fetch structured border mode from dialog/app (if user checked 'Structured' border)
     structured_mode = 0.0
     dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
-    if dialog and hasattr(dialog, 'border_logic_object'):
-        structured_mode = 1.0 if dialog.border_logic_object.isChecked() else 0.0
+    if dialog:
+        if hasattr(dialog, 'border_logic_hybrid') and dialog.border_logic_hybrid.isChecked():
+            structured_mode = 2.0
+        elif hasattr(dialog, 'border_logic_object') and dialog.border_logic_object.isChecked():
+            structured_mode = 1.0
     ctx.structured_border_mode = structured_mode
 
     base_point_size = float(getattr(actor, '_naksha_base_point_size', _BASE_POINT_SIZE))
@@ -1602,6 +1637,108 @@ def build_section_unified_actor(
  
  
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# PARTIAL UPDATES (The "Real" Performance Fix for 48M+ points)
+# ─────────────────────────────────────────────────────────────────────────────
+def fast_partial_cross_section_update(app, view_idx: int, global_changed_mask: np.ndarray):
+    """
+    Updates ONLY the points that changed within a specific cross-section.
+    Avoids re-mapping millions of unchanged points.
+    """
+    if not hasattr(app, 'section_vtks') or view_idx not in app.section_vtks:
+        return False
+    
+    vtk_widget = app.section_vtks[view_idx]
+    if vtk_widget is None:
+        return False
+
+    actor_name = f"_section_{view_idx}_unified"
+    actor = vtk_widget.actors.get(actor_name) if hasattr(vtk_widget, 'actors') else None
+    if actor is None:
+        return False
+
+    rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
+    if rgb_ptr is None or not _is_writable(rgb_ptr):
+        return False
+
+    # 1. Get the mapping of view points to global indices
+    section_mask = getattr(app, f"section_{view_idx}_combined_mask", None)
+    if section_mask is None:
+        return False
+
+    # 2. Find which points in THIS view have changed globallyS
+    changed_in_view_global_indices = np.where(global_changed_mask & section_mask)[0]
+    if len(changed_in_view_global_indices) == 0:
+        return True
+
+    # ✅ VECTORIZED MAPPING: Replaces slow Python dict loop
+    g_to_l_arr = getattr(actor, '_naksha_global_to_local_arr', None)
+    if g_to_l_arr is None:
+        full_indices = np.where(section_mask)[0]
+        # Map total_points -> local_pos. Initialize with -1 (not in view).
+        g_to_l_arr = np.full(len(app.data["xyz"]), -1, dtype=np.int32)
+        g_to_l_arr[full_indices] = np.arange(len(full_indices), dtype=np.int32)
+        actor._naksha_global_to_local_arr = g_to_l_arr
+    
+    local_indices = g_to_l_arr[changed_in_view_global_indices]
+    valid_mask = local_indices != -1
+    if not np.any(valid_mask):
+        return True
+    local_indices = local_indices[valid_mask]
+
+    # 3. Apply full patch (RGB + Classification Scalars for Shaders)
+    _patch_actor_memory(app, actor, local_indices, slot_idx=view_idx + 1)
+    
+    return True
+
+def fast_partial_classify_update(app, global_changed_mask: np.ndarray):
+    """
+    Updates ONLY the points that changed in the MAIN VIEW.
+    Avoids re-mapping millions of points.
+    """
+    actor = _get_unified_actor(app)
+    if actor is None:
+        return False
+
+    rgb_ptr = getattr(actor, "_naksha_rgb_ptr", None)
+    if rgb_ptr is None or not _is_writable(rgb_ptr):
+        return False
+
+    gi = getattr(app, '_main_global_indices', None)
+    palette = getattr(app, "class_palette", {})
+    classification = app.data["classification"]
+
+    if gi is None:
+        local_indices = np.where(global_changed_mask)[0]
+    else:
+        gi_mask = getattr(app, '_main_global_mask', None)
+        if gi_mask is None:
+            gi_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
+            gi_mask[gi] = True
+            app._main_global_mask = gi_mask
+        
+        changed_visible_global = np.where(global_changed_mask & gi_mask)[0]
+        if len(changed_visible_global) == 0:
+            return True
+            
+        g_to_l_arr = getattr(actor, '_naksha_global_to_local_arr', None)
+        if g_to_l_arr is None:
+            g_to_l_arr = np.full(len(app.data["xyz"]), -1, dtype=np.int32)
+            g_to_l_arr[gi] = np.arange(len(gi), dtype=np.int32)
+            actor._naksha_global_to_local_arr = g_to_l_arr
+        
+        local_indices = g_to_l_arr[changed_visible_global]
+        valid_mask = local_indices != -1
+        if not np.any(valid_mask):
+            return True
+        local_indices = local_indices[valid_mask]
+
+    # 3. Apply full patch (RGB + Classification Scalars for Shaders)
+    _patch_actor_memory(app, actor, local_indices, slot_idx=0)
+    
+    return True
+
+# ─────────────────────────────────────────────────────────────────────────────
 # fast_classify_update — main view
 # ─────────────────────────────────────────────────────────────────────────────
 def fast_classify_update(
@@ -2027,8 +2164,24 @@ def _get_slot_palette(app, slot_idx: int) -> dict:
         vp = getattr(app, "view_palettes", {})
         overrides = vp.get(slot_idx, {}) or {}
 
-    # ── Fingerprint: id() + len() is O(1) and catches all structural changes ─
-    fp = (id(master), len(master), id(overrides), len(overrides))
+    # ── Fingerprint: content-based hash so in-place dict mutations (checkbox
+    # toggled, weight changed) are always detected.  id() alone is O(1) but
+    # misses mutations on the *same* object — the most common case in practice.
+    try:
+        fp = (
+            hash(tuple(
+                (k, v.get("show", True), v.get("weight", 1.0),
+                 tuple(v.get("color", (128, 128, 128))))
+                for k, v in sorted(master.items())
+            )),
+            hash(tuple(
+                (k, v.get("show", True), v.get("weight", 1.0),
+                 tuple(v.get("color", (128, 128, 128))))
+                for k, v in sorted(overrides.items())
+            )) if overrides else 0,
+        )
+    except Exception:
+        fp = (id(master), id(overrides))   # fallback: never stale-caches, just no speedup
     cached = _palette_resolve_cache.get(slot_idx)
     if cached is not None and cached[0] == fp:
         return cached[1]                          # cache hit — zero allocation
@@ -2058,6 +2211,13 @@ def _get_slot_palette(app, slot_idx: int) -> dict:
 def invalidate_unified_actor(app):
     if hasattr(app, "_unified_actor"):
         del app._unified_actor
+    
+    # ✅ CLEANUP NEW MAPPINGS (Prevents stale data crashes on project switch)
+    if hasattr(app, "_main_global_mask"):
+        del app._main_global_mask
+    if hasattr(app, "_main_global_indices"):
+        del app._main_global_indices
+        
     for key in list(_lut_cache.keys()):
         _lut_cache[key]._palette_id = None
     _palette_resolve_cache.clear()   # Bug-5: flush fingerprint cache on file reload

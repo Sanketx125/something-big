@@ -397,7 +397,20 @@ def restore_global_display_settings(app):
             restored_anything = True
 
         saved_structured_border = settings.value("global_structured_border")
-        if saved_structured_border is not None:
+        saved_logic_mode = settings.value("global_border_logic_mode")
+        
+        if saved_logic_mode is not None:
+            mode_val = int(saved_logic_mode)
+            if hasattr(dialog, 'border_logic_hybrid') and hasattr(dialog, 'border_logic_object') and hasattr(dialog, 'border_logic_point'):
+                if mode_val == 2:
+                    dialog.border_logic_hybrid.setChecked(True)
+                elif mode_val == 1:
+                    dialog.border_logic_object.setChecked(True)
+                else:
+                    dialog.border_logic_point.setChecked(True)
+            print(f"✅ Restored GLOBAL border logic mode: {mode_val}")
+            restored_anything = True
+        elif saved_structured_border is not None:
             is_structured = str(saved_structured_border).lower() == 'true'
             if hasattr(dialog, 'border_logic_object') and hasattr(dialog, 'border_logic_point'):
                 if is_structured:
@@ -629,17 +642,23 @@ class DisplayModeDialog(QDialog):
         
         self.border_logic_object = QAction("Structured", self.border_setting_menu)
         self.border_logic_object.setCheckable(True)
+
+        self.border_logic_hybrid = QAction("Hybrid", self.border_setting_menu)
+        self.border_logic_hybrid.setCheckable(True)
         
         self.border_action_group = QActionGroup(self)
         self.border_action_group.addAction(self.border_logic_point)
         self.border_action_group.addAction(self.border_logic_object)
+        self.border_action_group.addAction(self.border_logic_hybrid)
         self.border_action_group.setExclusive(True)
         
         self.border_setting_menu.addAction(self.border_logic_point)
         self.border_setting_menu.addAction(self.border_logic_object)
+        self.border_setting_menu.addAction(self.border_logic_hybrid)
         
         self.border_logic_point.triggered.connect(self._on_border_mode_changed)
         self.border_logic_object.triggered.connect(self._on_border_mode_changed)
+        self.border_logic_hybrid.triggered.connect(self._on_border_mode_changed)
         
         # Show menu on click to avoid the auto-indicator arrow from setMenu
         self.border_setting_btn.clicked.connect(
@@ -1284,20 +1303,12 @@ class DisplayModeDialog(QDialog):
 
     def _on_color_mode_changed(self, idx):
         """
-        When user switches to Depth / Intensity / RGB / Elevation (idx 2-5),
-        automatically check ALL classes so every point is visible.
-        By Classification (0) and Shaded Classification (1) are left untouched
-        — they restore whatever the user had previously set.
+        When user switches between display modes, preserve existing checkbox states.
+        The checked classes in the table determine which classes are visible for
+        ALL modes (depth, intensity, rgb, elevation, classification).
         """
-        NON_CLASS_MODES = {2, 3, 4, 5}
-        if idx in NON_CLASS_MODES:
-            for row in range(self.table.rowCount()):
-                chk = self.table.cellWidget(row, 0)
-                if chk:
-                    chk.blockSignals(True)
-                    chk.setChecked(True)
-                    chk.blockSignals(False)
-            print(f"✅ Color mode idx={idx}: all classes auto-selected")
+        # Do not auto-check or modify checkboxes — user controls visibility for all modes.
+        pass
 
     def on_select_all(self):
         for row in range(self.table.rowCount()):
@@ -1494,7 +1505,8 @@ class DisplayModeDialog(QDialog):
             print(f"🟳 Border {_border_val}% preserved for {target_mode} mode (uniform only)")
             print(f"🎨 Display mode → {target_mode}")
 
-            # Reset shader visibility LUT — all classes visible for this mode.
+            # Sync shader visibility LUT — respect the user's checked classes.
+            # Only the checked (show=True) classes will be rendered in this mode.
             # One GPU uniform upload only, no geometry/actor change.
             try:
                 from gui.unified_actor_manager import (
@@ -1504,11 +1516,11 @@ class DisplayModeDialog(QDialog):
                 if _actor is not None:
                     _ctx = getattr(_actor, '_naksha_shader_ctx', None)
                     if _ctx is not None:
-                        _all_vis = {c: dict(v, show=True) for c, v in class_map.items()}
                         _base_sz = float(getattr(_actor, '_naksha_base_point_size', 2.5))
-                        _ctx.load_from_palette(_all_vis, _border_val, _base_sz)
+                        _ctx.load_from_palette(class_map, _border_val, _base_sz)
                         _push_uniforms_direct(_actor, _ctx)
-                        print(f"⚡ Shader LUT: all {len(_all_vis)} classes visible for {target_mode}")
+                        vis_count = sum(1 for v in class_map.values() if v.get('show', True))
+                        print(f"⚡ Shader LUT: {vis_count}/{len(class_map)} classes visible for {target_mode}")
             except Exception as _lut_err:
                 print(f"⚠️ Shader LUT reset failed: {_lut_err}")
 
@@ -1712,6 +1724,14 @@ class DisplayModeDialog(QDialog):
 
             # 6. Save color mode & structured border mode
             settings.setValue("global_color_mode", self.color_mode.currentIndex())
+            
+            if self.border_logic_hybrid.isChecked():
+                mode_val = 2
+            elif self.border_logic_object.isChecked():
+                mode_val = 1
+            else:
+                mode_val = 0
+            settings.setValue("global_border_logic_mode", mode_val)
             settings.setValue("global_structured_border", str(self.border_logic_object.isChecked()))
 
             settings.sync()
@@ -2120,7 +2140,7 @@ class EditClassDialog(QDialog):
             except Exception as gpu_err:
                 print(f"⚠️ GPU Weight Poke failed: {gpu_err}")
 
-            # 6. UI Feedback
+            # 6. UI FeedbackS
             if app and hasattr(app, 'statusBar'):
                 app.statusBar().showMessage(f"✨ Weight {new_weight:.2f}x applied to Slot {current_slot}", 1500)
 

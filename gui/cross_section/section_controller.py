@@ -2656,61 +2656,40 @@ class SectionController:
             return True
         
 
-    def update_section_colors_partial(self, changed_indices):
+    def update_section_colors_partial(self, changed_mask):
         """
         Update only the colors of the points whose classification changed.
-        No full refresh, no actor rebuild.
+        Uses the high-performance unified_actor_manager partial update.
         """
-        vtk_widget = self._get_active_vtk()
-        if vtk_widget is None:
+        if changed_mask is None:
             return
 
-        # Actor exists?
-        actor = getattr(self, "_core_actor", None)
-        if actor is None:
-            print("⚠️ No core actor found (cannot partial-refresh)")
+        # If changed_mask is a list of indices, convert to boolean mask
+        if not isinstance(changed_mask, np.ndarray) or changed_mask.dtype != bool:
+            m = np.zeros(len(self.app.data["xyz"]), dtype=bool)
+            m[changed_mask] = True
+            changed_mask = m
+
+        if changed_mask.sum() == 0:
             return
 
-        # Get VTK polydata from actor
-        mapper = actor.GetMapper()
-        poly = mapper.GetInput()
-
-        if poly is None:
-            print("⚠️ No polydata available")
-            return
-
-        rgb_array = poly.GetPointData().GetArray("RGB")
-        if rgb_array is None:
-            print("⚠️ No RGB array found")
-            return
-
-        # Current palette
-        palette = self._get_view_palette(self.active_view)
-
-        # Update only modified points
-        cls = self.app.data["classification"]
-
-        for idx in changed_indices:
-            if idx >= len(self.app.section_core_mask):
-                continue
-
-            if not self.app.section_core_mask[idx]:
-                continue
-
-            # VTK index in core actor
-            vtk_i = np.flatnonzero(self.app.section_core_mask).tolist().index(idx)
-
-            code = int(cls[idx])
-            entry = palette.get(code, {"color": (128,128,128)})
-
-            color = entry["color"]
-            rgb_array.SetTuple3(vtk_i, color[0], color[1], color[2])
-
-        rgb_array.Modified()
-        poly.Modified()
-
-        vtk_widget.render()
-        print(f"🔄 Partial refresh applied to {len(changed_indices)} points")
+        from gui.unified_actor_manager import fast_partial_cross_section_update
+        
+        # Update current active view
+        view_idx = self.active_view
+        success = fast_partial_cross_section_update(self.app, view_idx, changed_mask)
+        
+        if success:
+            vtk_widget = self.app.section_vtks.get(view_idx)
+            if vtk_widget:
+                vtk_widget.render()
+                
+        # Also update other views if they are visible
+        # (Classification in one view should reflect in others)
+        for i, sw in self.app.section_vtks.items():
+            if i != view_idx and sw and sw.isVisible():
+                if fast_partial_cross_section_update(self.app, i, changed_mask):
+                    sw.render()
 
     def unlock_after_classification(self):
         """

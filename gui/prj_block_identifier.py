@@ -56,7 +56,8 @@ class PRJBlockIdentifierDialog(QDialog):
         self.setProperty("themeStyledDialog", True)
 
         self.setWindowTitle("PRJ Block Identifier")
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(400, 300)
+        self.resize(800, 600)
         self._apply_dark_theme()
         self.setup_ui()
         self.detect_current_dxf()

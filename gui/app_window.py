@@ -2870,6 +2870,13 @@ class NakshaApp(QMainWindow):
                 
                 # ✅ THROTTLE: 30fps max (33ms between syncs)
                 now = _time.time()
+                
+                # 🚀 OPTIMIZATION: Disable real-time sync during classification dragging
+                # If SNT is loaded, the main view render is slow. Syncing it while
+                # the user is brushing in a section view causes extreme lag.
+                if getattr(self, 'is_dragging', False):
+                    return
+                    
                 last_sync = getattr(self, '_last_camera_sync_time', 0)
                 if (now - last_sync) < 0.033:
                     return
@@ -6008,7 +6015,7 @@ class NakshaApp(QMainWindow):
                 print("🛑 Deactivating cross-section (switching to classification)")
                 if hasattr(self, "_cancel_cross_section_tool_only"):
                     self._cancel_cross_section_tool_only()
-                    
+                   
             if tool_name is None:
                 self.active_classify_tool = None
                 if hasattr(self, 'skip_main_view_refresh'):
@@ -6018,18 +6025,18 @@ class NakshaApp(QMainWindow):
                     # self.class_picker = None
                     self.class_picker.hide()
             # Keep instance alive to preserve selections
-                
+               
                 if hasattr(self, 'digitizer'):
                     self.digitizer.enabled = True
                     print("✅ Digitizer re-enabled")
                 return
-    
+   
             # Brush size dialog
             if tool_name == "brush":
                 from gui.brush_size_dialog import activate_brush_tool_with_dialog
                 if not activate_brush_tool_with_dialog(self):
                     return
-                
+               
               # ✅ LiDAR algorithm dialogs — By Class ribbon buttons
             if tool_name.startswith("algo_") or tool_name.startswith("byclass_"):
                 try:
@@ -6050,67 +6057,67 @@ class NakshaApp(QMainWindow):
                 except Exception as e:
                     print(f"⚠️ Algorithm dialog failed ({tool_name}): {e}")
                 return  ###    
-            
+           
             if hasattr(self, 'digitizer'):
                 self.digitizer.enabled = False
                 print("🚫 Digitizer disabled (classification active)")
-    
+   
             has_cross_section = (hasattr(self, "section_vtks") and len(self.section_vtks) > 0)
             has_cut_section = (
                 hasattr(self, "cut_section_controller")
                 and self.cut_section_controller.cut_points is not None
             )
-    
+   
             # Tools that ONLY make sense in cross-section views
             section_only_tools = {"above_line", "below_line"}
-    
+   
             # Tool that ONLY targets cut-section view
             cut_only_tools = {"cut_section"}
-    
+   
             # Decide what to attach (can be multiple)
             do_cut = has_cut_section and tool_name in cut_only_tools
             do_sections = has_cross_section and tool_name not in cut_only_tools
             do_main = (tool_name not in cut_only_tools) and (tool_name not in section_only_tools)
-    
+   
             # If user chose a section-only tool but no section exists, fail early
             if tool_name in section_only_tools and not has_cross_section:
                 QMessageBox.warning(self, "Cross Section Required", "Open a Cross Section view to use this tool.")
                 return
-    
+   
             if self.data is None:
                 QMessageBox.warning(self, "No Data", "Please load a LiDAR file first.")
                 return
-    
+   
             self.skip_main_view_refresh = False
             self.active_classify_tool = tool_name
-    
+   
             self.from_classes = getattr(self, "from_classes", None)
             self.to_class = getattr(self, "to_class", None)
-    
+   
             # ✅ FIXED: Ensure class picker is ALWAYS visible (even if minimized)
             from gui.class_picker import ClassPicker
             if not hasattr(self, "class_picker") or self.class_picker is None:
                 # Create new ClassPicker
                 print("📋 Creating new ClassPicker...")
                 self.class_picker = ClassPicker(self)
-            
+           
                 # ✅ Configure for non-focus mode
                 self.class_picker.configure_for_background_mode()
-            
+           
                 self.class_picker.show()
                 print("✅ ClassPicker created and shown")
             else:
                 # ✅ CRITICAL FIX: Restore from minimized state
                 print("📋 ClassPicker exists - ensuring visibility...")
-            
+           
                 # First sync the data
                 self.class_picker.sync_with_app()
-            
+           
                 # ✅ NEW: This line fixes the minimized window issue!
                 self.class_picker.ensure_visible()
-            
+           
                 print("✅ ClassPicker is now visible and active")
-    
+   
             # ✅ CRITICAL: Keep focus on main view
             if hasattr(self, 'vtk_widget'):
                 self.vtk_widget.setFocus()
@@ -6125,6 +6132,10 @@ class NakshaApp(QMainWindow):
  
                 if do_main:
                     self.attach_classification_to_main()
+                    # ✅ PRE-BUILD SPATIAL INDEX: Eliminates the 1.7s "first-click" delay
+                    if tool_name == "brush" and hasattr(self, "classify_interactor"):
+                        from PySide6.QtCore import QTimer
+                        QTimer.singleShot(0, self.classify_interactor._build_spatial_index_for_brush)
  
                 # ✅ Always re-attach to cut section if cut data exists
                 if has_cut_section:
@@ -9088,12 +9099,7 @@ class NakshaApp(QMainWindow):
                         pass
                     draw_ribbon.clear_requested.connect(self.digitizer.clear_drawings)
                     
-                    
-                    try:
-                        draw_ribbon.grid_requested.disconnect()
-                    except Exception:
-                        pass
-                    draw_ribbon.grid_requested.connect(self.activate_grid_tool)
+
         
                 # =========================
                 # Measure ribbon
@@ -9280,9 +9286,7 @@ class NakshaApp(QMainWindow):
         elif tool_name == "cut_section":
             self.cut_section_controller.activate()
             self.set_cross_cursor_active(True)
-        elif tool_name == "set_cut_width":
-            self._prompt_cut_width()
-            self.set_cross_cursor_active(True)
+
         elif tool_name == "cross_settings":
             self.open_cross_section_settings()
         elif tool_name == "element_selection":
@@ -10352,6 +10356,18 @@ class NakshaApp(QMainWindow):
         elif tool_name == "measure_polygon":
             self.statusBar().showMessage("📏 Click points, right-click to close", 5000)
             
+        elif tool_name == "measure_block_area":
+            self.statusBar().showMessage("ðŸ“ Click inside a block to measure its area", 5000)
+
+        status_message = {
+            "measure_line": "Click 2 points to measure",
+            "measure_path": "Click points, right-click to finish",
+            "measure_polygon": "Click points, right-click to close",
+            "measure_block_area": "Click inside a block to measure its area",
+        }.get(tool_name)
+        if status_message:
+            self.statusBar().showMessage(status_message, 5000)
+
     def clear_all_measurements(self):
         """Clear all measurement lines and labels."""
         if hasattr(self, 'measurement_tool'):

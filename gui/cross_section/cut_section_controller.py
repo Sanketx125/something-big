@@ -4236,21 +4236,21 @@ class CutSectionController:
                             from gui.unified_actor_manager import _push_uniforms_direct
                             ctx = getattr(target_actor, '_naksha_shader_ctx', None)
                             if ctx is not None:
-                                _pal = getattr(self, 'cut_palette', None)
-                                if not _pal:
-                                    _pal = getattr(self.app, 'class_palette', {})
+                                last_gen = getattr(target_actor, '_last_uniform_gen', -1)
+                                if ctx._generation != last_gen:
+                                    _pal = getattr(self, 'cut_palette', None)
+                                    if not _pal:
+                                        _pal = getattr(self.app, 'class_palette', {})
+                                        
+                                    _bdr = float(getattr(self.app, 'view_borders', {}).get(5, 0.0))
+                                    _bsz = float(getattr(self.app, 'point_size', 2.5))
                                     
-                                _bdr = float(getattr(self.app, 'view_borders', {}).get(5, 0.0))
-                                
-                                # ✅ FIX: Use global app point size instead of stale actor attribute
-                                _bsz = float(getattr(self.app, 'point_size', 2.5))
-                                
-                                ctx.force_reload()
-                                ctx.load_from_palette(_pal, _bdr, _bsz)
-                                _push_uniforms_direct(target_actor, ctx)
-                                
-                                # ✅ Update actor's cached base size to keep it in sync
-                                target_actor._naksha_base_point_size = _bsz
+                                    ctx.force_reload()
+                                    ctx.load_from_palette(_pal, _bdr, _bsz)
+                                    _push_uniforms_direct(target_actor, ctx)
+                                    
+                                    target_actor._last_uniform_gen = ctx._generation
+                                    target_actor._naksha_base_point_size = _bsz
                         except Exception:
                             pass
                         _safe_vtk_render(self.cut_vtk)

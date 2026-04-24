@@ -222,6 +222,138 @@ class GlobalSettingsDialog(QDialog):
         self.shortcuts_summary.setWordWrap(True)
         group_layout.addWidget(self.shortcuts_summary)
 
+        # ═══════════════════════════════════════════════════════════════
+        # ✅ NEW: Enhanced search bar with keyboard capture mode
+        # ═══════════════════════════════════════════════════════════════
+        from PySide6.QtWidgets import QLineEdit, QCheckBox
+        from PySide6.QtCore import Qt, QEvent
+        from PySide6.QtGui import QKeyEvent
+
+        search_layout = QHBoxLayout()
+        search_layout.setSpacing(8)
+
+        search_label = QLabel("Search:")
+        search_layout.addWidget(search_label)
+
+        # Custom QLineEdit that captures keyboard shortcuts
+        class ShortcutCaptureLineEdit(QLineEdit):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.capture_mode = False
+                self.parent_dialog = parent
+                self._pressed_modifiers = set()
+                
+            def keyPressEvent(self, event):
+                if not self.capture_mode:
+                    # Normal typing mode
+                    super().keyPressEvent(event)
+                    return
+                    
+                # Keyboard capture mode - build shortcut string
+                key = event.key()
+                
+                # Track modifier keys being held
+                if key == Qt.Key_Control:
+                    self._pressed_modifiers.add("ctrl")
+                elif key == Qt.Key_Alt:
+                    self._pressed_modifiers.add("alt")
+                elif key == Qt.Key_Shift:
+                    self._pressed_modifiers.add("shift")
+                
+                # Build modifier list from currently pressed modifiers
+                modifiers = []
+                if event.modifiers() & Qt.ControlModifier or "ctrl" in self._pressed_modifiers:
+                    if "ctrl" not in modifiers:
+                        modifiers.append("ctrl")
+                if event.modifiers() & Qt.AltModifier or "alt" in self._pressed_modifiers:
+                    if "alt" not in modifiers:
+                        modifiers.append("alt")
+                if event.modifiers() & Qt.ShiftModifier or "shift" in self._pressed_modifiers:
+                    if "shift" not in modifiers:
+                        modifiers.append("shift")
+                
+                # Sort modifiers in standard order
+                modifier_order = {"ctrl": 0, "alt": 1, "shift": 2}
+                modifiers.sort(key=lambda x: modifier_order.get(x, 99))
+                
+                # Determine the actual key (non-modifier)
+                key_text = ""
+                is_modifier_only = False
+                
+                # Check if it's ONLY a modifier key press
+                if key in (Qt.Key_Control, Qt.Key_Alt, Qt.Key_Shift):
+                    is_modifier_only = True
+                    # Show modifiers being held
+                    if modifiers:
+                        search_text = "+".join(modifiers)
+                        self.setText(search_text)
+                else:
+                    # Function keys F1-F12
+                    if Qt.Key_F1 <= key <= Qt.Key_F12:
+                        key_text = f"F{key - Qt.Key_F1 + 1}"
+                    # Letters A-Z
+                    elif Qt.Key_A <= key <= Qt.Key_Z:
+                        key_text = chr(key).upper()
+                    # Space
+                    elif key == Qt.Key_Space:
+                        key_text = "Space"
+                    # Numbers 0-9
+                    elif Qt.Key_0 <= key <= Qt.Key_9:
+                        key_text = chr(key)
+                    # Escape, Enter, etc.
+                    elif key == Qt.Key_Escape:
+                        self.clear()
+                        self._pressed_modifiers.clear()
+                        event.accept()
+                        return
+                    else:
+                        # Unknown key - ignore
+                        event.accept()
+                        return
+                    
+                    # Build complete search string with modifiers + key
+                    if modifiers and key_text:
+                        search_text = "+".join(modifiers) + "+" + key_text
+                    elif key_text:
+                        search_text = key_text
+                    else:
+                        event.accept()
+                        return
+                    
+                    self.setText(search_text.lower())
+                    self._pressed_modifiers.clear()  # Reset after capturing full combo
+                
+                event.accept()
+            
+            def keyReleaseEvent(self, event):
+                if self.capture_mode:
+                    # Track when modifiers are released
+                    key = event.key()
+                    if key == Qt.Key_Control:
+                        self._pressed_modifiers.discard("ctrl")
+                    elif key == Qt.Key_Alt:
+                        self._pressed_modifiers.discard("alt")
+                    elif key == Qt.Key_Shift:
+                        self._pressed_modifiers.discard("shift")
+                super().keyReleaseEvent(event)
+
+        self.shortcuts_search = ShortcutCaptureLineEdit(self)
+        self.shortcuts_search.setPlaceholderText("Type to search or enable capture mode to press keys...")
+        self.shortcuts_search.setClearButtonEnabled(True)
+        self.shortcuts_search.textChanged.connect(self._filter_shortcuts)
+        search_layout.addWidget(self.shortcuts_search, stretch=1)
+
+        # Capture mode toggle
+        self.shortcuts_capture_mode = QCheckBox("Capture Keys")
+        self.shortcuts_capture_mode.setToolTip(
+            "Enable to press actual keyboard shortcuts (e.g., Shift+F1) instead of typing"
+        )
+        self.shortcuts_capture_mode.toggled.connect(self._toggle_capture_mode)
+        search_layout.addWidget(self.shortcuts_capture_mode)
+
+        group_layout.addLayout(search_layout)
+        # ═══════════════════════════════════════════════════════════════
+
         self.shortcuts_table = QTableWidget(0, 4)
         self.shortcuts_table.setHorizontalHeaderLabels(["Modifier", "Key", "Tool", "Details"])
         self.shortcuts_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -652,6 +784,71 @@ class GlobalSettingsDialog(QDialog):
             "Binding fields are editable here and saved directly in application settings. "
             "Existing advanced shortcut payloads are preserved."
         )
+
+    def _filter_shortcuts(self, search_text):
+        """Filter shortcuts table based on search text."""
+        search_text = search_text.lower().strip()
+        
+        for row in range(self.shortcuts_table.rowCount()):
+            # Get cell widgets and items
+            mod_combo = self.shortcuts_table.cellWidget(row, 0)
+            key_combo = self.shortcuts_table.cellWidget(row, 1)
+            tool_combo = self.shortcuts_table.cellWidget(row, 2)
+            details_item = self.shortcuts_table.item(row, 3)
+            
+            # Build searchable text from all columns
+            searchable_parts = []
+            
+            if mod_combo:
+                searchable_parts.append(mod_combo.currentText().lower())
+            if key_combo:
+                searchable_parts.append(key_combo.currentText().lower())
+            if tool_combo:
+                searchable_parts.append(tool_combo.currentText().lower())
+            if details_item:
+                searchable_parts.append(details_item.text().lower())
+            
+            searchable_text = " ".join(searchable_parts)
+            
+            # Show/hide row based on search match
+            if search_text == "" or search_text in searchable_text:
+                self.shortcuts_table.setRowHidden(row, False)
+            else:
+                self.shortcuts_table.setRowHidden(row, True)
+        
+        # Update summary with visible count
+        visible_count = sum(
+            1 for row in range(self.shortcuts_table.rowCount())
+            if not self.shortcuts_table.isRowHidden(row)
+        )
+        total_count = self.shortcuts_table.rowCount()
+        
+        if search_text:
+            self.shortcuts_summary.setText(
+                f"Showing {visible_count} of {total_count} shortcut(s). "
+                "Binding fields are editable here and saved directly in application settings."
+            )
+        else:
+            self.shortcuts_summary.setText(
+                f"{total_count} shortcut row(s). "
+                "Binding fields are editable here and saved directly in application settings. "
+                "Existing advanced shortcut payloads are preserved."
+            )
+
+    def _toggle_capture_mode(self, enabled):
+        """Toggle between typing mode and keyboard capture mode."""
+        self.shortcuts_search.capture_mode = enabled
+        
+        if enabled:
+            self.shortcuts_search.setPlaceholderText("Press a keyboard shortcut (e.g., Shift+F1)...")
+            self.shortcuts_search.setStyleSheet(
+                "QLineEdit { background-color: #2d4a2e; border: 2px solid #4a7c4e; }"
+            )
+            self.shortcuts_search.clear()
+            self.shortcuts_search.setFocus()
+        else:
+            self.shortcuts_search.setPlaceholderText("Type to search: modifier, key, tool, or details...")
+            self.shortcuts_search.setStyleSheet("")
 
     def _choose_cross_color(self):
         color = QColorDialog.getColor(self._cross_color, self, "Choose Cross-Section Color")
