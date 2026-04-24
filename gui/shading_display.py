@@ -907,11 +907,30 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
         except Exception:
             pass
     for sn in ("dxf_actors", "snt_actors"):
+        att_name = sn.replace("_actors", "_attachments")
+        attachments = getattr(app, att_name, [])
         for entry in getattr(app, sn, []):
+            target = os.path.basename(entry.get("filename", ""))
+            att = next((a for a in attachments if os.path.basename(a.get("filename", "")) == target), None)
+            
+            actor_layer_map = {}
+            selected_layers = None
+            if att:
+                selected_layers = att.get("selected_layers")
+                cache_map = att.get("actor_cache_map", {})
+                for layer_name, actors in cache_map.items():
+                    for a in actors:
+                        actor_layer_map[id(a)] = layer_name
+
             for a in entry.get("actors", []):
                 try:
                     if not renderer.HasViewProp(a): renderer.AddActor(a); nr += 1
-                    a.SetVisibility(True)
+                    
+                    if selected_layers is not None and id(a) in actor_layer_map:
+                        layer_name = actor_layer_map[id(a)]
+                        a.SetVisibility(True if layer_name in selected_layers else False)
+                    else:
+                        a.SetVisibility(True)
                 except Exception:
                     pass
     if nr > 0: print(f"   ✅ Restored {nr} DXF/SNT actors")

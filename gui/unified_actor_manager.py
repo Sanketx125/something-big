@@ -5,7 +5,7 @@ from vtkmodules.util import numpy_support
 from typing import Optional, Dict
 import time
 import vtk
- 
+import os
 UNIFIED_ACTOR_NAME = "_naksha_unified_cloud"
  
 # ─────────────────────────────────────────────────────────────────────────────
@@ -633,7 +633,7 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
         vtk_widget = getattr(ctrl, "cut_vtk", None) if ctrl else None
     else:
         return False
- 
+
     if vtk_widget is None:
         return False
 
@@ -660,10 +660,16 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
 
     actor = vtk_widget.actors.get(actor_name)
     if actor is None:
+        if slot_idx == 0:
+            # Try the 'fallback' cache in app._unified_actor
+            actor = _get_unified_actor(app)
+        
         if 1 <= slot_idx <= 4 and hasattr(app, '_refresh_single_section_view'):
             app._refresh_single_section_view(view_idx, float(border))
             return True
-        return False
+        
+        if actor is None:
+            return False
  
     ctx = getattr(actor, '_naksha_shader_ctx', None)
     if ctx is None:
@@ -1006,11 +1012,30 @@ def _restore_snt_overlays(app):
 
     count = 0
     for store_name in ['snt_actors']:
+        att_name = store_name.replace("_actors", "_attachments")
+        attachments = getattr(app, att_name, [])
         for entry in getattr(app, store_name, []):
+            target = os.path.basename(entry.get("filename", ""))
+            att = next((a for a in attachments if os.path.basename(a.get("filename", "")) == target), None)
+            
+            actor_layer_map = {}
+            selected_layers = None
+            if att:
+                selected_layers = att.get("selected_layers")
+                cache_map = att.get("actor_cache_map", {})
+                for layer_name, actors in cache_map.items():
+                    for a in actors:
+                        actor_layer_map[id(a)] = layer_name
+
             for actor in entry.get('actors', []):
                 try:
                     _apply_z_offset_to_actor(actor, z_offset)
                     renderer.AddActor(actor)
+                    
+                    if selected_layers is not None and id(actor) in actor_layer_map:
+                        layer_name = actor_layer_map[id(actor)]
+                        actor.SetVisibility(1 if layer_name in selected_layers else 0)
+                        
                     count += 1
                 except Exception:
                     pass
@@ -1024,7 +1049,6 @@ def _restore_snt_overlays(app):
         _snt_push_border_uniforms(app)
 
         print(f"  🔄 SNT overlays: {count} actors restored (z_offset={z_offset:.1f})")
- 
   
 # ─────────────────────────────────────────────────────────────────────────────
 # BUILD UNIFIED ACTOR  (main view)
@@ -1144,22 +1168,27 @@ def build_unified_actor(
             raise RuntimeError("build_unified_actor: mapper has no input after _ensure_opengl_polydata_mapper")
         vtk_ca = mesh.GetPointData().GetScalars()
         # ── Task-1: alias VTK's actual GPU buffer, not the pre-add numpy array.
-        # numpy_to_vtk(deep=False) wraps our array, but VTK may internally copy
-        # during the rendering pipeline.  vtk_to_numpy() gives us back the true
-        # write target — whatever buffer VTK actually uploads to the GPU.
         _vtk_rgb = numpy_support.vtk_to_numpy(vtk_ca)   # (N,3) view into VTK buffer
-        # Seed VTK's buffer unconditionally — O(N) memcpy, only happens at build time.
-        # Avoids an O(N) element-wise equality scan that is always slower than the copy.
         np.copyto(_vtk_rgb, app._rgb_buffer)
         vtk_ca.Modified()
-        actor._naksha_rgb_ptr         = _vtk_rgb         # view — writes visible to VTK
+        
+        # ── Classification and Boundary: keep underlying numpy arrays alive
+        # (Needed because numpy_to_vtk(deep=False) doesn't always ref-count the source)
+        _cls_np_f32 = vis_class.astype(np.float32)
+        _cls_vtk = numpy_support.numpy_to_vtk(_cls_np_f32, deep=False)
+        _cls_vtk.SetName("Classification")
+        mesh.GetPointData().AddArray(_cls_vtk)
+        
+        actor._naksha_rgb_ptr         = _vtk_rgb
+        actor._naksha_point_count     = len(vis_xyz)
         actor._naksha_vtk_array       = vtk_ca
-        actor._naksha_vtk_rgb_ref     = vtk_ca           # keep VTK array alive
+        actor._naksha_vtk_rgb_ref     = vtk_ca
+        actor._naksha_cls_np_ref      = _cls_np_f32    # ✅ Keep alive
+        actor._naksha_bf_np_ref       = _bf            # ✅ Keep alive
         actor._naksha_mesh            = mesh
         actor._naksha_base_point_size = actual_point_size
-        # ── NEW ──
-        actor._naksha_boundary_vtk = _bf_vtk
-        # ─────────
+        actor._naksha_boundary_vtk    = _bf_vtk
+        actor._naksha_data_id         = id(xyz)        # ✅ Link to specific data object
         app._unified_actor            = actor
         ctx = ViewShaderContext(slot_idx=0)
 
@@ -1776,6 +1805,9 @@ def fast_classify_update(
         return True
 
     # ── 2. Palette lookup (O(1), no dict copy) ────────────────────────────
+    if to_class is None:
+        return True
+    
     palette   = kwargs.get("palette") or _get_slot_palette(app, 0)
     entry     = palette.get(int(to_class), {})
     new_color = entry.get("color", (128, 128, 128)) if entry.get("show", True) else (0, 0, 0)
@@ -1801,6 +1833,7 @@ def fast_classify_update(
             cls_np = numpy_support.vtk_to_numpy(class_vtk_arr)
             cls_np[local_changed] = cls_np.dtype.type(to_class)  # preserve VTK array dtype
             class_vtk_arr.Modified()
+            mesh.Modified() # ✅ Ensure mapper re-scans attributes
 
     # ── 5. Dirty flag #2: mark actor only when data physically changed ─────
     _mark_actor_dirty(actor)
@@ -1923,6 +1956,7 @@ def fast_cross_section_update(
             actor._naksha_section_class[changed_idx] = new_classes
 
         vtk_scalars.Modified()
+        poly.Modified() # ✅ Ensure mapper re-scans attributes
         _mark_actor_dirty(actor)
  
     ctx = getattr(actor, '_naksha_shader_ctx', None)
@@ -2069,7 +2103,38 @@ def _get_unified_actor(app) -> Optional[object]:
             actor.GetVisibility()
             rgb = getattr(actor, "_naksha_rgb_ptr", None)
             if rgb is not None and _is_writable(rgb):
+                # ✅ NEW: Check for stale actor (point count mismatch)
+                if hasattr(app, 'data') and app.data is not None:
+                    xyz = app.data.get('xyz')
+                    if xyz is not None:
+                        # ── DATA IDENTITY CHECK ──
+                        current_data_id = id(xyz)
+                        actor_data_id   = getattr(actor, '_naksha_data_id', None)
+                        if actor_data_id is not None and actor_data_id != current_data_id:
+                            print(f"   DEBUG: _get_unified_actor STALE - Data changed (ID mismatch)")
+                            return None
+
+                        current_n = len(xyz)
+                        # Mirror build_unified_actor downsampling logic (target=10M)
+                        target_pts = 10000000
+                        if current_n > target_pts:
+                            lod_step = max(1, current_n // target_pts)
+                        else:
+                            lod_step = 1
+                        
+                        # len(np.arange(0, N, step)) is ceil(N/step)
+                        expected_actor_n = int(np.ceil(current_n / lod_step))
+                        
+                        actor_n = getattr(actor, '_naksha_point_count', 0)
+                        if actor_n > 0 and actor_n != expected_actor_n:
+                            print(f"   DEBUG: _get_unified_actor STALE - actor_n={actor_n} != expected={expected_actor_n} (step={lod_step})")
+                            return None
                 return actor
+            else:
+                if rgb is None:
+                    print(f"   DEBUG: _get_unified_actor FAILED - _naksha_rgb_ptr is None")
+                elif not _is_writable(rgb):
+                    print(f"   DEBUG: _get_unified_actor FAILED - _naksha_rgb_ptr is NOT writable")
         except (AttributeError, RuntimeError):
             # Underlying VTK C++ object was destroyed — drop stale ref
             try:
@@ -2087,6 +2152,22 @@ def _get_unified_actor(app) -> Optional[object]:
             actor.GetVisibility()
             rgb = getattr(actor, "_naksha_rgb_ptr", None)
             if rgb is not None and _is_writable(rgb):
+                # ✅ NEW: Check for stale actor (point count mismatch)
+                if hasattr(app, 'data') and app.data is not None:
+                    xyz = app.data.get('xyz')
+                    if xyz is not None:
+                        current_n = len(xyz)
+                        target_pts = 10000000
+                        if current_n > target_pts:
+                            lod_step = int(np.ceil(current_n / target_pts))
+                        else:
+                            lod_step = 1
+                        expected_actor_n = int(np.ceil(current_n / lod_step))
+                        
+                        actor_n = getattr(actor, '_naksha_point_count', 0)
+                        if actor_n > 0 and actor_n != expected_actor_n:
+                            return None
+                
                 app._unified_actor = actor
                 return actor
         except (AttributeError, RuntimeError):

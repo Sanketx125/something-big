@@ -2,6 +2,7 @@
 from PySide6.QtWidgets import QMessageBox
 from PySide6.QtCore import QSettings
 import os
+from .shading_display import clear_shading_cache
 
 def _save_display_settings_before_clear(app):
     """
@@ -142,6 +143,9 @@ def clear_project(app):
     ✅ EXECUTION ORDER: Close cut view → Clear main view → Clear cross-section views
     ✅ Display settings preserved, Display Mode dialog kept intact
     """
+    # ✅ FIX: Explicitly clear the shading cache to prevent stale data between projects
+    clear_shading_cache(reason="project_clear")
+
     # ============================================================================
     # ✅ CHECK IF PROJECT HAS UNSAVED DATA
     # ============================================================================

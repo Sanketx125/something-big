@@ -3268,12 +3268,21 @@ class GlobalShortcutFilter(QObject):
                                 info.get("show", False)
 
                         dlg.view_borders[view_idx] = border_percent
+                        
+                        border_type = preset.get("border_type", 0)
+                        if hasattr(dlg, 'border_logic_hybrid') and hasattr(dlg, 'border_logic_object') and hasattr(dlg, 'border_logic_point'):
+                            if border_type == 2:
+                                dlg.border_logic_hybrid.setChecked(True)
+                            elif border_type == 1:
+                                dlg.border_logic_object.setChecked(True)
+                            else:
+                                dlg.border_logic_point.setChecked(True)
 
                         visible = [
                             c for c, i in dlg.view_palettes[view_idx].items()
                             if i.get("show")
                         ]
-                        print(f"   ✅ View {view_idx}: {len(visible)} visible classes")
+                        print(f"   ✅ View {view_idx}: {len(visible)} visible classes, border={border_percent}%, type={border_type}")
 
                     # ============================================================
                     # STEP 3: Sync class_palette for Main View

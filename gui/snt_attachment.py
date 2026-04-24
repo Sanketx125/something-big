@@ -1447,13 +1447,29 @@ class MultiSNTAttachmentDialog(QDialog):
             else:
                 target = item.snt_path.name
                 for store in ['snt_actors', 'dxf_actors']:
+                    att_name = store.replace("_actors", "_attachments")
+                    attachments = getattr(self.app, att_name, [])
                     for snt_data in getattr(self.app, store, []):
                         if os.path.basename(snt_data.get("filename", "")) == target:
+                            att = next((a for a in attachments if os.path.basename(a.get("filename", "")) == target), None)
+                            actor_layer_map = {}
+                            selected_layers = None
+                            if att:
+                                selected_layers = att.get("selected_layers")
+                                cache_map = att.get("actor_cache_map", {})
+                                for layer_name, actors in cache_map.items():
+                                    for a in actors:
+                                        actor_layer_map[id(a)] = layer_name
+
                             for actor in snt_data.get("actors", []):
                                 try:
                                     _apply_z_offset_to_actor(actor, z_offset)
                                     renderer.AddActor(actor)
-                                    actor.SetVisibility(1)
+                                    if selected_layers is not None and id(actor) in actor_layer_map:
+                                        layer_name = actor_layer_map[id(actor)]
+                                        actor.SetVisibility(1 if layer_name in selected_layers else 0)
+                                    else:
+                                        actor.SetVisibility(1)
                                     restored += 1
                                 except Exception:
                                     pass

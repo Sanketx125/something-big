@@ -35,7 +35,7 @@ from .cross_section.interactor_classify import ClassificationInteractor
 from .cross_section.section_controller import SectionController
 from .data_loader import load_lidar_file
 from .pointcloud_display import update_pointcloud
-from .shading_display import update_shaded_class, ShadingControlPanel
+from .shading_display import update_shaded_class, ShadingControlPanel, clear_shading_cache
 from .display_mode import DisplayModeDialog
 from .save_pointcloud import save_pointcloud, save_pointcloud_quick
 from .clear_project import clear_project
@@ -46,12 +46,6 @@ from .classification_fast import UltraFastClassifier  # ✅ CORRECT - relative i
 from PySide6.QtWidgets import QApplication
 from .spatial_index import build_spatial_index_auto
 from pyproj import CRS  
-from gui.performance_optimizations import (
-    SpatialIndex, 
-    update_pointcloud_optimized,
-    fast_update_colors_optimized,
-    apply_classification_chunked
-)
 
 try:
     from shiboken6 import isValid as _qt_object_is_valid
@@ -3587,6 +3581,9 @@ class NakshaApp(QMainWindow):
             print(f"\n{'='*60}")
             print(f"🧹 CLEARING CURRENT PROJECT")
             print(f"{'='*60}")
+            
+            # ✅ FIX: Explicitly clear the shading cache to prevent stale data
+            clear_shading_cache(reason="new file")
             
             # ✅ OPTIMIZED: Only backup DXF if it actually exists
             dxf_backup = []

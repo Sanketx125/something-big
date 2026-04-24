@@ -513,6 +513,15 @@ class DisplayModeDialog(QDialog):
                 Qt.WindowCloseButtonHint
             )
 
+        # Stash border logic mode to restore after UI widgets are built
+        self._pending_border_logic_mode = None
+        saved_logic_mode = settings.value("global_border_logic_mode")
+        if saved_logic_mode is not None:
+            try:
+                self._pending_border_logic_mode = int(saved_logic_mode)
+            except (ValueError, TypeError):
+                pass
+
         # Bug-8 fix: single-shot debounce timer for QSettings registry flush.
         # Fires 2 s after the last Apply/border click; harmlessly restarts on each
         # new click so rapid interactions never block the main thread.
@@ -897,6 +906,21 @@ class DisplayModeDialog(QDialog):
             except Exception as _wire_err:
                 print(f"   ⚠️ palette_changed wire failed: {_wire_err}")
         print(f"🎯 DisplayModeDialog initialization complete")
+
+        # Apply stashed border logic mode now that all UI widgets exist
+        if getattr(self, '_pending_border_logic_mode', None) is not None:
+            mode_val = self._pending_border_logic_mode
+            try:
+                # Disable exclusivity briefly to avoid Qt state machine ordering issues
+                self.border_action_group.setExclusive(False)
+                self.border_logic_point.setChecked(mode_val == 0)
+                self.border_logic_object.setChecked(mode_val == 1)
+                self.border_logic_hybrid.setChecked(mode_val == 2)
+                self.border_action_group.setExclusive(True)
+                print(f"✅ Restored border logic mode from QSettings: {mode_val}")
+            except Exception as _e:
+                print(f"⚠️ Could not restore border logic mode: {_e}")
+            self._pending_border_logic_mode = None
 
     @staticmethod
     def wire_palette_signal(app) -> bool:
