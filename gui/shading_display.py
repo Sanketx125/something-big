@@ -540,9 +540,17 @@ def update_shaded_class(app, azimuth=45., angle=45., ambient=0.25,
     requested_cache_key = _build_cache_key(xyz_raw, vc, single_class_max_edge) if vc else None
     cache = get_cache(requested_cache_key) if vc else get_cache()
     rendered_cache_key = _get_rendered_cache_key(app)
-    if rendered_cache_key == requested_cache_key and cache.is_fully_current(xyz_raw, vc, azimuth, angle, ambient, app):
-        print("   ⚡ Requested shading preset already current")
+
+    _mesh_actor = getattr(app, '_shaded_mesh_actor', None)
+    _actor_still_live = (
+        _mesh_actor is not None
+        and getattr(app, 'vtk_widget', None) is not None
+        and "shaded_mesh" in app.vtk_widget.actors
+    )
+    if rendered_cache_key == requested_cache_key and _actor_still_live and cache.is_fully_current(xyz_raw, vc, azimuth, angle, ambient, app):
+        print(" ⚡ Requested shading preset already current")
         return
+
     if not force_rebuild and cache.is_geometry_valid(xyz_raw, vc):
         if rendered_cache_key != requested_cache_key:
             print("   🔁 Restoring requested shading preset from cache")

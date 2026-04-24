@@ -505,6 +505,7 @@ class DisplayModeDialog(QDialog):
                 }
             self.setWindowTitle("Display Mode")
             self.resize(850, 600)
+            self.setMinimumSize(560, 380)
             self.current_ptc_path = None
             self.setWindowFlags(
                 Qt.Window |
@@ -704,14 +705,14 @@ class DisplayModeDialog(QDialog):
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         self.table.horizontalHeader().setHighlightSections(False)
-        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Interactive)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Interactive)
         self.table.setColumnWidth(0, 56)
         self.table.setColumnWidth(1, 68)
         self.table.setColumnWidth(4, 88)

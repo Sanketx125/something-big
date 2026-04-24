@@ -971,7 +971,7 @@ class ClassVisibilityPicker(QDialog):
         controls_row.addWidget(QLabel("Border %:"))
 
         self.border_spin = QDoubleSpinBox()
-        self.border_spin.setRange(0, 100)
+        self.border_spin.setRange(0, 50)
         self.border_spin.setDecimals(2)
         self.border_spin.setValue(0)
         self.border_spin.setSingleStep(5.0)

@@ -145,6 +145,11 @@ def clear_project(app):
     """
     # ✅ FIX: Explicitly clear the shading cache to prevent stale data between projects
     clear_shading_cache(reason="project_clear")
+    # Also null out the rendered-cache-key and stale mesh actors so that
+    # update_shaded_class() doesn't skip the first rebuild on reload.
+    app._rendered_shading_cache_key = None
+    app._shaded_mesh_actor = None
+    app._shaded_mesh_polydata = None
 
     # ============================================================================
     # ✅ CHECK IF PROJECT HAS UNSAVED DATA
