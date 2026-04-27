@@ -221,6 +221,10 @@ RIBBON_TOOLTIP_META = {
         "description": "Measure total distance along a multi-point path.",
         "shortcut_tools": ("MeasurePath",),
     },
+    ("MeasurementRibbon", "Area", "Block"): {
+        "title": "Block Area",
+        "description": "Click inside a PRJ block to report its area.",
+    },
     ("MeasurementRibbon", "Actions", "Clear"): {
         "title": "Clear Measurements",
         "description": "Remove all measurements from the scene.",
@@ -370,7 +374,7 @@ class RibbonSection(QWidget):
         "ToolsRibbon": {"Cross", "Cut"},
         "DrawRibbon": {"Smart", "Line", "Polyline", "Rect", "Circle", "Free", "Text", "Move V", "Vertex", "Select"},
         "ClassifyRibbon": {"Above", "Below", "Rect", "Circle", "Free", "Brush", "Point"},
-        "MeasurementRibbon": {"Line", "Path"},
+        "MeasurementRibbon": {"Line", "Path", "Block"},
         "IdentificationRibbon": {"Identify", "Zoom", "Select"},
         "CurveRibbon": {"Curve"},
     }
@@ -1958,13 +1962,15 @@ class MeasurementRibbon(QWidget):
         distance.add_button("Line", "📐", lambda: self.measure_tool_selected.emit("measure_line"))
         distance.add_button("Path", "🛤️", lambda: self.measure_tool_selected.emit("measure_path"))
         layout.addWidget(distance)
+
+        area = RibbonSection("Area", self)
+        area.add_button("Block", "▦", lambda: self.measure_tool_selected.emit("measure_block_area"))
+        layout.addWidget(area)
     
-        
         # 🗑️ Actions
         actions = RibbonSection("Actions", self)
         actions.add_button("Clear", "🗑️", self.clear_measurements.emit)
-        layout.addWidget(actions)
-        
+        layout.addWidget(actions)  
         layout.addStretch()
 
 class IdentificationRibbon(QWidget):
