@@ -619,7 +619,7 @@ class DisplayModeDialog(QDialog):
 
         self.border_value_display = QLabel("0%")
         self.border_value_display.setObjectName("displayBorderValuePill")
-        self.border_value_display.setFixedWidth(36)
+        self.border_value_display.setFixedWidth(42)
         self.border_value_display.setFixedHeight(22)
         self.border_value_display.setAlignment(Qt.AlignCenter)
         self.border_value_display.setFont(QFont("Segoe UI", 9))
@@ -1948,18 +1948,17 @@ class DisplayModeDialog(QDialog):
 
     def on_border_value_changed(self):
         pass
-
     def update_border_display(self):
         value = self.view_borders[self.current_slot]
         self.border_label.setText("Border")
-        self.border_value_display.setText(f"{value}%")
+        self.border_value_display.setText(f"{int(value)}%")
 
     def load_view_border(self, view_idx):
         if not hasattr(self, 'view_borders'):
             self.view_borders = {i: 0 for i in range(6)}
         border_value = self.view_borders.get(view_idx, 0)
         self.border_label.setText("Border")
-        self.border_value_display.setText(f"{border_value}%")
+        self.border_value_display.setText(f"{int(border_value)}%")
 
     def on_view_switched_to_cut_section(self):
         if self.current_slot != 5:

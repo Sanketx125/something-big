@@ -3326,14 +3326,6 @@ class GlobalShortcutFilter(QObject):
                             if hasattr(dlg, 'load_view_border'):
                                 dlg.load_view_border(target_view)
 
-                            if hasattr(dlg, 'border_label'):
-                                dlg.border_label.setText(
-                                    f"🔳 Border: {border_percent}%"
-                                )
-                            if hasattr(dlg, 'border_value_display'):
-                                dlg.border_value_display.setText(
-                                    f"{border_percent}%"
-                                )
                             if hasattr(dlg, 'border_slider'):
                                 dlg.border_slider.blockSignals(True)
                                 dlg.border_slider.setValue(int(border_percent))
@@ -3381,10 +3373,8 @@ class GlobalShortcutFilter(QObject):
                         dlg.view_borders[target_view] = 0
 
                         if dlg.isVisible():
-                            if hasattr(dlg, 'border_label'):
-                                dlg.border_label.setText("🔳 Border: 0%")
-                            if hasattr(dlg, 'border_value_display'):
-                                dlg.border_value_display.setText("0%")
+                            if hasattr(dlg, 'load_view_border'):
+                                dlg.load_view_border(target_view)
                             if hasattr(dlg, 'border_slider'):
                                 dlg.border_slider.blockSignals(True)
                                 dlg.border_slider.setValue(0)

@@ -1101,6 +1101,91 @@ class SectionController:
         print("✅ Rectangle finalized (removed from ALL renderers)")
 
 
+    def _filter_points_by_visibility(self, points, point_indices, view_index):
+        """
+        ✅ FIXED: Filter points based on CURRENT visibility from Display Mode,
+        not the palette state from when the cross-section was first created.
+        
+        Args:
+            points: Section points array (N, 3)
+            point_indices: Indices into main point cloud for these points
+            view_index: Which cross-section view (0, 1, 2, ...)
+        
+        Returns:
+            Filtered points array containing only visible class points
+        """
+        try:
+            import numpy as np
+            
+            # ✅ CRITICAL FIX: Get CURRENT palette from Display Mode dialog
+            # This ensures we use the up-to-date visibility settings, not stale data
+            current_palette = None
+            
+            if hasattr(self.app, 'display_mode_dialog') and self.app.display_mode_dialog:
+                dialog = self.app.display_mode_dialog
+                
+                # Get palette for THIS specific view (slot = view_index + 1)
+                target_slot = view_index + 1  # View 0 = Slot 1, View 1 = Slot 2, etc.
+                
+                if hasattr(dialog, 'view_palettes') and target_slot in dialog.view_palettes:
+                    current_palette = dialog.view_palettes[target_slot]
+                    print(f"   🔍 Camera fit: Using Display Mode palette for View {view_index + 1}")
+            
+            # Fallback to app palette if dialog not available
+            if current_palette is None:
+                current_palette = self._get_view_palette(view_index)
+            
+            if not current_palette:
+                # No palette = show all
+                print(f"   📊 No palette filter for View {view_index + 1} - using all points")
+                return points
+            
+            # Get CURRENTLY visible class codes
+            visible_classes = [code for code, info in current_palette.items() if info.get('show', True)]
+            
+            if len(visible_classes) == len(current_palette):
+                # All classes visible = no filtering needed
+                print(f"   📊 All {len(current_palette)} classes visible - using all points")
+                return points
+            
+            if len(visible_classes) == 0:
+                # Nothing visible = return empty array
+                print(f"   ⚠️ No visible classes - returning empty point set")
+                return np.empty((0, 3), dtype=points.dtype)
+            
+            # Get classifications for these specific points
+            if not hasattr(self.app, 'data') or 'classification' not in self.app.data:
+                return points
+            
+            classifications = self.app.data['classification'][point_indices]
+            
+            # Create visibility mask
+            visible_mask = np.isin(classifications, visible_classes)
+            
+            # Filter points
+            filtered_points = points[visible_mask]
+            
+            hidden_count = len(points) - len(filtered_points)
+            hidden_classes = [c for c in np.unique(classifications) if c not in visible_classes]
+            
+            if hidden_count > 0:
+                print(f"   🔍 Camera fit: Excluding {hidden_count} points from hidden classes")
+                print(f"      Visible classes: {visible_classes}")
+            
+            # Safety: if all points filtered out, return original
+            if len(filtered_points) == 0:
+                print(f"   ⚠️ All points filtered - using original points for camera fit")
+                return points
+            
+            return filtered_points
+            
+        except Exception as e:
+            print(f"   ⚠️ Visibility filter failed: {e} - using all points")
+            import traceback
+            traceback.print_exc()
+            return points
+
+
     def finalize_section(self, P1, P2):
                 """
                 ✅ MICROSTATION METHOD:
@@ -1337,13 +1422,27 @@ class SectionController:
                 # ---------------- FIT CAMERA ----------------
                 try:
                     vtk_widget = self._get_active_vtk()
-                    self._fit_camera_to_section_points(vtk_widget, core_points_local)
+                    
+                    # ✅ FIX: Filter points by CURRENT visibility before camera fit
+                    # This ensures hidden classes (like Class 51) don't affect the initial view bounds
+                    visible_points_for_fit = self._filter_points_by_visibility(
+                        core_points_local, 
+                        core_indices,
+                        view_index
+                    )
+                    
+                    if len(visible_points_for_fit) > 0:
+                        self._fit_camera_to_section_points(vtk_widget, visible_points_for_fit)
+                        print(f"   📷 Initial camera fit to {len(visible_points_for_fit)}/{len(core_points_local)} visible points")
+                    else:
+                        # Fallback if filter returned empty
+                        self._fit_camera_to_section_points(vtk_widget, core_points_local)
+                        print(f"   ⚠️ Filter returned empty - using all {len(core_points_local)} points")
+                    
                 except Exception as e:
-                    print(f"   ⚠️ Force zoom failed: {e}")  ###
-            
-                # ✅ Re-enable camera sync BEFORE auto-apply
-                # Auto-apply will handle its own sync prevention
-                self.app._syncing_camera = prev_syncing
+                    print(f"   ⚠️ Camera fit failed: {e}")
+                    import traceback
+                    traceback.print_exc()
     
                 # ════════════════════════════════════════════════════════════════════════════════════
                 # ✅ AUTO-APPLY: Isolated palette to THIS VIEW ONLY (NOT main view)
@@ -1404,7 +1503,15 @@ class SectionController:
                     print(f"   ⚠️ View context invalidation failed: {e}")
 
     ##NEWWW
-    def _fit_camera_to_section_points(self, vtk_widget, points, padding_fraction=0.18):
+    def _fit_camera_to_section_points(self, vtk_widget, points, padding_fraction=0.05):
+        """
+        ✅ FIXED: Fits camera to include EVERY SINGLE POINT (no outlier filtering).
+        
+        Args:
+            vtk_widget: The VTK widget to update
+            points: Section points array (N, 3) - local coordinates
+            padding_fraction: Extra margin around data (default 5% = 0.05)
+        """
         if vtk_widget is None or points is None or len(points) == 0:
             return
 
@@ -1442,48 +1549,36 @@ class SectionController:
                 win_w, win_h = 900, 450
             aspect = win_w / win_h
 
-            # ── 3. Horizontal bounds ─────────────────────────────────────────
-            h_min = float(np.percentile(points[:, h_col],  2))
-            h_max = float(np.percentile(points[:, h_col], 98))
+            # ═══════════════════════════════════════════════════════════════════
+            # ✅ FIX: Use ACTUAL min/max to include ALL points (no percentile filtering)
+            # ═══════════════════════════════════════════════════════════════════
+            h_min = float(points[:, h_col].min())  # ✅ TRUE minimum
+            h_max = float(points[:, h_col].max())  # ✅ TRUE maximum
+            
+            z_min = float(points[:, 2].min())      # ✅ TRUE minimum elevation
+            z_max = float(points[:, 2].max())      # ✅ TRUE maximum elevation
 
-            # ── 4. Z bottom — remove underground noise ───────────────────────
-            z_min = float(np.percentile(points[:, 2], 5))
+            print(f"   📏 BOUNDS ({len(points)} points): {h_label}=[{h_min:.2f}, {h_max:.2f}] Z=[{z_min:.2f}, {z_max:.2f}]")
 
-            # ── 5. Z top — density-gap detection ────────────────────────────
-            z_vals     = np.sort(points[:, 2])
-            z_p95      = float(np.percentile(z_vals, 95))
-            z_p99      = float(np.percentile(z_vals, 99))
-            z_true_max = float(z_vals[-1])
-
-            main_z_range = max(z_p95 - z_min, 0.5)
-            gap_to_max   = z_true_max - z_p95
-
-            if gap_to_max > main_z_range * 0.30:
-                z_max = z_p99
-                print(f"   🔍 Gap detected ({gap_to_max:.2f}m > 30% of {main_z_range:.2f}m) → z_top=p99={z_p99:.2f}")
-            else:
-                z_max = z_true_max
-                print(f"   🔍 No gap → z_top=true_max={z_true_max:.2f}")
-
-            # ── 6. Minimum range guard ───────────────────────────────────────
+            # ── 3. Minimum range guard ───────────────────────────────────────
             h_range = max(h_max - h_min, 1.0)
             z_range = max(z_max - z_min, 1.0)
 
-            # ── 7. Padding — 18% each side ───────────────────────────────────
-            padded_h = h_range + 2.0 * h_range * padding_fraction
-            padded_z = z_range + 2.0 * z_range * padding_fraction
+            # ── 4. Padding — configurable margin (default 5%) ────────────────
+            padded_h = h_range * (1.0 + 2.0 * padding_fraction)
+            padded_z = z_range * (1.0 + 2.0 * padding_fraction)
 
-            # ── 8. Display centre ────────────────────────────────────────────
+            # ── 5. Display centre ────────────────────────────────────────────
             h_center = (h_min + h_max) / 2.0
             z_center = (z_min + z_max) / 2.0
 
-            # ── 9. Aspect-correct parallel scale ─────────────────────────────
+            # ── 6. Aspect-correct parallel scale ─────────────────────────────
             scale_from_h = (padded_h / 2.0) / aspect
             scale_from_z =  padded_z / 2.0
             parallel_scale = max(scale_from_h, scale_from_z)
             parallel_scale = max(parallel_scale, max(h_range, z_range) * 0.20)
 
-            # ── 10. Camera placement ─────────────────────────────────────────
+            # ── 7. Camera placement ─────────────────────────────────────────
             stand_off = max(padded_h, padded_z) * 10.0 + 100.0
 
             cam.ParallelProjectionOn()
@@ -1493,11 +1588,11 @@ class SectionController:
             if view_mode == 'side':
                 # Looking along -Y → sees X (horizontal) vs Z (vertical)
                 cam.SetFocalPoint(h_center, 0.0,        z_center)
-                cam.SetPosition( h_center, -stand_off,  z_center)
+                cam.SetPosition(  h_center, -stand_off, z_center)
             else:
                 # Looking along -X → sees Y (horizontal) vs Z (vertical)
                 cam.SetFocalPoint(x_mid,            h_center, z_center)
-                cam.SetPosition( x_mid - stand_off, h_center, z_center)
+                cam.SetPosition(  x_mid - stand_off, h_center, z_center)
 
             ren.ResetCameraClippingRange()
             vtk_widget.render()
@@ -1506,7 +1601,8 @@ class SectionController:
                 f"   📷 Camera fit [{view_mode}]: "
                 f"{h_label}[{h_min:.2f}~{h_max:.2f}] "
                 f"Z[{z_min:.2f}~{z_max:.2f}] "
-                f"scale={parallel_scale:.3f} aspect={aspect:.2f}"
+                f"scale={parallel_scale:.3f} aspect={aspect:.2f} "
+                f"padding={padding_fraction*100:.0f}%"
             )
 
         except Exception as e:
@@ -1515,69 +1611,158 @@ class SectionController:
                 vtk_widget.reset_camera()
                 vtk_widget.render()
             except Exception:
-                pass  ##
+                pass
+
+    def refit_camera_to_visible_points(self, view_index, source_view_index=None):
+        """
+        ✅ FIXED: Refit camera based on SOURCE view's visibility when synced.
+        
+        When View 1 is synced to View 2:
+        - View 1 shows View 2's section data
+        - But camera fits to View 1's visibility settings (exclude hidden classes)
+        
+        Args:
+            view_index: Target view to refit (0, 1, 2, ...)
+            source_view_index: View providing the section data (None = use view_index)
+        """
+        try:
+            import numpy as np
+            
+            # Get VTK widget for this view
+            if not hasattr(self.app, 'section_vtks') or view_index not in self.app.section_vtks:
+                print(f"   ⚠️ No VTK widget for view {view_index}")
+                return
+            
+            vtk_widget = self.app.section_vtks[view_index]
+            
+            # ✅ CRITICAL FIX: When synced, get section data from SOURCE view
+            # but use TARGET view's palette for visibility
+            if source_view_index is not None:
+                # Synced case: use source's data
+                core_points = getattr(self.app, f"section_{source_view_index}_core_points", None)
+                core_indices = getattr(self.app, f"section_{source_view_index}_core_indices", None)
+                print(f"   🔗 Using section data from View {source_view_index + 1} for View {view_index + 1} camera fit")
+            else:
+                # Normal case: use own data
+                core_points = getattr(self.app, f"section_{view_index}_core_points", None)
+                core_indices = getattr(self.app, f"section_{view_index}_core_indices", None)
+            
+            if core_points is None or core_indices is None or len(core_points) == 0:
+                print(f"   ⚠️ No section data for view {view_index}")
+                return
+            
+            # ✅ ALWAYS use TARGET view's palette for visibility (not source)
+            # This makes View 1 exclude Class 51 even when showing View 2's data
+            view_palette = self._get_view_palette(view_index)
+            if not view_palette:
+                print(f"   ⚠️ No palette for view {view_index} - using all points")
+                self._fit_camera_to_section_points(vtk_widget, core_points)
+                return
+            
+            # Get CURRENTLY visible classes from TARGET view's palette
+            visible_classes = [code for code, info in view_palette.items() if info.get('show', True)]
+            
+            if len(visible_classes) == len(view_palette):
+                # All visible - no filtering needed
+                print(f"   📊 All {len(view_palette)} classes visible - using full bounds")
+                self._fit_camera_to_section_points(vtk_widget, core_points)
+                return
+            
+            if len(visible_classes) == 0:
+                print(f"   ⚠️ No visible classes - cannot refit")
+                return
+            
+            # Get classifications for core points
+            if not hasattr(self.app, 'data') or 'classification' not in self.app.data:
+                return
+            
+            classifications = self.app.data['classification'][core_indices]
+            
+            # Filter to visible points only
+            visible_mask = np.isin(classifications, visible_classes)
+            visible_points = core_points[visible_mask]
+            
+            if len(visible_points) == 0:
+                print(f"   ⚠️ No visible points after filtering")
+                return
+            
+            hidden_count = len(core_points) - len(visible_points)
+            hidden_classes = [c for c in np.unique(classifications) if c not in visible_classes]
+            
+            if hidden_count > 0:
+                print(f"   🔍 REFIT VIEW {view_index + 1}: Excluding {hidden_count} points from classes {hidden_classes}")
+                print(f"   📊 Camera refit: {len(visible_points)}/{len(core_points)} points visible")
+            
+            # Fit camera to visible points only
+            self._fit_camera_to_section_points(vtk_widget, visible_points)
+            
+        except Exception as e:
+            print(f"   ⚠️ Refit camera failed for view {view_index}: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _auto_apply_view_palette(self, view_index: int, view_palette: dict):
         """
         ✅ AUTO-APPLY palette to ONLY this specific view (NOT main view)
-       
+        ✅ FIXED: When synced, uses SOURCE view's visibility for camera fit
+    
         - Gets view-specific palette from Display Mode dialog
         - Re-renders ONLY that cross-section view
         - Does NOT touch main view
-       
+    
         Args:
             view_index: 0-based view index (0=View 1, 1=View 2, etc.)
             view_palette: The view-specific palette dict from dialog
         """
-       
+    
         print(f"\n{'='*60}")
         print(f"🎨 AUTO-APPLY PALETTE TO VIEW {view_index + 1}")
         print(f"{'='*60}")
-       
+    
         try:
             # ✅ CRITICAL: Get the section data for THIS specific view
             core_points = getattr(self.app, f"section_{view_index}_core_points", None)
             buffer_points = getattr(self.app, f"section_{view_index}_buffer_points", None)
             core_mask = getattr(self.app, f"section_{view_index}_core_mask", None)
             buffer_mask = getattr(self.app, f"section_{view_index}_buffer_mask", None)
-           
+        
             if core_points is None or core_mask is None:
                 print(f" ⚠️ No section data for View {view_index + 1}")
                 print(f"{'='*60}\n")
                 return
-           
+        
             # ✅ Get this view's VTK widget
             if view_index not in self.app.section_vtks:
                 print(f" ⚠️ View {view_index + 1} not open")
                 print(f"{'='*60}\n")
                 return
-           
+        
             vtk_widget = self.app.section_vtks[view_index]
-           
+        
             # Get current classifications from MAIN data (not view-specific)
             current_classes = self.app.data.get("classification")
             if current_classes is None:
                 print(f" ⚠️ No classification data")
                 print(f"{'='*60}\n")
                 return
-           
+        
             # ✅ Get VISIBLE classes from THIS VIEW's palette ONLY
             visible_classes = [c for c, info in view_palette.items() if info.get("show", True)]
-           
+        
             if not visible_classes:
                 print(f" ⚠️ No visible classes in View {view_index + 1} palette")
                 vtk_widget.clear()
                 vtk_widget.render()
                 print(f"{'='*60}\n")
                 return
-           
+        
             print(f" 📋 Visible classes: {visible_classes}")
             print(f" 📊 View palette has {len(view_palette)} classes")
-           
+        
             # ✅ Re-render ONLY this view with the palette
             import numpy as np
             import pyvista as pv
-           
+        
             # Combine core + buffer
             if buffer_points is not None and buffer_mask is not None:
                 all_points = np.vstack([core_points, buffer_points])
@@ -1588,22 +1773,22 @@ class SectionController:
             else:
                 all_points = core_points
                 all_classes = current_classes[core_mask]
-           
+        
             # Filter by visible classes
             visible_mask = np.isin(all_classes, visible_classes)
             filtered_points = all_points[visible_mask]
             filtered_classes = all_classes[visible_mask]
-           
+        
             print(f" 📊 Total points in section: {len(all_points)}:,")
             print(f" 📊 Visible points: {len(filtered_points)}:,")
-           
+        
             if len(filtered_points) == 0:
                 print(f" ⚠️ No visible points after filtering")
                 vtk_widget.clear()
                 vtk_widget.render()
                 print(f"{'='*60}\n")
                 return
-           
+        
             # Save camera
             try:
                 cam = vtk_widget.renderer.GetActiveCamera()
@@ -1616,7 +1801,7 @@ class SectionController:
                 }
             except Exception:
                 cam_state = None
-           
+        
             # ✅ CRITICAL: Disable camera sync during this render to prevent blinking cascade
             # When we re-render with new palette, we don't want it to trigger sync to other views
             prev_syncing = getattr(self.app, '_syncing_camera', False)
@@ -1658,14 +1843,40 @@ class SectionController:
             vtk_widget.render()
             print(f" 🔒 Palette locked for View {view_index + 1} (prevents sync overwrite)")
             print(f" ✅ View {view_index + 1} re-rendered via GPU uniform (ISOLATED)")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # ✅ CRITICAL FIX: Refit camera based on SOURCE view's visibility when synced
+            # ═══════════════════════════════════════════════════════════════════
+            # Check if this view is synced to another view
+            try:
+                if hasattr(self, 'refit_camera_to_visible_points'):
+                    # Determine which view's data is being displayed
+                    source_view = None
+                    
+                    # Check if this view is synced (showing another view's data)
+                    if hasattr(self.app, 'section_sync_map') and view_index in self.app.section_sync_map:
+                        source_view = self.app.section_sync_map[view_index]
+                        print(f" 🔗 View {view_index + 1} synced to View {source_view + 1}")
+                        print(f"    Using View {source_view + 1}'s visibility for camera fit")
+                    
+                    # Call refit with source view index
+                    self.refit_camera_to_visible_points(view_index, source_view_index=source_view)
+                    print(f" 📷 Camera refitted to visible points only")
+                else:
+                    print(f" ⚠️ refit_camera_to_visible_points method not found")
+            except Exception as e:
+                print(f" ⚠️ Camera refit failed: {e}")
+                import traceback
+                traceback.print_exc()
+            # ═══════════════════════════════════════════════════════════════════
+            
             print(f"{'='*60}\n")
-           
+        
         except Exception as e:
             print(f" ❌ Auto-apply failed: {e}")
             import traceback
             traceback.print_exc()
             print(f"{'='*60}\n")
-
 
     def refresh_colors(self):
         """
