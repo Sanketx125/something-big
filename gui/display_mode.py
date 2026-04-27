@@ -905,8 +905,8 @@ class DisplayModeDialog(QDialog):
                 self.wire_palette_signal(parent)
                 print("   ✅ palette_changed signal auto-wired to GPU sync")
             except Exception as _wire_err:
-                print(f"   ⚠️ palette_changed wire failed: {_wire_err}")
-        print(f"🎯 DisplayModeDialog initialization complete")
+                print(f"   ⚠️ palette_changed wirezfailed: {_wire_err}")
+        print(f"🎯 DisplayModeDialog initializatioz complete")
 
         # Apply stashed border logic mode now that all UI widgets exist
         if getattr(self, '_pending_border_logic_mode', None) is not None:

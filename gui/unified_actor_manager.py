@@ -1,3 +1,4 @@
+"""unified_actor_manager.py: manages the unified shader contexts and palette sync for all point cloud actors, including main view and section views.  Also contains the core shader code for crisp silhouette borders and dynamic point sizing based on palette weights."""
 
 import numpy as np
 import pyvista as pv
@@ -7,7 +8,7 @@ import time
 import vtk
 import os
 UNIFIED_ACTOR_NAME = "_naksha_unified_cloud"
- 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -15,11 +16,25 @@ _BASE_POINT_SIZE = 2.5
 _BORDER_GROWTH_SCALE_PX = 4.0
 _BORDER_GROWTH_CUBIC_PX = 8.0
 _MAX_BORDER_GROWTH_PX = 3.0
-_BORDER_DEPTH_BIAS = 0.00005
+
+# ── Per-border-type depth biases ─────────────────────────────────────────────
+# Each border mode needs a different depth nudge because the geometry it draws
+# (ring thickness, point-size growth) differs substantially between modes.
+#
+#   PER-POINT   — every point gets a ring; small bias keeps ring flush with core.
+#   STRUCTURED  — only boundary-flagged points grow; larger bias ensures the
+#                 grown shell reliably occludes the smaller interior points.
+#   HYBRID      — all points grow AND boundary points paint a ring; the bias
+#                 just needs to separate the ring fragment from the core
+#                 fragment of the same (already-grown) point sprite.
+_BORDER_DEPTH_BIAS_PERPOINT    = 0.0002   # was the stable value before hybrid was added
+_BORDER_DEPTH_BIAS_STRUCTURED  = 0.001    # larger — boundary shell must cover interior pts
+_BORDER_DEPTH_BIAS_HYBRID      = 0.00005  # tiny — ring is on the same grown sprite
+
 # Fixed pixel-width for structured (object-edge) borders — stays constant at any zoom
 _STRUCTURED_BORDER_PX = 2.0
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VIEW SHADER CONTEXT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -30,7 +45,7 @@ class ViewShaderContext:
         "_has_vertex_attr_cache",
         "_vis_list_cache", "_wt_list_cache", "structured_border_mode",
     )
- 
+
     def __init__(self, slot_idx: int = 0):
         self.slot_idx            = slot_idx
         self.visibility_mask     = np.ones(256, dtype=np.float32)
@@ -44,7 +59,7 @@ class ViewShaderContext:
         self._wt_list_cache      = None
         self._has_vertex_attr_cache = False
         self.structured_border_mode = 0.0
- 
+
     def load_from_palette(self, palette: dict, border_percent: float = 0.0,
                           base_point_size: float = _BASE_POINT_SIZE) -> bool:
         palette = palette or {}
@@ -52,11 +67,11 @@ class ViewShaderContext:
         if fp == self._fingerprint:
             return False
         self._fingerprint = fp
- 
+
         self.visibility_mask[:] = 1.0
         self.weight_lut[:] = base_point_size
         self.color_lut[:] = 0.5
- 
+
         for code, info in palette.items():
             idx = int(code)
             if idx < 0 or idx >= 256:
@@ -70,28 +85,28 @@ class ViewShaderContext:
             self.color_lut[base]     = r / 255.0
             self.color_lut[base + 1] = g / 255.0
             self.color_lut[base + 2] = b / 255.0
- 
+
         self.border_ring = np.float32(min(0.50, max(0.0, border_percent / 100.0)))
         self._generation += 1
         self._vis_list_cache = None
         self._wt_list_cache  = None
         return True
- 
+
     def force_reload(self):
         self._fingerprint    = None
         self._vis_list_cache = None
         self._wt_list_cache  = None
- 
+
     def vis_as_list(self):
         if self._vis_list_cache is None:
             self._vis_list_cache = self.visibility_mask.tolist()
         return self._vis_list_cache
- 
+
     def wt_as_list(self):
         if self._wt_list_cache is None:
             self._wt_list_cache = self.weight_lut.tolist()
         return self._wt_list_cache
- 
+
     def clone_for_view(self, new_slot_idx: int) -> 'ViewShaderContext':
         ctx = ViewShaderContext(new_slot_idx)
         np.copyto(ctx.visibility_mask, self.visibility_mask)
@@ -102,8 +117,8 @@ class ViewShaderContext:
         ctx._has_vertex_attr_cache  = self._has_vertex_attr_cache
         ctx.structured_border_mode  = self.structured_border_mode
         return ctx
- 
- 
+
+
 def _palette_fingerprint_full(palette: dict, border_percent: float = 0.0) -> int:
     try:
         return hash((
@@ -117,26 +132,24 @@ def _palette_fingerprint_full(palette: dict, border_percent: float = 0.0) -> int
         ))
     except Exception:
         return id(palette) ^ int(border_percent * 100)
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SHADER REGISTRY
 # ─────────────────────────────────────────────────────────────────────────────
 _shader_contexts: Dict[str, ViewShaderContext] = {}
- 
- 
+
+
 def get_shader_context(actor_name: str) -> Optional[ViewShaderContext]:
     return _shader_contexts.get(actor_name)
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS — defined first so every function below can call them safely
 # ─────────────────────────────────────────────────────────────────────────────
- 
+
 def _mark_actor_dirty(actor) -> None:
-    """
-    Full VTK dirty chain for any in-place buffer modification.
-    """
+    """Full VTK dirty chain for any in-place buffer modification."""
     mesh = getattr(actor, '_naksha_mesh', None)
     if mesh is None:
         return
@@ -146,8 +159,8 @@ def _mark_actor_dirty(actor) -> None:
     if mapper is not None:
         mapper.Modified()
     actor.Modified()
- 
- 
+
+
 def _rewrite_rgb_from_palette(rgb_ptr: np.ndarray, classification: np.ndarray,
                                palette: dict):
     """Full buffer re-write (O(N)). Use only for initial load or full palette shifts."""
@@ -155,14 +168,13 @@ def _rewrite_rgb_from_palette(rgb_ptr: np.ndarray, classification: np.ndarray,
     lut = _get_lut_array(palette, max_c)
     np.copyto(rgb_ptr, lut[classification.clip(0, max_c - 1).astype(np.intp)])
 
-def _rewrite_rgb_partial(rgb_ptr: np.ndarray, classes_to_apply: np.ndarray, 
+def _rewrite_rgb_partial(rgb_ptr: np.ndarray, classes_to_apply: np.ndarray,
                          palette: dict, local_indices: np.ndarray):
     """Partial buffer update (O(M) where M is changed points). Critical for 48M+ point sets."""
     if local_indices is None or len(local_indices) == 0:
         return
     max_c = max(int(classes_to_apply.max()) + 1, 256)
     lut = _get_lut_array(palette, max_c)
-    # Only map and copy the points that actually changed
     changed_classes = classes_to_apply.clip(0, max_c - 1).astype(np.intp)
     rgb_ptr[local_indices] = lut[changed_classes]
 
@@ -175,19 +187,19 @@ def _get_lut_array(palette: dict, max_c: int) -> np.ndarray:
             lut[idx] = (info.get("color", (128, 128, 128))
                         if info.get("show", True) else (0, 0, 0))
     return lut
- 
- 
+
+
 def _touch_vtk_arrays(actor):
     vtk_ca = getattr(actor, '_naksha_vtk_array', None)
     if vtk_ca:
         vtk_ca.Modified()
     _mark_actor_dirty(actor)
- 
- 
+
+
 def _is_writable(arr: np.ndarray) -> bool:
     return arr.flags.writeable
- 
- 
+
+
 def _apply_border_once(actor, border_percent: float):
     """
     Fallback border shader for per-class actors that bypass
@@ -195,7 +207,7 @@ def _apply_border_once(actor, border_percent: float):
     """
     if border_percent <= 0:
         return
- 
+
     ctx = getattr(actor, '_naksha_shader_ctx', None)
     if ctx is not None:
         new_ring = np.float32(min(0.50, max(0.0, border_percent / 100.0)))
@@ -203,7 +215,7 @@ def _apply_border_once(actor, border_percent: float):
             ctx.border_ring = new_ring
             ctx._fingerprint = None
         return
- 
+
     cached = getattr(actor, "_naksha_border_percent", None)
     if cached == border_percent:
         return
@@ -212,7 +224,7 @@ def _apply_border_once(actor, border_percent: float):
         sp        = actor.GetShaderProperty()
         if sp is None:
             return
- 
+
         if ring_val <= 0.001:
             frag_code = (
                 "//VTK::Color::Impl\n"
@@ -233,7 +245,7 @@ def _apply_border_once(actor, border_percent: float):
                 "}\n"
                 "opacity = 1.0;\n"
             )
- 
+
         sp.ClearAllFragmentShaderReplacements()
         sp.AddFragmentShaderReplacement("//VTK::Color::Impl", True, frag_code, False)
         sp.Modified()
@@ -243,11 +255,11 @@ def _apply_border_once(actor, border_percent: float):
             mapper.Modified()
         actor.Modified()
         actor._naksha_border_percent = border_percent
- 
+
     except Exception as e:
         print(f"      ⚠️ _apply_border_once failed: {e}")
- 
- 
+
+
 def update_visibility_lut(actor, palette, base_point_size=_BASE_POINT_SIZE):
     ctx = getattr(actor, '_naksha_shader_ctx', None)
     if ctx is not None:
@@ -274,10 +286,8 @@ def update_visibility_lut(actor, palette, base_point_size=_BASE_POINT_SIZE):
 def _try_enable_program_point_size(render_window) -> bool:
     """
     Enable GL_PROGRAM_POINT_SIZE (0x8642) so vertex shaders can write gl_PointSize.
-
-    This must be called AFTER the OpenGL context is initialized (i.e. after at
-    least one render).  Returns True if the state object was available and the
-    call succeeded.
+    Must be called AFTER the OpenGL context is initialized (after at least one render).
+    Returns True if the state object was available and the call succeeded.
     """
     if render_window is None:
         return False
@@ -297,7 +307,7 @@ def _install_program_point_size_observer(actor, render_window) -> bool:
     Install a StartEvent observer on the render window so that
     GL_PROGRAM_POINT_SIZE is re-enabled before EVERY draw call.
 
-    VTK's state machine can reset GL flags between renders.  This observer
+    VTK's state machine can reset GL flags between renders. This observer
     is the only guaranteed way to keep the flag set persistently.
 
     Safe to call multiple times — the guard flag prevents duplicate observers.
@@ -336,15 +346,10 @@ def _deferred_actor_gpu_init(actor, ctx, plotter, label: str = "actor"):
       2. Install the persistent StartEvent observer so it stays enabled.
       3. Re-push all GPU uniforms (weight_lut, visibility_lut, border_ring_val).
       4. Trigger one more render so the updated point sizes appear.
-
-    Without this step, weight changes made right after the file loads have no
-    visual effect because gl_PointSize writes are silently ignored by the GPU
-    until GL_PROGRAM_POINT_SIZE is set.
     """
     try:
         rw = getattr(actor, '_naksha_render_window', None)
         if rw is None:
-            # Try to fetch from plotter
             try:
                 rw = plotter.render_window
                 actor._naksha_render_window = rw
@@ -360,7 +365,6 @@ def _deferred_actor_gpu_init(actor, ctx, plotter, label: str = "actor"):
         else:
             print(f"      ⚠️ Deferred GPU init: GL state still unavailable for {label}")
 
-        # Re-push uniforms now that the flag is active
         _push_uniforms_direct(actor, ctx)
 
         try:
@@ -381,34 +385,24 @@ def _push_uniforms_direct(actor, ctx: 'ViewShaderContext') -> bool:
     try:
         rw = getattr(actor, '_naksha_render_window', None)
 
-        # ── GL_PROGRAM_POINT_SIZE ─────────────────────────────────────────────
-        # Always attempt to enable when we push uniforms.
-        # If the observer is already installed it costs nothing; if not yet
-        # installed (first push before deferred init fires) we try anyway.
-        # This is the critical fix: previously it only tried once and gave up
-        # if the state wasn't ready, leaving gl_PointSize writes ignored.
         if rw:
             if not getattr(rw, '_naksha_pps_observer_installed', False):
-                # Observer not yet installed — try to enable immediately and
-                # install observer so it persists across future renders.
                 if _try_enable_program_point_size(rw):
                     _install_program_point_size_observer(actor, rw)
                     actor._naksha_needs_program_point_size = False
                     print("      ✅ GL_PROGRAM_POINT_SIZE enabled via _push_uniforms_direct")
                 else:
-                    # State not ready yet — mark for retry by deferred init.
                     actor._naksha_needs_program_point_size = True
             else:
-                # Observer installed — GL state maintained by observer; clear flag.
                 actor._naksha_needs_program_point_size = False
 
         sp = actor.GetShaderProperty()
         if sp is None:
             return False
- 
+
         attached_ctx = getattr(actor, '_naksha_shader_ctx', ctx)
         has_vertex   = attached_ctx._has_vertex_attr_cache
- 
+
         if has_vertex:
             v_uni = sp.GetVertexCustomUniforms()
             if v_uni:
@@ -418,37 +412,37 @@ def _push_uniforms_direct(actor, ctx: 'ViewShaderContext') -> bool:
                 v_uni.SetUniformf("structured_border_mode", float(getattr(ctx, 'structured_border_mode', 0.0)))
                 v_uni.Modified()
                 sp.Modified()
- 
+
         f_uni = sp.GetFragmentCustomUniforms()
         if f_uni:
             f_uni.SetUniformf("border_ring_val", float(ctx.border_ring))
             f_uni.SetUniformf("structured_border_mode", float(getattr(ctx, 'structured_border_mode', 0.0)))
- 
+
         actor.GetMapper().Modified()
         actor.GetProperty().Modified()
         return True
- 
+
     except Exception as e:
         print(f"⚠️ _push_uniforms_direct failed: {e}")
         return False
- 
- 
+
+
 _push_shader_uniforms = _push_uniforms_direct
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SHADER ATTACHMENT — called ONCE at actor build time
 # ─────────────────────────────────────────────────────────────────────────────
 def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True):
     if actor is None:
         return
- 
+
     actor._naksha_shader_ctx = ctx
     _shader_contexts[actor_name] = ctx
- 
+
     mesh = getattr(actor, '_naksha_mesh', None)
     _ensure_opengl_polydata_mapper(actor, mesh)
- 
+
     vertex_attr_wired = False
     try:
         mapper = actor.GetMapper()
@@ -465,16 +459,17 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
         print(f"      🔗 Linked 'Classification' + 'BoundaryFlag' to shader")
     except Exception as e:
         print(f"      ⚠️ Shader Attribute Mapping failed: {e}")
- 
+
     ctx._has_vertex_attr_cache = vertex_attr_wired
     actor.GetProperty().SetRenderPointsAsSpheres(False)
- 
+
     sp = actor.GetShaderProperty()
- 
-    if not hasattr(actor, "_shaders_finalized_v26"):
+
+    if not hasattr(actor, "_shaders_finalized_v27"):
         sp.ClearAllVertexShaderReplacements()
         sp.ClearAllFragmentShaderReplacements()
 
+        # ── Vertex declarations ──────────────────────────────────────────────
         sp.AddVertexShaderReplacement(
             "//VTK::PositionVC::Dec", True,
             "//VTK::PositionVC::Dec\n"
@@ -486,6 +481,10 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             False
         )
 
+        # ── Vertex implementation ────────────────────────────────────────────
+        # Vertex logic is the same for all three modes — the difference is only
+        # which points GROW (all vs boundary-only) which is already branched on
+        # structured_border_mode.  No depth work happens here.
         sp.AddVertexShaderReplacement(
             "//VTK::PositionVC::Impl", True,
             "//VTK::PositionVC::Impl\n"
@@ -500,15 +499,14 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "  } else {\n"
             "    float ps = max(1.0, weight_lut[c_idx]);\n"
             "    if (structured_border_mode > 1.5) {\n"
-            "      // Hybrid mode\n"
+            "      // HYBRID: every point grows (for the border ring on all points)\n"
             f"      float border_growth = clamp((border_ring_val * {_BORDER_GROWTH_SCALE_PX:.1f}) + (border_ring_val * border_ring_val * border_ring_val * {_BORDER_GROWTH_CUBIC_PX:.1f}), 0.0, {_MAX_BORDER_GROWTH_PX:.1f});\n"
             "      float total_ps = ps + border_growth;\n"
             "      gl_PointSize = total_ps;\n"
             "      v_point_size = total_ps;\n"
             "      v_core_size  = ps;\n"
             "    } else if (structured_border_mode > 0.5) {\n"
-            "      // Structured mode: only boundary points grow, and growth\n"
-            "      // is driven by border_ring_val so the % slider is live.\n"
+            "      // STRUCTURED: only boundary-flagged points grow\n"
             f"      float border_growth = (boundary_flag > 0.5)\n"
             f"        ? clamp(\n"
             f"            (border_ring_val * {_BORDER_GROWTH_SCALE_PX:.1f})\n"
@@ -521,6 +519,7 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "      v_point_size = total_ps;\n"
             "      v_core_size  = ps;\n"
             "    } else {\n"
+            "      // PER-POINT: every point grows uniformly\n"
             f"      float border_growth = clamp((border_ring_val * {_BORDER_GROWTH_SCALE_PX:.1f}) + (border_ring_val * border_ring_val * border_ring_val * {_BORDER_GROWTH_CUBIC_PX:.1f}), 0.0, {_MAX_BORDER_GROWTH_PX:.1f});\n"
             "      float total_ps = ps + border_growth;\n"
             "      gl_PointSize = total_ps;\n"
@@ -532,6 +531,7 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             False
         )
 
+        # ── Fragment declarations ────────────────────────────────────────────
         sp.AddFragmentShaderReplacement(
             "//VTK::Color::Dec", True,
             "//VTK::Color::Dec\n"
@@ -540,6 +540,23 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "in float v_boundary;\n",
             False
         )
+
+        # ── Fragment implementation — each mode uses its own depth bias ──────
+        #
+        # HYBRID      (structured_border_mode > 1.5)
+        #   All points have a grown sprite; the outer annulus is painted black
+        #   for every point.  Bias = _BORDER_DEPTH_BIAS_HYBRID (tiny) because
+        #   the ring fragment and the core fragment come from the same sprite —
+        #   they are already at almost identical depth.
+        #
+        # STRUCTURED  (structured_border_mode > 0.5, ≤ 1.5)
+        #   Only boundary points are grown.  Their black shell must reliably
+        #   occlude the smaller un-grown interior points behind them.
+        #   Bias = _BORDER_DEPTH_BIAS_STRUCTURED (largest of the three).
+        #
+        # PER-POINT   (else)
+        #   Every point grows uniformly so the ring sits flush with its own
+        #   core fragment.  Bias = _BORDER_DEPTH_BIAS_PERPOINT (medium).
         sp.AddFragmentShaderReplacement(
             "//VTK::Color::Impl", True,
             "//VTK::Color::Impl\n"
@@ -549,32 +566,34 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "\n"
             "if (border_ring_val > 0.001) {\n"
             "  if (structured_border_mode > 1.5) {\n"
+            "    // ── HYBRID: ring on every point, tiny depth nudge ──────────\n"
             "    if (dist_px >= v_core_size * 0.5) {\n"
             "      diffuseColor = vec3(0.0);\n"
             "      ambientColor = vec3(0.0);\n"
-            f"      gl_FragDepth = clamp(gl_FragCoord.z + {_BORDER_DEPTH_BIAS:.4f}, 0.0, 1.0);\n"
+            f"      gl_FragDepth = clamp(gl_FragCoord.z + {_BORDER_DEPTH_BIAS_HYBRID:.6f}, 0.0, 1.0);\n"
             "    } else {\n"
             "      gl_FragDepth = gl_FragCoord.z;\n"
             "    }\n"
             "  } else if (structured_border_mode > 0.5) {\n"
+            "    // ── STRUCTURED: ring only on boundary points, larger nudge ─\n"
             "    if (v_boundary > 0.5) {\n"
-            "      // boundary point: draw black ring outside core radius\n"
             "      if (dist_px >= v_core_size * 0.5) {\n"
             "        diffuseColor = vec3(0.0);\n"
             "        ambientColor = vec3(0.0);\n"
-            f"        gl_FragDepth = clamp(gl_FragCoord.z + {_BORDER_DEPTH_BIAS:.4f}, 0.0, 1.0);\n"
+            f"        gl_FragDepth = clamp(gl_FragCoord.z + {_BORDER_DEPTH_BIAS_STRUCTURED:.6f}, 0.0, 1.0);\n"
             "      } else {\n"
             "        gl_FragDepth = gl_FragCoord.z;\n"
             "      }\n"
             "    } else {\n"
-            "      // interior point: no ring at all\n"
+            "      // interior point — no ring, no depth shift\n"
             "      gl_FragDepth = gl_FragCoord.z;\n"
             "    }\n"
             "  } else {\n"
+            "    // ── PER-POINT: ring on every point, medium depth nudge ─────\n"
             "    if (dist_px >= v_core_size * 0.5) {\n"
             "      diffuseColor = vec3(0.0);\n"
             "      ambientColor = vec3(0.0);\n"
-            f"      gl_FragDepth = clamp(gl_FragCoord.z + {_BORDER_DEPTH_BIAS:.4f}, 0.0, 1.0);\n"
+            f"      gl_FragDepth = clamp(gl_FragCoord.z + {_BORDER_DEPTH_BIAS_PERPOINT:.6f}, 0.0, 1.0);\n"
             "    } else {\n"
             "      gl_FragDepth = gl_FragCoord.z;\n"
             "    }\n"
@@ -585,12 +604,12 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "opacity = 1.0;\n",
             False
         )
+
         actor._shaders_finalized_v25 = True
         actor._shaders_finalized_v26 = True
-        print(f"      ✅ GPU Shader v26 (structured border respects slider): {actor_name}")
- 
-    # Mark that GL_PROGRAM_POINT_SIZE needs to be enabled (deferred until after
-    # first render when the OpenGL context is guaranteed to be initialised).
+        actor._shaders_finalized_v27 = True
+        print(f"      ✅ GPU Shader v27 (per-mode depth bias): {actor_name}")
+
     actor._naksha_needs_program_point_size = True
     actor.GetProperty().Modified()
     _push_uniforms_direct(actor, ctx)
@@ -602,7 +621,7 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
 def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
                         border: Optional[float] = None, render: bool = True, **kwargs):
     t0 = time.perf_counter()
- 
+
     border_explicitly_provided = (border is not None)
     if border is None:
         kw_border = kwargs.get('border_percent', None)
@@ -619,7 +638,7 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
             border = float(_uc.border_ring) * 100.0
         elif float(getattr(app, 'point_border_percent', 0) or 0.0) > 0.0:
             border = float(app.point_border_percent)
- 
+
     if slot_idx == 0:
         actor_name = UNIFIED_ACTOR_NAME
         vtk_widget = getattr(app, "vtk_widget", None)
@@ -642,18 +661,11 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
     if 1 <= slot_idx <= 4:
         if not hasattr(app, 'view_borders'):
             app.view_borders = {}
-        # ── AUTHORITATIVE BORDER SOURCE ──────────────────────────────
-        # app.view_borders is set ONLY by the Display Mode dialog
-        # (on_apply / increase_border / decrease_border).
-        # NEVER overwrite it from a caller value — auto-display code
-        # can accidentally pass app.point_border_percent (main view).
         if slot_idx in app.view_borders:
             border = float(app.view_borders[slot_idx])
         elif border_explicitly_provided:
             app.view_borders[slot_idx] = float(border)
-        # ─────────────────────────────────────────────────────────────
         if section_requires_legacy_border_render(app, view_idx, palette, float(border)):
-
             if hasattr(app, '_refresh_single_section_view'):
                 app._refresh_single_section_view(view_idx, float(border))
                 return True
@@ -661,23 +673,21 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
     actor = vtk_widget.actors.get(actor_name)
     if actor is None:
         if slot_idx == 0:
-            # Try the 'fallback' cache in app._unified_actor
             actor = _get_unified_actor(app)
-        
+
         if 1 <= slot_idx <= 4 and hasattr(app, '_refresh_single_section_view'):
             app._refresh_single_section_view(view_idx, float(border))
             return True
-        
+
         if actor is None:
             return False
- 
+
     ctx = getattr(actor, '_naksha_shader_ctx', None)
     if ctx is None:
         ctx = ViewShaderContext(slot_idx)
         _shader_contexts[actor_name] = ctx
         _attach_view_shader_context(actor, ctx, actor_name)
- 
-    # Fetch structured border mode from dialog/app (if user checked 'Structured' border)
+
     structured_mode = 0.0
     dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
     if dialog:
@@ -688,23 +698,22 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
     ctx.structured_border_mode = structured_mode
 
     base_point_size = float(getattr(actor, '_naksha_base_point_size', _BASE_POINT_SIZE))
- 
+
     ctx.force_reload()
     ctx.load_from_palette(palette, float(border), base_point_size)
     _push_uniforms_direct(actor, ctx)
 
     if slot_idx == 0:
-        # Remove legacy border actor since the unified shader now handles it natively
         if "_naksha_unified_border" in (getattr(app, "vtk_widget", None) or {}).actors:
             app.vtk_widget.remove_actor("_naksha_unified_border", render=False)
- 
+
     if slot_idx == 0 and float(border) > 0.0:
         app.point_border_percent = float(border)
     elif 1 <= slot_idx <= 5:
         if not hasattr(app, 'view_borders'):
             app.view_borders = {}
         app.view_borders[slot_idx] = float(border)
- 
+
     rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
     if rgb_ptr is not None and _is_writable(rgb_ptr):
         sc = getattr(actor, '_naksha_section_class', None)
@@ -716,23 +725,23 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
             if classification is not None:
                 vis_class = classification[gi] if gi is not None else classification
                 _rewrite_rgb_from_palette(rgb_ptr, vis_class, palette)
- 
+
         vtk_ca = getattr(actor, '_naksha_vtk_array', None)
         if vtk_ca:
             vtk_ca.Modified()
         _mark_actor_dirty(actor)
- 
+
     if render:
         try:
             vtk_widget.render()
         except Exception:
             pass
- 
+
     elapsed = (time.perf_counter() - t0) * 1000
     print(f"   ⚡ GPU Sync (Slot {slot_idx}): {elapsed:.1f} ms")
     return True
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # connect_palette_signal
 # ─────────────────────────────────────────────────────────────────────────────
@@ -745,7 +754,7 @@ def connect_palette_signal(app) -> bool:
     if not hasattr(dialog, 'palette_changed'):
         print("   ⚠️ connect_palette_signal: no palette_changed signal")
         return False
- 
+
     def _on_palette_changed(slot_idx: int):
         palette = _get_slot_palette(app, slot_idx)
         if slot_idx == 0:
@@ -760,7 +769,7 @@ def connect_palette_signal(app) -> bool:
                       or getattr(app, 'display_dialog', None))
             border = float(dlg.view_borders.get(slot_idx, 0)) if dlg else 0.0
         sync_palette_to_gpu(app, slot_idx, palette, border, render=True)
- 
+
     try:
         dialog.palette_changed.disconnect(_on_palette_changed)
     except (TypeError, RuntimeError):
@@ -768,8 +777,8 @@ def connect_palette_signal(app) -> bool:
     dialog.palette_changed.connect(_on_palette_changed)
     print("   ✅ connect_palette_signal: wired")
     return True
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # refresh_section_after_weight_change
 # ─────────────────────────────────────────────────────────────────────────────
@@ -782,7 +791,6 @@ def refresh_section_after_weight_change(
     slot_idx = view_idx + 1
     palette  = palette or _get_slot_palette(app, slot_idx)
 
-    # Always prefer per-view border from app.view_borders (authoritative source)
     if hasattr(app, 'view_borders') and slot_idx in app.view_borders:
         border_percent = float(app.view_borders[slot_idx])
 
@@ -797,23 +805,23 @@ def refresh_section_after_weight_change(
             app._refresh_single_section_view(view_idx, float(border_percent))
             return True
         return False
- 
+
     actor_name = f"_section_{view_idx}_unified"
     actor = (vtk_widget.actors.get(actor_name)
              if hasattr(vtk_widget, 'actors') else None)
- 
+
     if actor is None:
         if hasattr(app, '_refresh_single_section_view'):
             app._refresh_single_section_view(view_idx, float(border_percent))
             return True
         return False
- 
+
     rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
     if rgb_ptr is None or not _is_writable(rgb_ptr):
         return False
- 
+
     base_point_size = float(getattr(actor, '_naksha_base_point_size', _BASE_POINT_SIZE))
- 
+
     ctx = getattr(actor, '_naksha_shader_ctx', None)
     if ctx is not None:
         ctx.force_reload()
@@ -823,11 +831,14 @@ def refresh_section_after_weight_change(
         ctx = ViewShaderContext(slot_idx=slot_idx)
         ctx.load_from_palette(palette, border_percent, base_point_size)
         _attach_view_shader_context(actor, ctx, actor_name)
- 
+
     structured_mode = 0.0
     dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
-    if dialog and hasattr(dialog, 'border_logic_object'):
-        structured_mode = 1.0 if dialog.border_logic_object.isChecked() else 0.0
+    if dialog:
+        if hasattr(dialog, 'border_logic_hybrid') and dialog.border_logic_hybrid.isChecked():
+            structured_mode = 2.0
+        elif hasattr(dialog, 'border_logic_object') and dialog.border_logic_object.isChecked():
+            structured_mode = 1.0
     ctx.structured_border_mode = structured_mode
 
     sc = getattr(actor, '_naksha_section_class', None)
@@ -837,18 +848,19 @@ def refresh_section_after_weight_change(
         if vtk_ca:
             vtk_ca.Modified()
         _mark_actor_dirty(actor)
- 
+
     _push_uniforms_direct(actor, ctx)
- 
+
     try:
         vtk_widget.render()
     except Exception:
         pass
- 
+
     print(f"   ✅ refresh_section_after_weight_change: view={view_idx+1} "
           f"(slot={slot_idx}, border={border_percent}%, base_size={base_point_size})")
     return True
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # fast_palette_refresh — main view weight/visibility/color update
 # ─────────────────────────────────────────────────────────────────────────────
@@ -858,7 +870,7 @@ def fast_palette_refresh(
     border_percent: float = 0.0,
 ) -> bool:
     t0 = time.perf_counter()
- 
+
     actor = _get_unified_actor(app)
     if actor is None:
         return False
@@ -867,11 +879,11 @@ def fast_palette_refresh(
     vtk_ca  = getattr(actor, "_naksha_vtk_array", None)
     if rgb_ptr is None or vtk_ca is None or not _is_writable(rgb_ptr):
         return False
- 
+
     palette         = palette or getattr(app, "class_palette", {})
     classification  = app.data["classification"]
     base_point_size = float(getattr(actor, '_naksha_base_point_size', _BASE_POINT_SIZE))
- 
+
     ctx = getattr(actor, '_naksha_shader_ctx', None)
 
     if border_percent <= 0.0:
@@ -896,31 +908,34 @@ def fast_palette_refresh(
 
     structured_mode = 0.0
     dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
-    if dialog and hasattr(dialog, 'border_logic_object'):
-        structured_mode = 1.0 if dialog.border_logic_object.isChecked() else 0.0
+    if dialog:
+        if hasattr(dialog, 'border_logic_hybrid') and dialog.border_logic_hybrid.isChecked():
+            structured_mode = 2.0
+        elif hasattr(dialog, 'border_logic_object') and dialog.border_logic_object.isChecked():
+            structured_mode = 1.0
     ctx.structured_border_mode = structured_mode
 
     gi        = getattr(app, '_main_global_indices', None)
     vis_class = classification[gi] if gi is not None else classification
     _rewrite_rgb_from_palette(rgb_ptr, vis_class, palette)
- 
+
     vtk_ca.Modified()
     _mark_actor_dirty(actor)
- 
+
     _apply_border_once(actor, border_percent)
     _push_uniforms_direct(actor, ctx)
- 
+
     try:
         app.vtk_widget.render()
     except Exception:
         pass
- 
+
     elapsed = (time.perf_counter() - t0) * 1000
     print(f"   ⚡ fast_palette_refresh: {len(vis_class):,} pts "
           f"[{elapsed:.1f} ms] base_size={base_point_size}")
     return True
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # COLOR LUT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -930,7 +945,7 @@ class ColorLUT:
         self._palette_id: Optional[int] = None
         self._max_class: int = 0
         self._hidden_color = np.array([0, 0, 0], dtype=np.uint8)
- 
+
     def _palette_fingerprint(self, palette: dict) -> int:
         try:
             return hash(tuple(
@@ -939,7 +954,7 @@ class ColorLUT:
             ))
         except Exception:
             return id(palette)
- 
+
     def build(self, palette: dict, max_class_hint: int = 256) -> np.ndarray:
         fp = self._palette_fingerprint(palette)
         if fp == self._palette_id and self._lut is not None:
@@ -954,14 +969,12 @@ class ColorLUT:
         self._palette_id = fp
         self._max_class  = max_c
         return lut
- 
+
     @property
     def lut(self) -> Optional[np.ndarray]:
-        """Return the cached LUT array (None if not yet built)."""
         return self._lut
 
     def load_from_palette(self, palette: dict) -> None:
-        """Build / refresh the cached LUT from palette (no-op if fingerprint matches)."""
         self.build(palette, max(max(palette.keys(), default=0) + 1, 256))
 
     def map_classes(self, classification: np.ndarray, palette: dict) -> np.ndarray:
@@ -972,23 +985,24 @@ class ColorLUT:
                    palette: dict) -> np.ndarray:
         lut = self.build(palette, int(classification.max()) + 1)
         return lut[classification[indices].clip(0, len(lut) - 1).astype(np.intp)]
- 
- 
+
+
 _lut_cache: Dict[str, ColorLUT] = {}
- 
- 
+
+
 def _get_lut(view_key: str = "main") -> ColorLUT:
     if view_key not in _lut_cache:
         _lut_cache[view_key] = ColorLUT()
     return _lut_cache[view_key]
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SNT OVERLAY Z-OFFSET
 # ─────────────────────────────────────────────────────────────────────────────
 def _restore_snt_overlays(app):
     if hasattr(app, 'snt_dialog') and app.snt_dialog is not None:
         try:
-            app.snt_dialog.restore_snt_actors()  # Already has the fixes above
+            app.snt_dialog.restore_snt_actors()
             return
         except Exception as e:
             print(f"  ⚠️ SNT dialog restore: {e}")
@@ -1017,7 +1031,7 @@ def _restore_snt_overlays(app):
         for entry in getattr(app, store_name, []):
             target = os.path.basename(entry.get("filename", ""))
             att = next((a for a in attachments if os.path.basename(a.get("filename", "")) == target), None)
-            
+
             actor_layer_map = {}
             selected_layers = None
             if att:
@@ -1031,25 +1045,22 @@ def _restore_snt_overlays(app):
                 try:
                     _apply_z_offset_to_actor(actor, z_offset)
                     renderer.AddActor(actor)
-                    
+
                     if selected_layers is not None and id(actor) in actor_layer_map:
                         layer_name = actor_layer_map[id(actor)]
                         actor.SetVisibility(1 if layer_name in selected_layers else 0)
-                        
+
                     count += 1
                 except Exception:
                     pass
 
     if count > 0:
-        # FIX: No clipping range expansion — tight range preserves depth precision.
         renderer.ResetCameraClippingRange()
-
-        # FIX: Enable GL_PROGRAM_POINT_SIZE + push uniforms before render.
         _snt_enable_gl_point_size(app)
         _snt_push_border_uniforms(app)
-
         print(f"  🔄 SNT overlays: {count} actors restored (z_offset={z_offset:.1f})")
-  
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BUILD UNIFIED ACTOR  (main view)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1060,7 +1071,7 @@ def build_unified_actor(
     point_size: float = _BASE_POINT_SIZE,
 ) -> Optional[object]:
     t0 = time.perf_counter()
- 
+
     plotter = getattr(app, "vtk_widget", None)
     if plotter is None:
         return None
@@ -1071,15 +1082,15 @@ def build_unified_actor(
     classification = data.get("classification")
     if classification is None:
         return None
- 
+
     palette = palette or getattr(app, "class_palette", {})
- 
+
     if UNIFIED_ACTOR_NAME in plotter.actors:
         plotter.remove_actor(UNIFIED_ACTOR_NAME, render=False)
     for name in list(plotter.actors.keys()):
         if str(name).startswith("class_"):
             plotter.remove_actor(name, render=False)
- 
+
     N_total      = len(xyz)
     target_points = 10_000_000
     if N_total > target_points:
@@ -1087,38 +1098,36 @@ def build_unified_actor(
         global_indices = np.arange(0, N_total, step)
     else:
         global_indices = np.arange(N_total)
- 
+
     app._main_global_indices = global_indices
     vis_xyz   = xyz[global_indices]
     vis_class = classification[global_indices]
- 
+
     cloud     = pv.PolyData(vis_xyz)
     class_vtk = numpy_support.numpy_to_vtk(vis_class.astype(np.float32, copy=False),
                                             deep=False)
     class_vtk.SetName("Classification")
     cloud.GetPointData().AddArray(class_vtk)
 
-    # ── NEW: boundary flags must be on cloud BEFORE add_points ──
     _bf = _compute_boundary_flags(vis_xyz, vis_class)
     _bf_vtk = numpy_support.numpy_to_vtk(_bf, deep=False)
     _bf_vtk.SetName("BoundaryFlag")
     cloud.GetPointData().AddArray(_bf_vtk)
     print(f"      🔲 BoundaryFlag: {int(_bf.sum()):,}/{len(_bf):,} edge pts")
-    # ────────────────────────────────────────────────────────────
- 
+
     if not hasattr(app, "_rgb_buffer") or len(app._rgb_buffer) != len(vis_xyz):
         app._rgb_buffer = np.zeros((len(vis_xyz), 3), dtype=np.uint8)
- 
+
     rgb_vtk = numpy_support.numpy_to_vtk(app._rgb_buffer, deep=False)
     rgb_vtk.SetName("RGB")
     cloud.GetPointData().SetScalars(rgb_vtk)
- 
+
     lut = _get_lut("main")
     np.copyto(app._rgb_buffer, lut.map_classes(vis_class, palette))
- 
+
     n_pts             = len(xyz)
     actual_point_size = _BASE_POINT_SIZE
- 
+
     actor = plotter.add_points(
         cloud, scalars="RGB", rgb=True,
         point_size=actual_point_size,
@@ -1128,7 +1137,7 @@ def build_unified_actor(
     )
     if actor:
         actor.GetProperty().LightingOff()
- 
+
     if actor:
         try:
             actor._naksha_render_window = plotter.render_window
@@ -1136,10 +1145,6 @@ def build_unified_actor(
             pass
 
     if actor:
-        # ── Immediate GL_PROGRAM_POINT_SIZE attempt ──────────────────────────
-        # If the GL context is already warm (file reloaded, not first-ever load),
-        # this succeeds right away and the border is visible from the first render.
-        # If the context isn't ready yet, _deferred_actor_gpu_init retries below.
         try:
             rw = plotter.render_window
             if _try_enable_program_point_size(rw):
@@ -1149,73 +1154,52 @@ def build_unified_actor(
         except Exception:
             pass
 
-        # # ── Deferred GPU init (fallback for cold first-load) ─────────────
-        # try:
-        #     from PySide6.QtCore import QTimer
-        #     _a, _c, _p = actor, ctx, plotter
-        #     QTimer.singleShot(
-        #         100,   # ← Reduced from 500ms to 100ms — closes the visibility gap
-        #         lambda: _deferred_actor_gpu_init(_a, _c, _p, "MainView")
-        #     )
-        #     print("      ⏱️  Deferred GPU init scheduled (100 ms)")
-        # except Exception as _te:
-        #     print(f"      ⚠️ Could not schedule deferred init: {_te}")
-
         _ensure_opengl_polydata_mapper(actor, cloud)
         _bm = actor.GetMapper()
         mesh   = _bm.GetInput() if _bm is not None else None
         if mesh is None:
             raise RuntimeError("build_unified_actor: mapper has no input after _ensure_opengl_polydata_mapper")
         vtk_ca = mesh.GetPointData().GetScalars()
-        # ── Task-1: alias VTK's actual GPU buffer, not the pre-add numpy array.
-        _vtk_rgb = numpy_support.vtk_to_numpy(vtk_ca)   # (N,3) view into VTK buffer
+
+        _vtk_rgb = numpy_support.vtk_to_numpy(vtk_ca)
         np.copyto(_vtk_rgb, app._rgb_buffer)
         vtk_ca.Modified()
-        
-        # ── Classification and Boundary: keep underlying numpy arrays alive
-        # (Needed because numpy_to_vtk(deep=False) doesn't always ref-count the source)
+
         _cls_np_f32 = vis_class.astype(np.float32)
         _cls_vtk = numpy_support.numpy_to_vtk(_cls_np_f32, deep=False)
         _cls_vtk.SetName("Classification")
         mesh.GetPointData().AddArray(_cls_vtk)
-        
+
         actor._naksha_rgb_ptr         = _vtk_rgb
         actor._naksha_point_count     = len(vis_xyz)
         actor._naksha_vtk_array       = vtk_ca
         actor._naksha_vtk_rgb_ref     = vtk_ca
-        actor._naksha_cls_np_ref      = _cls_np_f32    # ✅ Keep alive
-        actor._naksha_bf_np_ref       = _bf            # ✅ Keep alive
+        actor._naksha_cls_np_ref      = _cls_np_f32
+        actor._naksha_bf_np_ref       = _bf
         actor._naksha_mesh            = mesh
         actor._naksha_base_point_size = actual_point_size
         actor._naksha_boundary_vtk    = _bf_vtk
-        actor._naksha_data_id         = id(xyz)        # ✅ Link to specific data object
+        actor._naksha_data_id         = id(xyz)
         app._unified_actor            = actor
         ctx = ViewShaderContext(slot_idx=0)
 
         ctx.load_from_palette(palette, border_percent, actual_point_size)
-        
+
         structured_mode = 0.0
         dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
-        if dialog and hasattr(dialog, 'border_logic_object'):
-            structured_mode = 1.0 if dialog.border_logic_object.isChecked() else 0.0
+        if dialog:
+            if hasattr(dialog, 'border_logic_hybrid') and dialog.border_logic_hybrid.isChecked():
+                structured_mode = 2.0
+            elif hasattr(dialog, 'border_logic_object') and dialog.border_logic_object.isChecked():
+                structured_mode = 1.0
         ctx.structured_border_mode = structured_mode
-        
+
         _attach_view_shader_context(actor, ctx, UNIFIED_ACTOR_NAME)
         print(f"      ✅ Main view: {len(app._rgb_buffer):,} pts "
               f"(base_size={actual_point_size}, LOD_step={max(1, n_pts//target_points)})")
 
-        # ── Deferred GPU init ─────────────────────────────────────────────────
-        # The OpenGL context may not be fully ready at build time (file is loaded
-        # before the first render).  Schedule a deferred call that fires AFTER
-        # the first render so GetState() returns a valid object and we can:
-        #   1. Enable GL_PROGRAM_POINT_SIZE (makes gl_PointSize writes take effect)
-        #   2. Install a persistent StartEvent observer so it stays enabled
-        #   3. Re-push all uniforms so weight_lut is live from the very first
-        #      weight change the user makes — no shortcut / rebuild required.
         try:
             from PySide6.QtCore import QTimer
-            # Capture references — closure must not hold 'actor' as a local
-            # that could be rebound if build_unified_actor is called again.
             _a, _c, _p = actor, ctx, plotter
             QTimer.singleShot(
                 500,
@@ -1224,8 +1208,6 @@ def build_unified_actor(
             print("      ⏱️  Deferred GPU init scheduled (500 ms)")
         except Exception as _te:
             print(f"      ⚠️ Could not schedule deferred init: {_te}")
-
-
 
     elapsed = (time.perf_counter() - t0) * 1000
     print(f"   🏗️ Unified actor built: {n_pts:,} pts in {elapsed:.1f} ms")
@@ -1412,27 +1394,17 @@ def build_section_legacy_border_actors(
                 border_cloud = pv.PolyData(class_pts)
                 border_cloud["RGB"] = np.zeros((len(class_pts), 3), dtype=np.uint8)
                 vtk_widget.add_points(
-                    border_cloud,
-                    scalars="RGB",
-                    rgb=True,
-                    point_size=border_size,
-                    render_points_as_spheres=True,
-                    name=f"border_{code}",
-                    reset_camera=False,
-                    render=False,
+                    border_cloud, scalars="RGB", rgb=True,
+                    point_size=border_size, render_points_as_spheres=True,
+                    name=f"border_{code}", reset_camera=False, render=False,
                 )
 
             cloud = pv.PolyData(class_pts)
             cloud["RGB"] = np.tile(color, (len(class_pts), 1)).astype(np.uint8)
             vtk_widget.add_points(
-                cloud,
-                scalars="RGB",
-                rgb=True,
-                point_size=color_size,
-                render_points_as_spheres=True,
-                name=f"class_{code}",
-                reset_camera=False,
-                render=False,
+                cloud, scalars="RGB", rgb=True,
+                point_size=color_size, render_points_as_spheres=True,
+                name=f"class_{code}", reset_camera=False, render=False,
             )
     else:
         lut_size = max(int(filtered_cls.max()) + 1, 256)
@@ -1448,27 +1420,17 @@ def build_section_legacy_border_actors(
             border_cloud = pv.PolyData(filtered_pts)
             border_cloud["RGB"] = np.zeros((len(filtered_pts), 3), dtype=np.uint8)
             vtk_widget.add_points(
-                border_cloud,
-                scalars="RGB",
-                rgb=True,
-                point_size=border_size,
-                render_points_as_spheres=True,
-                name="border_layer",
-                reset_camera=False,
-                render=False,
+                border_cloud, scalars="RGB", rgb=True,
+                point_size=border_size, render_points_as_spheres=True,
+                name="border_layer", reset_camera=False, render=False,
             )
 
         cloud = pv.PolyData(filtered_pts)
         cloud["RGB"] = color_lut[filtered_cls.astype(np.intp)]
         vtk_widget.add_points(
-            cloud,
-            scalars="RGB",
-            rgb=True,
-            point_size=base_point_size,
-            render_points_as_spheres=True,
-            name="color_layer",
-            reset_camera=False,
-            render=False,
+            cloud, scalars="RGB", rgb=True,
+            point_size=base_point_size, render_points_as_spheres=True,
+            name="color_layer", reset_camera=False, render=False,
         )
 
     vtk_widget._naksha_section_render_mode = "legacy"
@@ -1488,7 +1450,8 @@ def build_section_legacy_border_actors(
         f"{len(filtered_pts):,} pts (border={border_percent}%)"
     )
     return True
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BUILD SECTION UNIFIED ACTOR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1502,30 +1465,28 @@ def build_section_unified_actor(
 ) -> Optional[object]:
     t0 = time.perf_counter()
     slot_idx = view_idx + 1
- 
+
     if not hasattr(app, 'section_vtks') or view_idx not in app.section_vtks:
         return None
     vtk_widget = app.section_vtks[view_idx]
     if vtk_widget is None:
         return None
- 
+
     core_pts  = getattr(app, f"section_{view_idx}_core_points",  None)
     buf_pts   = getattr(app, f"section_{view_idx}_buffer_points", None)
     core_mask = getattr(app, f"section_{view_idx}_core_mask",    None)
     buf_mask  = getattr(app, f"section_{view_idx}_buffer_mask",  None)
- 
+
     if core_pts is None or core_mask is None:
         return None
- 
+
     data = getattr(app, 'data', None)
     if data is None or 'classification' not in data:
         return None
- 
+
     classification_full = data['classification']
     core_global_idx     = np.flatnonzero(core_mask)
 
-    # Use pre-built all_points_local from finalize_section() when available
-    # to avoid an extra np.vstack allocation here.
     all_pts_prebuilt = getattr(app, f"section_{view_idx}_points_transformed", None)
     if buf_pts is not None and buf_mask is not None and len(buf_pts) > 0:
         buf_only_mask        = buf_mask & ~core_mask
@@ -1544,32 +1505,31 @@ def build_section_unified_actor(
         all_cls              = classification_full[core_global_idx]
         all_global_indices   = core_global_idx
         combined_global_mask = core_mask
- 
+
     if len(all_pts) == 0:
         return None
- 
+
     setattr(app, f"_section_{view_idx}_global_indices", all_global_indices)
     palette = palette or _get_slot_palette(app, slot_idx)
- 
+
     if hasattr(app, 'view_borders') and slot_idx in app.view_borders:
         border_percent = float(app.view_borders[slot_idx])
- 
+
     actor_name = f"_section_{view_idx}_unified"
     cam_pos    = vtk_widget.camera_position
- 
+
     if actor_name in vtk_widget.actors:
         vtk_widget.remove_actor(actor_name, render=False)
     for name in list(vtk_widget.actors.keys()):
         if str(name).startswith(("class_", "border_")) or str(name) in ("border_layer", "color_layer"):
             vtk_widget.remove_actor(name, render=False)
- 
+
     cloud     = pv.PolyData(all_pts)
     cls_f32   = all_cls.astype(np.float32, copy=False)
     class_vtk = numpy_support.numpy_to_vtk(cls_f32, deep=False)
     class_vtk.SetName("Classification")
     cloud.GetPointData().AddArray(class_vtk)
 
-    # Skip expensive boundary-flag computation when border shading is off
     if border_percent > 0.0:
         _bf = _compute_boundary_flags(all_pts, all_cls)
     else:
@@ -1579,15 +1539,15 @@ def build_section_unified_actor(
     cloud.GetPointData().AddArray(_bf_vtk)
 
     lut        = _get_lut(f"section_{view_idx}")
-    rgb_buffer = lut.map_classes(all_cls, palette)   # returns uint8 (N,3) directly
- 
+    rgb_buffer = lut.map_classes(all_cls, palette)
+
     rgb_vtk = numpy_support.numpy_to_vtk(rgb_buffer, deep=False)
     rgb_vtk.SetName("RGB")
     cloud.GetPointData().SetScalars(rgb_vtk)
- 
+
     n_pts          = len(all_pts)
     actual_pt_size = max(1.0, float(point_size or _BASE_POINT_SIZE))
- 
+
     actor = vtk_widget.add_points(
         cloud, scalars="RGB", rgb=True,
         point_size=actual_pt_size,
@@ -1597,15 +1557,15 @@ def build_section_unified_actor(
     )
     if actor:
         actor.GetProperty().LightingOff()
- 
+
     if actor is None:
         return None
- 
+
     try:
         actor._naksha_render_window = vtk_widget.render_window
     except Exception:
         pass
- 
+
     _ensure_opengl_polydata_mapper(actor, cloud)
 
     _sbm = actor.GetMapper()
@@ -1614,37 +1574,27 @@ def build_section_unified_actor(
         raise RuntimeError("build_section_unified_actor: mapper has no input after _ensure_opengl_polydata_mapper")
     vtk_ca = mesh.GetPointData().GetScalars()
 
-    # ── Task-1: alias VTK's actual GPU buffer for both RGB and Classification.
-    # If VTK copied internally, writes to the pre-add rgb_buffer are invisible
-    # to the GPU.  vtk_to_numpy() returns a numpy VIEW into VTK's true buffer —
-    # any write to this view is immediately visible to the GPU dirty chain.
-    _vtk_rgb = numpy_support.vtk_to_numpy(vtk_ca)   # (N,3) view into VTK buffer
-    np.copyto(_vtk_rgb, rgb_buffer)                  # seed initial palette colors
+    _vtk_rgb = numpy_support.vtk_to_numpy(vtk_ca)
+    np.copyto(_vtk_rgb, rgb_buffer)
     vtk_ca.Modified()
 
-    # Classification: view into VTK's float32 Classification buffer.
-    # fast_cross_section_update already writes through vtk_to_numpy(class_vtk_arr),
-    # so aliasing here ensures _naksha_section_class stays in sync automatically.
     _class_vtk_arr = mesh.GetPointData().GetArray("Classification")
     _vtk_cls = (numpy_support.vtk_to_numpy(_class_vtk_arr)
                 if _class_vtk_arr is not None else all_cls.copy())
 
-    actor._naksha_rgb_ptr         = _vtk_rgb         # view — writes visible to VTK
+    actor._naksha_rgb_ptr         = _vtk_rgb
     actor._naksha_vtk_array       = vtk_ca
-    actor._naksha_vtk_rgb_ref     = vtk_ca           # keep VTK array alive
+    actor._naksha_vtk_rgb_ref     = vtk_ca
     actor._naksha_mesh            = mesh
-    actor._naksha_section_class   = _vtk_cls         # view — stays in sync with VTK
+    actor._naksha_section_class   = _vtk_cls
     actor._naksha_section_mask    = combined_global_mask
     actor._naksha_base_point_size = actual_pt_size
-    # ── NEW ──
-    actor._naksha_boundary_vtk = _bf_vtk
-    # ─────────
- 
+    actor._naksha_boundary_vtk    = _bf_vtk
+
     ctx = ViewShaderContext(slot_idx=slot_idx)
     ctx.load_from_palette(palette, border_percent, actual_pt_size)
     _attach_view_shader_context(actor, ctx, actor_name)
 
-    # Deferred GL_PROGRAM_POINT_SIZE init for section views too
     try:
         from PySide6.QtCore import QTimer
         _a, _c, _w = actor, ctx, vtk_widget
@@ -1654,29 +1604,25 @@ def build_section_unified_actor(
         )
     except Exception:
         pass
- 
+
     vtk_widget._naksha_section_render_mode = "unified"
     vtk_widget.camera_position = cam_pos
     vtk_widget.render()
- 
+
     elapsed = (time.perf_counter() - t0) * 1000
     print(f"   🏗️ Section {view_idx+1} unified actor: {n_pts:,} pts in {elapsed:.1f} ms "
           f"(slot={slot_idx}, border={border_percent}%, base_size={actual_pt_size})")
     return actor
- 
- 
-# ─────────────────────────────────────────────────────────────────────────────
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PARTIAL UPDATES (The "Real" Performance Fix for 48M+ points)
 # ─────────────────────────────────────────────────────────────────────────────
 def fast_partial_cross_section_update(app, view_idx: int, global_changed_mask: np.ndarray):
-    """
-    Updates ONLY the points that changed within a specific cross-section.
-    Avoids re-mapping millions of unchanged points.
-    """
+    """Updates ONLY the points that changed within a specific cross-section."""
     if not hasattr(app, 'section_vtks') or view_idx not in app.section_vtks:
         return False
-    
+
     vtk_widget = app.section_vtks[view_idx]
     if vtk_widget is None:
         return False
@@ -1690,41 +1636,33 @@ def fast_partial_cross_section_update(app, view_idx: int, global_changed_mask: n
     if rgb_ptr is None or not _is_writable(rgb_ptr):
         return False
 
-    # 1. Get the mapping of view points to global indices
     section_mask = getattr(app, f"section_{view_idx}_combined_mask", None)
     if section_mask is None:
         return False
 
-    # 2. Find which points in THIS view have changed globallyS
     changed_in_view_global_indices = np.where(global_changed_mask & section_mask)[0]
     if len(changed_in_view_global_indices) == 0:
         return True
 
-    # ✅ VECTORIZED MAPPING: Replaces slow Python dict loop
     g_to_l_arr = getattr(actor, '_naksha_global_to_local_arr', None)
     if g_to_l_arr is None:
         full_indices = np.where(section_mask)[0]
-        # Map total_points -> local_pos. Initialize with -1 (not in view).
         g_to_l_arr = np.full(len(app.data["xyz"]), -1, dtype=np.int32)
         g_to_l_arr[full_indices] = np.arange(len(full_indices), dtype=np.int32)
         actor._naksha_global_to_local_arr = g_to_l_arr
-    
+
     local_indices = g_to_l_arr[changed_in_view_global_indices]
     valid_mask = local_indices != -1
     if not np.any(valid_mask):
         return True
     local_indices = local_indices[valid_mask]
 
-    # 3. Apply full patch (RGB + Classification Scalars for Shaders)
     _patch_actor_memory(app, actor, local_indices, slot_idx=view_idx + 1)
-    
     return True
 
+
 def fast_partial_classify_update(app, global_changed_mask: np.ndarray):
-    """
-    Updates ONLY the points that changed in the MAIN VIEW.
-    Avoids re-mapping millions of points.
-    """
+    """Updates ONLY the points that changed in the MAIN VIEW."""
     actor = _get_unified_actor(app)
     if actor is None:
         return False
@@ -1745,27 +1683,26 @@ def fast_partial_classify_update(app, global_changed_mask: np.ndarray):
             gi_mask = np.zeros(len(app.data["xyz"]), dtype=bool)
             gi_mask[gi] = True
             app._main_global_mask = gi_mask
-        
+
         changed_visible_global = np.where(global_changed_mask & gi_mask)[0]
         if len(changed_visible_global) == 0:
             return True
-            
+
         g_to_l_arr = getattr(actor, '_naksha_global_to_local_arr', None)
         if g_to_l_arr is None:
             g_to_l_arr = np.full(len(app.data["xyz"]), -1, dtype=np.int32)
             g_to_l_arr[gi] = np.arange(len(gi), dtype=np.int32)
             actor._naksha_global_to_local_arr = g_to_l_arr
-        
+
         local_indices = g_to_l_arr[changed_visible_global]
         valid_mask = local_indices != -1
         if not np.any(valid_mask):
             return True
         local_indices = local_indices[valid_mask]
 
-    # 3. Apply full patch (RGB + Classification Scalars for Shaders)
     _patch_actor_memory(app, actor, local_indices, slot_idx=0)
-    
     return True
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # fast_classify_update — main view
@@ -1777,87 +1714,65 @@ def fast_classify_update(
     skip_render: bool = False,
     **kwargs,
 ) -> bool:
-    """
-    Vectorized, dirty-flagged GPU RGB poke for the main view.
-
-    Complexity: O(k) NumPy C-layer — k = changed points.
-    Zero Python loops. Uniforms pushed only when shader generation changed.
-
-    Parameters
-    ----------
-    skip_render : bool
-        Pass True when the caller will issue its own render() — avoids
-        a redundant GPU flush when this is called from _apply_mask_and_record.
-    """
     actor = _get_unified_actor(app)
     if actor is None:
         return False
 
-    # ── 1. Global → local index mapping (vectorized, no Python loop) ─────
     global_indices = getattr(app, '_main_global_indices', None)
     if global_indices is not None:
         local_changed = np.flatnonzero(changed_mask[global_indices])
     else:
         local_changed = np.flatnonzero(changed_mask)
 
-    # Dirty flag #1: nothing changed → skip all GPU work
     if local_changed.size == 0:
         return True
 
-    # ── 2. Palette lookup (O(1), no dict copy) ────────────────────────────
     if to_class is None:
         return True
-    
+
     palette   = kwargs.get("palette") or _get_slot_palette(app, 0)
     entry     = palette.get(int(to_class), {})
     new_color = entry.get("color", (128, 128, 128)) if entry.get("show", True) else (0, 0, 0)
 
-    # ── 3. RGB poke — single vectorized broadcast write ───────────────────
     rgb_ptr = getattr(actor, "_naksha_rgb_ptr", None)
     if rgb_ptr is not None:
-        # Clamp to valid range instead of asserting — prevents fallback to full rebuild
         if local_changed[-1] >= len(rgb_ptr):
             local_changed = local_changed[local_changed < len(rgb_ptr)]
         if local_changed.size == 0:
             return True
-        rgb_ptr[local_changed] = new_color          # O(k) NumPy broadcast
+        rgb_ptr[local_changed] = new_color
         vtk_ca = getattr(actor, "_naksha_vtk_array", None)
         if vtk_ca is not None:
             vtk_ca.Modified()
 
-    # ── 4. Classification scalar array — dtype-safe write ─────────────────
     mesh = getattr(actor, '_naksha_mesh', None)
     if mesh is not None:
         class_vtk_arr = mesh.GetPointData().GetArray("Classification")
         if class_vtk_arr is not None:
             cls_np = numpy_support.vtk_to_numpy(class_vtk_arr)
-            cls_np[local_changed] = cls_np.dtype.type(to_class)  # preserve VTK array dtype
+            cls_np[local_changed] = cls_np.dtype.type(to_class)
             class_vtk_arr.Modified()
-            mesh.Modified() # ✅ Ensure mapper re-scans attributes
+            mesh.Modified()
 
-    # ── 5. Dirty flag #2: mark actor only when data physically changed ─────
     _mark_actor_dirty(actor)
 
-    # ── 6. Uniforms: push only when shader context generation changed ──────
     ctx = getattr(actor, '_naksha_shader_ctx', None)
     if ctx is not None:
         last_gen = getattr(actor, '_last_uniform_generation', -1)
-        if ctx._generation != last_gen:             # dirty flag #3: skip if palette unchanged
+        if ctx._generation != last_gen:
             _push_uniforms_direct(actor, ctx)
             actor._last_uniform_generation = ctx._generation
 
-    # ── 7. Single render (skipped when caller batches its own render) ────
     if not skip_render:
         try:
             app.vtk_widget.render()
             app._gpu_sync_done = True
         except Exception as _e:
             print(f"⚠️ GPU render error (fast_classify_update): {_e}")
-            # Don't set _gpu_sync_done — caller will retry on next event
 
     return True
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # fast_cross_section_update — section views
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1869,10 +1784,10 @@ def fast_cross_section_update(
     skip_render: bool = False,
 ) -> bool:
     t0 = time.perf_counter()
- 
+
     if not hasattr(app, "section_vtks") or view_idx not in app.section_vtks:
         return False
- 
+
     vtk_widget     = app.section_vtks[view_idx]
     slot_idx       = view_idx + 1
     palette        = palette or _get_slot_palette(app, slot_idx)
@@ -1885,67 +1800,62 @@ def fast_cross_section_update(
             app._refresh_single_section_view(view_idx, border_percent)
             return True
         return False
- 
+
     actor_name     = f"_section_{view_idx}_unified"
     global_indices = getattr(app, f"_section_{view_idx}_global_indices", None)
- 
+
     if actor_name not in vtk_widget.actors or global_indices is None:
         if hasattr(app, '_refresh_single_section_view'):
             app._refresh_single_section_view(view_idx, border_percent)
             return True
         return False
- 
+
     actor = vtk_widget.actors.get(actor_name)
     if actor is None:
         if hasattr(app, '_refresh_single_section_view'):
             app._refresh_single_section_view(view_idx, border_percent)
             return True
         return False
- 
+
     rgb_ptr = getattr(actor, "_naksha_rgb_ptr", None)
     if rgb_ptr is None or not _is_writable(rgb_ptr):
         return False
- 
+
     classification = (app.data.get("classification")
                       if hasattr(app, 'data') and app.data else None)
     if classification is None:
         return False
- 
+
     mapper = actor.GetMapper()
     poly   = mapper.GetInput() if mapper else None
     if poly is None:
         return False
- 
+
     vtk_scalars = poly.GetPointData().GetScalars()
     if vtk_scalars is None:
         return False
- 
+
     if (changed_mask_global is not None
             and len(changed_mask_global) >= global_indices.max(initial=0) + 1):
         section_changed = changed_mask_global[global_indices]
     else:
         section_changed = np.ones(len(global_indices), dtype=bool)
- 
+
     n_changed = int(np.count_nonzero(section_changed))
- 
+
     if n_changed > 0:
-        changed_idx = np.flatnonzero(section_changed)        # ~15% faster than np.where()[0]
+        changed_idx = np.flatnonzero(section_changed)
         new_classes = classification[global_indices[changed_idx]]
 
-        # ── Bug-2 fix: ColorLUT singleton — zero Python dict loop ─────────
-        # _get_lut() returns the same (256,3) uint8 array each call;
-        # load_from_palette() is a no-op when the palette fingerprint matches.
         lut_obj   = _get_lut(f"section_{view_idx}")
         lut_obj.load_from_palette(palette)
         color_lut = lut_obj.lut
         rgb_ptr[changed_idx] = color_lut[new_classes.clip(0, len(color_lut) - 1).astype(np.intp)]
 
-        # Mark RGB array dirty so VTK mapper re-uploads to GPU
         vtk_rgb_arr = getattr(actor, "_naksha_vtk_array", None)
         if vtk_rgb_arr is not None:
             vtk_rgb_arr.Modified()
 
-        # ── Dirty flag: Modified() only when data physically changed ──────
         class_vtk_arr = poly.GetPointData().GetArray("Classification")
         if class_vtk_arr is not None:
             cls_np = numpy_support.vtk_to_numpy(class_vtk_arr)
@@ -1956,9 +1866,9 @@ def fast_cross_section_update(
             actor._naksha_section_class[changed_idx] = new_classes
 
         vtk_scalars.Modified()
-        poly.Modified() # ✅ Ensure mapper re-scans attributes
+        poly.Modified()
         _mark_actor_dirty(actor)
- 
+
     ctx = getattr(actor, '_naksha_shader_ctx', None)
     if ctx is not None:
         _last_gen = getattr(actor, '_last_uniform_generation', -1)
@@ -1967,7 +1877,7 @@ def fast_cross_section_update(
             actor._last_uniform_generation = ctx._generation
     else:
         print("   ⚠️  No shader context on actor — uniforms not pushed")
- 
+
     if not skip_render:
         try:
             vtk_widget.render()
@@ -1978,13 +1888,13 @@ def fast_cross_section_update(
     elapsed = (time.perf_counter() - t0) * 1000
     print(f"   ⚡ Section {view_idx + 1} RGB inject: {n_changed} pts [{elapsed:.1f} ms]")
     return True
- 
- 
+
+
 def fast_undo_update(app, changed_mask: np.ndarray, **kwargs) -> bool:
     t0 = time.perf_counter()
     actors_updated = 0
     total_pts = 0
- 
+
     main_actor = _get_unified_actor(app)
     if main_actor:
         gi = getattr(app, '_main_global_indices', None)
@@ -1992,18 +1902,18 @@ def fast_undo_update(app, changed_mask: np.ndarray, **kwargs) -> bool:
             local_changed = np.flatnonzero(changed_mask[gi])
         else:
             local_changed = np.flatnonzero(changed_mask)
- 
+
         if local_changed.size > 0:
             _patch_actor_memory(app, main_actor, local_changed, slot_idx=0)
             actors_updated += 1
             total_pts += local_changed.size
- 
+
     if not (hasattr(app, 'section_vtks') and app.section_vtks):
         elapsed = (time.perf_counter() - t0) * 1000
         print(f"   ⚡ fast_undo_update: {total_pts:,} pts across "
               f"{actors_updated} views [{elapsed:.1f} ms]")
         return actors_updated > 0
- 
+
     sections_to_render = []
     for view_idx, vtk_widget in app.section_vtks.items():
         if vtk_widget is None:
@@ -2036,17 +1946,17 @@ def fast_undo_update(app, changed_mask: np.ndarray, **kwargs) -> bool:
             print(f"   ⚡ Section {view_idx+1} RGB inject: {n_pts} pts")
         except Exception as e:
             print(f"   ⚠️  fast_undo_update: render failed section {view_idx+1}: {e}")
- 
+
     elapsed = (time.perf_counter() - t0) * 1000
     print(f"   ⚡ fast_undo_update: {total_pts:,} pts across "
           f"{actors_updated} views [{elapsed:.1f} ms]")
     return actors_updated > 0
- 
- 
+
+
 def _patch_actor_memory(app, actor, local_indices: np.ndarray,
                         slot_idx: int) -> None:
     full_cls = app.data["classification"]
- 
+
     if slot_idx == 0:
         gi = getattr(app, '_main_global_indices', None)
         if gi is not None:
@@ -2059,10 +1969,10 @@ def _patch_actor_memory(app, actor, local_indices: np.ndarray,
         if gi_section is None:
             return
         reverted_cls = full_cls[gi_section[local_indices]]
- 
+
     if hasattr(actor, "_naksha_section_class"):
         actor._naksha_section_class[local_indices] = reverted_cls
- 
+
     mesh = getattr(actor, '_naksha_mesh', None)
     if mesh is not None:
         class_vtk = mesh.GetPointData().GetArray("Classification")
@@ -2070,12 +1980,11 @@ def _patch_actor_memory(app, actor, local_indices: np.ndarray,
             numpy_support.vtk_to_numpy(class_vtk)[local_indices] = (
                 reverted_cls.astype(np.float32))
             class_vtk.Modified()
- 
+
     rgb_ptr = getattr(actor, "_naksha_rgb_ptr", None)
     if rgb_ptr is not None and _is_writable(rgb_ptr):
         palette   = _get_slot_palette(app, slot_idx)
         max_hint  = max(int(reverted_cls.max()) + 1, 256) if reverted_cls.size else 256
-        # Reuse ColorLUT cache — O(1) when palette unchanged, zero Python dict loop
         lut_obj   = _get_lut(f"undo_{slot_idx}")
         color_lut = lut_obj.build(palette, max_hint)
         rgb_ptr[local_indices] = color_lut[
@@ -2086,28 +1995,25 @@ def _patch_actor_memory(app, actor, local_indices: np.ndarray,
             vtk_ca.Modified()
 
     _mark_actor_dirty(actor)
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ACTOR LOOKUP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def is_unified_actor_ready(app) -> bool:
     return _get_unified_actor(app) is not None
- 
- 
+
+
 def _get_unified_actor(app) -> Optional[object]:
     actor = getattr(app, "_unified_actor", None)
     if actor is not None:
         try:
-            # Validate C++ object is still alive (GetVisibility is cheap)
             actor.GetVisibility()
             rgb = getattr(actor, "_naksha_rgb_ptr", None)
             if rgb is not None and _is_writable(rgb):
-                # ✅ NEW: Check for stale actor (point count mismatch)
                 if hasattr(app, 'data') and app.data is not None:
                     xyz = app.data.get('xyz')
                     if xyz is not None:
-                        # ── DATA IDENTITY CHECK ──
                         current_data_id = id(xyz)
                         actor_data_id   = getattr(actor, '_naksha_data_id', None)
                         if actor_data_id is not None and actor_data_id != current_data_id:
@@ -2115,19 +2021,13 @@ def _get_unified_actor(app) -> Optional[object]:
                             return None
 
                         current_n = len(xyz)
-                        # Mirror build_unified_actor downsampling logic (target=10M)
                         target_pts = 10000000
-                        if current_n > target_pts:
-                            lod_step = max(1, current_n // target_pts)
-                        else:
-                            lod_step = 1
-                        
-                        # len(np.arange(0, N, step)) is ceil(N/step)
+                        lod_step = max(1, current_n // target_pts) if current_n > target_pts else 1
                         expected_actor_n = int(np.ceil(current_n / lod_step))
-                        
+
                         actor_n = getattr(actor, '_naksha_point_count', 0)
                         if actor_n > 0 and actor_n != expected_actor_n:
-                            print(f"   DEBUG: _get_unified_actor STALE - actor_n={actor_n} != expected={expected_actor_n} (step={lod_step})")
+                            print(f"   DEBUG: _get_unified_actor STALE - actor_n={actor_n} != expected={expected_actor_n}")
                             return None
                 return actor
             else:
@@ -2136,7 +2036,6 @@ def _get_unified_actor(app) -> Optional[object]:
                 elif not _is_writable(rgb):
                     print(f"   DEBUG: _get_unified_actor FAILED - _naksha_rgb_ptr is NOT writable")
         except (AttributeError, RuntimeError):
-            # Underlying VTK C++ object was destroyed — drop stale ref
             try:
                 del app._unified_actor
             except AttributeError:
@@ -2152,36 +2051,31 @@ def _get_unified_actor(app) -> Optional[object]:
             actor.GetVisibility()
             rgb = getattr(actor, "_naksha_rgb_ptr", None)
             if rgb is not None and _is_writable(rgb):
-                # ✅ NEW: Check for stale actor (point count mismatch)
                 if hasattr(app, 'data') and app.data is not None:
                     xyz = app.data.get('xyz')
                     if xyz is not None:
                         current_n = len(xyz)
                         target_pts = 10000000
-                        if current_n > target_pts:
-                            lod_step = int(np.ceil(current_n / target_pts))
-                        else:
-                            lod_step = 1
+                        lod_step = max(1, current_n // target_pts) if current_n > target_pts else 1
                         expected_actor_n = int(np.ceil(current_n / lod_step))
-                        
                         actor_n = getattr(actor, '_naksha_point_count', 0)
                         if actor_n > 0 and actor_n != expected_actor_n:
                             return None
-                
+
                 app._unified_actor = actor
                 return actor
         except (AttributeError, RuntimeError):
             pass
 
     return None
- 
- 
+
+
 def _get_all_unified_actors(app):
     main_actor = _get_unified_actor(app)
     vtk_widget = getattr(app, "vtk_widget", None)
     if main_actor is not None and vtk_widget is not None:
         yield (main_actor, 0, getattr(app, "_main_global_indices", None), vtk_widget)
- 
+
     if hasattr(app, "section_vtks"):
         for view_idx, widget in app.section_vtks.items():
             actor_name = f"_section_{view_idx}_unified"
@@ -2191,45 +2085,15 @@ def _get_all_unified_actors(app):
                 if rgb is not None and _is_writable(rgb):
                     gi = getattr(app, f"_section_{view_idx}_global_indices", None)
                     yield (actor, view_idx + 1, gi, widget)
- 
- 
-# def _get_slot_palette(app, slot_idx: int) -> dict:
-#     master = getattr(app, "class_palette", {}) or {}
-    
-#     if not master:
-#         return {}
- 
-#     overrides = {}
-#     dlg = getattr(app, "display_mode_dialog", None)
-#     if dlg and hasattr(dlg, "view_palettes"):
-#         vp = getattr(dlg, "view_palettes", None)
-#         if vp and slot_idx in vp:
-#             overrides = vp[slot_idx] or {}
-    
-#     if not overrides:
-#         vp = getattr(app, "view_palettes", {})
-#         overrides = vp.get(slot_idx, {}) or {}
- 
-#     if slot_idx == 0:
-#         return master
- 
-#     resolved_palette = {code: dict(info) for code, info in master.items()}
-    
-#     for code, info in overrides.items():
-#         if code in resolved_palette:
-#             resolved_palette[code].update(info)
-#         else:
-#             resolved_palette[code] = dict(info)
- 
-#     return resolved_palette
-_palette_resolve_cache: dict = {}   # slot_idx → (fingerprint, resolved_dict)
+
+
+_palette_resolve_cache: dict = {}
 
 
 def _get_slot_palette(app, slot_idx: int) -> dict:
     """
-    Bug-5 fix: fingerprint-guarded palette resolver.
+    Fingerprint-guarded palette resolver.
     Returns a cached resolved dict when master + overrides have not changed.
-    Falls back to full resolution only on first call or real palette change.
     """
     master = getattr(app, "class_palette", {}) or {}
     if not master:
@@ -2245,9 +2109,6 @@ def _get_slot_palette(app, slot_idx: int) -> dict:
         vp = getattr(app, "view_palettes", {})
         overrides = vp.get(slot_idx, {}) or {}
 
-    # ── Fingerprint: content-based hash so in-place dict mutations (checkbox
-    # toggled, weight changed) are always detected.  id() alone is O(1) but
-    # misses mutations on the *same* object — the most common case in practice.
     try:
         fp = (
             hash(tuple(
@@ -2262,12 +2123,12 @@ def _get_slot_palette(app, slot_idx: int) -> dict:
             )) if overrides else 0,
         )
     except Exception:
-        fp = (id(master), id(overrides))   # fallback: never stale-caches, just no speedup
+        fp = (id(master), id(overrides))
+
     cached = _palette_resolve_cache.get(slot_idx)
     if cached is not None and cached[0] == fp:
-        return cached[1]                          # cache hit — zero allocation
+        return cached[1]
 
-    # ── Full resolution (only on real change) ─────────────────────────────
     if slot_idx == 0:
         if not overrides:
             result = master
@@ -2287,23 +2148,23 @@ def _get_slot_palette(app, slot_idx: int) -> dict:
                 result[code] = dict(info)
 
     _palette_resolve_cache[slot_idx] = (fp, result)
-    return result 
- 
+    return result
+
+
 def invalidate_unified_actor(app):
     if hasattr(app, "_unified_actor"):
         del app._unified_actor
-    
-    # ✅ CLEANUP NEW MAPPINGS (Prevents stale data crashes on project switch)
+
     if hasattr(app, "_main_global_mask"):
         del app._main_global_mask
     if hasattr(app, "_main_global_indices"):
         del app._main_global_indices
-        
+
     for key in list(_lut_cache.keys()):
         _lut_cache[key]._palette_id = None
-    _palette_resolve_cache.clear()   # Bug-5: flush fingerprint cache on file reload
- 
- 
+    _palette_resolve_cache.clear()
+
+
 def _ensure_opengl_polydata_mapper(actor, cloud, use_spheres=True):
     if actor is None:
         return
@@ -2318,12 +2179,13 @@ def _ensure_opengl_polydata_mapper(actor, cloud, use_spheres=True):
         new_mapper.SetScalarVisibility(raw_mapper.GetScalarVisibility())
         actor.SetMapper(new_mapper)
         print("      ℹ️ Swapped vtkDataSetMapper → vtkOpenGLPolyDataMapper")
- 
- 
+
+
 def compute_point_size(weight: float, base: float = _BASE_POINT_SIZE) -> float:
     min_size = max(0.5, base * 0.1)
     return float(max(min_size, min(base * weight, 30.0)))
- 
+
+
 def _compute_boundary_flags(xyz: np.ndarray, classification: np.ndarray = None,
                              resolution: float = 0.0) -> np.ndarray:
     """
@@ -2332,10 +2194,8 @@ def _compute_boundary_flags(xyz: np.ndarray, classification: np.ndarray = None,
       2. Class-change          — only when neighbour cell is OCCUPIED + different class
       3. Scan-edge             — point has < 4 of 8 occupied neighbours (true cloud edge)
 
-    KEY FIX vs old version: empty neighbour cells (nb == -1) are NO LONGER
-    treated as boundary. This was the root cause of dark-roof artefacts in
-    structured border mode — interior roof points with scan gaps in their
-    neighbourhood were wrongly flagged.
+    Empty neighbour cells are NOT treated as boundary — this prevents dark-roof
+    artefacts where interior points with scan gaps were wrongly flagged.
     """
     n = len(xyz)
     if n == 0:
@@ -2357,30 +2217,23 @@ def _compute_boundary_flags(xyz: np.ndarray, classification: np.ndarray = None,
     gx_max   = int(gx.max()) + 2
     gy_max   = int(gy.max()) + 2
 
-    # ── Build Z-mean grid ────────────────────────────────────────────────────
     z_sum   = np.zeros((gx_max, gy_max), dtype=np.float64)
     z_count = np.zeros((gx_max, gy_max), dtype=np.int32)
     np.add.at(z_sum,   (gx, gy), z_arr)
     np.add.at(z_count, (gx, gy), 1)
-    # Use 0.0 for empty cells — we gate all comparisons on nb_occ anyway
     z_mean = np.where(z_count > 0, z_sum / np.maximum(z_count, 1), 0.0)
 
-    # Mean Z of THIS point's own cell (always valid — point is in the cell)
     my_z_cell = z_mean[gx, gy]
 
-    # Adaptive Z threshold: structural edge = height change > 3% of total
-    # Z range, minimum 0.5 m (handles both dense urban and sparse rural scenes)
     z_global_range = max(float(z_arr.max() - z_arr.min()), 1.0)
     z_thresh = max(0.5, z_global_range * 0.03)
 
-    # ── Class grid ───────────────────────────────────────────────────────────
     has_class = classification is not None
     if has_class:
         class_grid = np.full((gx_max, gy_max), -1, dtype=np.int32)
         class_grid[gx, gy] = classification.astype(np.int32)
         my_class = classification.astype(np.int32)
 
-    # ── Boundary accumulation over 8 neighbours ──────────────────────────────
     _DIRS = [(-1, -1), (-1, 0), (-1, 1),
              ( 0, -1),          ( 0, 1),
              ( 1, -1), ( 1, 0), ( 1, 1)]
@@ -2390,26 +2243,17 @@ def _compute_boundary_flags(xyz: np.ndarray, classification: np.ndarray = None,
 
     for dx, dy in _DIRS:
         nx, ny = gx + dx, gy + dy
-        nb_occ = (z_count[nx, ny] > 0)          # True if neighbour cell has points
+        nb_occ = (z_count[nx, ny] > 0)
         occ_nb_count += nb_occ.astype(np.int32)
 
-        # ── Criterion 1: height discontinuity (geometric/structural edge) ────
-        # Only compare against OCCUPIED neighbours to avoid gap-based false flags
         nb_z   = z_mean[nx, ny]
         z_diff = np.where(nb_occ, np.abs(my_z_cell - nb_z), 0.0)
         boundary |= nb_occ & (z_diff > z_thresh)
 
-        # ── Criterion 2: class-change boundary ───────────────────────────────
-        # Neighbour must be OCCUPIED and a different class — empty ≠ boundary
         if has_class:
             nb_cls = class_grid[nx, ny]
             boundary |= nb_occ & (nb_cls >= 0) & (nb_cls != my_class)
 
-    # ── Criterion 3: scan/cloud edge ─────────────────────────────────────────
-    # A point with < 4 occupied 8-neighbours is genuinely at the edge of the
-    # scan (not a gap — a real spatial boundary).  This replaces the old
-    # "empty neighbour = boundary" logic with a majority-vote approach that
-    # is robust against irregular point spacing on roof interiors.
     boundary |= (occ_nb_count < 4)
 
     pct = int(boundary.sum()) * 100 // max(n, 1)
@@ -2417,13 +2261,13 @@ def _compute_boundary_flags(xyz: np.ndarray, classification: np.ndarray = None,
           f"({pct}%, z_thresh={z_thresh:.2f}m, res={resolution:.3f}m)")
 
     return boundary.astype(np.float32)
- 
- 
+
+
 def diagnose_weight_pipeline(app, slot_idx=1):
     print("\n" + "=" * 70)
     print(f"🔬 WEIGHT PIPELINE DIAGNOSTIC  (slot={slot_idx})")
     print("=" * 70)
- 
+
     if slot_idx == 0:
         actor_name = UNIFIED_ACTOR_NAME
         vtk_widget = getattr(app, "vtk_widget", None)
@@ -2432,25 +2276,27 @@ def diagnose_weight_pipeline(app, slot_idx=1):
         actor_name = f"_section_{view_idx}_unified"
         vtk_widget = (app.section_vtks.get(view_idx)
                       if hasattr(app, "section_vtks") else None)
- 
+
     print(f"\n[1] Actor: {actor_name}")
     if vtk_widget is None:
         print("    ❌ No vtk_widget"); return
- 
+
     actor = vtk_widget.actors.get(actor_name) if hasattr(vtk_widget, 'actors') else None
     if actor is None:
         print("    ❌ Actor not found"); return
- 
+
     ctx = getattr(actor, '_naksha_shader_ctx', None)
     print(f"\n[2] shader_ctx: {'✅' if ctx else '❌ None'}")
     if ctx:
         print(f"    _has_vertex_attr_cache:  {ctx._has_vertex_attr_cache}")
         print(f"    _naksha_base_point_size: {getattr(actor, '_naksha_base_point_size', '?')}")
         print(f"    _naksha_pps_observer_installed: {getattr(actor, '_naksha_pps_observer_installed', False)}")
+        print(f"    structured_border_mode:  {ctx.structured_border_mode}  "
+              f"(0=per-point, 1=structured, 2=hybrid)")
         for c in [2, 6, 7]:
             print(f"    class {c}: weight_lut={ctx.weight_lut[c]:.2f}  "
                   f"vis={ctx.visibility_mask[c]:.1f}")
- 
+
     sp = actor.GetShaderProperty() if actor else None
     print(f"\n[3] ShaderProperty: {'✅' if sp else '❌'}")
     if sp:
@@ -2458,7 +2304,11 @@ def diagnose_weight_pipeline(app, slot_idx=1):
         f_uni = sp.GetFragmentCustomUniforms()
         print(f"    VertexCustomUniforms:   {'✅' if v_uni else '❌'}")
         print(f"    FragmentCustomUniforms: {'✅' if f_uni else '❌'}")
-        print(f"    _shaders_finalized_v23:  {getattr(actor, '_shaders_finalized_v23', False)}")
- 
+        print(f"    _shaders_finalized_v27:  {getattr(actor, '_shaders_finalized_v27', False)}")
+
     print(f"\n[4] render_window: {getattr(actor, '_naksha_render_window', None)}")
+    print(f"\n[5] Depth bias constants:")
+    print(f"    PER-POINT:   {_BORDER_DEPTH_BIAS_PERPOINT}")
+    print(f"    STRUCTURED:  {_BORDER_DEPTH_BIAS_STRUCTURED}")
+    print(f"    HYBRID:      {_BORDER_DEPTH_BIAS_HYBRID}")
     print("=" * 70 + "\n")
