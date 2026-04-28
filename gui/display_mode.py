@@ -1758,12 +1758,8 @@ class DisplayModeDialog(QDialog):
             # 6. Save color mode & structured border mode
             settings.setValue("global_color_mode", self.color_mode.currentIndex())
             
-            if self.border_logic_hybrid.isChecked():
-                mode_val = 2
-            elif self.border_logic_object.isChecked():
-                mode_val = 1
-            else:
-                mode_val = 0
+            mode_val = int(self.get_border_mode())
+
             settings.setValue("global_border_logic_mode", mode_val)
             settings.setValue("global_structured_border", str(self.border_logic_object.isChecked()))
 
@@ -1945,6 +1941,12 @@ class DisplayModeDialog(QDialog):
                     _uam_sync(app, 0, border=float_border, render=True)
             else:
                 _uam_sync(app, slot_idx, border=float_border, render=True)
+            # Re-enforce the dialog's visual selection after any GPU push.
+            # Shortcuts and external callers skip _select_border_mode, leaving
+            # the action group in a stale state — causing two items to appear
+            # checked simultaneously when the dialog is next opened.
+            current_mode = int(self.get_border_mode())
+            self._select_border_mode(current_mode, push_gpu=False)
         except Exception as e:
             print(f"⚠️ _push_border_to_gpu failed (slot={slot_idx}): {e}")
 
