@@ -688,14 +688,8 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
         _shader_contexts[actor_name] = ctx
         _attach_view_shader_context(actor, ctx, actor_name)
 
-    structured_mode = 0.0
     dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
-    if dialog:
-        if hasattr(dialog, 'border_logic_hybrid') and dialog.border_logic_hybrid.isChecked():
-            structured_mode = 2.0
-        elif hasattr(dialog, 'border_logic_object') and dialog.border_logic_object.isChecked():
-            structured_mode = 1.0
-    ctx.structured_border_mode = structured_mode
+    ctx.structured_border_mode = dialog.get_border_mode() if dialog and hasattr(dialog, 'get_border_mode') else 0.0
 
     base_point_size = float(getattr(actor, '_naksha_base_point_size', _BASE_POINT_SIZE))
 
@@ -832,14 +826,8 @@ def refresh_section_after_weight_change(
         ctx.load_from_palette(palette, border_percent, base_point_size)
         _attach_view_shader_context(actor, ctx, actor_name)
 
-    structured_mode = 0.0
     dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
-    if dialog:
-        if hasattr(dialog, 'border_logic_hybrid') and dialog.border_logic_hybrid.isChecked():
-            structured_mode = 2.0
-        elif hasattr(dialog, 'border_logic_object') and dialog.border_logic_object.isChecked():
-            structured_mode = 1.0
-    ctx.structured_border_mode = structured_mode
+    ctx.structured_border_mode = dialog.get_border_mode() if dialog and hasattr(dialog, 'get_border_mode') else 0.0
 
     sc = getattr(actor, '_naksha_section_class', None)
     if sc is not None:
@@ -906,14 +894,8 @@ def fast_palette_refresh(
         actor._naksha_shader_ctx   = ctx
         _shader_contexts[UNIFIED_ACTOR_NAME] = ctx
 
-    structured_mode = 0.0
     dialog = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
-    if dialog:
-        if hasattr(dialog, 'border_logic_hybrid') and dialog.border_logic_hybrid.isChecked():
-            structured_mode = 2.0
-        elif hasattr(dialog, 'border_logic_object') and dialog.border_logic_object.isChecked():
-            structured_mode = 1.0
-    ctx.structured_border_mode = structured_mode
+    ctx.structured_border_mode = dialog.get_border_mode() if dialog and hasattr(dialog, 'get_border_mode') else 0.0
 
     gi        = getattr(app, '_main_global_indices', None)
     vis_class = classification[gi] if gi is not None else classification

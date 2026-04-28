@@ -398,26 +398,18 @@ def restore_global_display_settings(app):
 
         saved_structured_border = settings.value("global_structured_border")
         saved_logic_mode = settings.value("global_border_logic_mode")
-        
+
         if saved_logic_mode is not None:
-            mode_val = int(saved_logic_mode)
-            if hasattr(dialog, 'border_logic_hybrid') and hasattr(dialog, 'border_logic_object') and hasattr(dialog, 'border_logic_point'):
-                if mode_val == 2:
-                    dialog.border_logic_hybrid.setChecked(True)
-                elif mode_val == 1:
-                    dialog.border_logic_object.setChecked(True)
-                else:
-                    dialog.border_logic_point.setChecked(True)
-            print(f"✅ Restored GLOBAL border logic mode: {mode_val}")
+            try:
+                dialog._pending_border_logic_mode = int(saved_logic_mode)
+            except (ValueError, TypeError):
+                dialog._pending_border_logic_mode = 0
+            print(f"✅ Stashed border logic mode for deferred apply: {dialog._pending_border_logic_mode}")
             restored_anything = True
         elif saved_structured_border is not None:
             is_structured = str(saved_structured_border).lower() == 'true'
-            if hasattr(dialog, 'border_logic_object') and hasattr(dialog, 'border_logic_point'):
-                if is_structured:
-                    dialog.border_logic_object.setChecked(True)
-                else:
-                    dialog.border_logic_point.setChecked(True)
-            print(f"✅ Restored GLOBAL structured border mode: {is_structured}")
+            dialog._pending_border_logic_mode = 1 if is_structured else 0
+            print(f"✅ Stashed structured border mode for deferred apply: {is_structured}")
             restored_anything = True
 
         if restored_anything:
@@ -1939,6 +1931,16 @@ class DisplayModeDialog(QDialog):
                 _uam_sync(app, slot_idx, border=float_border, render=True)
         except Exception as e:
             print(f"⚠️ _push_border_to_gpu failed (slot={slot_idx}): {e}")
+
+    def get_border_mode(self) -> float:
+        """Single authoritative read of border logic mode for GPU use.
+        Returns 2.0=Hybrid, 1.0=Structured, 0.0=Per-Point.
+        Never read isChecked() directly outside this method."""
+        if getattr(self, 'border_logic_hybrid', None) and self.border_logic_hybrid.isChecked():
+            return 2.0
+        if getattr(self, 'border_logic_object', None) and self.border_logic_object.isChecked():
+            return 1.0
+        return 0.0
 
     def _on_border_mode_changed(self):
         app = self.parent()
