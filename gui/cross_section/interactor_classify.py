@@ -3120,27 +3120,6 @@ class ClassificationInteractor:
         tool = getattr(self.app, "active_classify_tool", None)
         self._gesture_tool = tool
 
-        # ── Display-mode guard ────────────────────────────────────────────────
-        _VIS_ONLY_MODES = {"depth", "rgb", "intensity", "elevation"}
-        _current_display_mode = getattr(self.app, "display_mode", "class")
-        print(f"DEBUG display_mode: '{_current_display_mode}'")  # ← TEMP: remove after confirming
-        if _current_display_mode in _VIS_ONLY_MODES:
-            _mode_label = _current_display_mode.replace("_", " ").title()
-            try:
-                self.app.statusBar().showMessage(
-                    f"⚠️ Classification is disabled in {_mode_label} view. "
-                    f"Switch to Classification view to use tools.",
-                    4000
-                )
-            except Exception as e:
-                print(f"⚠️ statusBar message failed: {e}")
-            try:
-                self.style.OnLeftButtonDown()
-            except Exception:
-                pass
-            return
-        # ── End display-mode guard ────────────────────────────────────────────
-
         if tool in ("above_line", "below_line") and self._is_main_view():
 
             if hasattr(self.app, "statusBar"):
@@ -3162,6 +3141,7 @@ class ClassificationInteractor:
                 return self.style.OnLeftButtonDown()
             except Exception:
                 return
+
         # ✅ IMPORTANT: clear stored preview end when starting a new above/below line
         if tool in ("above_line", "below_line"):
             self._last_line_preview_P2 = None

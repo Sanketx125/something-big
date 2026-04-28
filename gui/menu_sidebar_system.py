@@ -1145,11 +1145,172 @@ class ClassifyRibbon(QWidget):
     """Ribbon for Classify menu"""
     
     classify_tool_selected = Signal(str)
-    
+
+    # Display modes that block classification tools
+    _RESTRICTED_MODES = {"depth", "rgb", "intensity", "elevation"}
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.build_ribbon()
-        
+
+    # ------------------------------------------------------------------
+    # Guard: check current display mode before activating any tool
+    # ------------------------------------------------------------------
+    def _try_activate_tool(self, tool_name: str):
+        """
+        Emit classify_tool_selected only when the active display mode is
+        'class' or 'shaded_class'.  For Depth / RGB / Intensity / Elevation
+        views show a friendly info popup instead.
+        """
+        # Walk up the widget tree to find the main app that owns display_mode
+        app = None
+        widget = self
+        while widget:
+            if hasattr(widget, "display_mode"):
+                app = widget
+                break
+            widget = widget.parent()
+
+        current_mode = getattr(app, "display_mode", "class") if app else "class"
+
+        if current_mode in self._RESTRICTED_MODES:
+            self._show_restriction_popup(current_mode)
+            return
+
+        # Safe to proceed
+        self.classify_tool_selected.emit(tool_name)
+
+    def _show_restriction_popup(self, current_mode: str):
+        """Show a styled, informative warning popup."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+        from PySide6.QtCore import Qt
+
+        mode_label = {
+            "depth":     "Depth",
+            "rgb":       "RGB",
+            "intensity": "Intensity",
+            "elevation": "Elevation",
+        }.get(current_mode, current_mode.capitalize())
+
+        try:
+            from gui.theme_manager import get_dialog_stylesheet, ThemeColors
+            sheet = get_dialog_stylesheet()
+            accent   = ThemeColors.get("accent", "#f59e0b")
+            txt_pri  = ThemeColors.get("text_primary", "#f1f5f9")
+            txt_sec  = ThemeColors.get("text_secondary", "#94a3b8")
+            btn_bg   = ThemeColors.get("bg_button", "#334155")
+        except Exception:
+            sheet = ""
+            accent, txt_pri, txt_sec, btn_bg = "#f59e0b", "#f1f5f9", "#94a3b8", "#334155"
+
+        # ── Dialog ──────────────────────────────────────────────────────
+        dlg = QDialog(self.window(), Qt.Dialog | Qt.FramelessWindowHint)
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setStyleSheet(sheet + f"""
+            QDialog {{
+                border: 2px solid {accent};
+                border-radius: 12px;
+            }}
+        """)
+        dlg.setFixedWidth(380)
+
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Header bar ──────────────────────────────────────────────────
+        header = QLabel(f"  ⚠️  Classification Unavailable")
+        header.setFixedHeight(42)
+        header.setStyleSheet(f"""
+            QLabel {{
+                background-color: {accent};
+                color: #0f172a;
+                font-weight: bold;
+                font-size: 13px;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+                padding-left: 8px;
+            }}
+        """)
+        outer.addWidget(header)
+
+        # ── Body ────────────────────────────────────────────────────────
+        body = QVBoxLayout()
+        body.setContentsMargins(20, 16, 20, 20)
+        body.setSpacing(10)
+
+        icon_lbl = QLabel("🚫")
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setStyleSheet("font-size: 36px; background: transparent;")
+        body.addWidget(icon_lbl)
+
+        msg = QLabel(
+            f"<b>Classification tools are disabled</b><br>"
+            f"while <b>{mode_label}</b> view is active.<br><br>"
+            f"Please switch to <b>Class</b> or <b>Shading</b> view<br>"
+            f"from the <i>View → Display</i> ribbon to use<br>"
+            f"classification tools."
+        )
+        msg.setAlignment(Qt.AlignCenter)
+        msg.setWordWrap(True)
+        msg.setStyleSheet(f"""
+            QLabel {{
+                color: {txt_pri};
+                font-size: 12px;
+                line-height: 1.6;
+                background: transparent;
+            }}
+        """)
+        body.addWidget(msg)
+
+        hint = QLabel("💡 Tip: Use  View › Class  or  View › Shading")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet(f"""
+            QLabel {{
+                color: {txt_sec};
+                font-size: 10px;
+                background: transparent;
+                padding: 4px 8px;
+                border: 1px solid {accent};
+                border-radius: 6px;
+            }}
+        """)
+        body.addWidget(hint)
+
+        # OK button
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        ok_btn = QPushButton("  Got it  ")
+        ok_btn.setFixedHeight(34)
+        ok_btn.setCursor(Qt.PointingHandCursor)
+        ok_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {accent};
+                color: #0f172a;
+                font-weight: bold;
+                font-size: 12px;
+                border-radius: 7px;
+                padding: 4px 20px;
+                border: none;
+            }}
+            QPushButton:hover {{
+                background-color: #fbbf24;
+            }}
+            QPushButton:pressed {{
+                background-color: #d97706;
+            }}
+        """)
+        ok_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(ok_btn)
+        btn_row.addStretch()
+        body.addLayout(btn_row)
+
+        outer.addLayout(body)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
+    # Build the ribbon – all buttons route through _try_activate_tool
+    # ------------------------------------------------------------------
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1157,22 +1318,22 @@ class ClassifyRibbon(QWidget):
         
         # Line Tools
         lines = RibbonSection("Lines", self)
-        lines.add_button("Above", "⬆️", lambda: self.classify_tool_selected.emit("above_line"))
-        lines.add_button("Below", "⬇️", lambda: self.classify_tool_selected.emit("below_line"))
+        lines.add_button("Above", "⬆️", lambda: self._try_activate_tool("above_line"))
+        lines.add_button("Below", "⬇️", lambda: self._try_activate_tool("below_line"))
         layout.addWidget(lines)
         
         # Shape Selection
         shapes = RibbonSection("Shapes", self)
-        shapes.add_button("Rect", "⬜", lambda: self.classify_tool_selected.emit("rectangle"))
-        shapes.add_button("Circle", "⭕", lambda: self.classify_tool_selected.emit("circle"))
-        # shapes.add_button("Polygon", "⬡", lambda: self.classify_tool_selected.emit("polygon"))
-        shapes.add_button("Free", "✏️", lambda: self.classify_tool_selected.emit("freehand"))
+        shapes.add_button("Rect",   "⬜", lambda: self._try_activate_tool("rectangle"))
+        shapes.add_button("Circle", "⭕", lambda: self._try_activate_tool("circle"))
+        # shapes.add_button("Polygon", "⬡", lambda: self._try_activate_tool("polygon"))
+        shapes.add_button("Free",   "✏️", lambda: self._try_activate_tool("freehand"))
         layout.addWidget(shapes)
         
         # Point Tools
         points = RibbonSection("Points", self)
-        points.add_button("Brush", "🖌️", lambda: self.classify_tool_selected.emit("brush"))
-        points.add_button("Point", "📍", lambda: self.classify_tool_selected.emit("point"))
+        points.add_button("Brush", "🖌️", lambda: self._try_activate_tool("brush"))
+        points.add_button("Point", "📍", lambda: self._try_activate_tool("point"))
         layout.addWidget(points)
 
         layout.addStretch()

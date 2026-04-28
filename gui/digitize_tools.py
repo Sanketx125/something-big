@@ -393,21 +393,48 @@ class DigitizeManager:
         return None
 
     def _build_styled_polydata_world(self, world_points, line_style='solid'):
-        """Build world-space polydata with visible line styles using explicit segments."""
+        """
+        Build world-space polydata with visible line styles using explicit segments.
+
+        ✅ ZOOM FIX: Re-centres all geometry around world_points[0] before
+        inserting into vtkPoints.  Large coordinate values (e.g. 456789.123)
+        lose sub-millimetre precision when passed through VTK's float32
+        pipeline stages, causing visible shape distortion at high zoom.
+        Keeping values near zero preserves full float64 precision.
+        The returned poly carries a _world_origin attribute so callers can
+        shift the actor back to the correct world location via SetPosition().
+        """
         poly = vtk.vtkPolyData()
-        pts = vtk.vtkPoints()
+        pts  = vtk.vtkPoints()
         pts.SetDataTypeToDouble()
         lines = vtk.vtkCellArray()
 
+        # Always tag origin so callers never have to guard against missing attr
         if not world_points or len(world_points) < 2:
             poly.SetPoints(pts)
             poly.SetLines(lines)
             poly.Modified()
+            poly._world_origin = np.zeros(3, dtype=np.float64)
             return poly
 
+        # ── Re-centre around the first vertex ──────────────────────────────
+        origin = np.array(
+            [float(world_points[0][0]),
+             float(world_points[0][1]),
+             float(world_points[0][2])],
+            dtype=np.float64,
+        )
+        centred = [
+            np.array([float(p[0]), float(p[1]), float(p[2])], dtype=np.float64) - origin
+            for p in world_points
+        ]
+        # ───────────────────────────────────────────────────────────────────
+
         dash_pattern = self._get_line_dash_pattern(line_style)
+
         if not dash_pattern:
-            for p in world_points:
+            # Solid line — single polyline cell using centred coords
+            for p in centred:
                 pts.InsertNextPoint(float(p[0]), float(p[1]), float(p[2]))
 
             n = pts.GetNumberOfPoints()
@@ -418,24 +445,28 @@ class DigitizeManager:
             poly.SetPoints(pts)
             poly.SetLines(lines)
             poly.Modified()
+            poly._world_origin = origin
             return poly
 
+        # Dashed / dotted — explicit segment pairs using centred coords
         point_idx = 0
-        for seg_idx in range(len(world_points) - 1):
-            p1 = np.array(world_points[seg_idx], dtype=np.float64)
-            p2 = np.array(world_points[seg_idx + 1], dtype=np.float64)
+        for seg_idx in range(len(centred) - 1):
+            p1 = centred[seg_idx]
+            p2 = centred[seg_idx + 1]
 
             world_vec = p2 - p1
             world_len = np.linalg.norm(world_vec)
             if world_len < 1e-9:
                 continue
 
-            screen_len = float(self._world_to_screen_distance(p1, p2))
+            # Screen-length must use original world coords for correct projection
+            screen_len = float(self._world_to_screen_distance(
+                world_points[seg_idx], world_points[seg_idx + 1]))
             if screen_len < 1e-6:
                 screen_len = world_len
 
             direction = world_vec / world_len
-            t_px = 0.0
+            t_px      = 0.0
             pattern_idx = 0
 
             while t_px < screen_len:
@@ -444,29 +475,32 @@ class DigitizeManager:
                 if dash_end_px - t_px <= 1e-6:
                     break
 
-                start_ratio = t_px / screen_len
-                end_ratio = dash_end_px / screen_len
-                dash_start = p1 + direction * (world_len * start_ratio)
-                dash_end = p1 + direction * (world_len * end_ratio)
+                start_ratio = t_px       / screen_len
+                end_ratio   = dash_end_px / screen_len
+                dash_start  = p1 + direction * (world_len * start_ratio)
+                dash_end    = p1 + direction * (world_len * end_ratio)
 
-                pts.InsertNextPoint(float(dash_start[0]), float(dash_start[1]), float(dash_start[2]))
-                start_idx = point_idx
+                pts.InsertNextPoint(
+                    float(dash_start[0]), float(dash_start[1]), float(dash_start[2]))
+                start_idx  = point_idx
                 point_idx += 1
 
-                pts.InsertNextPoint(float(dash_end[0]), float(dash_end[1]), float(dash_end[2]))
-                end_idx = point_idx
+                pts.InsertNextPoint(
+                    float(dash_end[0]), float(dash_end[1]), float(dash_end[2]))
+                end_idx    = point_idx
                 point_idx += 1
 
                 lines.InsertNextCell(2)
                 lines.InsertCellPoint(start_idx)
                 lines.InsertCellPoint(end_idx)
 
-                t_px = dash_end_px + gap_length
+                t_px        = dash_end_px + gap_length
                 pattern_idx = (pattern_idx + 1) % len(dash_pattern)
 
         poly.SetPoints(pts)
         poly.SetLines(lines)
         poly.Modified()
+        poly._world_origin = origin
         return poly
 
     def _apply_world_line_style(self, prop, line_style='solid'):
@@ -481,6 +515,10 @@ class DigitizeManager:
         """
         World-space preview geometry — zooms/pans perfectly with no lag.
         Uses vtkPolyDataMapper (3D) instead of 2D screen-space mapper.
+
+        ✅ ZOOM FIX: _build_styled_polydata_world now re-centres geometry and
+        tags poly._world_origin.  We apply that offset via actor.SetPosition()
+        so the actor lands in the correct world location at any zoom level.
         """
         if not world_points or len(world_points) < 2:
             actor = getattr(self, attr_name, None)
@@ -490,6 +528,9 @@ class DigitizeManager:
             return
 
         poly = self._build_styled_polydata_world(world_points, line_style=line_style)
+
+        # ✅ Retrieve the re-centring origin written by _build_styled_polydata_world
+        origin = getattr(poly, '_world_origin', np.zeros(3, dtype=np.float64))
 
         actor = getattr(self, attr_name, None)
         if actor is not None and actor.IsA("vtkActor2D"):
@@ -509,6 +550,8 @@ class DigitizeManager:
             self._apply_world_line_style(actor.GetProperty(), line_style=line_style)
             actor.PickableOff()
             actor.SetVisibility(1)
+            # ✅ Shift actor back to true world position
+            actor.SetPosition(float(origin[0]), float(origin[1]), float(origin[2]))
             self._add_actor_to_overlay(actor)
             setattr(self, attr_name, actor)
         else:
@@ -519,6 +562,8 @@ class DigitizeManager:
             actor.GetProperty().SetColor(float(color[0]), float(color[1]), float(color[2]))
             actor.GetProperty().SetLineWidth(float(width))
             self._apply_world_line_style(actor.GetProperty(), line_style=line_style)
+            # ✅ Always update position — origin may differ between calls
+            actor.SetPosition(float(origin[0]), float(origin[1]), float(origin[2]))
             actor.SetVisibility(1)
 
     def _restore_shared_interactor_observers(self):
@@ -3183,8 +3228,15 @@ class DigitizeManager:
         end_point     = np.array(self.temp_points[-1])
         snap_target   = None
         snap_distance = float('inf')
-        world_tol     = self._screen_to_world_tolerance(15)
+        # ✅ FIX: Use a FIXED small snap tolerance at finalization only.
+        # _screen_to_world_tolerance(15) at extreme zoom returns a world value
+        # so small that neighbouring legitimate vertices snap to each other,
+        # collapsing a 5-vertex polygon into 2-3 vertices.
+        # We use 8 pixels (half the live-snap radius) so only the cursor
+        # position that is essentially ON an existing vertex gets snapped.
+        world_tol = self._screen_to_world_tolerance(8)
 
+        # ── Snap end point to an existing drawing vertex ─────────────────
         for drawing in self.drawings:
             if 'coords' in drawing:
                 for vertex in drawing["coords"]:
@@ -3196,7 +3248,10 @@ class DigitizeManager:
                         snap_distance = dist
                         snap_target   = vertex_arr
 
-        if len(self.temp_points) > 2:
+        # ── Snap end point to own start (close the polygon) ──────────────
+        # Only attempt if we have at least 3 unique interior vertices so
+        # that closing does not collapse the shape.
+        if len(self.temp_points) >= 4:          # 4 pts = triangle + close
             start_point = np.array(self.temp_points[0])
             dx = float(start_point[0]) - float(end_point[0])
             dy = float(start_point[1]) - float(end_point[1])
@@ -3206,10 +3261,7 @@ class DigitizeManager:
                 snap_distance = dist_to_start
 
         if snap_target is not None:
-            # ✅ FIX: Only REPLACE the last point — never append a duplicate.
-            # The old code appended snap_target a second time which created
-            # an extra hanging vertex every time a line was finalized near
-            # an existing vertex or its own start point.
+            # Only REPLACE the last point — never append
             self.temp_points[-1] = tuple(snap_target)
             if hasattr(self, '_smartline_vertex_markers') and self._smartline_vertex_markers:
                 self._smartline_vertex_markers[-1].SetPosition(snap_target)
@@ -3221,11 +3273,15 @@ class DigitizeManager:
         self._remove_preview_actor_2d('_preview_line_actor')
         self._remove_preview_actor_2d('_continuous_line_actor')
 
-        # ✅ FIX: Deduplicate consecutive identical points before finalizing
-        # This guards against any remaining duplicates from snap or double-click
+        # ✅ FIX: Deduplicate ONLY truly identical consecutive points.
+        # Use exact equality (atol=0) so that vertices which are merely
+        # close but distinct (common at high zoom) are never merged.
+        # This prevents a 5-vertex polygon from becoming 3 vertices.
         clean_points = [self.temp_points[0]]
         for pt in self.temp_points[1:]:
-            if not np.allclose(np.array(pt), np.array(clean_points[-1]), atol=1e-9):
+            prev = np.array(clean_points[-1], dtype=np.float64)
+            curr = np.array(pt,              dtype=np.float64)
+            if not np.array_equal(prev, curr):
                 clean_points.append(pt)
 
         if len(clean_points) < 2:
@@ -3241,7 +3297,8 @@ class DigitizeManager:
         sl_width  = sl_style['width']
         sl_lstyle = sl_style['style']
 
-        actor = self._make_polyline_actor(clean_points, color=sl_color, width=sl_width, line_style=sl_lstyle)
+        actor = self._make_polyline_actor(
+            clean_points, color=sl_color, width=sl_width, line_style=sl_lstyle)
         actor.PickableOn()
         self._add_actor_to_overlay(actor)
 
@@ -3250,12 +3307,13 @@ class DigitizeManager:
             arrow_actor = self._add_arrow_to_line(clean_points)
 
         drawing_entry = {
-            "type": "smartline",
-            "coords": list(clean_points),
-            "actor": actor,
-            "bounds": actor.GetBounds(),
-            "vertex_markers": list(self._smartline_vertex_markers) if hasattr(self, '_smartline_vertex_markers') else [],
-            "arrow_actor": arrow_actor,
+            "type":           "smartline",
+            "coords":         list(clean_points),
+            "actor":          actor,
+            "bounds":         actor.GetBounds(),
+            "vertex_markers": list(self._smartline_vertex_markers)
+                              if hasattr(self, '_smartline_vertex_markers') else [],
+            "arrow_actor":    arrow_actor,
             "original_color": sl_color,
             "original_width": sl_width,
             "original_style": sl_lstyle,
@@ -3499,32 +3557,40 @@ class DigitizeManager:
     def _make_polyline_actor(self, points, color=(1, 0, 0), width=2, line_style='solid'):
         """
         ✅ BULLETPROOF 3D LINE
-        Uses 3D mapping so it pans correctly, but relies on OpenGL LineWidth 
+        Uses 3D mapping so it pans correctly, but relies on OpenGL LineWidth
         so thickness never scales with zoom.
-        """
-        if len(points) < 2: return None
 
-        # 1. Geometry
+        ✅ ZOOM FIX: _build_styled_polydata_world re-centres geometry around
+        points[0] and tags poly._world_origin.  We apply that offset via
+        actor.SetPosition() so the actor lands in the correct world location
+        at any zoom level — no shape distortion at maximum zoom.
+        """
+        if len(points) < 2:
+            return None
+
+        # 1. Geometry — re-centred for float64 precision at high zoom
         polydata = self._build_styled_polydata_world(points, line_style=line_style)
+
+        # ✅ Retrieve the re-centring origin written by _build_styled_polydata_world
+        origin = getattr(polydata, '_world_origin', np.zeros(3, dtype=np.float64))
 
         # 2. 3D Mapper
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(polydata)
-        
         mapper.SetResolveCoincidentTopologyToPolygonOffset()
         mapper.SetResolveCoincidentTopologyPolygonOffsetParameters(-3, -3)
 
         # 3. 3D Actor
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        
         actor.GetProperty().SetColor(color)
         actor.GetProperty().SetLineWidth(width)
-
         self._apply_world_line_style(actor.GetProperty(), line_style=line_style)
 
-        actor._digitize_overlay = True 
-        
+        # ✅ Shift actor back to true world position
+        actor.SetPosition(float(origin[0]), float(origin[1]), float(origin[2]))
+
+        actor._digitize_overlay = True
         return actor
     
     # ============================================================
@@ -4428,29 +4494,39 @@ class DigitizeManager:
         """
         Rebuild the visual actor for a drawing after coordinates changed.
         Preserves color, width, arrows, and markers.
+
+        ✅ ZOOM FIX: _make_polyline_actor now sets actor.SetPosition(origin)
+        for float64 precision at high zoom.  We must call _add_actor_to_overlay
+        BEFORE reading GetBounds() so VTK's pipeline has applied the position
+        transform — otherwise bounds are stale/wrong at maximum zoom.
         """
         try:
             coords = drawing['coords']
             color = drawing.get('original_color', (1, 0, 0))
             width = drawing.get('original_width', 2)
-            
+            line_style = drawing.get('original_style', 'solid')
+
             if 'actor' in drawing and drawing['actor']:
                 self._remove_actor_from_overlay(drawing['actor'])
-            
-            new_actor = self._make_polyline_actor(coords, color=color, width=width)
-            
-            drawing['actor'] = new_actor
-            drawing['bounds'] = new_actor.GetBounds()
-            
+
+            new_actor = self._make_polyline_actor(
+                coords, color=color, width=width, line_style=line_style)
+
+            # ✅ Add to renderer FIRST so VTK pipeline applies SetPosition()
+            # transform before we read GetBounds() — critical at high zoom.
             self._add_actor_to_overlay(new_actor)
-            
+
+            drawing['actor'] = new_actor
+            # ✅ Read bounds AFTER actor is in the renderer
+            drawing['bounds'] = new_actor.GetBounds()
+
             if 'vertex_markers' in drawing and drawing['vertex_markers']:
                 for marker in drawing['vertex_markers']:
                     try:
                         self._remove_actor_from_overlay(marker)
                     except Exception:
                         pass
-                
+
                 drawing['vertex_markers'] = []
                 for i, pt in enumerate(coords):
                     if i == 0:
@@ -4459,11 +4535,11 @@ class DigitizeManager:
                         marker_color = (1, 0, 0)
                     else:
                         marker_color = (1, 1, 0)
-                    
+
                     marker = self._add_endpoint_sphere(pt, color=marker_color, radius=0.05)
                     marker.GetProperty().SetOpacity(0.8)
                     drawing['vertex_markers'].append(marker)
-            
+
             if 'arrow_actor' in drawing and drawing['arrow_actor']:
                 arrows = drawing['arrow_actor']
                 if not isinstance(arrows, list):
@@ -4473,14 +4549,14 @@ class DigitizeManager:
                         self.renderer.RemoveActor2D(arr)
                     except Exception:
                         pass
-                
+
                 if getattr(self, f"{drawing['type']}_arrow_mode", False):
                     drawing['arrow_actor'] = self._add_arrow_to_line(coords)
                 else:
                     drawing['arrow_actor'] = None
-            
+
             self.renderer.Modified()
-            
+
         except Exception as e:
             print(f"⚠️ Failed to rebuild drawing actor: {e}")
             import traceback
@@ -4693,19 +4769,21 @@ class DigitizeManager:
                 
                 if drawing_type in ("smartline", "line", "freehand", "rectangle", "polygon", "circle"):
                     actor = self._make_polyline_actor(coords)
-                    
+
                     if "color" in d:
                         actor.GetProperty().SetColor(*d["color"])
                     if "width" in d:
                         actor.GetProperty().SetLineWidth(d["width"])
-                    
+
+                    # ✅ ZOOM FIX: Add to renderer BEFORE reading GetBounds()
+                    # so VTK pipeline applies actor.SetPosition(origin) transform.
                     self._add_actor_to_overlay(actor)
-                    
+
                     drawing_entry = {
                         "type": drawing_type,
                         "coords": coords,
                         "actor": actor,
-                        "bounds": actor.GetBounds()
+                        "bounds": actor.GetBounds()  # correct now — actor is in renderer
                     }
                     
                     if "color" in d:

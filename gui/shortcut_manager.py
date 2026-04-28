@@ -2436,6 +2436,27 @@ class ShortcutManager(QWidget):
                 self._open_draw_settings_for_row(row)
             return
 
+        # ── Classification tool (AboveLine, BelowLine, Brush, Freehand, etc.) ──
+        # When the user switches between two classification tools, the existing
+        # from/to class configuration must be preserved.  Only reset to
+        # "Any → Any" when the previous cell held a preset (DisplayMode /
+        # ShadingMode / DrawSettings) or an N/A entry — i.e. when the stored
+        # JSON does NOT contain the "from" / "to" keys that encode_classes writes.
+        if not self._is_loading_shortcuts:
+            existing_cell = self.table.item(row, self.COL_CLASSES)
+            if existing_cell is not None:
+                raw = existing_cell.data(Qt.UserRole)
+                if raw is not None:
+                    try:
+                        import json as _json
+                        data = _json.loads(raw) if isinstance(raw, str) else raw
+                        if isinstance(data, dict) and "from" in data and "to" in data:
+                            # Cell already holds class data from a classification
+                            # tool — keep it exactly as-is, nothing to do.
+                            return
+                    except Exception:
+                        pass  # malformed data → fall through and reset below
+
         item = QTableWidgetItem("Any → Any")
         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
         item.setData(Qt.UserRole, encode_classes(None, None))
