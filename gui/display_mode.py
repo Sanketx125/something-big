@@ -652,15 +652,15 @@ class DisplayModeDialog(QDialog):
         self.border_action_group.addAction(self.border_logic_point)
         self.border_action_group.addAction(self.border_logic_object)
         self.border_action_group.addAction(self.border_logic_hybrid)
-        self.border_action_group.setExclusive(True)
+        self.border_action_group.setExclusive(False)
         
         self.border_setting_menu.addAction(self.border_logic_point)
         self.border_setting_menu.addAction(self.border_logic_object)
         self.border_setting_menu.addAction(self.border_logic_hybrid)
         
-        self.border_logic_point.triggered.connect(self._on_border_mode_changed)
-        self.border_logic_object.triggered.connect(self._on_border_mode_changed)
-        self.border_logic_hybrid.triggered.connect(self._on_border_mode_changed)
+        self.border_logic_point.triggered.connect(lambda _=False: self._select_border_mode(0))
+        self.border_logic_object.triggered.connect(lambda _=False: self._select_border_mode(1))
+        self.border_logic_hybrid.triggered.connect(lambda _=False: self._select_border_mode(2))
         
         # Show menu on click to avoid the auto-indicator arrow from setMenu
         self.border_setting_btn.clicked.connect(
@@ -904,12 +904,8 @@ class DisplayModeDialog(QDialog):
         if getattr(self, '_pending_border_logic_mode', None) is not None:
             mode_val = self._pending_border_logic_mode
             try:
-                # Disable exclusivity briefly to avoid Qt state machine ordering issues
-                self.border_action_group.setExclusive(False)
-                self.border_logic_point.setChecked(mode_val == 0)
-                self.border_logic_object.setChecked(mode_val == 1)
-                self.border_logic_hybrid.setChecked(mode_val == 2)
-                self.border_action_group.setExclusive(True)
+                # push_gpu=False: GPU not ready yet during __init__
+                self._select_border_mode(mode_val, push_gpu=False)
                 print(f"✅ Restored border logic mode from QSettings: {mode_val}")
             except Exception as _e:
                 print(f"⚠️ Could not restore border logic mode: {_e}")
@@ -947,6 +943,26 @@ class DisplayModeDialog(QDialog):
                 slot_pal.setdefault(code, {}).update({'show': show, 'weight': weight})
             except Exception:
                 continue
+
+    def _select_border_mode(self, mode_val: int, push_gpu: bool = True) -> None:
+        """
+        Enforce exactly ONE border action checked. Never rely on QActionGroup
+        internal exclusivity — toggling setExclusive() corrupts its 'current'
+        pointer causing two items to appear checked simultaneously on next click.
+        """
+        actions = [self.border_logic_point, self.border_logic_object, self.border_logic_hybrid]
+        # Block signals so setChecked() calls don't trigger _select_border_mode recursively
+        for a in actions:
+            a.blockSignals(True)
+        try:
+            self.border_logic_point.setChecked(mode_val == 0)
+            self.border_logic_object.setChecked(mode_val == 1)
+            self.border_logic_hybrid.setChecked(mode_val == 2)
+        finally:
+            for a in actions:
+                a.blockSignals(False)
+        if push_gpu:
+            self._on_border_mode_changed()
 
     def _load_slot_state(self, slot_idx: int) -> None:
         """

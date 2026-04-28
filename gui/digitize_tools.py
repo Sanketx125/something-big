@@ -1240,7 +1240,10 @@ class DigitizeManager:
         x, y = self.interactor.GetEventPosition()
         self.picker.Pick(x, y, 0, self.renderer)
         pos = np.array(self.picker.GetPickPosition())
-        if self.active_tool and self.snap_enabled:  # ✅ Only snap if enabled
+        # ✅ FIX: Always snap for line and smartline tools regardless of snap_enabled flag
+        if self.active_tool in ("line", "smartline"):
+            pos = self._snap_point(pos)
+        elif self.active_tool and self.snap_enabled:
             pos = self._snap_point(pos)
         return pos
     
@@ -1252,31 +1255,92 @@ class DigitizeManager:
         pos = np.array(self.picker.GetPickPosition())
         return pos  # No snapping applied
 
-    def _snap_point(self, pos, tol=0.5):
+    # CURRENT: (no such method — fixed world-space tolerance everywhere)
+
+    # AFTER: (new method — converts screen pixels → world units at current zoom)
+    def _screen_to_world_tolerance(self, screen_pixels=15):
+        """
+        Convert a fixed screen-pixel snap radius into world-space units
+        at the current camera zoom level.  This makes snap feel identical
+        regardless of how far in or out the user is zoomed — exactly like
+        MicroStation's AccuSnap.
+        """
+        try:
+            camera = self.renderer.GetActiveCamera()
+            win_size = self.interactor.GetRenderWindow().GetSize()
+            win_h = win_size[1] if win_size[1] > 0 else 1
+
+            if camera.GetParallelProjection():
+                # Orthographic: world_per_pixel is trivially derived from parallel scale
+                world_per_px = (2.0 * camera.GetParallelScale()) / win_h
+            else:
+                # Perspective
+                focal   = np.array(camera.GetFocalPoint())
+                cam_pos = np.array(camera.GetPosition())
+                dist    = np.linalg.norm(cam_pos - focal)
+                fov_rad = np.radians(camera.GetViewAngle())
+                world_per_px = (2.0 * dist * np.tan(fov_rad / 2.0)) / win_h
+
+            return max(world_per_px * screen_pixels, 1e-6)
+        except Exception:
+            return 0.5          # safe fallback
+
+    def _snap_point(self, pos, screen_tol_px=15):
+        """
+        Snap to the nearest existing vertex within `screen_tol_px` screen pixels.
+        The tolerance is converted to world units per frame so it stays constant
+        at every zoom level — identical to MicroStation AccuSnap behaviour.
+        """
+        world_tol = self._screen_to_world_tolerance(screen_tol_px)
+
         snap_target = None
-        best = tol
+        best_world  = world_tol
+
         for d in self.drawings:
             for c in d["coords"]:
-                dist = np.linalg.norm(np.array(c) - pos)
-                if dist < best:
-                    best = dist
+                # Use 2-D XY distance for plan-view snapping (ignore Z drift in point cloud)
+                dx = float(c[0]) - float(pos[0])
+                dy = float(c[1]) - float(pos[1])
+                dist = np.sqrt(dx * dx + dy * dy)
+                if dist < best_world:
+                    best_world  = dist
                     snap_target = c
 
-        if not hasattr(self, "_snap_marker"):
+        # ── Also snap to the current in-progress line's own vertices ─────────
+        for c in self.temp_points:
+            dx = float(c[0]) - float(pos[0])
+            dy = float(c[1]) - float(pos[1])
+            dist = np.sqrt(dx * dx + dy * dy)
+            if dist < best_world:
+                best_world  = dist
+                snap_target = c
+
+        # ── Snap marker (green sphere, scales with zoom like a fixed-pixel dot) ──
+        if not hasattr(self, "_snap_marker") or self._snap_marker is None:
             sphere = vtk.vtkSphereSource()
-            sphere.SetRadius(0.15)
+            sphere.SetRadius(1.0)           # visual size — will be hidden most of the time
+            sphere.SetThetaResolution(16)
+            sphere.SetPhiResolution(16)
             mapper = vtk.vtkPolyDataMapper()
             mapper.SetInputConnection(sphere.GetOutputPort())
             actor = vtk.vtkActor()
             actor.SetMapper(mapper)
-            actor.GetProperty().SetColor(0, 1, 0)
-            actor.GetProperty().SetOpacity(0.8)
+            actor.GetProperty().SetColor(0.0, 1.0, 0.0)   # bright green
+            actor.GetProperty().SetOpacity(0.9)
             actor.SetVisibility(False)
+            actor.PickableOff()
             self._snap_marker = actor
             self._add_actor_to_overlay(actor)
 
         if snap_target is not None:
-            self._snap_marker.SetPosition(*snap_target)
+            # Scale the marker so it is always ~10 px regardless of zoom
+            marker_world_r = self._screen_to_world_tolerance(6)
+            self._snap_marker.SetPosition(float(snap_target[0]),
+                                        float(snap_target[1]),
+                                        float(snap_target[2]))
+            # vtkSphereSource radius can't be changed on-the-fly without rebuilding,
+            # so scale the actor instead
+            self._snap_marker.SetScale(marker_world_r, marker_world_r, marker_world_r)
             self._snap_marker.SetVisibility(True)
         else:
             self._snap_marker.SetVisibility(False)
@@ -1379,17 +1443,19 @@ class DigitizeManager:
             self._push_temp_vertex_history()
 
             if len(self.temp_points) == 0:
-                snap_target = None
+                snap_target   = None
                 snap_distance = float('inf')
-                snap_tolerance = 0.95
+                world_tol     = self._screen_to_world_tolerance(15)   # ← zoom-aware pixels→world
                 for drawing in self.drawings:
                     if 'coords' in drawing:
                         for vertex in drawing['coords']:
                             vertex_arr = np.array(vertex)
-                            dist = np.linalg.norm(pos - vertex_arr)
-                            if dist < snap_tolerance and dist < snap_distance:
+                            dx = float(vertex_arr[0]) - float(pos[0])
+                            dy = float(vertex_arr[1]) - float(pos[1])
+                            dist = np.sqrt(dx * dx + dy * dy)
+                            if dist < world_tol and dist < snap_distance:
                                 snap_distance = dist
-                                snap_target = vertex_arr
+                                snap_target   = vertex_arr
                 if snap_target is not None:
                     pos = snap_target
 
@@ -2033,7 +2099,11 @@ class DigitizeManager:
             mouse_x, mouse_y = self.interactor.GetEventPosition()
             sl_style = self._get_draw_style('smartline')
 
-            # Continuous line through all placed points
+            # ── Live snap-marker update so user sees green dot on candidate vertices ──
+            if self.snap_enabled:
+                raw_pos = self._get_mouse_world_no_snap()
+                self._snap_point(raw_pos)          # updates/hides marker as side-effect
+
             if len(self.temp_points) >= 2:
                 self._update_continuous_preview(
                     color=sl_style['color'],
@@ -2054,13 +2124,16 @@ class DigitizeManager:
             mouse_x, mouse_y = self.interactor.GetEventPosition()
             ln_style = self._get_draw_style('line')
 
+            # ✅ FIX: Always update snap marker for line tool (not just when snap_enabled)
+            raw_pos = self._get_mouse_world_no_snap()
+            self._snap_point(raw_pos)   # updates green snap marker as side-effect
+
             if len(self.temp_points) >= 2:
                 self._update_continuous_preview(
                     color=ln_style['color'],
                     width=ln_style['width'],
                     line_style=ln_style['style'],
                 )
-
             self._update_cursor_preview(
                 color=ln_style['color'],
                 width=ln_style['width'],
@@ -3107,57 +3180,78 @@ class DigitizeManager:
         if len(self.temp_points) < 2:
             return
 
-        end_point = np.array(self.temp_points[-1])
-        snap_target = None
+        end_point     = np.array(self.temp_points[-1])
+        snap_target   = None
         snap_distance = float('inf')
-        snap_tolerance = 0.99
+        world_tol     = self._screen_to_world_tolerance(15)
 
         for drawing in self.drawings:
             if 'coords' in drawing:
                 for vertex in drawing["coords"]:
                     vertex_arr = np.array(vertex)
-                    dist = np.linalg.norm(end_point - vertex_arr)
-                    if dist < snap_tolerance and dist < snap_distance:
+                    dx = float(vertex_arr[0]) - float(end_point[0])
+                    dy = float(vertex_arr[1]) - float(end_point[1])
+                    dist = np.sqrt(dx * dx + dy * dy)
+                    if dist < world_tol and dist < snap_distance:
                         snap_distance = dist
-                        snap_target = vertex_arr
+                        snap_target   = vertex_arr
 
         if len(self.temp_points) > 2:
             start_point = np.array(self.temp_points[0])
-            dist_to_start = np.linalg.norm(end_point - start_point)
-            if dist_to_start < snap_tolerance and dist_to_start < snap_distance:
-                snap_target = start_point
+            dx = float(start_point[0]) - float(end_point[0])
+            dy = float(start_point[1]) - float(end_point[1])
+            dist_to_start = np.sqrt(dx * dx + dy * dy)
+            if dist_to_start < world_tol and dist_to_start < snap_distance:
+                snap_target   = start_point
                 snap_distance = dist_to_start
 
         if snap_target is not None:
+            # ✅ FIX: Only REPLACE the last point — never append a duplicate.
+            # The old code appended snap_target a second time which created
+            # an extra hanging vertex every time a line was finalized near
+            # an existing vertex or its own start point.
             self.temp_points[-1] = tuple(snap_target)
             if hasattr(self, '_smartline_vertex_markers') and self._smartline_vertex_markers:
                 self._smartline_vertex_markers[-1].SetPosition(snap_target)
-            if len(self.temp_points) < 2 or not np.allclose(snap_target, self.temp_points[-2]):
-                self.temp_points.append(tuple(snap_target))
 
         if hasattr(self, '_smartline_vertex_markers') and self._smartline_vertex_markers:
             self._smartline_vertex_markers[-1].GetProperty().SetColor(1, 0, 0)
 
-        # ✅ FIX: Remove 2D preview actors
+        # Remove preview actors
         self._remove_preview_actor_2d('_preview_line_actor')
         self._remove_preview_actor_2d('_continuous_line_actor')
 
-        sl_style = self._get_draw_style('smartline')
-        sl_color = sl_style['color']
-        sl_width = sl_style['width']
+        # ✅ FIX: Deduplicate consecutive identical points before finalizing
+        # This guards against any remaining duplicates from snap or double-click
+        clean_points = [self.temp_points[0]]
+        for pt in self.temp_points[1:]:
+            if not np.allclose(np.array(pt), np.array(clean_points[-1]), atol=1e-9):
+                clean_points.append(pt)
+
+        if len(clean_points) < 2:
+            print("⚠️ SmartLine cancelled — not enough unique points after dedup")
+            self.temp_points = []
+            self._smartline_vertex_markers = []
+            self._clear_temp_vertex_history()
+            self.app.vtk_widget.render()
+            return
+
+        sl_style  = self._get_draw_style('smartline')
+        sl_color  = sl_style['color']
+        sl_width  = sl_style['width']
         sl_lstyle = sl_style['style']
 
-        actor = self._make_polyline_actor(self.temp_points, color=sl_color, width=sl_width, line_style=sl_lstyle)
+        actor = self._make_polyline_actor(clean_points, color=sl_color, width=sl_width, line_style=sl_lstyle)
         actor.PickableOn()
         self._add_actor_to_overlay(actor)
 
         arrow_actor = None
         if getattr(self, 'smartline_arrow_mode', False):
-            arrow_actor = self._add_arrow_to_line(self.temp_points)
+            arrow_actor = self._add_arrow_to_line(clean_points)
 
         drawing_entry = {
             "type": "smartline",
-            "coords": list(self.temp_points),
+            "coords": list(clean_points),
             "actor": actor,
             "bounds": actor.GetBounds(),
             "vertex_markers": list(self._smartline_vertex_markers) if hasattr(self, '_smartline_vertex_markers') else [],
@@ -3168,7 +3262,7 @@ class DigitizeManager:
         }
         self.drawings.append(drawing_entry)
 
-        print(f"✅ SmartLine finalized: {len(self.temp_points)} vertices")
+        print(f"✅ SmartLine finalized: {len(clean_points)} vertices")
         self.temp_points = []
         self._smartline_vertex_markers = []
         self._clear_temp_vertex_history()
