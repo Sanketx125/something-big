@@ -2897,20 +2897,12 @@ class ClassificationInteractor:
                                 # If we have a mask of changed points in this view, poke them directly.
                                 if self._brush_section_local_mask is not None and self._brush_section_local_mask.any():
                                     v_idx = self._get_view_index_from_interactor()
-                                    
-                                    # ✅ Support Cut Section real-time poke
-                                    if v_idx is None and is_cut_section:
-                                        sw = self.app.cut_section_controller.cut_vtk
-                                        actor = sw.actors.get("_cut_section_unified")
-                                    elif v_idx is not None:
+                                    if v_idx is not None:
                                         actor_name = f"_section_{v_idx}_unified"
                                         sw = self.app.section_vtks.get(v_idx)
                                         actor = sw.actors.get(actor_name) if sw else None
-                                    else:
-                                        actor = None
-                                        sw = None
-
-                                    if actor and hasattr(actor, '_naksha_rgb_ptr'):
+                                        
+                                        if actor and hasattr(actor, '_naksha_rgb_ptr'):
                                             # Only poke if it's been long enough since last poke
                                             now = time.time()
                                             if (now - getattr(self, '_last_sec_poke', 0)) > 0.033:
@@ -3128,6 +3120,27 @@ class ClassificationInteractor:
         tool = getattr(self.app, "active_classify_tool", None)
         self._gesture_tool = tool
 
+        # ── Display-mode guard ────────────────────────────────────────────────
+        _VIS_ONLY_MODES = {"depth", "rgb", "intensity", "elevation"}
+        _current_display_mode = getattr(self.app, "display_mode", "class")
+        print(f"DEBUG display_mode: '{_current_display_mode}'")  # ← TEMP: remove after confirming
+        if _current_display_mode in _VIS_ONLY_MODES:
+            _mode_label = _current_display_mode.replace("_", " ").title()
+            try:
+                self.app.statusBar().showMessage(
+                    f"⚠️ Classification is disabled in {_mode_label} view. "
+                    f"Switch to Classification view to use tools.",
+                    4000
+                )
+            except Exception as e:
+                print(f"⚠️ statusBar message failed: {e}")
+            try:
+                self.style.OnLeftButtonDown()
+            except Exception:
+                pass
+            return
+        # ── End display-mode guard ────────────────────────────────────────────
+
         if tool in ("above_line", "below_line") and self._is_main_view():
 
             if hasattr(self.app, "statusBar"):
@@ -3149,7 +3162,6 @@ class ClassificationInteractor:
                 return self.style.OnLeftButtonDown()
             except Exception:
                 return
-
         # ✅ IMPORTANT: clear stored preview end when starting a new above/below line
         if tool in ("above_line", "below_line"):
             self._last_line_preview_P2 = None
@@ -3281,15 +3293,8 @@ class ClassificationInteractor:
                             idxs = np.asarray(cut_idx, dtype=np.int64)
                             pts2d = _project_to_cut_view(self.app, cut_pts)
                             self._brush_section_indices   = idxs
-                            self._brush_section_pts2d     = np.asarray(pts2d, dtype=np.float64)
+                            self._brush_section_pts2d     = pts2d
                             self._brush_section_local_mask = np.zeros(len(idxs), dtype=bool)
-                            
-                            # ✅ GRID INIT (Cut Section)
-                            self._brush_section_grid = SpatialGridIndex(self._brush_section_pts2d)
-                            # Cut section is typically Slot 5 in this app
-                            self._brush_visible_classes = self._get_visible_classes_for_slot(5)
-                            self._brush_indices_arrays = []
-                            self._brush_old_classes_arrays = []
                 else:
                     # Cross-section brush init.
                     # CRITICAL: idxs and pts2d MUST be in the same order.

@@ -2815,8 +2815,11 @@ class ByClassDialog(QDialog):
                     print(f"   ✅ Main view refreshed (class mode)")
                     
                 else:
-                    # Other modes (RGB, intensity, etc.)
-                    print(f"   📊 {display_mode} mode — undo refresh already handled")
+                    # For depth/rgb/intensity: same policy as perform_conversion.
+                    # Do NOT call update_pointcloud — it would repaint with raw
+                    # scalar arrays and corrupt classification colors or data.
+                    print(f"   📊 {display_mode} mode — undo stored; "
+                          f"skipping main view repaint")
 
                 # Refresh cross-sections (safety net — undo_classification also does this)
                 if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
@@ -3261,11 +3264,14 @@ class ByClassDialog(QDialog):
                 print(f"   ✅ Class mode refreshed")
                 
             else:
-                # Other display modes (RGB, intensity, elevation, etc.)
-                print(f"   🌈 Refreshing {display_mode.upper()} mode...")
-                from gui.pointcloud_display import update_pointcloud
-                update_pointcloud(self.app, display_mode)
-                print(f"   ✅ {display_mode} mode refreshed")
+                # For depth/rgb/intensity: do NOT re-render main view.
+                # update_pointcloud() in these modes repaints ALL points
+                # with scalar/raw-color arrays — wiping classification colors
+                # (depth) or corrupting the raw data array in-place (rgb/brush).
+                # The cross-section views carry the classification result; the
+                # main view stays in its current non-class display as-is.
+                print(f"   ℹ️ {display_mode} mode — skipping main view repaint "
+                      f"(classification stored; visible in section views)")
 
             # Refresh cross-sections if needed
             if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
