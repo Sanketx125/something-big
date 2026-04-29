@@ -604,6 +604,12 @@ def _queue_deferred_rebuild(app, reason="", newly_visible_indices=None):
                  getattr(app.interactor, 'is_dragging', False))):
             _queue_deferred_rebuild(app, _rebuild_reason, di)
             return
+
+        # ── Pan guard: if main view is panning, defer 200ms and retry ──
+        if getattr(app, '_is_panning_main_view', False):
+            print("⏸️  Shading deferred rebuild waiting — main view pan in progress")
+            _queue_deferred_rebuild(app, _rebuild_reason, di)
+            return
         
         cache = get_cache()
         if cache.faces is None or len(cache.faces) == 0:
@@ -670,10 +676,14 @@ def _queue_incremental_patch(app, sci):
         except Exception:
             pass
         _rebuild_timer = None
+        
     def do_patch():
         global _rebuild_timer
         _rebuild_timer = None
         if getattr(app, 'is_dragging', False) or (hasattr(app, 'interactor') and getattr(app.interactor, 'is_dragging', False)):
+            _queue_incremental_patch(app, sci); return
+        # ── Pan guard ──
+        if getattr(app, '_is_panning_main_view', False):
             _queue_incremental_patch(app, sci); return
         _rebuild_single_class(app, sci)
     _rebuild_timer = QTimer(); _rebuild_timer.setSingleShot(True)
