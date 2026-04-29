@@ -1052,30 +1052,28 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
     va = np.array(sorted(vc), dtype=np.int32)
 
     # ── CACHE MISMATCH GUARD ────────────────────────────────────────────
-    # If _shading_visibility_override changed to a single class but the
-    # current cached geometry was built for a different visible-class set
-    # (e.g. all-open cross-section), the cache holds millions of faces for
-    # the wrong geometry.  Rebuild once so subsequent strokes are fast.
     cached_vc_hash = getattr(cache, 'visible_classes_hash', None)
     expected_hash  = cache.get_visible_hash(vc)
     if cached_vc_hash != expected_hash:
-        print(f"   ⚡ Visibility override changed — rebuilding geometry for {sorted(vc)}")
-        # Build and CACHE under the correct key so subsequent strokes hit the fast path.
+        print(f"   ⚡ vc mismatch (cached={cached_vc_hash} want={expected_hash}) — checking store")
         xyz_raw = app.data.get("xyz")
         new_cache_key = _build_cache_key(xyz_raw, vc)
+        
+        # Check store by key (hash-independent — key uses vc tuple directly)
         existing = _cache_store.get(new_cache_key)
-        if existing and existing.is_geometry_valid(xyz_raw, vc):
-            # We already have a valid cache for this vc — just restore it
+        if existing is not None and existing.faces is not None and len(existing.faces) > 0 \
+                and existing.visible_classes_hash == expected_hash:
+            # Valid cached geometry for this vc — activate and use it
             global _active_cache_key
             _active_cache_key = new_cache_key
             _cache_store.move_to_end(new_cache_key)
-            _refresh_from_cache(app, existing,
-                                 getattr(app, 'last_shade_azimuth', 45.),
-                                 getattr(app, 'last_shade_angle', 45.),
-                                 getattr(app, 'shade_ambient', 0.25))
+            # Now the active cache matches vc — fall through to fast color update below
+            cache = existing
         else:
+            # Genuinely new geometry needed — build once
+            print(f"   🔺 Building geometry for {sorted(vc)}")
             update_shaded_class(app, force_rebuild=True)
-        return True
+            return True
 
     isc = getattr(cache, 'n_visible_classes', 0) == 1
     sci = getattr(cache, 'single_class_id', None)
