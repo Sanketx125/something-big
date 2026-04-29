@@ -1,6 +1,7 @@
 
 import numpy as np
 import pyvista as pv
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QDoubleSpinBox, QHBoxLayout, QPushButton,
     QProgressDialog, QApplication
@@ -539,39 +540,107 @@ def _restore_camera(app, c):
             cam.SetParallelProjection(c['parallel']); cam.SetParallelScale(c['scale'])
         except Exception:
             pass
+
 def _queue_deferred_rebuild(app, reason="", newly_visible_indices=None):
+    """
+    Debounced deferred mesh rebuild.
+    
+    KEY FIX: Accumulates `newly_visible_indices` across calls instead of
+    overwriting. If user classifies polygon A, then polygon B before the
+    timer fires, both A's and B's indices are processed in a single rebuild.
+    """
     global _rebuild_timer, _rebuild_reason, _rebuild_changed_indices
-    _rebuild_reason = reason; _rebuild_changed_indices = newly_visible_indices
+    _rebuild_reason = reason
+    
+    # ── ACCUMULATE indices instead of overwriting ──
+    if newly_visible_indices is not None and len(newly_visible_indices) > 0:
+        new_arr = np.asarray(newly_visible_indices, dtype=np.int64)
+        if _rebuild_changed_indices is None or len(_rebuild_changed_indices) == 0:
+            _rebuild_changed_indices = new_arr
+        else:
+            _rebuild_changed_indices = np.unique(
+                np.concatenate([np.asarray(_rebuild_changed_indices,
+                                           dtype=np.int64),
+                                new_arr]))
+    
+    # Cancel any pending timer (debounce)
     if _rebuild_timer is not None:
-        try: _rebuild_timer.stop(); _rebuild_timer.deleteLater()
+        try:
+            _rebuild_timer.stop()
+            _rebuild_timer.deleteLater()
         except Exception:
             pass
         _rebuild_timer = None
+    
     def do_rebuild():
         global _rebuild_timer, _rebuild_changed_indices
-        _rebuild_timer = None; di = _rebuild_changed_indices; _rebuild_changed_indices = None
-        if getattr(app, 'is_dragging', False) or (hasattr(app, 'interactor') and getattr(app.interactor, 'is_dragging', False)):
-            _queue_deferred_rebuild(app, _rebuild_reason, di); return
-        cache = get_cache(); vc = _get_shading_visibility(app)
-        cls = app.data.get("classification").astype(np.int32); xyz = app.data.get("xyz")
-        cm = cls[cache.unique_indices]; va = np.array(sorted(vc), dtype=np.int32)
-        nh = ~np.isin(cm, va)
-        if np.any(nh):
-            if not _incremental_visibility_patch(app, cache.unique_indices[nh], vc):
-                clear_shading_cache("patch failed"); update_shaded_class(app, force_rebuild=True)
+        _rebuild_timer = None
+        di = _rebuild_changed_indices
+        _rebuild_changed_indices = None
+        
+        # If user is still dragging, requeue
+        if (getattr(app, 'is_dragging', False) or
+                (hasattr(app, 'interactor') and
+                 getattr(app.interactor, 'is_dragging', False))):
+            _queue_deferred_rebuild(app, _rebuild_reason, di)
             return
+        
+        cache = get_cache()
+        if cache.faces is None or len(cache.faces) == 0:
+            return
+        
+        vc = _get_shading_visibility(app)
+        cls = app.data.get("classification").astype(np.int32)
+        xyz = app.data.get("xyz")
+        if xyz is None or cls is None:
+            return
+        cm = cls[cache.unique_indices]
+        va = np.array(sorted(vc), dtype=np.int32) if vc else np.array([], dtype=np.int32)
+        nh = ~np.isin(cm, va) if len(va) > 0 else np.ones(len(cm), dtype=bool)
+        
+        import time
+        t0 = time.time()
+        
+        # ── Step 1: prune hidden vertices (if any) ──
+        had_hidden = bool(np.any(nh))
+        if had_hidden:
+            n_hidden = int(np.sum(nh))
+            print(f"   🔁 Deferred rebuild: pruning {n_hidden:,} hidden vertices")
+            if not _incremental_visibility_patch(app, cache.unique_indices[nh], vc):
+                clear_shading_cache("patch failed")
+                update_shaded_class(app, force_rebuild=True)
+                return
+        
+        # ── Step 2: add newly visible vertices (if any) ──
+        # IMPORTANT: We process this even if had_hidden was True (old code
+        # returned early after hide). Now both are handled per call.
         if di is not None and len(di) > 0:
             g2u = cache.build_global_to_unique(len(xyz))
-            sv = np.isin(cls[di], va); vod = di[sv]
+            sv = np.isin(cls[di], va) if len(va) > 0 else np.zeros(len(di), dtype=bool)
+            vod = di[sv]
             mg = vod[g2u[vod] < 0] if len(vod) > 0 else np.array([], dtype=np.intp)
             if len(mg) > 0:
+                print(f"   🔁 Deferred rebuild: adding {len(mg):,} newly visible vertices")
                 if not _fast_incremental_add_points(app, mg):
-                    cm2 = np.zeros(len(xyz), dtype=bool); cm2[mg] = True
+                    cm2 = np.zeros(len(xyz), dtype=bool)
+                    cm2[mg] = True
                     if not _multi_class_region_undo_patch(app, cm2, vc):
-                        clear_shading_cache("region failed"); update_shaded_class(app, force_rebuild=True)
-    dl = 150 if (newly_visible_indices is not None and len(newly_visible_indices) > 0) else 1000
-    _rebuild_timer = QTimer(); _rebuild_timer.setSingleShot(True)
-    _rebuild_timer.timeout.connect(do_rebuild); _rebuild_timer.start(dl)
+                        clear_shading_cache("region failed")
+                        update_shaded_class(app, force_rebuild=True)
+                        return
+        
+        print(f"   ✅ Deferred rebuild complete [{(time.time()-t0)*1000:.0f}ms]")
+    
+    # Shorter delay when we have specific points to add (responsive feel),
+    # longer when it's just visibility cleanup.
+    has_points = (_rebuild_changed_indices is not None and
+                  len(_rebuild_changed_indices) > 0)
+    delay_ms = 300 if has_points else 600
+    
+    _rebuild_timer = QTimer()
+    _rebuild_timer.setSingleShot(True)
+    _rebuild_timer.timeout.connect(do_rebuild)
+    _rebuild_timer.start(delay_ms)
 
 def _queue_incremental_patch(app, sci):
     global _rebuild_timer, _rebuild_reason
@@ -1076,12 +1145,21 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
 # ALL REMAINING FUNCTIONS — identical behavior, compressed
 # ═══════════════════════════════════════════════════════════════
 def refresh_shaded_after_classification_fast(app, changed_mask=None):
-    """Optimized classification update for single-class shading."""
+    """
+    Optimized classification update for shaded view.
+    
+    Strategy:
+      1. INSTANT: Update cell colors of existing mesh in-place (~10-30ms).
+      2. DEFERRED: Queue geometry rebuild (only fires after user pauses ~300ms).
+    
+    This decouples user-facing latency from VTK GPU upload cost.
+    """
     cache = get_cache()
     if cache.faces is None or len(cache.faces) == 0:
-        update_shaded_class(app, force_rebuild=True); return True
+        update_shaded_class(app, force_rebuild=True)
+        return True
     
-    # Hide point cloud actors
+    # Hide point cloud actors (kept from old code)
     if hasattr(app, 'vtk_widget'):
         for name in list(app.vtk_widget.actors.keys()):
             ns = str(name).lower()
@@ -1091,90 +1169,91 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
     isc = getattr(cache, 'n_visible_classes', 0) == 1
     sci = getattr(cache, 'single_class_id', None)
     vc = _get_shading_visibility(app)
-    va = np.array(sorted(vc), dtype=np.int32)
+    va = np.array(sorted(vc), dtype=np.int32) if vc else np.array([], dtype=np.int32)
     
+    # No mask → just refresh colors based on current state
     if changed_mask is None or not np.any(changed_mask):
         if not isc or sci is None:
-            return _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=vc)
+            return _update_colors_gpu_fast(app, cache, changed_mask=None,
+                                           _visible_classes=vc)
         return True
     
     cls = app.data.get("classification").astype(np.int32)
     ci = np.flatnonzero(changed_mask)
+    if len(ci) == 0:
+        return True
+    
     cc = cls[ci]
-    nh = ~np.isin(cc, va)  # Points now hidden (classified away from visible class)
-    nvis = np.isin(cc, va)  # Points now visible
+    nh = ~np.isin(cc, va)    # now hidden (classified away from visible)
+    nvis = np.isin(cc, va)    # now visible (classified to visible class)
     g2u = cache.build_global_to_unique(len(app.data["xyz"]))
     
-    # ✅ FAST PATH for single-class: blacken affected faces immediately, queue rebuild
+    # ════════════════════════════════════════════════════════════════════
+    # SINGLE-CLASS PATH (the user's mode in the log)
+    # ════════════════════════════════════════════════════════════════════
     if isc and sci is not None:
-        mesh = getattr(app, '_shaded_mesh_polydata', None)
-        if np.all(nh) and mesh:
-            # All changed points are now hidden - fast blacken
-            cellc = mesh.GetCellData().GetScalars()
-            if cellc and cache.faces is not None and cellc.GetNumberOfTuples() == len(cache.faces):
-                blackened_any = False
-                try:
-                    vp = numpy_support.vtk_to_numpy(cellc)
-                    cu = g2u[ci]; cu = cu[cu >= 0]
-                    if len(cu) > 0:
-                        cs = np.zeros(len(cache.unique_indices), dtype=bool)
-                        cs[cu] = True
-                        af = cs[cache.faces[:,0]] | cs[cache.faces[:,1]] | cs[cache.faces[:,2]]
-                        if np.any(af):
-                            vp[af] = [0, 0, 0]
-                            cellc.Modified()
-                            mesh.Modified()
-                            a = getattr(app, '_shaded_mesh_actor', None)
-                            if a: a.GetMapper().Modified()
-                            app.vtk_widget.render()
-                            blackened_any = True
-                except Exception:
-                    pass
-                # Only queue a mesh rebuild if faces were actually affected.
-                # If the changed points weren't in the mesh (cu all -1),
-                # there's nothing to repair — skip the 1s timer entirely.
-                if blackened_any:
-                    _queue_incremental_patch(app, sci)
-                return True
+        hidden_global = ci[nh] if np.any(nh) else None
+        visible_global = ci[nvis] if np.any(nvis) else None
+        
+        # ── INSTANT (≈10-30ms): in-place cell color update ──
+        # Blackens faces of newly-hidden points, recolors faces of newly-visible
+        # points that are already represented in the mesh.
+        _blacken_or_recolor_in_place(
+            app, cache,
+            hidden_global=hidden_global,
+            visible_global=visible_global)
+        
+        # ── Identify points that need geometry change (not yet in mesh) ──
+        missing_global = None
+        if visible_global is not None and len(visible_global) > 0:
+            mg = visible_global[g2u[visible_global] < 0]
+            if len(mg) > 0:
+                missing_global = mg
+        
+        # ── DEFERRED (~300ms after last call): rebuild geometry ──
+        # Hidden points need triangle removal; missing points need triangle
+        # addition. Both are slow (1.1s for full mesh re-upload). Defer them.
+        needs_rebuild = (hidden_global is not None and len(hidden_global) > 0) or \
+                        (missing_global is not None and len(missing_global) > 0)
+        if needs_rebuild:
+            n_hide = len(hidden_global) if hidden_global is not None else 0
+            n_add = len(missing_global) if missing_global is not None else 0
+            print(f"   ⏳ Deferred geometry rebuild queued: -{n_hide} hide, +{n_add} add")
+            _queue_deferred_rebuild(
+                app, "classification (deferred)",
+                newly_visible_indices=missing_global)
+        
+        return True
     
-    # Handle visibility changes
+    # ════════════════════════════════════════════════════════════════════
+    # MULTI-CLASS PATH (kept similar to original, but defers add path)
+    # ════════════════════════════════════════════════════════════════════
+    
+    # All changed points are still visible → fast color recompute
     if np.all(nvis):
         if _check_previous_classes_visible(app, ci, va):
-            if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
+            if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask,
+                                       _visible_classes=vc, _defer_render=True):
                 return True
         nvg = ci[nvis]
         mg = nvg[g2u[nvg] < 0]
         if len(mg) > 0:
-            if _fast_incremental_add_points(app, mg):
-                return True
-            _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=mg)
-            _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True)
+            # ── KEY CHANGE: defer instead of synchronous _fast_incremental_add_points ──
+            print(f"   ⏳ Deferred multi-class geometry add queued: +{len(mg)} pts")
+            _update_colors_gpu_fast(app, cache, changed_mask=changed_mask,
+                                    _visible_classes=vc, _defer_render=True)
+            _queue_deferred_rebuild(app, "multi-cls new vis (deferred)",
+                                    newly_visible_indices=mg)
             return True
-        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
+        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask,
+                                   _visible_classes=vc, _defer_render=True):
             return True
     
-    voided = None
-    if np.any(nvis):
-        nvg = ci[nvis]
-        nim = int(np.sum(g2u[nvg] < 0))
-        if nim > 0:
-            pwh = True
-            if getattr(app, '_shading_visibility_override', None) is None:
-                for sa in ('undo_stack', 'undostack'):
-                    stk = getattr(app, sa, None)
-                    if stk:
-                        try:
-                            old = (stk[-1].get('old_classes') or stk[-1].get('oldclasses'))
-                            if old is not None:
-                                pwh = not set(int(x) for x in np.unique(np.asarray(old))).issubset(set(int(c) for c in vc))
-                        except Exception:
-                            pass
-                        break
-            if pwh:
-                _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=nvg[g2u[nvg] < 0])
+    # Mix of hide + add (multi-class): defer rebuild, immediate point color update
+    voided = ci[nh] if np.any(nh) else None
     
-    if np.any(nh):
-        voided = ci[nh]
+    # Update point-data colors for hidden points (multi-class uses point scalars)
+    if voided is not None and len(voided) > 0:
         mesh = getattr(app, '_shaded_mesh_polydata', None)
         if mesh:
             pc = mesh.GetPointData().GetScalars()
@@ -1182,14 +1261,25 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
                 hu = g2u[voided]
                 hu = hu[(hu >= 0) & (hu < len(cache.unique_indices))]
                 if len(hu) > 0:
-                    numpy_support.vtk_to_numpy(pc)[hu] = [0,0,0]
+                    numpy_support.vtk_to_numpy(pc)[hu] = [0, 0, 0]
                     pc.Modified()
     
-    if _update_colors_gpu_fast(app, cache, changed_mask, _visible_classes=vc, _defer_render=True):
+    # Defer the heavy geometry rebuild
+    if np.any(nvis):
+        nvg = ci[nvis]
+        nvg_missing = nvg[g2u[nvg] < 0]
+        if len(nvg_missing) > 0:
+            print(f"   ⏳ Deferred multi-class mixed rebuild queued: +{len(nvg_missing)} pts")
+            _queue_deferred_rebuild(app, "multi-cls mix (deferred)",
+                                    newly_visible_indices=nvg_missing)
+    
+    if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask,
+                               _visible_classes=vc, _defer_render=True):
         if voided is not None and len(voided) > 0:
-            _queue_deferred_rebuild(app, "void cleanup")
+            _queue_deferred_rebuild(app, "void cleanup (deferred)")
         return True
     
+    # Fallback (rare): full rebuild
     update_shaded_class(app, force_rebuild=True)
     return True
 
@@ -1311,6 +1401,100 @@ def refresh_shaded_after_visibility_change(app, cgi, vcs):
         clear_shading_cache("no cache"); update_shaded_class(app, force_rebuild=True); return
     if not _incremental_visibility_patch(app, cgi, vcs):
         clear_shading_cache("patch failed"); update_shaded_class(app, force_rebuild=True)
+
+def _blacken_or_recolor_in_place(app, cache, hidden_global=None, visible_global=None):
+    """
+    Update cell colors of the existing VTK mesh WITHOUT touching geometry.
+    
+    - hidden_global:  global point indices that are NOW hidden (paint black)
+    - visible_global: global point indices that are NOW visible (repaint with
+                      class color × shade for points already in the mesh)
+    
+    Both arrays are global xyz indices (not unique-mesh indices). This function
+    looks up which are present in the mesh via cache.build_global_to_unique
+    and only recolors those. Missing points are silently skipped — they need
+    a geometry rebuild, which the caller should defer.
+    
+    Returns True if the mesh was modified, False if nothing changed.
+    """
+    mesh = getattr(app, '_shaded_mesh_polydata', None)
+    if mesh is None or cache.faces is None or len(cache.faces) == 0:
+        return False
+    
+    cellc = mesh.GetCellData().GetScalars()
+    if cellc is None or cellc.GetNumberOfTuples() != len(cache.faces):
+        return False
+    
+    isc = getattr(cache, 'n_visible_classes', 0) == 1
+    sci = getattr(cache, 'single_class_id', None)
+    if not isc or sci is None:
+        return False  # multi-class uses point colors, different path
+    
+    try:
+        vp = numpy_support.vtk_to_numpy(cellc)
+        # Normalize to (N_faces, ncols) view
+        nf = len(cache.faces)
+        if vp.ndim == 1:
+            ncols = len(vp) // nf
+            vp_2d = vp.reshape(nf, ncols)
+        else:
+            vp_2d = vp
+            ncols = vp_2d.shape[1]
+        
+        g2u = cache.build_global_to_unique(len(app.data["xyz"]))
+        modified = False
+        
+        # ─── Step 1: blacken faces touching newly-hidden points ───
+        if hidden_global is not None and len(hidden_global) > 0:
+            hu = g2u[hidden_global]
+            hu = hu[hu >= 0]
+            if len(hu) > 0:
+                cs = np.zeros(len(cache.unique_indices), dtype=bool)
+                cs[hu] = True
+                af = (cs[cache.faces[:, 0]] |
+                      cs[cache.faces[:, 1]] |
+                      cs[cache.faces[:, 2]])
+                if np.any(af):
+                    vp_2d[af, :3] = 0
+                    modified = True
+        
+        # ─── Step 2: recolor faces touching newly-visible points (if in mesh) ───
+        if visible_global is not None and len(visible_global) > 0:
+            vu = g2u[visible_global]
+            vu = vu[vu >= 0]  # only those already in mesh
+            if len(vu) > 0:
+                cs = np.zeros(len(cache.unique_indices), dtype=bool)
+                cs[vu] = True
+                af = (cs[cache.faces[:, 0]] |
+                      cs[cache.faces[:, 1]] |
+                      cs[cache.faces[:, 2]])
+                if np.any(af):
+                    sh = (cache.shade if cache.shade is not None and
+                          len(cache.shade) == nf
+                          else np.ones(nf, dtype=np.float32))
+                    rgb = np.array(
+                        app.class_palette.get(int(sci), {}).get("color",
+                                                                (128, 128, 128)),
+                        dtype=np.float32)
+                    vp_2d[af, :3] = np.clip(rgb * sh[af, None],
+                                            0, 255).astype(np.uint8)
+                    modified = True
+        
+        if modified:
+            cellc.Modified()
+            mesh.Modified()
+            actor = getattr(app, '_shaded_mesh_actor', None)
+            if actor:
+                actor.GetMapper().Modified()
+            try:
+                app.vtk_widget.render()
+            except Exception:
+                pass
+        
+        return modified
+    except Exception as e:
+        print(f"   ⚠️  In-place color update failed: {e}")
+        return False
 
 def _compute_face_shade_global_z(xyz_unique, faces, azimuth, angle, ambient, face_normals=None):
     """Compute face shading using GLOBAL z-range from xyz_unique (not just face subset)."""
@@ -1964,141 +2148,137 @@ def _render_mesh_fast_update(app, cache, n_removed, n_added):
         _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
 
 def _fast_incremental_add_points(app, ngi):
+    """Add new points to the visible mesh by re-triangulating their local region."""
+    import time
     cache = get_cache()
     if cache.faces is None or cache.xyz_unique is None or cache.xyz_final is None:
         return False
-    if len(ngi) == 0: return True
-    xr = app.data.get("xyz"); cr = app.data.get("classification")
-    if xr is None or cr is None: return False
-    g2u = cache.build_global_to_unique(len(xr)); mg = ngi[g2u[ngi] < 0]
+    if len(ngi) == 0:
+        return True
+    xr = app.data.get("xyz")
+    cr = app.data.get("classification")
+    if xr is None or cr is None:
+        return False
+    
+    g2u = cache.build_global_to_unique(len(xr))
+    mg = ngi[g2u[ngi] < 0]
     if len(mg) == 0:
+        # All already in mesh — just recolor
         return _update_colors_gpu_fast(app, cache, changed_mask=None)
     
-    nn = len(mg); nxr2 = xr[mg]; nxl = (nxr2 - cache.offset).astype(np.float64)
-    xn = nxl[:,0].min(); yn = nxl[:,1].min()
-    xx = nxl[:,0].max(); yx = nxl[:,1].max()
+    t0 = time.time()
+    nn = len(mg)
+    nxr2 = xr[mg]
+    nxl = (nxr2 - cache.offset).astype(np.float64)
+    
+    # Local bounding box for re-triangulation region
+    xn, yn = nxl[:, 0].min(), nxl[:, 1].min()
+    xx, yx = nxl[:, 0].max(), nxl[:, 1].max()
     mrg = max(cache.spacing * 8, 0.5)
-    xn -= mrg; yn -= mrg; xx += mrg; yx += mrg
+    xn -= mrg
+    yn -= mrg
+    xx += mrg
+    yx += mrg
     
-    eib = ((cache.xyz_unique[:,0] >= xn) & (cache.xyz_unique[:,0] <= xx) &
-           (cache.xyz_unique[:,1] >= yn) & (cache.xyz_unique[:,1] <= yx))
-    ei = np.flatnonzero(eib); onv = len(cache.xyz_unique)
+    # Existing vertices in the region (will be re-meshed together with new ones)
+    eib = ((cache.xyz_unique[:, 0] >= xn) & (cache.xyz_unique[:, 0] <= xx) &
+           (cache.xyz_unique[:, 1] >= yn) & (cache.xyz_unique[:, 1] <= yx))
+    ei = np.flatnonzero(eib)
+    onv = len(cache.xyz_unique)
     
+    # Append new vertices
     cache.unique_indices = np.concatenate([cache.unique_indices, mg])
     cache.xyz_unique = np.vstack([cache.xyz_unique, nxl])
     cache.xyz_final = np.vstack([cache.xyz_final, nxr2])
-    cache._global_to_unique = None; cache._vtk_colors_ptr = None
+    cache._global_to_unique = None
+    cache._vtk_colors_ptr = None
     
     nvi = np.arange(onv, onv + nn, dtype=np.int32)
+    
+    # Remove old faces that will be replaced
     if len(ei) > 0:
         ib = np.zeros(len(cache.xyz_unique), dtype=bool)
-        ib[ei] = True; ib[nvi] = True
-        fir = ib[cache.faces[:,0]] & ib[cache.faces[:,1]] & ib[cache.faces[:,2]]
+        ib[ei] = True
+        ib[nvi] = True
+        fir = ib[cache.faces[:, 0]] & ib[cache.faces[:, 1]] & ib[cache.faces[:, 2]]
         fo = cache.faces[~fir]
         no = cache.face_normals[~fir] if cache.face_normals is not None else None
     else:
         fo = cache.faces
         no = cache.face_normals
     
-    lai = np.concatenate([ei, nvi]); lxy = cache.xyz_unique[lai, :2]
+    # Local Delaunay
+    lai = np.concatenate([ei, nvi])
+    lxy = cache.xyz_unique[lai, :2]
+    
+    az = getattr(app, 'last_shade_azimuth', 45.)
+    an = getattr(app, 'last_shade_angle', 45.)
+    am = getattr(app, 'shade_ambient', 0.25)
+    
     if len(lai) < 3:
-        cache.faces = fo; cache.face_normals = no
+        cache.faces = fo
+        cache.face_normals = no
         cache.shade = _compute_face_shade_global_z(
-            cache.xyz_unique, fo,
-            getattr(app, 'last_shade_azimuth', 45.),
-            getattr(app, 'last_shade_angle', 45.),
-            getattr(app, 'shade_ambient', .25),
-            face_normals=no)
+            cache.xyz_unique, fo, az, an, am, face_normals=no)
         _render_mesh(app, cache, cr, _save_camera(app))
         return True
     
     try:
         lf = _do_triangulate(lxy)
     except Exception:
-        cache.faces = fo; cache.face_normals = no
+        cache.faces = fo
+        cache.face_normals = no
         cache.shade = _compute_face_shade_global_z(
-            cache.xyz_unique, fo,
-            getattr(app, 'last_shade_azimuth', 45.),
-            getattr(app, 'last_shade_angle', 45.),
-            getattr(app, 'shade_ambient', .25),
-            face_normals=no)
+            cache.xyz_unique, fo, az, an, am, face_normals=no)
         _render_mesh(app, cache, cr, _save_camera(app))
         return True
     
     if len(lf) > 0:
-        le = max(lxy[:,0].max()-lxy[:,0].min(), lxy[:,1].max()-lxy[:,1].min())
+        le = max(lxy[:, 0].max() - lxy[:, 0].min(),
+                 lxy[:, 1].max() - lxy[:, 1].min())
         lf = _filter_edges_by_absolute(
             lf, lxy, max(le * 0.5, cache.spacing * cache.max_edge_factor))
     
     if len(lf) == 0:
-        cache.faces = fo; cache.face_normals = no
+        cache.faces = fo
+        cache.face_normals = no
         cache.shade = _compute_face_shade_global_z(
-            cache.xyz_unique, fo,
-            getattr(app, 'last_shade_azimuth', 45.),
-            getattr(app, 'last_shade_angle', 45.),
-            getattr(app, 'shade_ambient', .25),
-            face_normals=no)
+            cache.xyz_unique, fo, az, an, am, face_normals=no)
         _render_mesh(app, cache, cr, _save_camera(app))
         return True
     
+    # Remap local face indices to global unique indices
     pf = lai[lf]
     pn = _compute_face_normals(cache.xyz_unique, pf)
     
-    az = getattr(app, 'last_shade_azimuth', 45.)
-    an = getattr(app, 'last_shade_angle', 45.)
-    am = getattr(app, 'shade_ambient', .25)
-    
+    # Combine kept + new
     nk = len(fo)
     cache.faces = np.vstack([fo, pf])
     cache.face_normals = pn if no is None else np.vstack([no, pn])
     
-    # ✅ FIX: Single shade call with global z-range
+    # Recompute shading with global z-range over ALL faces
     cache.shade = _compute_face_shade_global_z(
         cache.xyz_unique, cache.faces, az, an, am,
         face_normals=cache.face_normals)
     
     _recompute_vertex_normals_partial(cache, nk)
+    
     vc = _get_shading_visibility(app)
     cache.visible_classes_hash = cache.get_visible_hash(vc)
     cache.data_hash = _compute_xyz_hash(xr)
-
-    # ── Try in-place color update first (avoids full VTK mesh re-upload) ──
-    isc = getattr(cache, 'n_visible_classes', 0) == 1
-    sci = getattr(cache, 'single_class_id', None)
-    mesh = getattr(app, '_shaded_mesh_polydata', None)
-    actor = getattr(app, '_shaded_mesh_actor', None)
-    nv_mesh = len(cache.xyz_final)
-    nf_mesh = len(cache.faces)
-
-    if (isc and sci is not None and mesh is not None and actor is not None
-            and mesh.GetNumberOfCells() == nf_mesh):
-        try:
-            cell_scalars = mesh.GetCellData().GetScalars()
-            if cell_scalars is not None and cell_scalars.GetNumberOfTuples() == nf_mesh:
-                cols = numpy_support.vtk_to_numpy(cell_scalars)
-                ncols = len(cols) // nf_mesh if cols.ndim == 1 else cols.shape[1]
-                c2d = cols.reshape(nf_mesh, ncols) if cols.ndim == 1 else cols
-                shade = cache.shade
-                if shade is None or len(shade) != nf_mesh:
-                    shade = _compute_face_shade_global_z(
-                        cache.xyz_unique, cache.faces, az, an, am,
-                        face_normals=cache.face_normals)
-                    cache.shade = shade
-                cinfo = app.class_palette.get(int(sci), {})
-                rgb = np.array(cinfo.get("color", (128, 128, 128)), dtype=np.float32)
-                c2d[:, :3] = np.clip(rgb * shade.reshape(-1, 1), 0, 255).astype(np.uint8)
-                cell_scalars.Modified()
-                mesh.Modified()
-                actor.GetMapper().Modified()
-                app.vtk_widget.render()
-                print(f"   ⚡ Incremental in-place recolor: {nf_mesh:,} faces")
-                return True
-        except Exception as e:
-            print(f"   ⚠️ Incremental in-place failed ({e}), falling back to _render_mesh")
-
-    # Full upload fallback (geometry changed or multi-class)
+    
+    print(f"   📐 Local re-tri: {nn:,} new pts, {len(pf):,} new tris [{(time.time()-t0)*1000:.0f}ms]")
+    
+    
+    # Geometry has grown → must do a full VTK upload (unavoidable).
+    # This is the ~1.1s cost, but it now happens only ONCE per deferred fire,
+    # not once per click.
     _render_mesh(app, cache, cr, _save_camera(app))
     return True
+
+def is_deferred_rebuild_pending():
+    """True if a classification-triggered geometry rebuild is queued."""
+    return _rebuild_timer is not None
 
 def _rebuild_mesh_vtk(app, cache, cr, sc): _render_mesh(app, cache, cr, sc)
 
