@@ -593,14 +593,49 @@ def _queue_incremental_patch(app, sci):
 def update_shaded_class(app, azimuth=45., angle=45., ambient=0.25,
                         max_edge_factor=3.0, force_rebuild=False,
                         single_class_max_edge=None, **kwargs):
-    xyz_raw = app.data.get("xyz"); classes_raw = app.data.get("classification")
+    # ── Use pre-computed combined (core + buffer) if available ─────────
+    # The classification pipeline uses this transformed set; shading must
+    # use the same source so face counts are consistent with point counts.
+    xyz_raw = (getattr(app, '_combined_xyz', None)
+               or getattr(app, '_precomputed_xyz', None)
+               or getattr(app, '_transformed_xyz', None)
+               or app.data.get("xyz"))
+    classes_raw = (getattr(app, '_combined_classification', None)
+                   or getattr(app, '_precomputed_classification', None)
+                   or app.data.get("classification"))
     if xyz_raw is None or classes_raw is None: return
+    # Safety: if lengths mismatch, fall back to raw data
+    if len(xyz_raw) != len(classes_raw):
+        print(f"   ⚠️ xyz/class length mismatch ({len(xyz_raw)} vs {len(classes_raw)}), falling back to raw")
+        xyz_raw = app.data.get("xyz"); classes_raw = app.data.get("classification")
+    if xyz_raw is None or classes_raw is None: return
+
     azimuth = getattr(app, 'last_shade_azimuth', azimuth)
     angle = getattr(app, 'last_shade_angle', angle)
     ambient = getattr(app, 'shade_ambient', ambient)
     vc = _get_shading_visibility(app)
     requested_cache_key = _build_cache_key(xyz_raw, vc, single_class_max_edge) if vc else None
     cache = get_cache(requested_cache_key) if vc else get_cache()
+
+    # ── Fast single-class recolor: if geometry already built for a multi-class
+    #    or prior single-class render, skip re-triangulation and just recolor. ──
+    if not force_rebuild and len(vc) == 1:
+        for ck, existing_cache in _cache_store.items():
+            if (existing_cache.data_hash == _compute_xyz_hash(xyz_raw)
+                    and existing_cache.faces is not None
+                    and len(existing_cache.faces) > 0
+                    and existing_cache.xyz_unique is not None):
+                # Reuse geometry, just update class visibility and recolor
+                cache = existing_cache
+                cache.visible_classes_hash = cache.get_visible_hash(vc)
+                cache.visible_classes_set = vc.copy()
+                cache.n_visible_classes = 1
+                cache.single_class_id = list(vc)[0]
+                cache.last_azimuth = -1  # force shade recompute
+                _refresh_from_cache(app, cache, azimuth, angle, ambient)
+                return
+
+
     rendered_cache_key = _get_rendered_cache_key(app)
 
     _mesh_actor = getattr(app, '_shaded_mesh_actor', None)
@@ -859,7 +894,11 @@ def _refresh_from_cache(app, cache, azimuth, angle, ambient):
         zv = cache.xyz_unique[:,2] if cache.xyz_unique is not None else None
         if isc:
             if cache.face_normals is not None and len(cache.face_normals) > 0:
-                cache.shade = _compute_face_shade(cache.xyz_unique, cache.faces, azimuth, angle, ambient, face_normals=cache.face_normals)
+                # Reuse existing face normals — geometry unchanged, only lighting params differ
+                cache.shade = _compute_face_shade(
+                    cache.xyz_unique, cache.faces, azimuth, angle, ambient,
+                    face_normals=cache.face_normals   # pass cached normals, skip recompute
+                )
         else:
             if cache.vertex_normals is not None and len(cache.vertex_normals) > 0:
                 cache.vertex_shade = _compute_shading(cache.vertex_normals, azimuth, angle, ambient, z_values=zv)
