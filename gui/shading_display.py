@@ -1044,9 +1044,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
     va = np.array(sorted(vc), dtype=np.int32)
     
     if changed_mask is None or not np.any(changed_mask):
-        if not isc or sci is None:
-            return _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=vc)
-        return True
+        return _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=vc)
     
     cls = app.data.get("classification").astype(np.int32)
     ci = np.flatnonzero(changed_mask)
@@ -1096,6 +1094,18 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
         if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
             return True
     
+
+    # ── FAST PATH: multi-class, all changed points already in mesh ──────
+    # If every changed point was already a unique-mesh vertex (g2u >= 0)
+    # AND the new class is still visible, only colors need updating —
+    # no geometry rebuild is needed.
+    all_already_in_mesh = np.all(g2u[ci] >= 0)
+    if all_already_in_mesh and np.all(nvis):
+        # All reclassified points are visible in new class AND already in mesh.
+        # Pure color-only update — no Delaunay, no normals recompute.
+        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc):
+            return True
+
     voided = None
     if np.any(nvis):
         nvg = ci[nvis]
@@ -1118,6 +1128,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
     
     if np.any(nh):
         voided = ci[nh]
+
         mesh = getattr(app, '_shaded_mesh_polydata', None)
         if mesh:
             pc = mesh.GetPointData().GetScalars()
@@ -1131,6 +1142,12 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
     if _update_colors_gpu_fast(app, cache, changed_mask, _visible_classes=vc, _defer_render=True):
         if voided is not None and len(voided) > 0:
             _queue_deferred_rebuild(app, "void cleanup")
+        else:
+            # No geometry void — render immediately instead of deferring
+            try:
+                app.vtk_widget.render()
+            except Exception:
+                pass
         return True
     
     update_shaded_class(app, force_rebuild=True)

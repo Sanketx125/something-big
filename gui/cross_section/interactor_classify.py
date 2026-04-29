@@ -2897,12 +2897,20 @@ class ClassificationInteractor:
                                 # If we have a mask of changed points in this view, poke them directly.
                                 if self._brush_section_local_mask is not None and self._brush_section_local_mask.any():
                                     v_idx = self._get_view_index_from_interactor()
-                                    if v_idx is not None:
+                                    
+                                    # ✅ Support Cut Section real-time poke
+                                    if v_idx is None and is_cut_section:
+                                        sw = self.app.cut_section_controller.cut_vtk
+                                        actor = sw.actors.get("_cut_section_unified")
+                                    elif v_idx is not None:
                                         actor_name = f"_section_{v_idx}_unified"
                                         sw = self.app.section_vtks.get(v_idx)
                                         actor = sw.actors.get(actor_name) if sw else None
-                                        
-                                        if actor and hasattr(actor, '_naksha_rgb_ptr'):
+                                    else:
+                                        actor = None
+                                        sw = None
+
+                                    if actor and hasattr(actor, '_naksha_rgb_ptr'):
                                             # Only poke if it's been long enough since last poke
                                             now = time.time()
                                             if (now - getattr(self, '_last_sec_poke', 0)) > 0.033:
@@ -3273,8 +3281,15 @@ class ClassificationInteractor:
                             idxs = np.asarray(cut_idx, dtype=np.int64)
                             pts2d = _project_to_cut_view(self.app, cut_pts)
                             self._brush_section_indices   = idxs
-                            self._brush_section_pts2d     = pts2d
+                            self._brush_section_pts2d     = np.asarray(pts2d, dtype=np.float64)
                             self._brush_section_local_mask = np.zeros(len(idxs), dtype=bool)
+                            
+                            # ✅ GRID INIT (Cut Section)
+                            self._brush_section_grid = SpatialGridIndex(self._brush_section_pts2d)
+                            # Cut section is typically Slot 5 in this app
+                            self._brush_visible_classes = self._get_visible_classes_for_slot(5)
+                            self._brush_indices_arrays = []
+                            self._brush_old_classes_arrays = []
                 else:
                     # Cross-section brush init.
                     # CRITICAL: idxs and pts2d MUST be in the same order.

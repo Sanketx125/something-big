@@ -3270,9 +3270,7 @@ class GlobalShortcutFilter(QObject):
                         dlg.view_borders[view_idx] = border_percent
                         
                         border_type = preset.get("border_type", 0)
-                        if hasattr(dlg, '_select_border_mode'):
-                            dlg._select_border_mode(border_type, push_gpu=False)
-                        elif hasattr(dlg, 'border_logic_hybrid') and hasattr(dlg, 'border_logic_object') and hasattr(dlg, 'border_logic_point'):
+                        if hasattr(dlg, 'border_logic_hybrid') and hasattr(dlg, 'border_logic_object') and hasattr(dlg, 'border_logic_point'):
                             if border_type == 2:
                                 dlg.border_logic_hybrid.setChecked(True)
                             elif border_type == 1:

@@ -2435,8 +2435,7 @@ class ShortcutManager(QWidget):
             if not self._is_loading_shortcuts:
                 self._open_draw_settings_for_row(row)
             return
-
-        # ── Classification tool (AboveLine, BelowLine, Brush, Freehand, etc.) ──
+# ── Classification tool (AboveLine, BelowLine, Brush, Freehand, etc.) ──
         # When the user switches between two classification tools, the existing
         # from/to class configuration must be preserved.  Only reset to
         # "Any → Any" when the previous cell held a preset (DisplayMode /
