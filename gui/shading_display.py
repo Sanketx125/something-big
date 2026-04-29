@@ -1112,41 +1112,84 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
                     pass
                 _queue_incremental_patch(app, sci)
                 return True
+
+        # ✅ NEW: Points from a hidden class are being classified TO the single shaded class.
+        # The generic nvis path below calls _fast_incremental_add_points which lacks
+        # single-class face-color shading, and falls back to full Delaunay on failure.
+        # Instead: use the same fast incremental patch path used for the hide case.
+        if np.any(nvis) and mesh:
+            # Try the fast incremental add first (local Delaunay around new points only)
+            newly_in = ci[nvis]
+            truly_new = newly_in[g2u[newly_in] < 0]
+            if len(truly_new) > 0:
+                if _fast_incremental_add_points(app, truly_new):
+                    return True
+            # Fallback: queue a bounded region rebuild (single-class patch), NOT a full rebuild
+            _queue_incremental_patch(app, sci)
+            return True
     
     # Handle visibility changes
     if np.all(nvis):
-        if _check_previous_classes_visible(app, ci, va):
-            if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
+        # Check if ALL changed points are already in the mesh (g2u >= 0).
+        # If yes: pure color-only update — no geometry work needed at all,
+        # regardless of undo stack state.
+        mg_candidates = ci[nvis]
+        mg = mg_candidates[g2u[mg_candidates] < 0]  # points NOT yet in mesh
+
+        if len(mg) == 0:
+            # Every changed point is already a mesh vertex — just recolor.
+            if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=False):
                 return True
-        nvg = ci[nvis]
-        mg = nvg[g2u[nvg] < 0]
-        if len(mg) > 0:
+        else:
+            # Some points are new to the mesh — try incremental add first.
+            if _check_previous_classes_visible(app, ci, va):
+                # Previous classes were visible: these were already rendered,
+                # just recolor without adding geometry.
+                if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
+                    return True
             if _fast_incremental_add_points(app, mg):
                 return True
             _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=mg)
             _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True)
             return True
-        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
-            return True
     
 
     # ── FAST PATH: multi-class, all changed points already in mesh ──────
-    # If every changed point was already a unique-mesh vertex (g2u >= 0)
-    # AND the new class is still visible, only colors need updating —
-    # no geometry rebuild is needed.
+    # Whether points are being shown, hidden, or reclassified between visible
+    # classes — if every changed point is already in the mesh, only colors need
+    # updating.  Geometry rebuild is deferred only when hidden points leave voids.
     all_already_in_mesh = np.all(g2u[ci] >= 0)
-    if all_already_in_mesh and np.all(nvis):
-        # All reclassified points are visible in new class AND already in mesh.
-        # Pure color-only update — no Delaunay, no normals recompute.
-        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc):
+    if all_already_in_mesh:
+        if np.any(nh):
+            # Immediately blacken vertex colors for points going hidden
+            mesh_obj = getattr(app, '_shaded_mesh_polydata', None)
+            if mesh_obj:
+                pc2 = mesh_obj.GetPointData().GetScalars()
+                if pc2 and pc2.GetNumberOfTuples() == len(cache.unique_indices):
+                    hu = g2u[ci[nh]]
+                    hu = hu[(hu >= 0) & (hu < len(cache.unique_indices))]
+                    if len(hu) > 0:
+                        numpy_support.vtk_to_numpy(pc2)[hu] = [0, 0, 0]
+                        pc2.Modified()
+        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
+            if np.any(nh):
+                _queue_deferred_rebuild(app, "void cleanup")
+            else:
+                try: app.vtk_widget.render()
+                except Exception: pass
             return True
 
     voided = None
     if np.any(nvis):
         nvg = ci[nvis]
-        nim = int(np.sum(g2u[nvg] < 0))
+        # Only points that are NOT already in the mesh need a geometry rebuild
+        truly_new = nvg[g2u[nvg] < 0]
+        nim = len(truly_new)
         if nim > 0:
-            pwh = True
+            # Check if the old classification of these points was also visible.
+            # If so, they were already in the mesh and g2u simply hasn't been
+            # refreshed yet — avoid a full rebuild in that case.
+            old_classes_were_visible = False
             if getattr(app, '_shading_visibility_override', None) is None:
                 for sa in ('undo_stack', 'undostack'):
                     stk = getattr(app, sa, None)
@@ -1154,12 +1197,14 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
                         try:
                             old = (stk[-1].get('old_classes') or stk[-1].get('oldclasses'))
                             if old is not None:
-                                pwh = not set(int(x) for x in np.unique(np.asarray(old))).issubset(set(int(c) for c in vc))
+                                old_arr = np.asarray(old)
+                                old_classes_of_changed = set(int(x) for x in np.unique(old_arr[truly_new] if len(old_arr) > truly_new.max() else old_arr))
+                                old_classes_were_visible = old_classes_of_changed.issubset(set(int(c) for c in vc))
                         except Exception:
                             pass
                         break
-            if pwh:
-                _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=nvg[g2u[nvg] < 0])
+            if not old_classes_were_visible:
+                _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=truly_new)
     
     if np.any(nh):
         voided = ci[nh]
