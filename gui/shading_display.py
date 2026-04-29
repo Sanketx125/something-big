@@ -974,17 +974,7 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
             p2.SetAmbient(0.12); p2.SetDiffuse(0.88); p2.SetSpecular(0.18); p2.SetSpecularPower(48.)
             p2.SetInterpolationToFlat(); p2.EdgeVisibilityOff()
         _setup_microstation_lighting(plotter.renderer, az, an)
-    app._shaded_mesh_polydata = mesh
-    # Populate the ptr immediately so _update_colors_gpu_fast can use it
-    # on the very next call without re-querying VTK.
-    try:
-        if isc:
-            _vtc = mesh.GetCellData().GetScalars()
-        else:
-            _vtc = mesh.GetPointData().GetScalars()
-        cache._vtk_colors_ptr = numpy_support.vtk_to_numpy(_vtc) if _vtc else None
-    except Exception:
-        cache._vtk_colors_ptr = None
+    app._shaded_mesh_polydata = mesh; cache._vtk_colors_ptr = None
     _set_rendered_cache_key(app, cache)
 
     renderer = plotter.renderer; nr = 0
@@ -1048,38 +1038,15 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
             if ns.startswith("class_") or ns in ("main_pc", "main_pc_border"):
                 app.vtk_widget.actors[name].SetVisibility(False)
     
-    vc = _get_shading_visibility(app)
-    va = np.array(sorted(vc), dtype=np.int32)
-
-    # ── CACHE MISMATCH GUARD ────────────────────────────────────────────
-    cached_vc_hash = getattr(cache, 'visible_classes_hash', None)
-    expected_hash  = cache.get_visible_hash(vc)
-    if cached_vc_hash != expected_hash:
-        print(f"   ⚡ vc mismatch (cached={cached_vc_hash} want={expected_hash}) — checking store")
-        xyz_raw = app.data.get("xyz")
-        new_cache_key = _build_cache_key(xyz_raw, vc)
-        
-        # Check store by key (hash-independent — key uses vc tuple directly)
-        existing = _cache_store.get(new_cache_key)
-        if existing is not None and existing.faces is not None and len(existing.faces) > 0 \
-                and existing.visible_classes_hash == expected_hash:
-            # Valid cached geometry for this vc — activate and use it
-            global _active_cache_key
-            _active_cache_key = new_cache_key
-            _cache_store.move_to_end(new_cache_key)
-            # Now the active cache matches vc — fall through to fast color update below
-            cache = existing
-        else:
-            # Genuinely new geometry needed — build once
-            print(f"   🔺 Building geometry for {sorted(vc)}")
-            update_shaded_class(app, force_rebuild=True)
-            return True
-
     isc = getattr(cache, 'n_visible_classes', 0) == 1
     sci = getattr(cache, 'single_class_id', None)
-
+    vc = _get_shading_visibility(app)
+    va = np.array(sorted(vc), dtype=np.int32)
+    
     if changed_mask is None or not np.any(changed_mask):
-        return _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=vc)
+        if not isc or sci is None:
+            return _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=vc)
+        return True
     
     cls = app.data.get("classification").astype(np.int32)
     ci = np.flatnonzero(changed_mask)
@@ -1112,84 +1079,29 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
                     pass
                 _queue_incremental_patch(app, sci)
                 return True
-
-        # ✅ NEW: Points from a hidden class are being classified TO the single shaded class.
-        # The generic nvis path below calls _fast_incremental_add_points which lacks
-        # single-class face-color shading, and falls back to full Delaunay on failure.
-        # Instead: use the same fast incremental patch path used for the hide case.
-        if np.any(nvis) and mesh:
-            # Try the fast incremental add first (local Delaunay around new points only)
-            newly_in = ci[nvis]
-            truly_new = newly_in[g2u[newly_in] < 0]
-            if len(truly_new) > 0:
-                if _fast_incremental_add_points(app, truly_new):
-                    return True
-            # Fallback: queue a bounded region rebuild (single-class patch), NOT a full rebuild
-            _queue_incremental_patch(app, sci)
-            return True
     
     # Handle visibility changes
     if np.all(nvis):
-        # Check if ALL changed points are already in the mesh (g2u >= 0).
-        # If yes: pure color-only update — no geometry work needed at all,
-        # regardless of undo stack state.
-        mg_candidates = ci[nvis]
-        mg = mg_candidates[g2u[mg_candidates] < 0]  # points NOT yet in mesh
-
-        if len(mg) == 0:
-            # Every changed point is already a mesh vertex — just recolor.
-            if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=False):
+        if _check_previous_classes_visible(app, ci, va):
+            if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
                 return True
-        else:
-            # Some points are new to the mesh — try incremental add first.
-            if _check_previous_classes_visible(app, ci, va):
-                # Previous classes were visible: these were already rendered,
-                # just recolor without adding geometry.
-                if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
-                    return True
+        nvg = ci[nvis]
+        mg = nvg[g2u[nvg] < 0]
+        if len(mg) > 0:
             if _fast_incremental_add_points(app, mg):
                 return True
             _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=mg)
             _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True)
             return True
-    
-
-    # ── FAST PATH: multi-class, all changed points already in mesh ──────
-    # Whether points are being shown, hidden, or reclassified between visible
-    # classes — if every changed point is already in the mesh, only colors need
-    # updating.  Geometry rebuild is deferred only when hidden points leave voids.
-    all_already_in_mesh = np.all(g2u[ci] >= 0)
-    if all_already_in_mesh:
-        if np.any(nh):
-            # Immediately blacken vertex colors for points going hidden
-            mesh_obj = getattr(app, '_shaded_mesh_polydata', None)
-            if mesh_obj:
-                pc2 = mesh_obj.GetPointData().GetScalars()
-                if pc2 and pc2.GetNumberOfTuples() == len(cache.unique_indices):
-                    hu = g2u[ci[nh]]
-                    hu = hu[(hu >= 0) & (hu < len(cache.unique_indices))]
-                    if len(hu) > 0:
-                        numpy_support.vtk_to_numpy(pc2)[hu] = [0, 0, 0]
-                        pc2.Modified()
         if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
-            if np.any(nh):
-                _queue_deferred_rebuild(app, "void cleanup")
-            else:
-                try: app.vtk_widget.render()
-                except Exception: pass
             return True
-
+    
     voided = None
     if np.any(nvis):
         nvg = ci[nvis]
-        # Only points that are NOT already in the mesh need a geometry rebuild
-        truly_new = nvg[g2u[nvg] < 0]
-        nim = len(truly_new)
+        nim = int(np.sum(g2u[nvg] < 0))
         if nim > 0:
-            # Check if the old classification of these points was also visible.
-            # If so, they were already in the mesh and g2u simply hasn't been
-            # refreshed yet — avoid a full rebuild in that case.
-            old_classes_were_visible = False
+            pwh = True
             if getattr(app, '_shading_visibility_override', None) is None:
                 for sa in ('undo_stack', 'undostack'):
                     stk = getattr(app, sa, None)
@@ -1197,18 +1109,15 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
                         try:
                             old = (stk[-1].get('old_classes') or stk[-1].get('oldclasses'))
                             if old is not None:
-                                old_arr = np.asarray(old)
-                                old_classes_of_changed = set(int(x) for x in np.unique(old_arr[truly_new] if len(old_arr) > truly_new.max() else old_arr))
-                                old_classes_were_visible = old_classes_of_changed.issubset(set(int(c) for c in vc))
+                                pwh = not set(int(x) for x in np.unique(np.asarray(old))).issubset(set(int(c) for c in vc))
                         except Exception:
                             pass
                         break
-            if not old_classes_were_visible:
-                _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=truly_new)
+            if pwh:
+                _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=nvg[g2u[nvg] < 0])
     
     if np.any(nh):
         voided = ci[nh]
-
         mesh = getattr(app, '_shaded_mesh_polydata', None)
         if mesh:
             pc = mesh.GetPointData().GetScalars()
@@ -1222,12 +1131,6 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
     if _update_colors_gpu_fast(app, cache, changed_mask, _visible_classes=vc, _defer_render=True):
         if voided is not None and len(voided) > 0:
             _queue_deferred_rebuild(app, "void cleanup")
-        else:
-            # No geometry void — render immediately instead of deferring
-            try:
-                app.vtk_widget.render()
-            except Exception:
-                pass
         return True
     
     update_shaded_class(app, force_rebuild=True)
@@ -1713,21 +1616,7 @@ def _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=None
                 vp = numpy_support.vtk_to_numpy(cc)
                 sh = cache.shade if cache.shade is not None and len(cache.shade) == len(cache.faces) else np.ones(len(cache.faces), dtype=np.float32)
                 bc = np.array(app.class_palette.get(sci, {}).get("color", (128,128,128)), dtype=np.float32)
-                # ── Fast partial update: only recolor faces touched by changed points ──
-                if changed_mask is not None and np.any(changed_mask) and cache.faces is not None:
-                    g2u = cache.build_global_to_unique(len(app.data["xyz"]))
-                    cu = g2u[np.flatnonzero(changed_mask)]
-                    cu = cu[(cu >= 0) & (cu < len(cache.unique_indices))]
-                    if len(cu) > 0:
-                        cu_set = np.zeros(len(cache.unique_indices), dtype=bool)
-                        cu_set[cu] = True
-                        af = cu_set[cache.faces[:,0]] | cu_set[cache.faces[:,1]] | cu_set[cache.faces[:,2]]
-                        af_idx = np.flatnonzero(af)
-                        if len(af_idx) > 0:
-                            vp[af_idx] = np.clip(bc * sh[af_idx, None], 0, 255).astype(np.uint8)
-                        cc.Modified()
-                else:
-                    vp[:] = np.clip(bc * sh[:, None], 0, 255).astype(np.uint8); cc.Modified()
+                vp[:] = np.clip(bc * sh[:, None], 0, 255).astype(np.uint8); cc.Modified()
                 if _defer_render:
                     mesh.Modified(); a = getattr(app, '_shaded_mesh_actor', None)
                     if a: a.GetMapper().Modified()
