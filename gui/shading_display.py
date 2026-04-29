@@ -974,7 +974,17 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
             p2.SetAmbient(0.12); p2.SetDiffuse(0.88); p2.SetSpecular(0.18); p2.SetSpecularPower(48.)
             p2.SetInterpolationToFlat(); p2.EdgeVisibilityOff()
         _setup_microstation_lighting(plotter.renderer, az, an)
-    app._shaded_mesh_polydata = mesh; cache._vtk_colors_ptr = None
+    app._shaded_mesh_polydata = mesh
+    # Populate the ptr immediately so _update_colors_gpu_fast can use it
+    # on the very next call without re-querying VTK.
+    try:
+        if isc:
+            _vtc = mesh.GetCellData().GetScalars()
+        else:
+            _vtc = mesh.GetPointData().GetScalars()
+        cache._vtk_colors_ptr = numpy_support.vtk_to_numpy(_vtc) if _vtc else None
+    except Exception:
+        cache._vtk_colors_ptr = None
     _set_rendered_cache_key(app, cache)
 
     renderer = plotter.renderer; nr = 0
@@ -1038,11 +1048,38 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
             if ns.startswith("class_") or ns in ("main_pc", "main_pc_border"):
                 app.vtk_widget.actors[name].SetVisibility(False)
     
-    isc = getattr(cache, 'n_visible_classes', 0) == 1
-    sci = getattr(cache, 'single_class_id', None)
     vc = _get_shading_visibility(app)
     va = np.array(sorted(vc), dtype=np.int32)
-    
+
+    # ── CACHE MISMATCH GUARD ────────────────────────────────────────────
+    # If _shading_visibility_override changed to a single class but the
+    # current cached geometry was built for a different visible-class set
+    # (e.g. all-open cross-section), the cache holds millions of faces for
+    # the wrong geometry.  Rebuild once so subsequent strokes are fast.
+    cached_vc_hash = getattr(cache, 'visible_classes_hash', None)
+    expected_hash  = cache.get_visible_hash(vc)
+    if cached_vc_hash != expected_hash:
+        print(f"   ⚡ Visibility override changed — rebuilding geometry for {sorted(vc)}")
+        # Build and CACHE under the correct key so subsequent strokes hit the fast path.
+        xyz_raw = app.data.get("xyz")
+        new_cache_key = _build_cache_key(xyz_raw, vc)
+        existing = _cache_store.get(new_cache_key)
+        if existing and existing.is_geometry_valid(xyz_raw, vc):
+            # We already have a valid cache for this vc — just restore it
+            global _active_cache_key
+            _active_cache_key = new_cache_key
+            _cache_store.move_to_end(new_cache_key)
+            _refresh_from_cache(app, existing,
+                                 getattr(app, 'last_shade_azimuth', 45.),
+                                 getattr(app, 'last_shade_angle', 45.),
+                                 getattr(app, 'shade_ambient', 0.25))
+        else:
+            update_shaded_class(app, force_rebuild=True)
+        return True
+
+    isc = getattr(cache, 'n_visible_classes', 0) == 1
+    sci = getattr(cache, 'single_class_id', None)
+
     if changed_mask is None or not np.any(changed_mask):
         return _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=vc)
     
@@ -1633,7 +1670,21 @@ def _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=None
                 vp = numpy_support.vtk_to_numpy(cc)
                 sh = cache.shade if cache.shade is not None and len(cache.shade) == len(cache.faces) else np.ones(len(cache.faces), dtype=np.float32)
                 bc = np.array(app.class_palette.get(sci, {}).get("color", (128,128,128)), dtype=np.float32)
-                vp[:] = np.clip(bc * sh[:, None], 0, 255).astype(np.uint8); cc.Modified()
+                # ── Fast partial update: only recolor faces touched by changed points ──
+                if changed_mask is not None and np.any(changed_mask) and cache.faces is not None:
+                    g2u = cache.build_global_to_unique(len(app.data["xyz"]))
+                    cu = g2u[np.flatnonzero(changed_mask)]
+                    cu = cu[(cu >= 0) & (cu < len(cache.unique_indices))]
+                    if len(cu) > 0:
+                        cu_set = np.zeros(len(cache.unique_indices), dtype=bool)
+                        cu_set[cu] = True
+                        af = cu_set[cache.faces[:,0]] | cu_set[cache.faces[:,1]] | cu_set[cache.faces[:,2]]
+                        af_idx = np.flatnonzero(af)
+                        if len(af_idx) > 0:
+                            vp[af_idx] = np.clip(bc * sh[af_idx, None], 0, 255).astype(np.uint8)
+                        cc.Modified()
+                else:
+                    vp[:] = np.clip(bc * sh[:, None], 0, 255).astype(np.uint8); cc.Modified()
                 if _defer_render:
                     mesh.Modified(); a = getattr(app, '_shaded_mesh_actor', None)
                     if a: a.GetMapper().Modified()
