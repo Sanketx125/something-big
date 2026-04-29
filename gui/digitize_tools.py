@@ -1992,7 +1992,8 @@ class DigitizeManager:
     def _on_middle_press(self, obj, evt):
         """Start panning - always works, even during drawing."""
         print("🖱️ Middle button PRESSED - starting pan")
-
+        if hasattr(self, 'app') and self.app is not None:
+            self.app._set_main_panning(True)
         self._consume_vtk_event(obj)
         self.middle_down = True
         self._is_panning = True
@@ -2032,6 +2033,8 @@ class DigitizeManager:
             return
 
         print("🛑 Middle button RELEASED - stopping pan NOW")
+        if hasattr(self, 'app') and self.app is not None:
+            self.app._set_main_panning(False)
 
         self.middle_down = False
         self._is_panning = False

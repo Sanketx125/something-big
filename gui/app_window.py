@@ -12440,6 +12440,14 @@ class NakshaApp(QMainWindow):
         self.shading_dock = None
         self.shading_panel = None
         self.last_shade_max_edge = 100.0
+
+        # ── Shading rebuild queue (pan-safe, debounced) ──────────────
+        self._is_panning_main_view    = False       # set by VTK middle-button observers
+        self._pending_shading_rebuild = False        # True = a rebuild is waiting
+        self._shading_rebuild_timer   = QTimer(self)
+        self._shading_rebuild_timer.setSingleShot(True)
+        self._shading_rebuild_timer.timeout.connect(self._fire_shading_rebuild)
+
         self.point_border_percent = 0
         self.layers = []
         self.dxf_attachments = []  # Store DXF attachment metadata
@@ -17764,21 +17772,24 @@ class NakshaApp(QMainWindow):
                         pass  # Fall through to rebuild
 
                 # 🔄 REBUILD PATH
+                # 🔄 REBUILD PATH — queued, debounced, pan-safe
                 point_count = len(self.data["xyz"]) if hasattr(self, 'data') and self.data and "xyz" in self.data else 0
 
-                def deferred_rebuild():
+                if point_count > 500_000:
+                    # Queue it — _fire_shading_rebuild will run it when user is idle
+                    self._pending_shading_rebuild = True
+                    # Restart debounce: 300ms after the LAST classification fires
+                    if hasattr(self, '_shading_rebuild_timer'):
+                        self._shading_rebuild_timer.start(300)
+                    self._is_applying_class_map = False
+                    return
+                else:
+                    # Small cloud — rebuild immediately as before
                     try:
                         from gui.class_display import update_class_mode
                         update_class_mode(self, force_refresh=True)
                     except Exception as e:
                         print(f"⚠️ Rebuild error: {e}")
-
-                if point_count > 500_000:
-                    QTimer.singleShot(0, deferred_rebuild)
-                    self._is_applying_class_map = False
-                    return
-                else:
-                    deferred_rebuild()
 
             # ============================================================
             # CASE B: CROSS-SECTIONS (Views 1-4) - ASYNC OPTIMIZED
@@ -23991,6 +24002,37 @@ class NakshaApp(QMainWindow):
         finally:
             if hasattr(self, "_last_classified_to_class"):
                 delattr(self, "_last_classified_to_class")
+
+    # ── Shading rebuild queue helpers ────────────────────────────────────────
+    def _fire_shading_rebuild(self):
+        """
+        Fires 300ms after the last classification. Defers further if user
+        is actively panning the main view — VTK is NOT thread-safe.
+        """
+        if not getattr(self, '_pending_shading_rebuild', False):
+            return
+
+        if getattr(self, '_is_panning_main_view', False):
+            # Pan is active — retry after 200ms
+            print("⏸️  Shading rebuild deferred — pan in progress")
+            self._shading_rebuild_timer.start(200)
+            return
+
+        self._pending_shading_rebuild = False
+        print("🎨 Shading rebuild firing (queued, debounced)")
+        try:
+            from gui.class_display import update_class_mode
+            update_class_mode(self, force_refresh=True)
+        except Exception as e:
+            print(f"⚠️ Queued rebuild error: {e}")
+
+    def _set_main_panning(self, is_panning: bool):
+        """Call this from the main VTK interactor's middle-button events."""
+        self._is_panning_main_view = is_panning
+        if not is_panning and getattr(self, '_pending_shading_rebuild', False):
+            # Pan just ended and a rebuild is waiting — fire after 1 frame
+            QTimer.singleShot(50, self._fire_shading_rebuild)
+
 
     def ensure_main_view_2d_interaction(self, preserve_camera=True, reason=None):
         """

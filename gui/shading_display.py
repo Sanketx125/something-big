@@ -216,7 +216,27 @@ if HAS_NUMBA:
     import threading
     threading.Thread(target=_warmup_numba_jit, daemon=True).start()
 
+from PySide6.QtCore import QObject, QThread, Signal
 
+class ShadingRebuildWorker(QObject):
+    rebuild_ready = Signal(object)   # emits dict: {verts, faces, colors, cache_key}
+    error = Signal(str)
+
+    def __init__(self, snapshot):
+        super().__init__()
+        self._snapshot = snapshot
+
+    def run(self):
+        try:
+            snap = self._snapshot
+            # All heavy CPU work here — pure numpy/numba, zero VTK calls
+            xyz    = snap['xyz']
+            faces  = snap['faces']           # already triangulated if reusing cache
+            # ... compute normals, shading, colors ...
+            result = { 'verts': xyz, 'faces': faces, 'colors': colors, 'cache_key': snap['cache_key'] }
+            self.rebuild_ready.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
 # # ── DIAGNOSTIC: Print accelerator status at import time ──────────────────────
 # def _print_accel_status():
 #     import sys as _sys
