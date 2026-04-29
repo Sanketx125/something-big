@@ -216,23 +216,23 @@ if HAS_NUMBA:
     threading.Thread(target=_warmup_numba_jit, daemon=True).start()
 
 
-# ── DIAGNOSTIC: Print accelerator status at import time ──────────────────────
-def _print_accel_status():
-    import sys as _sys
-    frozen = getattr(_sys, 'frozen', False)
-    print(f"\n{'='*60}")
-    print(f"🔧 SHADING ACCELERATOR STATUS ({'FROZEN EXE' if frozen else 'DEV MODE'})")
-    print(f"{'='*60}")
-    print(f"   numba    : {'✅ LOADED' if HAS_NUMBA else '❌ MISSING — normals/shading 3-5x slower'}")
-    print(f"   triangle : {'✅ LOADED' if HAS_TRIANGLE else '❌ MISSING — Delaunay via scipy (2x slower)'}")
-    print(f"   scipy    : {'✅ LOADED' if HAS_SCIPY else '❌ MISSING — no triangulation available'}")
-    for var in ('MKL_NUM_THREADS', 'OMP_NUM_THREADS',
-                'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
-        print(f"   {var}: {os.environ.get(var, 'NOT SET')}")
-    print(f"   CPU cores: {os.cpu_count()}")
-    print(f"{'='*60}\n")
+# # ── DIAGNOSTIC: Print accelerator status at import time ──────────────────────
+# def _print_accel_status():
+#     import sys as _sys
+#     frozen = getattr(_sys, 'frozen', False)
+#     print(f"\n{'='*60}")
+#     print(f"🔧 SHADING ACCELERATOR STATUS ({'FROZEN EXE' if frozen else 'DEV MODE'})")
+#     print(f"{'='*60}")
+#     print(f"   numba    : {'✅ LOADED' if HAS_NUMBA else '❌ MISSING — normals/shading 3-5x slower'}")
+#     print(f"   triangle : {'✅ LOADED' if HAS_TRIANGLE else '❌ MISSING — Delaunay via scipy (2x slower)'}")
+#     print(f"   scipy    : {'✅ LOADED' if HAS_SCIPY else '❌ MISSING — no triangulation available'}")
+#     for var in ('MKL_NUM_THREADS', 'OMP_NUM_THREADS',
+#                 'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+#         print(f"   {var}: {os.environ.get(var, 'NOT SET')}")
+#     print(f"   CPU cores: {os.cpu_count()}")
+#     print(f"{'='*60}\n")
 
-_print_accel_status()
+# _print_accel_status()
 
 def triangulate_with_triangle(xy):
     if not HAS_TRIANGLE: raise ImportError("no triangle")
@@ -625,14 +625,16 @@ def update_shaded_class(app, azimuth=45., angle=45., ambient=0.25,
                     and existing_cache.faces is not None
                     and len(existing_cache.faces) > 0
                     and existing_cache.xyz_unique is not None):
-                # Reuse geometry, just update class visibility and recolor
-                cache = existing_cache
-                cache.visible_classes_hash = cache.get_visible_hash(vc)
-                cache.visible_classes_set = vc.copy()
-                cache.n_visible_classes = 1
-                cache.single_class_id = list(vc)[0]
-                cache.last_azimuth = -1  # force shade recompute
-                _refresh_from_cache(app, cache, azimuth, angle, ambient)
+                # Reuse geometry for rendering only — do NOT mutate the source cache's
+                # visibility metadata or it will invalidate multi-class cache hits later.
+                import copy as _copy
+                _sc_view = _copy.copy(existing_cache)  # shallow copy — shares arrays, not metadata
+                _sc_view.visible_classes_hash = _sc_view.get_visible_hash(vc)
+                _sc_view.visible_classes_set = vc.copy()
+                _sc_view.n_visible_classes = 1
+                _sc_view.single_class_id = list(vc)[0]
+                _sc_view.last_azimuth = -1  # force shade recompute 
+                _refresh_from_cache(app, _sc_view, azimuth, angle, ambient)
                 return
 
 
@@ -905,7 +907,12 @@ def _refresh_from_cache(app, cache, azimuth, angle, ambient):
             cache.shade = _compute_face_shade(cache.xyz_unique, cache.faces, azimuth, angle, ambient, face_normals=cache.face_normals)
         cache.last_azimuth = azimuth; cache.last_angle = angle; cache.last_ambient = ambient
         cache._vtk_colors_ptr = None
-    _render_mesh(app, cache, app.data.get("classification"), sc)
+    _classes_for_render = (
+        getattr(app, '_combined_classification', None)
+        or getattr(app, '_precomputed_classification', None)
+        or app.data.get("classification")
+    )
+    _render_mesh(app, cache, _classes_for_render, sc)
 
 def _render_mesh(app, cache, classes_raw, saved_camera):
     if cache.faces is None or len(cache.faces) == 0: return
@@ -937,11 +944,15 @@ def _render_mesh(app, cache, classes_raw, saved_camera):
         # (faces stores unique indices, not global indices) and produces wrong/OOB entries.
         # In single-class mode every visible face belongs to sci, so look up lut[sci] once.
         sci_id = getattr(cache, 'single_class_id', None)
-        if sci_id is not None and sci_id < mc:
-            fbc = lut[sci_id]  # shape (3,) — broadcast across faces
+        if sci_id is None:
+            # Derive from visible classes — single-class mode means exactly 1
+            _vc_local = _get_shading_visibility(app)
+            sci_id = list(_vc_local)[0] if len(_vc_local) == 1 else None
+        if sci_id is not None and int(sci_id) < mc:
+            fbc = lut[int(sci_id)]  # shape (3,) — broadcast across faces
         else:
-            fvc = np.clip(cache.faces[:,0], 0, len(cm)-1)
-            fbc = lut[np.clip(cm[fvc], 0, mc-1)]
+            # last resort: majority class from unique indices
+            fbc = lut[int(np.bincount(np.clip(cm, 0, mc-1)).argmax())]
         fc = np.clip(fbc * fi[:, None], 0, 255).astype(np.uint8)
         em = getattr(app, '_shaded_mesh_polydata', None); ea = getattr(app, '_shaded_mesh_actor', None)
         if em is not None and ea is not None and em.GetNumberOfPoints() == nv and em.GetNumberOfCells() == nf:
