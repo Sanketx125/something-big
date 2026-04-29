@@ -588,7 +588,7 @@ def _queue_incremental_patch(app, sci):
             _queue_incremental_patch(app, sci); return
         _rebuild_single_class(app, sci)
     _rebuild_timer = QTimer(); _rebuild_timer.setSingleShot(True)
-    _rebuild_timer.timeout.connect(do_patch); _rebuild_timer.start(1000)
+    _rebuild_timer.timeout.connect(do_patch); _rebuild_timer.start(250)
 
 def update_shaded_class(app, azimuth=45., angle=45., ambient=0.25,
                         max_edge_factor=3.0, force_rebuild=False,
@@ -1112,6 +1112,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
             # All changed points are now hidden - fast blacken
             cellc = mesh.GetCellData().GetScalars()
             if cellc and cache.faces is not None and cellc.GetNumberOfTuples() == len(cache.faces):
+                blackened_any = False
                 try:
                     vp = numpy_support.vtk_to_numpy(cellc)
                     cu = g2u[ci]; cu = cu[cu >= 0]
@@ -1119,15 +1120,21 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None):
                         cs = np.zeros(len(cache.unique_indices), dtype=bool)
                         cs[cu] = True
                         af = cs[cache.faces[:,0]] | cs[cache.faces[:,1]] | cs[cache.faces[:,2]]
-                        vp[af] = [0,0,0]
-                        cellc.Modified()
-                        mesh.Modified()
-                        a = getattr(app, '_shaded_mesh_actor', None)
-                        if a: a.GetMapper().Modified()
-                        app.vtk_widget.render()
+                        if np.any(af):
+                            vp[af] = [0, 0, 0]
+                            cellc.Modified()
+                            mesh.Modified()
+                            a = getattr(app, '_shaded_mesh_actor', None)
+                            if a: a.GetMapper().Modified()
+                            app.vtk_widget.render()
+                            blackened_any = True
                 except Exception:
                     pass
-                _queue_incremental_patch(app, sci)
+                # Only queue a mesh rebuild if faces were actually affected.
+                # If the changed points weren't in the mesh (cu all -1),
+                # there's nothing to repair — skip the 1s timer entirely.
+                if blackened_any:
+                    _queue_incremental_patch(app, sci)
                 return True
     
     # Handle visibility changes
@@ -1484,74 +1491,101 @@ def _multi_class_region_undo_patch(app, changed_mask, vcs):
     return True
 
 def _rebuild_single_class(app, sci):
-    """Optimized single-class rebuild."""
+    """Recolor a single-class shaded mesh in-place. NEVER re-uploads geometry."""
     cache = get_cache()
-    if cache.faces is None or len(cache.faces) == 0:
-        cache.clear("no mesh")
-        _do_full_rebuild(app, sci)
+    if cache is None or cache.faces is None or cache.xyz_unique is None:
+        update_shaded_class(app, force_rebuild=True)
         return
-    
-    # Use cache values for shading parameters
-    az = cache.last_azimuth if cache.last_azimuth >= 0 else getattr(app, 'last_shade_azimuth', 45.)
-    an = cache.last_angle if cache.last_angle >= 0 else getattr(app, 'last_shade_angle', 45.)
-    am = cache.last_ambient if cache.last_ambient >= 0 else getattr(app, 'shade_ambient', .25)
-    
-    cls = app.data.get("classification").astype(np.int32)
-    cvl = cls[cache.unique_indices]
-    vl = cvl != sci
-    if np.sum(vl) == 0:
+
+    mesh = getattr(app, '_shaded_mesh_polydata', None)
+    actor = getattr(app, '_shaded_mesh_actor', None)
+    if mesh is None or actor is None:
+        update_shaded_class(app, force_rebuild=True)
         return
-    
-    ifm = vl[cache.faces[:,0]] | vl[cache.faces[:,1]] | vl[cache.faces[:,2]]
-    vfm = ~ifm
-    if np.sum(vfm) == 0:
-        cache.clear("all invalid")
-        _do_full_rebuild(app, sci)
+
+    # ── Fast in-place recolor: only touch face color scalars ─────────────────
+    # Geometry (faces, vertices) is UNCHANGED by classification.
+    # We only need to recolor faces whose vertices belong to the changed class.
+    try:
+        cls = app.data.get("classification").astype(np.int32)
+        combined_cls = (getattr(app, '_combined_classification', None)
+                        or getattr(app, '_precomputed_classification', None))
+        if combined_cls is not None and len(combined_cls) == len(cache.unique_indices):
+            cls_unique = combined_cls[cache.unique_indices].astype(np.int32)
+        else:
+            cls_unique = cls[cache.unique_indices].astype(np.int32)
+
+        cell_scalars = mesh.GetCellData().GetScalars()
+        if cell_scalars is None or cell_scalars.GetNumberOfTuples() != len(cache.faces):
+            # Geometry mismatch — need a real rebuild
+            update_shaded_class(app, force_rebuild=True)
+            return
+
+        colors = numpy_support.vtk_to_numpy(cell_scalars)  # shape (N_faces, 3 or 4), in-place view
+
+        # Recompute shading values if not cached
+        az = getattr(app, 'last_shade_azimuth', 45.)
+        an = getattr(app, 'last_shade_angle', 45.)
+        am = getattr(app, 'shade_ambient', 0.25)
+        palette = app.class_palette
+        f = cache.faces  # (N_faces, 3)
+        nf = len(f)
+
+        # Single-class mode stores per-face shade in cache.shade (vertex_shade is None).
+        # Fall back to recomputing from face_normals if stale.
+        if cache.shade is not None and len(cache.shade) == nf:
+            face_shade = cache.shade.astype(np.float32)
+        elif cache.face_normals is not None and len(cache.face_normals) == nf:
+            face_shade = _compute_face_shade_global_z(
+                cache.xyz_unique, f, az, an, am,
+                face_normals=cache.face_normals)
+            cache.shade = face_shade
+        else:
+            face_shade = np.full(nf, am, dtype=np.float32)
+
+        # Determine per-face class from majority vertex class
+        c0 = cls_unique[f[:, 0]]
+        c1 = cls_unique[f[:, 1]]
+        c2 = cls_unique[f[:, 2]]
+        # Use vertex 0's class as face class (consistent with original logic)
+        face_cls = c0
+
+        # Normalize colors to (N_faces, C) regardless of VTK packing
+        nf = len(cache.faces)
+        if colors.ndim == 1:
+            ncols = len(colors) // nf   # 3 or 4
+            colors_2d = colors.reshape(nf, ncols)
+        else:
+            colors_2d = colors
+            ncols = colors_2d.shape[1]
+
+        unique_cls_ids = np.unique(face_cls)
+        for cid in unique_cls_ids:
+            cinfo = palette.get(int(cid), {})
+            rgb = np.array(cinfo.get("color", (128, 128, 128)), dtype=np.float32)
+            mask = face_cls == cid
+            fs = face_shade[mask].reshape(-1, 1)
+            colors_2d[mask, :3] = np.clip(rgb * fs, 0, 255).astype(np.uint8)
+            if ncols == 4:
+                colors_2d[mask, 3] = 255  # preserve alpha
+
+        # colors_2d is a view into the original buffer — no copy needed
+        # (if it was reshaped from 1D it still points to the same memory)
+
+        cell_scalars.Modified()
+        mesh.Modified()
+        actor.GetMapper().Modified()
+        app.vtk_widget.render()
+
+        cache.last_azimuth = az
+        cache.last_angle = an
+        cache.last_ambient = am
+        print(f"   ⚡ In-place recolor: {len(cache.faces):,} faces [{len(unique_cls_ids)} classes] — 0 VTK rebuild")
         return
-    
-    rva = np.flatnonzero(vl).astype(np.int32)
-    ifa = cache.faces[ifm]
-    irf = np.zeros(len(cache.unique_indices), dtype=bool)
-    if len(rva) > 0:
-        irf[rva] = True
-    bv = np.unique(ifa.ravel()[~irf[ifa.ravel()]]).astype(np.int32)
-    
-    vf = cache.faces[vfm]
-    vn = cache.face_normals[vfm] if cache.face_normals is not None else None
-    vs = cache.shade[vfm] if cache.shade is not None and len(cache.shade) == len(cache.faces) else None
-    npf = np.array([], dtype=np.int32).reshape(0, 3)
-    
-    if len(bv) >= 3:
-        bxy = cache.xyz_unique[bv, :2]
-        try:
-            lf = _do_triangulate(bxy)
-            if len(lf) > 0 and len(bv) > 10:
-                xr = bxy[:,0].max() - bxy[:,0].min()
-                yr = bxy[:,1].max() - bxy[:,1].min()
-                lf = _filter_edges_by_absolute(
-                    lf, bxy,
-                    max(np.sqrt(xr * yr / len(bv)) * 5,
-                        cache.spacing * 1000))
-            if len(lf) > 0:
-                npf = bv[lf]
-        except Exception:
-            pass
-    
-    if len(npf) > 0:
-        pn = _compute_face_normals(cache.xyz_unique, npf)
-        cache.faces = np.vstack([vf, npf])
-        cache.face_normals = pn if vn is None else np.vstack([vn, pn])
-        
-        # Compute shade for new patch with global z-range
-        ps = _compute_face_shade_global_z(cache.xyz_unique, npf, az, an, am, face_normals=pn)
-        cache.shade = ps if vs is None else np.concatenate([vs, ps])
-    else:
-        cache.faces = vf
-        cache.face_normals = vn
-        cache.shade = vs
-    
-    cache._vtk_colors_ptr = None
-    _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
+
+    except Exception as e:
+        print(f"   ⚠️ In-place recolor failed ({e}), falling back to full rebuild")
+        update_shaded_class(app, force_rebuild=True)
 
 def _do_full_rebuild(app, sci):
     sv = {c: app.class_palette[c].get("show", True) for c in app.class_palette}
@@ -1876,10 +1910,34 @@ def _render_mesh_fast_update(app, cache, n_removed, n_added):
     """Fast mesh update - rebuild only if structure changed significantly."""
     mesh = getattr(app, '_shaded_mesh_polydata', None)
     actor = getattr(app, '_shaded_mesh_actor', None)
-    
-    # If mesh structure changed, we need full rebuild
+    cr = app.data.get("classification")
+
+    # ── Fast scalar-only update when face count is unchanged ──────────────
+    if (mesh is not None and actor is not None
+            and mesh.GetNumberOfCells() == len(cache.faces)
+            and n_removed == 0 and n_added == 0):
+        try:
+            sci = getattr(cache, 'single_class_id', None)
+            if sci is not None:
+                cc = mesh.GetCellData().GetScalars()
+                if cc is not None and cc.GetNumberOfTuples() == len(cache.faces):
+                    from vtkmodules.util import numpy_support as _ns
+                    import numpy as _np
+                    sh = (cache.shade if cache.shade is not None
+                          and len(cache.shade) == len(cache.faces)
+                          else _np.ones(len(cache.faces), dtype=_np.float32))
+                    bc = _np.array(app.class_palette.get(sci, {}).get("color", (128, 128, 128)),
+                                   dtype=_np.float32)
+                    _ns.vtk_to_numpy(cc)[:] = _np.clip(bc * sh[:, None], 0, 255).astype(_np.uint8)
+                    cc.Modified(); mesh.Modified(); actor.GetMapper().Modified()
+                    app.vtk_widget.render()
+                    return
+        except Exception:
+            pass
+
+    # ── Face count changed → full VTK mesh rebuild ────────────────────────
     if mesh is None or actor is None or mesh.GetNumberOfCells() != len(cache.faces):
-        _render_mesh(app, cache, app.data.get("classification"), _save_camera(app))
+        _render_mesh(app, cache, cr, _save_camera(app))
         return
     
     # Structure same - just update colors (much faster)
@@ -2003,6 +2061,42 @@ def _fast_incremental_add_points(app, ngi):
     vc = _get_shading_visibility(app)
     cache.visible_classes_hash = cache.get_visible_hash(vc)
     cache.data_hash = _compute_xyz_hash(xr)
+
+    # ── Try in-place color update first (avoids full VTK mesh re-upload) ──
+    isc = getattr(cache, 'n_visible_classes', 0) == 1
+    sci = getattr(cache, 'single_class_id', None)
+    mesh = getattr(app, '_shaded_mesh_polydata', None)
+    actor = getattr(app, '_shaded_mesh_actor', None)
+    nv_mesh = len(cache.xyz_final)
+    nf_mesh = len(cache.faces)
+
+    if (isc and sci is not None and mesh is not None and actor is not None
+            and mesh.GetNumberOfCells() == nf_mesh):
+        try:
+            cell_scalars = mesh.GetCellData().GetScalars()
+            if cell_scalars is not None and cell_scalars.GetNumberOfTuples() == nf_mesh:
+                cols = numpy_support.vtk_to_numpy(cell_scalars)
+                ncols = len(cols) // nf_mesh if cols.ndim == 1 else cols.shape[1]
+                c2d = cols.reshape(nf_mesh, ncols) if cols.ndim == 1 else cols
+                shade = cache.shade
+                if shade is None or len(shade) != nf_mesh:
+                    shade = _compute_face_shade_global_z(
+                        cache.xyz_unique, cache.faces, az, an, am,
+                        face_normals=cache.face_normals)
+                    cache.shade = shade
+                cinfo = app.class_palette.get(int(sci), {})
+                rgb = np.array(cinfo.get("color", (128, 128, 128)), dtype=np.float32)
+                c2d[:, :3] = np.clip(rgb * shade.reshape(-1, 1), 0, 255).astype(np.uint8)
+                cell_scalars.Modified()
+                mesh.Modified()
+                actor.GetMapper().Modified()
+                app.vtk_widget.render()
+                print(f"   ⚡ Incremental in-place recolor: {nf_mesh:,} faces")
+                return True
+        except Exception as e:
+            print(f"   ⚠️ Incremental in-place failed ({e}), falling back to _render_mesh")
+
+    # Full upload fallback (geometry changed or multi-class)
     _render_mesh(app, cache, cr, _save_camera(app))
     return True
 
