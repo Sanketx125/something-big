@@ -1,3 +1,4 @@
+
 import numpy as np
 import pyvista as pv
 from PySide6.QtWidgets import (
@@ -25,7 +26,7 @@ except ImportError:
 
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
-
+import os
 _LARGE_MESH_THRESHOLD = 50_000_000
 _MAX_STORED_SHADING_CACHES = 2
 _rebuild_timer = None
@@ -37,6 +38,49 @@ try:
     HAS_NUMBA = True
 except ImportError:
     HAS_NUMBA = False
+
+# ── DIAGNOSTIC: Print accelerator status at import time ──────────────
+def _print_accel_status():
+    import sys
+    frozen = getattr(sys, 'frozen', False)
+    print(f"\n{'='*60}")
+    print(f"🔧 SHADING ACCELERATOR STATUS ({'FROZEN EXE' if frozen else 'DEV'})")
+    print(f"{'='*60}")
+    print(f"   numba    : {'✅ LOADED' if HAS_NUMBA else '❌ MISSING — normals/shading will be 3-5x slower'}")
+    print(f"   triangle : {'✅ LOADED' if HAS_TRIANGLE else '❌ MISSING — Delaunay will use scipy (2x slower)'}")
+    print(f"   scipy    : {'✅ LOADED' if HAS_SCIPY else '❌ MISSING — no triangulation possible'}")
+    
+    # Check numpy threading (MKL vs OpenBLAS)
+    try:
+        np_config = np.__config__
+        blas_info = str(getattr(np_config, 'blas_opt_info', {}))
+        if 'mkl' in blas_info.lower():
+            print(f"   numpy BLAS: ✅ MKL (multi-threaded)")
+        elif 'openblas' in blas_info.lower():
+            print(f"   numpy BLAS: ⚠️ OpenBLAS")
+        else:
+            print(f"   numpy BLAS: ⚠️ unknown ({blas_info[:80]})")
+    except Exception:
+        try:
+            cfg = np.show_config(mode='dicts')
+            print(f"   numpy BLAS: {cfg}")
+        except Exception:
+            print(f"   numpy BLAS: ⚠️ cannot determine")
+    
+    # Check thread counts
+    import os
+    for var in ('MKL_NUM_THREADS', 'OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+        val = os.environ.get(var, 'NOT SET')
+        print(f"   {var}: {val}")
+    
+    try:
+        import multiprocessing
+        print(f"   CPU cores: {multiprocessing.cpu_count()}")
+    except Exception:
+        pass
+    print(f"{'='*60}\n")
+
+_print_accel_status()
 
 if HAS_NUMBA:
     @njit(parallel=True, fastmath=True)
@@ -171,6 +215,24 @@ if HAS_NUMBA:
     import threading
     threading.Thread(target=_warmup_numba_jit, daemon=True).start()
 
+
+# ── DIAGNOSTIC: Print accelerator status at import time ──────────────────────
+def _print_accel_status():
+    import sys as _sys
+    frozen = getattr(_sys, 'frozen', False)
+    print(f"\n{'='*60}")
+    print(f"🔧 SHADING ACCELERATOR STATUS ({'FROZEN EXE' if frozen else 'DEV MODE'})")
+    print(f"{'='*60}")
+    print(f"   numba    : {'✅ LOADED' if HAS_NUMBA else '❌ MISSING — normals/shading 3-5x slower'}")
+    print(f"   triangle : {'✅ LOADED' if HAS_TRIANGLE else '❌ MISSING — Delaunay via scipy (2x slower)'}")
+    print(f"   scipy    : {'✅ LOADED' if HAS_SCIPY else '❌ MISSING — no triangulation available'}")
+    for var in ('MKL_NUM_THREADS', 'OMP_NUM_THREADS',
+                'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+        print(f"   {var}: {os.environ.get(var, 'NOT SET')}")
+    print(f"   CPU cores: {os.cpu_count()}")
+    print(f"{'='*60}\n")
+
+_print_accel_status()
 
 def triangulate_with_triangle(xy):
     if not HAS_TRIANGLE: raise ImportError("no triangle")
@@ -609,6 +671,14 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
     print(f"🔺 {'SINGLE-CLASS' if is_sc else 'MULTI-CLASS'} SHADING (MicroStation mode)")
     print(f"{'='*60}")
     t_total = time.time()
+
+    # ── Ensure numba JIT is fully compiled before timing real work ────
+    if HAS_NUMBA and not getattr(_build_visible_geometry, '_numba_warmed', False):
+        t_w = time.time()
+        _warmup_numba_jit()
+        _build_visible_geometry._numba_warmed = True
+        print(f"   🔥 Numba JIT warmup: {(time.time()-t_w)*1000:.0f}ms")
+
     app.last_shade_azimuth = azimuth; app.last_shade_angle = angle
     app.shade_ambient = ambient; app.display_mode = "shaded_class"
     saved_camera = _save_camera(app)
