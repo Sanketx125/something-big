@@ -1,8 +1,7 @@
-
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QProgressBar, QPushButton, QMessageBox,
-    QSpinBox, QDoubleSpinBox,
+    QSpinBox, QDoubleSpinBox, QCheckBox,
     QGroupBox, QFrame, QTabWidget, QWidget,
     QFormLayout, QFileDialog, QSizePolicy
 )
@@ -139,20 +138,23 @@ class ClassMappingDialog(QDialog):
 
     def __init__(self, parent=None, existing_classes=None):
         super().__init__(parent)
-        self.existing_classes       = existing_classes or set()
-        self.accepted_class_mapping = None
-        self.accepted_power_mapping = None
-        self.accepted_advanced      = None
-        self._code_spins            = {}
-        self._adv                   = {}
+        self.existing_classes           = existing_classes or set()
+        self.accepted_class_mapping     = None
+        self.accepted_power_mapping     = None
+        self.accepted_advanced          = None
+        self.accepted_enable_power_lines = False
+        self._code_spins                = {}
+        self._code_labels               = {}    # name labels for power rows
+        self._adv                       = {}
+        self._enable_power_cb           = None
         self._setup_ui()
 
     # ── UI ────────────────────────────────────────────────────
 
     def _setup_ui(self):
         self.setWindowTitle("AI Classification")
-        self.setMinimumWidth(680)    # wide enough for 2-col Advanced
-        self.setMinimumHeight(480)
+        self.setMinimumWidth(680)
+        self.setMinimumHeight(520)
         self.setModal(True)
 
         root = QVBoxLayout(self)
@@ -193,8 +195,6 @@ class ClassMappingDialog(QDialog):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
 
-        # ── No "existing codes" label ──
-
         grp        = QGroupBox("Class → Output Code Mapping")
         grp_layout = QVBoxLayout(grp)
         grp_layout.setSpacing(0)
@@ -218,11 +218,33 @@ class ClassMappingDialog(QDialog):
         grp_layout.addWidget(sep)
 
         for idx, (key, name, default_code) in enumerate(self._CLASSES):
-            if idx == 5:                 # divider before power classes
+            if idx == 5:
+                # ── Divider + power-line toggle BEFORE the power rows ──
                 div = QFrame()
                 div.setFrameShape(QFrame.HLine)
                 div.setFrameShadow(QFrame.Sunken)
                 grp_layout.addWidget(div)
+
+                cb_row = QHBoxLayout()
+                cb_row.setContentsMargins(8, 6, 8, 4)
+                self._enable_power_cb = QCheckBox(
+                    "Enable Power Line Detection (Wire & Pole)"
+                )
+                self._enable_power_cb.setChecked(False)
+                self._enable_power_cb.setToolTip(
+                    "OFF (default): pipeline runs in 5-class mode "
+                    "(Ground / Low / Mid / High Veg / Building).\n"
+                    "Building detection is preserved exactly.\n\n"
+                    "ON: an additional post-pass attempts to identify "
+                    "wires and poles. Some building walls may be "
+                    "reclassified as poles when this is enabled."
+                )
+                cb_font = QFont(); cb_font.setBold(True)
+                self._enable_power_cb.setFont(cb_font)
+                self._enable_power_cb.toggled.connect(self._on_power_toggle)
+                cb_row.addWidget(self._enable_power_cb)
+                cb_row.addStretch()
+                grp_layout.addLayout(cb_row)
 
             row = QHBoxLayout()
             row.setContentsMargins(8, 5, 8, 5)
@@ -236,6 +258,12 @@ class ClassMappingDialog(QDialog):
             spin.setAlignment(Qt.AlignCenter)
             spin.setFixedWidth(120)
             self._code_spins[key] = spin
+
+            # Track power rows so we can grey them out when checkbox is off
+            if key in ('wire', 'pole'):
+                self._code_labels[key] = name_lbl
+                spin.setEnabled(False)
+                name_lbl.setEnabled(False)
 
             row.addWidget(name_lbl)
             row.addWidget(spin)
@@ -263,6 +291,16 @@ class ClassMappingDialog(QDialog):
         layout.addStretch()
         return page
 
+    # ── POWER TOGGLE HANDLER ─────────────────────────────────
+
+    def _on_power_toggle(self, checked: bool):
+        """Enable / disable Wire and Pole spinbox + label together."""
+        for key in ('wire', 'pole'):
+            if key in self._code_spins:
+                self._code_spins[key].setEnabled(checked)
+            if key in self._code_labels:
+                self._code_labels[key].setEnabled(checked)
+
     # ── TAB 2: ADVANCED (2-column grid) ──────────────────────
 
     def _build_advanced_tab(self):
@@ -271,7 +309,7 @@ class ClassMappingDialog(QDialog):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        # ── MAC loader row (compact) ──────────────────────────
+        # ── MAC loader row ──
         mac_row = QHBoxLayout()
         mac_row.setSpacing(8)
 
@@ -297,13 +335,12 @@ class ClassMappingDialog(QDialog):
         sep.setFrameShadow(QFrame.Sunken)
         layout.addWidget(sep)
 
-        # ── 2-column grid: CSF (left) | HAG (right) ──────────
         grid = QGridLayout()
         grid.setSpacing(8)
 
         grid.addWidget(self._build_csf_group(),  0, 0)
         grid.addWidget(self._build_hag_group(),  0, 1)
-        grid.addWidget(self._build_wire_group(), 1, 0, 1, 2)  # spans both cols
+        grid.addWidget(self._build_wire_group(), 1, 0, 1, 2)
 
         layout.addLayout(grid)
         layout.addStretch()
@@ -365,8 +402,7 @@ class ClassMappingDialog(QDialog):
         return grp
 
     def _build_wire_group(self):
-        grp  = QGroupBox("Wire Detection Geometry")
-        # 2×3 grid inside for the 6 wire params
+        grp  = QGroupBox("Wire Detection Geometry  (used only when Power Line Detection is enabled)")
         grid = QGridLayout(grp)
         grid.setSpacing(6)
         grid.setColumnStretch(0, 1)
@@ -384,8 +420,7 @@ class ClassMappingDialog(QDialog):
         )
         self._adv['wire_chain_radius'] = self._dspin(
             0.5, 20.0, _DEFAULTS['wire_chain_radius'], 0.5, 1,
-            "Max gap between wire points to connect. "
-            "Increase for sparse/low-density scans."
+            "Max gap between wire points to connect."
         )
         self._adv['wire_density_max'] = self._ispin(
             1, 200, _DEFAULTS['wire_density_max'],
@@ -400,8 +435,6 @@ class ClassMappingDialog(QDialog):
             "Minimum linearity score (0–1). Higher = stricter."
         )
 
-        # Row 0: HAG Min | HAG Max | Chain Radius
-        # Row 1: Density Max | Min Segment Pts | Linearity Min
         params_grid = [
             ("HAG Min (m)",         'wire_hag_min',        0, 0),
             ("HAG Max (m)",         'wire_hag_max',        0, 2),
@@ -410,11 +443,9 @@ class ClassMappingDialog(QDialog):
             ("Min Segment Pts",     'wire_min_segment_pts',2, 0),
             ("Linearity Min",       'wire_linearity_min',  2, 2),
         ]
-        lbl_font = QFont()
         for label_text, key, row, col in params_grid:
             lbl = QLabel(label_text + ":")
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            lbl.setFont(lbl_font)
             grid.addWidget(lbl,                   row, col)
             grid.addWidget(self._adv[key],        row, col + 1)
 
@@ -457,7 +488,6 @@ class ClassMappingDialog(QDialog):
                 self._adv[key].setValue(typ(params[key]))
                 n_filled += 1
 
-        # Single-line status only — no verbose listing
         self._mac_status.setText(
             f"✓  {Path(path).name}  ({n_filled} params loaded)"
         )
@@ -503,20 +533,34 @@ class ClassMappingDialog(QDialog):
     # ── VALIDATE + ACCEPT ────────────────────────────────────
 
     def _validate_and_accept(self):
-        model_codes = [self._code_spins[i].value() for i in range(5)]
-        wire_code   = self._code_spins['wire'].value()
-        pole_code   = self._code_spins['pole'].value()
-        all_codes   = model_codes + [wire_code, pole_code]
+        enable_power = self._enable_power_cb.isChecked()
 
-        if len(set(all_codes)) != len(all_codes):
-            dupes = {c for c in all_codes if all_codes.count(c) > 1}
-            QMessageBox.warning(self, "Duplicate Codes",
-                f"All output codes must be unique.\nDuplicates: {dupes}")
-            return
-        if wire_code == pole_code:
-            QMessageBox.warning(self, "Duplicate Power Codes",
-                f"Wire and Pole codes must differ (both = {wire_code}).")
-            return
+        model_codes = [self._code_spins[i].value() for i in range(5)]
+
+        # Only validate wire/pole codes when power detection is enabled.
+        if enable_power:
+            wire_code = self._code_spins['wire'].value()
+            pole_code = self._code_spins['pole'].value()
+            all_codes = model_codes + [wire_code, pole_code]
+
+            if len(set(all_codes)) != len(all_codes):
+                dupes = {c for c in all_codes if all_codes.count(c) > 1}
+                QMessageBox.warning(self, "Duplicate Codes",
+                    f"All output codes must be unique.\nDuplicates: {dupes}")
+                return
+            if wire_code == pole_code:
+                QMessageBox.warning(self, "Duplicate Power Codes",
+                    f"Wire and Pole codes must differ (both = {wire_code}).")
+                return
+        else:
+            # Validate only the 5 base classes
+            if len(set(model_codes)) != len(model_codes):
+                dupes = {c for c in model_codes if model_codes.count(c) > 1}
+                QMessageBox.warning(self, "Duplicate Codes",
+                    f"All output codes must be unique.\nDuplicates: {dupes}")
+                return
+            wire_code = self._code_spins['wire'].value()
+            pole_code = self._code_spins['pole'].value()
 
         lv_min = self._adv['lowveg_min'].value()
         lv_max = self._adv['lowveg_max'].value()
@@ -534,15 +578,16 @@ class ClassMappingDialog(QDialog):
             QMessageBox.warning(self, "Invalid HAG Boundaries",
                 "Low Veg max must be less than Mid Veg max.")
             return
-        if wh_min >= wh_max:
+        if enable_power and wh_min >= wh_max:
             self.tabs.setCurrentIndex(1)
             QMessageBox.warning(self, "Invalid Wire HAG Range",
                 "Wire HAG Min must be less than Wire HAG Max.")
             return
 
-        self.accepted_class_mapping = {i: self._code_spins[i].value()
-                                        for i in range(5)}
-        self.accepted_power_mapping = {
+        self.accepted_enable_power_lines = enable_power
+        self.accepted_class_mapping      = {i: self._code_spins[i].value()
+                                             for i in range(5)}
+        self.accepted_power_mapping      = {
             InferenceConfig.WIRE_INTERNAL_CODE: wire_code,
             InferenceConfig.POLE_INTERNAL_CODE: pole_code,
         }
@@ -562,9 +607,10 @@ class ClassMappingDialog(QDialog):
         }
         self.accept()
 
-    def get_class_mapping(self):   return self.accepted_class_mapping
-    def get_power_mapping(self):   return self.accepted_power_mapping
-    def get_advanced_config(self): return self.accepted_advanced
+    def get_class_mapping(self):        return self.accepted_class_mapping
+    def get_power_mapping(self):        return self.accepted_power_mapping
+    def get_advanced_config(self):      return self.accepted_advanced
+    def get_enable_power_lines(self):   return self.accepted_enable_power_lines
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -574,13 +620,14 @@ class ClassMappingDialog(QDialog):
 class AIClassificationDialog(QDialog):
 
     def __init__(self, app, class_mapping, power_mapping,
-                 advanced_config=None, parent=None):
+                 advanced_config=None, enable_power_lines=False, parent=None):
         super().__init__(parent)
-        self.app             = app
-        self.class_mapping   = class_mapping
-        self.power_mapping   = power_mapping
-        self.advanced_config = advanced_config or {}
-        self.worker          = None
+        self.app                = app
+        self.class_mapping      = class_mapping
+        self.power_mapping      = power_mapping
+        self.advanced_config    = advanced_config or {}
+        self.enable_power_lines = bool(enable_power_lines)
+        self.worker             = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -589,7 +636,8 @@ class AIClassificationDialog(QDialog):
         self.setModal(True)
         layout = QVBoxLayout(self)
 
-        self.status_label = QLabel("Initializing AI pipeline...")
+        mode = "with Power Lines" if self.enable_power_lines else "5-class mode"
+        self.status_label = QLabel(f"Initializing AI pipeline ({mode})...")
         self.status_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.status_label)
 
@@ -611,8 +659,11 @@ class AIClassificationDialog(QDialog):
     def start_classification(self, data_dict):
         from gui.ai_inference import InferenceWorker
         self.worker = InferenceWorker(
-            data_dict, self.class_mapping,
-            self.power_mapping, self.advanced_config,
+            data_dict,
+            self.class_mapping,
+            self.power_mapping,
+            advanced_config=self.advanced_config,
+            enable_power_lines=self.enable_power_lines,
         )
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.classification_finished)
@@ -629,16 +680,11 @@ class AIClassificationDialog(QDialog):
         self.cancel_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
 
-        # ── CRITICAL: Release GPU/CUDA memory before any new VTK render windows ──
-        # After PyTorch inference the CUDA context holds GPU allocations that can
-        # prevent VTK from obtaining a valid OpenGL pixel format on Windows.
-        # Releasing them here avoids the "failed to get valid pixel format" crash
-        # that occurs when the user takes a cut section immediately after AI runs.
         try:
             import torch
             if torch.cuda.is_available():
-                torch.cuda.synchronize()   # wait for all pending CUDA kernels
-                torch.cuda.empty_cache()   # return GPU memory to the driver
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
                 print("✅ AI finish: CUDA memory released")
         except Exception:
             pass
@@ -648,7 +694,7 @@ class AIClassificationDialog(QDialog):
             print("✅ AI finish: GC collected")
         except Exception:
             pass
-        # ─────────────────────────────────────────────────────────────────────────
+
         self._teardown_worker()
 
         try:
@@ -674,30 +720,36 @@ class AIClassificationDialog(QDialog):
         model_names = {0:'Ground', 1:'Low Vegetation', 2:'Medium Vegetation',
                        3:'High Vegetation', 4:'Building'}
         code_to_name = {v: model_names[k] for k, v in self.class_mapping.items()}
-        wire_out = self.power_mapping.get(InferenceConfig.WIRE_INTERNAL_CODE, 14)
-        pole_out = self.power_mapping.get(InferenceConfig.POLE_INTERNAL_CODE, 15)
-        code_to_name[wire_out] = "Power Line Wire"
-        code_to_name[pole_out] = "Power Line Pole/Tower"
+
+        wire_out = pole_out = None
+        if self.enable_power_lines:
+            wire_out = self.power_mapping.get(InferenceConfig.WIRE_INTERNAL_CODE, 14)
+            pole_out = self.power_mapping.get(InferenceConfig.POLE_INTERNAL_CODE, 15)
+            code_to_name[wire_out] = "Power Line Wire"
+            code_to_name[pole_out] = "Power Line Pole/Tower"
+
         try:
             classification = self.app.data.get("classification")
             if classification is None:
                 return "Classification complete!\n\nNo result data available."
             n_total      = len(classification)
             unique, cnts = np.unique(classification, return_counts=True)
-            lines = ["Classification complete!\n",
+            mode = "Power Line mode" if self.enable_power_lines else "5-class mode"
+            lines = [f"Classification complete! ({mode})\n",
                      f"Total points: {n_total:,}\n", "Results:"]
             for cls, cnt in zip(unique, cnts):
                 ci   = int(cls)
                 name = code_to_name.get(ci, f'Code {ci}')
                 pct  = 100 * cnt / n_total
-                icon = "⚡" if ci in (wire_out, pole_out) else " "
+                icon = "⚡" if (self.enable_power_lines and ci in (wire_out, pole_out)) else " "
                 lines.append(f"  {icon} {name} (code {ci}): {cnt:,} ({pct:.1f}%)")
-            n_wire = int(np.sum(classification == wire_out))
-            n_pole = int(np.sum(classification == pole_out))
-            if n_wire > 0 or n_pole > 0:
-                lines.append("\nPower Line Detection:")
-                if n_wire > 0: lines.append(f"  Wire (code {wire_out}): {n_wire:,} pts")
-                if n_pole > 0: lines.append(f"  Pole (code {pole_out}): {n_pole:,} pts")
+            if self.enable_power_lines:
+                n_wire = int(np.sum(classification == wire_out))
+                n_pole = int(np.sum(classification == pole_out))
+                if n_wire > 0 or n_pole > 0:
+                    lines.append("\nPower Line Detection:")
+                    if n_wire > 0: lines.append(f"  Wire (code {wire_out}): {n_wire:,} pts")
+                    if n_pole > 0: lines.append(f"  Pole (code {pole_out}): {n_pole:,} pts")
             return "\n".join(lines)
         except Exception:
             return "Classification complete!\n\nPoint cloud updated."
@@ -898,16 +950,22 @@ def show_ai_classification_dialog(app):
         if mapping_dialog.exec() != QDialog.Accepted:
             print("  Cancelled by user"); return
 
-        class_mapping   = mapping_dialog.get_class_mapping()
-        power_mapping   = mapping_dialog.get_power_mapping()
-        advanced_config = mapping_dialog.get_advanced_config()
+        class_mapping       = mapping_dialog.get_class_mapping()
+        power_mapping       = mapping_dialog.get_power_mapping()
+        advanced_config     = mapping_dialog.get_advanced_config()
+        enable_power_lines  = mapping_dialog.get_enable_power_lines()
 
         if class_mapping is None or power_mapping is None:
             return
 
+        print(f"  Power-line detection: "
+              f"{'ENABLED' if enable_power_lines else 'DISABLED (5-class mode)'}")
+
         progress_dialog = AIClassificationDialog(
             app, class_mapping, power_mapping,
-            advanced_config=advanced_config, parent=app,
+            advanced_config=advanced_config,
+            enable_power_lines=enable_power_lines,
+            parent=app,
         )
         progress_dialog.start_classification(app.data)
         progress_dialog.exec()

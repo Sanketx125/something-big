@@ -84,6 +84,7 @@ class DigitizeManager:
         self._suspended_preview_actor = None
 
         self.snap_enabled = False  # ✅ Snap disabled by default
+        self._snap_hide_seq = 0    # ✅ used to safely hide snap marker with timer
         self.vertex_move_mode = False
         self.dragging_vertex = None
         self.vertex_hover_marker = None
@@ -1057,9 +1058,18 @@ class DigitizeManager:
         """Activate drawing tool and handle tool-specific setup.
 
         suspend_only=True  →  only pause input handling, do NOT cancel/clear
-                               any in-progress drawing (preview actors + temp_points
-                               are preserved so the user can resume later).
+                            any in-progress drawing (preview actors + temp_points
+                            are preserved so the user can resume later).
         """
+
+        # ============================================================
+        # ✅ FIX: Clean up text tool BEFORE active_tool is reassigned.
+        # Text tool sets _placing_text, installs its own observers,
+        # and leaves temp_points dirty. Must clean NOW while
+        # active_tool still == 'text', before it gets overwritten.
+        # ============================================================
+        if getattr(self, 'active_tool', None) == 'text':
+            self._cleanup_text_tool()
 
         # Clear the shared canvas tool cursor if no draw tool is selected
         if tool is None and hasattr(self.app, 'set_cross_cursor_active'):
@@ -1083,8 +1093,6 @@ class DigitizeManager:
             print("📏 Measurement tool deactivated before drawing")
 
         # When suspend_only=True we are just parking the tool temporarily
-        # (e.g. user activated a section tool mid-draw).  Keep all preview
-        # actors and temp_points intact so the drawing is NOT lost.
         if not suspend_only:
             # Cancel any unfinished SmartLine before switching
             if getattr(self, "active_tool", None) == "smartline" and self.temp_points:
@@ -1116,7 +1124,7 @@ class DigitizeManager:
                 self.temp_points = []
                 print("🧹 Cancelled unfinished Polyline on tool switch")
 
-            # Cancel any active OrthogonalPolygon before switching to another tool
+            # Cancel any active OrthogonalPolygon before switching
             if getattr(self, "active_tool", None) == "orthopolygon":
                 old_inst = getattr(self, '_ortho_polygon_tool', None)
                 if old_inst:
@@ -1129,7 +1137,11 @@ class DigitizeManager:
         if tool:
             tool = tool.lower().replace(" ", "").replace("_", "")
 
-        # Draw tool selection must immediately shut down an active classification session.
+        # ✅ Capture requested tool BEFORE self.active_tool is changed
+        # This is used later for observer attachment logic fix
+        _requested_tool = tool
+
+        # Draw tool selection must immediately shut down classification session
         if tool and getattr(self.app, 'active_classify_tool', None):
             try:
                 print(f"🛑 Draw tool '{tool}' selected — deactivating classification tool")
@@ -1140,17 +1152,17 @@ class DigitizeManager:
         if tool:
             if getattr(self.app, 'cross_section_active', False):
                 try:
-                    print(f"ðŸ›‘ Draw tool '{tool}' selected â€” deactivating cross-section tool")
+                    print(f"🛑 Draw tool '{tool}' selected — deactivating cross-section tool")
                     self.app.deactivate_cross_section_tool()
                 except Exception as e:
-                    print(f"âš ï¸ Failed to deactivate cross-section before drawing: {e}")
+                    print(f"⚠️ Failed to deactivate cross-section before drawing: {e}")
             if getattr(self.app, 'cut_section_mode_on', False):
                 try:
-                    print(f"ðŸ›‘ Draw tool '{tool}' selected â€” deactivating cut-section tool")
+                    print(f"🛑 Draw tool '{tool}' selected — deactivating cut-section tool")
                     self.app.cut_section_controller.cancel_cut_section()
                     self.app.cut_section_mode_on = False
                 except Exception as e:
-                    print(f"âš ï¸ Failed to deactivate cut-section before drawing: {e}")
+                    print(f"⚠️ Failed to deactivate cut-section before drawing: {e}")
 
         if tool:
             self._ensure_plan_view_interaction(f"draw tool: {tool}")
@@ -1159,7 +1171,7 @@ class DigitizeManager:
         _resumed = False
 
         if suspend_only and tool is None and getattr(self, 'active_tool', None):
-            # SUSPENDING: save current drawing state so it can be resumed later
+            # SUSPENDING: save current drawing state
             markers = []
             if hasattr(self, '_line_vertex_markers'):
                 markers = list(self._line_vertex_markers)
@@ -1177,7 +1189,7 @@ class DigitizeManager:
             suspended_tool = self._suspended_state["tool"]
             normalized = tool.lower().replace(" ", "").replace("_", "") if tool else ""
             if normalized == suspended_tool:
-                # RESUMING same tool → restore temp_points (drawing continues)
+                # RESUMING same tool → restore temp_points
                 self.temp_points = self._suspended_state["temp_points"]
                 _resumed = True
                 self._clear_suspended_preview_actor()
@@ -1217,8 +1229,7 @@ class DigitizeManager:
         else:
             print(f"🖊️ Tool activated: {self.active_tool or 'select'}")
 
-
-        # ── Ortho-Polygon tool ────────────────────────────────────────────────────
+        # ── Ortho-Polygon tool ─────────────────────────────────────────────────
         if tool == 'orthopolygon':
             from gui.orthogonal_polygon_tool import OrthogonalPolygonTool
             old = getattr(self, '_ortho_polygon_tool', None)
@@ -1228,11 +1239,24 @@ class DigitizeManager:
             inst.activate()
             self._ortho_polygon_tool = inst
             return
-        # ─────────────────────────────────────────────────────────────────────────
+        # ──────────────────────────────────────────────────────────────────────
 
-        # ✅ Re-attach event observers for drawing tools
-        if self.active_tool and self.active_tool not in ("text", "movevertex"):
-            # Remove only OUR old observers (not grid_label_system's or other tools')
+        # ============================================================
+        # ✅ FIX: Use _requested_tool (captured BEFORE self.active_tool
+        # was set) instead of self.active_tool.
+        #
+        # ORIGINAL BUG: "if self.active_tool and self.active_tool not in
+        # ("text", "movevertex")" — by this point self.active_tool is
+        # already the NEW tool, so switching FROM text TO polyline would
+        # check "polyline" not in ("text","movevertex") = True and attach
+        # observers, but text cleanup had already been skipped because
+        # active_tool was overwritten before the check ran.
+        #
+        # With _requested_tool we always check what was ASKED FOR, and
+        # text cleanup already ran at the very top of this method.
+        # ============================================================
+        if _requested_tool and _requested_tool not in ("text", "movevertex"):
+            # Remove only OUR old observers
             for oid in list(self._draw_observer_ids):
                 try:
                     self.interactor.RemoveObserver(oid)
@@ -1242,14 +1266,17 @@ class DigitizeManager:
 
             # Add fresh observers and track their IDs
             self._draw_observer_ids.append(
-                self.interactor.AddObserver("LeftButtonPressEvent", self._on_left_press, 1.0))
+                self.interactor.AddObserver(
+                    "LeftButtonPressEvent", self._on_left_press, 1.0))
             self._draw_observer_ids.append(
-                self.interactor.AddObserver("MouseMoveEvent", self._on_mouse_move, 1.0))
+                self.interactor.AddObserver(
+                    "MouseMoveEvent", self._on_mouse_move, 1.0))
             self._draw_observer_ids.append(
-                self.interactor.AddObserver("RightButtonPressEvent", self._on_right_press, 1.0))
+                self.interactor.AddObserver(
+                    "RightButtonPressEvent", self._on_right_press, 1.0))
 
-            print(f"✅ Event observers attached for {self.active_tool}")
-        
+            print(f"✅ Event observers attached for {_requested_tool}")
+
         # Handle polyline modes
         if self.active_tool == "polyline":
             if getattr(self, 'polyline_permanent_mode', False):
@@ -1258,9 +1285,8 @@ class DigitizeManager:
                         "🔄 Permanent Polyline Mode - Draw multiple polylines (Shift+Esc to exit)"
                     )
                 except Exception:
-                    pass    
-            
-        # REPLACE WITH:
+                    pass
+
         if tool and "polyline" in tool.lower():
             self.active_tool = "polyline"
             print("🔄 Permanent Polyline mode activated" if self.polyline_permanent_mode else "🖊️ Polyline activated")
@@ -1268,12 +1294,11 @@ class DigitizeManager:
         # ✅ Start text placement if text tool
         if self.active_tool == "text":
             self._start_text_label()
-        
+
         # Activate the shared canvas tool cursor after interactor changes
         if self.active_tool and hasattr(self.app, 'set_cross_cursor_active'):
             self.app.set_cross_cursor_active(True, "draw")
             print("Canvas tool cursor activated for drawing")
-
 
         if _resumed and self.active_tool and self.temp_points:
             self._deferred_preview_update()
@@ -1392,6 +1417,52 @@ class DigitizeManager:
 
         return np.array(snap_target) if snap_target is not None else pos
     
+
+    def _hide_snap_marker_now(self):
+        """Hide the AccuSnap marker immediately."""
+        marker = getattr(self, "_snap_marker", None)
+        if marker is not None:
+            try:
+                marker.SetVisibility(False)
+            except Exception:
+                pass
+
+    def _schedule_hide_snap_marker(self, delay_ms=500):
+        """
+        Hide snap marker after delay. Safe against multiple drawings:
+        an older timer won't hide a new snap marker (sequence guard).
+        """
+        marker = getattr(self, "_snap_marker", None)
+        if marker is None:
+            return
+
+        # Only schedule if currently visible
+        try:
+            if not marker.GetVisibility():
+                return
+        except Exception:
+            return
+
+        try:
+            from PySide6.QtCore import QTimer
+        except ImportError:
+            from PyQt5.QtCore import QTimer
+
+        self._snap_hide_seq += 1
+        seq = self._snap_hide_seq
+
+        def _do_hide():
+            # If another schedule happened after this one, ignore this timer
+            if seq != getattr(self, "_snap_hide_seq", 0):
+                return
+            self._hide_snap_marker_now()
+            try:
+                self.app.vtk_widget.render()
+            except Exception:
+                pass
+
+        QTimer.singleShot(delay_ms, _do_hide)
+    
     
     def keyPressEvent(self, event):
         """Handle keyboard events - check digitizer first!"""
@@ -1422,6 +1493,15 @@ class DigitizeManager:
         """Handle left mouse press - add vertices continuously."""
         if not self.enabled:
             return
+        
+        # ── TEXT TOOL: placement is handled entirely by _start_text_label observers ──
+        # We must NOT consume the event here — doing so blocks middle-mouse panning
+        # because VTK's interactor style never receives the button-press.
+        # The text tool installs its own high-priority observer in _start_text_label,
+        # so returning here is safe and correct.
+        if self.active_tool == "text":
+            return
+
         self._consume_vtk_event(obj)
         self.left_down = True
         pos = self._get_mouse_world()
@@ -1490,7 +1570,7 @@ class DigitizeManager:
             if len(self.temp_points) == 0:
                 snap_target   = None
                 snap_distance = float('inf')
-                world_tol     = self._screen_to_world_tolerance(15)   # ← zoom-aware pixels→world
+                world_tol     = self._screen_to_world_tolerance(15)
                 for drawing in self.drawings:
                     if 'coords' in drawing:
                         for vertex in drawing['coords']:
@@ -1517,7 +1597,6 @@ class DigitizeManager:
                     self._smartline_vertex_markers[-1].GetProperty().SetColor(1, 1, 0)
             self._smartline_vertex_markers.append(sphere)
 
-            # ✅ Use update in-place — no remove+add = no blink on click
             if len(self.temp_points) >= 2:
                 self._update_continuous_preview(
                     color=sl_style['color'],
@@ -1553,7 +1632,6 @@ class DigitizeManager:
                     self._line_vertex_markers[-1].GetProperty().SetColor(1, 1, 0)
             self._line_vertex_markers.append(sphere)
 
-            # ✅ Use update in-place
             if len(self.temp_points) >= 2:
                 self._update_continuous_preview(
                     color=ln_style['color'],
@@ -1610,7 +1688,6 @@ class DigitizeManager:
                     self._polyline_vertex_markers[-1].GetProperty().SetColor(1, 1, 0)
             self._polyline_vertex_markers.append(sphere)
 
-            # ✅ Use update in-place
             if len(self.temp_points) >= 2:
                 self._update_continuous_preview(
                     color=pl_style['color'],
@@ -1626,9 +1703,6 @@ class DigitizeManager:
                 )
                 self.app.vtk_widget.render()
             return
-
-        if self.active_tool == "text":
-            return  ###
 
     # ============================================================================
     # VERTEX INSERTION METHODS
@@ -1990,33 +2064,447 @@ class DigitizeManager:
         
         
     def _on_middle_press(self, obj, evt):
-        """Start panning - always works, even during drawing."""
+        """Start panning - always works, even during drawing or text placement."""
         print("🖱️ Middle button PRESSED - starting pan")
-        if hasattr(self, 'app') and self.app is not None:
-            self.app._set_main_panning(True)
-        self._consume_vtk_event(obj)
+
+        # ── CRITICAL: Do NOT consume this event.
+        # _consume_vtk_event blocks vtkInteractorStyleImage from receiving
+        # the button press, so its internal pan state never initializes.
+        # We set our flags and delegate to the style — that's all.
         self.middle_down = True
         self._is_panning = True
         self._pan_start_pos = self.interactor.GetEventPosition()
         self._last_pos = None
 
-        # ── Smooth pan: tell VTK this is interactive mode so it can skip
-        # expensive still-render steps (anti-aliasing, SSAO, etc.).
         try:
             rw = self.interactor.GetRenderWindow()
             if rw is not None:
-                rw.SetDesiredUpdateRate(30.0)   # interactive = fast render
+                rw.SetDesiredUpdateRate(30.0)
         except Exception:
             pass
 
-        # Allow VTK's built-in pan to also handle this
+        # Let VTK's built-in pan handler do the actual work
         style = self.interactor.GetInteractorStyle()
-        if hasattr(style, "OnMiddleButtonDown"):
+        if style and hasattr(style, "OnMiddleButtonDown"):
             style.OnMiddleButtonDown()
 
-        # ✅ NEW: Ensure release handler has HIGH priority
+        # Ensure release handler stays registered with high priority
         self.interactor.RemoveObservers("MiddleButtonReleaseEvent")
-        self.interactor.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release, 10.0)
+        self.interactor.AddObserver(
+            "MiddleButtonReleaseEvent", self._on_middle_release, 10.0
+        )
+
+
+    def _on_mouse_move(self, obj, evt):
+        """Show rubber-band preview line as you move mouse."""
+        if not self.enabled:
+            if not getattr(self, "active_tool", None) or \
+            not getattr(self, "is_drawing_freehand", False):
+                return
+            return
+
+        # ══════════════════════════════════════════════════════════════════
+        # PANNING: Absolute top priority — never block middle-mouse pan.
+        # Check this BEFORE any _consume_vtk_event call so the interactor
+        # style always receives MouseMoveEvent during pan.
+        # ══════════════════════════════════════════════════════════════════
+        if self._is_panning:
+            if not self.middle_down:
+                # Middle button was released without us catching it — reset
+                self._is_panning = False
+                self._pan_start_pos = None
+                self.app.vtk_widget.render()
+                return
+            # Forward to interactor style — this is what moves the camera
+            style = self.interactor.GetInteractorStyle()
+            if style and hasattr(style, "OnMouseMove"):
+                style.OnMouseMove()
+            self.app.vtk_widget.render()
+            return
+
+        # ══════════════════════════════════════════════════════════════════
+        # Vertex dragging (Shift+Click drag mode)
+        # ══════════════════════════════════════════════════════════════════
+        if self.dragging_vertex:
+            self._consume_vtk_event(obj)
+            new_pos = self._get_mouse_world()
+            drawing = self.dragging_vertex['drawing']
+            vertex_idx = self.dragging_vertex['vertex_index']
+            coords = drawing['coords']
+            coords[vertex_idx] = tuple(new_pos)
+            if self.vertex_drag_marker:
+                self.vertex_drag_marker.SetPosition(*new_pos)
+            self._rebuild_drawing_actor(drawing)
+            if self.selected_drawing is drawing:
+                self.clear_coordinate_labels()
+                self.show_vertex_coordinates(coords)
+            self.app.vtk_widget.render()
+            return
+
+        # ══════════════════════════════════════════════════════════════════
+        # TEXT TOOL: Update preview position WITHOUT consuming the event.
+        # Consuming here would block panning even though _is_panning=False,
+        # because the middle press sets _is_panning=True only AFTER the
+        # style receives OnMiddleButtonDown — there is a 1-frame gap where
+        # a consumed MouseMoveEvent breaks the pan initialization sequence.
+        # ══════════════════════════════════════════════════════════════════
+        if self.active_tool == "text" and getattr(self, "_placing_text", False):
+            try:
+                world_pos = self._get_mouse_world_no_snap()
+                if hasattr(self, "_temp_text_actor") and self._temp_text_actor:
+                    self._temp_text_actor.SetPosition(
+                        world_pos[0], world_pos[1], world_pos[2]
+                    )
+                    self.app.vtk_widget.render()
+            except Exception:
+                pass
+            return
+
+        # ══════════════════════════════════════════════════════════════════
+        # All remaining active tools consume the event to prevent the
+        # interactor style from also processing it (avoids double-handling).
+        # ══════════════════════════════════════════════════════════════════
+        if self.active_tool:
+            self._consume_vtk_event(obj)
+
+        # --- FREEHAND CONTINUOUS DRAWING ---
+        if self.active_tool == "freehand" and \
+        getattr(self, "left_down", False) and \
+        getattr(self, "is_drawing_freehand", False):
+            world_pos = self._get_mouse_world_no_snap()
+            dist_px = 999
+            if self.temp_points:
+                dist_px = self._world_to_screen_distance(world_pos, self.temp_points[-1])
+            if len(self.temp_points) == 0 or dist_px > 2.0:
+                self.temp_points.append(world_pos)
+                if len(self.temp_points) >= 2:
+                    fh_style = self._get_draw_style('freehand')
+                    self._update_freehand_preview_world(
+                        color=fh_style['color'],
+                        width=fh_style['width'],
+                        line_style=fh_style['style'],
+                    )
+                self.app.vtk_widget.render()
+            return
+
+        # --- SMARTLINE ---
+        if self.active_tool == "smartline" and len(self.temp_points) >= 1:
+            sl_style = self._get_draw_style('smartline')
+            if self.snap_enabled:
+                raw_pos = self._get_mouse_world_no_snap()
+                self._snap_point(raw_pos)
+            if len(self.temp_points) >= 2:
+                self._update_continuous_preview(
+                    color=sl_style['color'],
+                    width=sl_style['width'],
+                    line_style=sl_style['style'],
+                )
+            self._update_cursor_preview(
+                color=sl_style['color'],
+                width=sl_style['width'],
+                line_style=sl_style['style'],
+            )
+            self.app.vtk_widget.render()
+            return
+
+        # --- LINE ---
+        if self.active_tool == "line" and len(self.temp_points) >= 1:
+            ln_style = self._get_draw_style('line')
+            raw_pos = self._get_mouse_world_no_snap()
+            self._snap_point(raw_pos)
+            if len(self.temp_points) >= 2:
+                self._update_continuous_preview(
+                    color=ln_style['color'],
+                    width=ln_style['width'],
+                    line_style=ln_style['style'],
+                )
+            self._update_cursor_preview(
+                color=ln_style['color'],
+                width=ln_style['width'],
+                line_style=ln_style['style'],
+            )
+            self.app.vtk_widget.render()
+            return
+
+        # --- RECTANGLE PREVIEW ---
+        if self.active_tool == "rectangle" and len(self.temp_points) == 1:
+            rc_style = self._get_draw_style('rectangle')
+            self._update_rectangle_preview(
+                color=rc_style['color'],
+                width=rc_style['width'],
+                line_style=rc_style['style'],
+            )
+            self.app.vtk_widget.render()
+            return
+
+        # --- CIRCLE PREVIEW ---
+        if self.active_tool == "circle" and len(self.temp_points) == 1:
+            ci_style = self._get_draw_style('circle')
+            self._update_circle_preview_world(
+                color=ci_style['color'],
+                width=ci_style['width'],
+                line_style=ci_style['style'],
+            )
+            self.app.vtk_widget.render()
+            return
+
+        # --- POLYLINE ---
+        if self.active_tool == "polyline" and len(self.temp_points) >= 1:
+            pl_style = self._get_draw_style('polyline')
+            if len(self.temp_points) >= 2:
+                self._update_continuous_preview(
+                    color=pl_style['color'],
+                    width=pl_style['width'],
+                    line_style=pl_style['style'],
+                )
+            self._update_cursor_preview(
+                color=pl_style['color'],
+                width=pl_style['width'],
+                line_style='dotted',
+                close_loop=True,
+            )
+            self.app.vtk_widget.render()
+            return
+
+        # --- MOVE SELECTED ACTOR ---
+        if getattr(self, "move_mode", False) and \
+        getattr(self, "selected", None) and \
+        self.left_down and not self._is_panning:
+            pos = self._get_mouse_world()
+            if not hasattr(self, "_last_pos") or self._last_pos is None:
+                self._last_pos = pos
+            delta = np.array(pos) - np.array(self._last_pos)
+            self._last_pos = pos
+            self._translate_selected(delta)
+            self.app.vtk_widget.render()
+            return
+
+
+    def _on_left_press(self, obj, evt):
+        """Handle left mouse press - add vertices continuously."""
+        if not self.enabled:
+            return
+
+        # ══════════════════════════════════════════════════════════════════
+        # TEXT TOOL: Placement is handled entirely by _start_text_label's
+        # own high-priority observer (_finalize_text_drag at priority 2.0).
+        # We must NOT consume the event here — doing so would prevent
+        # middle-mouse pan from working because VTK's style never sees
+        # the button state change.
+        # ══════════════════════════════════════════════════════════════════
+        if self.active_tool == "text":
+            return
+
+        self._consume_vtk_event(obj)
+        self.left_down = True
+        pos = self._get_mouse_world()
+        x, y = self.interactor.GetEventPosition()
+        world_pos = self._display_to_world(x, y)
+
+        # Shift+Click vertex drag
+        if self.interactor.GetShiftKey() and not self.active_tool:
+            nearest_vertex, nearest_drawing, vertex_idx = \
+                self._find_nearest_vertex_at_position(x, y, tolerance=15.0)
+            if nearest_vertex is not None and nearest_drawing:
+                self._save_state()
+                self.dragging_vertex = {
+                    'drawing': nearest_drawing,
+                    'vertex_index': vertex_idx,
+                    'original_pos': nearest_vertex
+                }
+                if self.vertex_drag_marker:
+                    self._remove_actor_from_overlay(self.vertex_drag_marker)
+                self.vertex_drag_marker = self._add_endpoint_sphere(
+                    nearest_vertex, color=(1, 1, 0), radius=0.12
+                )
+                self.app.vtk_widget.render()
+                return
+
+        # Vertex insertion tool
+        if self.active_tool == "vertex":
+            render_window = self.app.vtk_widget.GetRenderWindow()
+            window_height = render_window.GetSize()[1]
+            qt_y = window_height - y
+            picked_drawing, insertion_point = self._find_line_at_position(x, qt_y)
+            if picked_drawing and insertion_point is not None:
+                self._insert_vertex_at_point(picked_drawing, insertion_point)
+            else:
+                print("⚪ No line found at cursor position")
+            return
+
+        # Selection mode (no active tool)
+        if not self.active_tool:
+            actor = self._pick_actor(x, y)
+            if actor:
+                self._select_actor(actor)
+            return
+
+        # ============ FREEHAND ============
+        if self.active_tool == "freehand":
+            if not self.temp_points:
+                self.temp_points = [world_pos]
+                print("🖊️ Freehand STARTED")
+            else:
+                self.temp_points.append(world_pos)
+                if len(self.temp_points) >= 2:
+                    fh_style = self._get_draw_style('freehand')
+                    self._update_freehand_preview_world(
+                        color=fh_style['color'],
+                        width=fh_style['width'],
+                        line_style=fh_style['style'],
+                    )
+                self.app.vtk_widget.render()
+                print("🖊️ Freehand RESUMED")
+            self.is_drawing_freehand = True
+            return
+
+        # ============ SMARTLINE ============
+        if self.active_tool == "smartline":
+            sl_style = self._get_draw_style('smartline')
+            self._push_temp_vertex_history()
+
+            if len(self.temp_points) == 0:
+                snap_target = None
+                snap_distance = float('inf')
+                world_tol = self._screen_to_world_tolerance(15)
+                for drawing in self.drawings:
+                    if 'coords' in drawing:
+                        for vertex in drawing['coords']:
+                            vertex_arr = np.array(vertex)
+                            dx = float(vertex_arr[0]) - float(pos[0])
+                            dy = float(vertex_arr[1]) - float(pos[1])
+                            dist = np.sqrt(dx * dx + dy * dy)
+                            if dist < world_tol and dist < snap_distance:
+                                snap_distance = dist
+                                snap_target = vertex_arr
+                if snap_target is not None:
+                    pos = snap_target
+
+            self.temp_points.append(pos)
+
+            if not hasattr(self, '_smartline_vertex_markers'):
+                self._smartline_vertex_markers = []
+
+            if len(self.temp_points) == 1:
+                sphere = self._add_endpoint_sphere(pos, color=(0, 1, 0), radius=0.20)
+            else:
+                sphere = self._add_endpoint_sphere(pos, color=(1, 1, 0), radius=0.20)
+                if len(self._smartline_vertex_markers) > 1:
+                    self._smartline_vertex_markers[-1].GetProperty().SetColor(1, 1, 0)
+            self._smartline_vertex_markers.append(sphere)
+
+            if len(self.temp_points) >= 2:
+                self._update_continuous_preview(
+                    color=sl_style['color'],
+                    width=sl_style['width'],
+                    line_style=sl_style['style'],
+                )
+                self._update_cursor_preview(
+                    color=sl_style['color'],
+                    width=sl_style['width'],
+                    line_style=sl_style['style'],
+                    current_world=pos,
+                )
+                self.app.vtk_widget.render()
+            return
+
+        # ============ LINE ============
+        if self.active_tool == "line":
+            ln_style = self._get_draw_style('line')
+            self._push_temp_vertex_history()
+
+            self.temp_points.append(pos)
+
+            if not hasattr(self, '_line_vertex_markers'):
+                self._line_vertex_markers = []
+
+            if len(self.temp_points) == 1:
+                sphere = self._add_endpoint_sphere(pos, color=(0, 1, 0), radius=0.05)
+                sphere.GetProperty().SetOpacity(0.8)
+            else:
+                sphere = self._add_endpoint_sphere(pos, color=(1, 1, 0), radius=0.05)
+                sphere.GetProperty().SetOpacity(0.8)
+                if len(self._line_vertex_markers) > 1:
+                    self._line_vertex_markers[-1].GetProperty().SetColor(1, 1, 0)
+            self._line_vertex_markers.append(sphere)
+
+            if len(self.temp_points) >= 2:
+                self._update_continuous_preview(
+                    color=ln_style['color'],
+                    width=ln_style['width'],
+                    line_style=ln_style['style'],
+                )
+                self._update_cursor_preview(
+                    color=ln_style['color'],
+                    width=ln_style['width'],
+                    line_style=ln_style['style'],
+                    current_world=pos,
+                )
+                self.app.vtk_widget.render()
+            return
+
+        # ============ RECTANGLE ============
+        if self.active_tool == "rectangle":
+            if not self.temp_points:
+                # First click: store the anchor corner
+                self.temp_points = [pos]
+                print(f"🟥 Rectangle: first corner set at {pos}")
+                return
+            if len(self.temp_points) == 1:
+                # Second click: finalize
+                self.temp_points.append(pos)
+                self._remove_preview_actor_2d('_rectangle_preview_actor')
+                self._finalize_rectangle()
+                return
+
+        # ============ CIRCLE ============
+        if self.active_tool == "circle":
+            if not self.temp_points:
+                # First click: store the center
+                self.temp_points = [pos]
+                print(f"⭕ Circle: center set at {pos}")
+                return
+            if len(self.temp_points) == 1:
+                # Second click: finalize
+                self.temp_points.append(pos)
+                self._finalize_circle()
+                return
+
+        # ============ POLYLINE ============
+        if self.active_tool == "polyline":
+            pl_style = self._get_draw_style('polyline')
+            self._push_temp_vertex_history()
+
+            self.temp_points.append(pos)
+
+            if not hasattr(self, '_polyline_vertex_markers'):
+                self._polyline_vertex_markers = []
+
+            if len(self.temp_points) == 1:
+                sphere = self._add_endpoint_sphere(pos, color=(0, 1, 0), radius=0.05)
+                sphere.GetProperty().SetOpacity(0.8)
+            else:
+                sphere = self._add_endpoint_sphere(pos, color=(1, 1, 0), radius=0.05)
+                sphere.GetProperty().SetOpacity(0.8)
+                if len(self._polyline_vertex_markers) > 1:
+                    self._polyline_vertex_markers[-1].GetProperty().SetColor(1, 1, 0)
+            self._polyline_vertex_markers.append(sphere)
+
+            if len(self.temp_points) >= 2:
+                self._update_continuous_preview(
+                    color=pl_style['color'],
+                    width=pl_style['width'],
+                    line_style=pl_style['style'],
+                )
+                self._update_cursor_preview(
+                    color=pl_style['color'],
+                    width=pl_style['width'],
+                    line_style='dotted',
+                    close_loop=True,
+                    current_world=pos,
+                )
+                self.app.vtk_widget.render()
+            return
         
         
     def _reset_pan_state(self):
@@ -2033,8 +2521,6 @@ class DigitizeManager:
             return
 
         print("🛑 Middle button RELEASED - stopping pan NOW")
-        if hasattr(self, 'app') and self.app is not None:
-            self.app._set_main_panning(False)
 
         self.middle_down = False
         self._is_panning = False
@@ -2085,16 +2571,25 @@ class DigitizeManager:
                 return
             return
 
-        if self._is_panning or self.dragging_vertex or self.active_tool:
-            self._consume_vtk_event(obj)
-
-        # Pan state guard
+        # ── PANNING takes absolute priority — never block middle-mouse pan ──────
         if self._is_panning:
+            # Don't consume the event during pan — let VTK style handle it
             if not self.middle_down:
                 self._is_panning = False
                 self._pan_start_pos = None
                 self.app.vtk_widget.render()
                 return
+            style = self.interactor.GetInteractorStyle()
+            if style and hasattr(style, "OnMouseMove"):
+                style.OnMouseMove()
+            self.app.vtk_widget.render()
+            return
+
+        # Only consume event for non-pan, non-text active tools
+        if self.active_tool and self.active_tool != "text":
+            self._consume_vtk_event(obj)
+        elif self.dragging_vertex:
+            self._consume_vtk_event(obj)
 
         # Vertex dragging
         if self.dragging_vertex:
@@ -2112,17 +2607,17 @@ class DigitizeManager:
             self.app.vtk_widget.render()
             return
 
-        # Panning
-        if self._is_panning:
-            if not self._pan_start_pos:
-                self.middle_down = False
-                self._is_panning = False
-                return
-            style = self.interactor.GetInteractorStyle()
-            if style and hasattr(style, "OnMouseMove"):
-                style.OnMouseMove()
-            self.app.vtk_widget.render()
-            return   ####
+        # --- TEXT TOOL: text follows mouse, panning must still work ---
+        if self.active_tool == "text" and getattr(self, "_placing_text", False):
+            # Update text position to follow mouse WITHOUT consuming event
+            # This allows middle-mouse pan to still function
+            try:
+                world_pos = self._get_mouse_world_no_snap()
+                self._update_text_preview_position(world_pos)
+                self.app.vtk_widget.render()
+            except Exception:
+                pass
+            return
 
         # --- FREEHAND CONTINUOUS DRAWING ---
         if self.active_tool == "freehand" and getattr(self, "left_down", False) and getattr(self, "is_drawing_freehand", False):
@@ -2144,21 +2639,16 @@ class DigitizeManager:
 
         # --- SMARTLINE ---
         if self.active_tool == "smartline" and len(self.temp_points) >= 1:
-            mouse_x, mouse_y = self.interactor.GetEventPosition()
             sl_style = self._get_draw_style('smartline')
-
-            # ── Live snap-marker update so user sees green dot on candidate vertices ──
             if self.snap_enabled:
                 raw_pos = self._get_mouse_world_no_snap()
-                self._snap_point(raw_pos)          # updates/hides marker as side-effect
-
+                self._snap_point(raw_pos)
             if len(self.temp_points) >= 2:
                 self._update_continuous_preview(
                     color=sl_style['color'],
                     width=sl_style['width'],
                     line_style=sl_style['style'],
                 )
-
             self._update_cursor_preview(
                 color=sl_style['color'],
                 width=sl_style['width'],
@@ -2169,13 +2659,9 @@ class DigitizeManager:
 
         # --- LINE ---
         if self.active_tool == "line" and len(self.temp_points) >= 1:
-            mouse_x, mouse_y = self.interactor.GetEventPosition()
             ln_style = self._get_draw_style('line')
-
-            # ✅ FIX: Always update snap marker for line tool (not just when snap_enabled)
             raw_pos = self._get_mouse_world_no_snap()
-            self._snap_point(raw_pos)   # updates green snap marker as side-effect
-
+            self._snap_point(raw_pos)
             if len(self.temp_points) >= 2:
                 self._update_continuous_preview(
                     color=ln_style['color'],
@@ -2214,16 +2700,13 @@ class DigitizeManager:
 
         # --- POLYLINE ---
         if self.active_tool == "polyline" and len(self.temp_points) >= 1:
-            mouse_x, mouse_y = self.interactor.GetEventPosition()
             pl_style = self._get_draw_style('polyline')
-
             if len(self.temp_points) >= 2:
                 self._update_continuous_preview(
                     color=pl_style['color'],
                     width=pl_style['width'],
                     line_style=pl_style['style'],
                 )
-
             self._update_cursor_preview(
                 color=pl_style['color'],
                 width=pl_style['width'],
@@ -2233,7 +2716,7 @@ class DigitizeManager:
             self.app.vtk_widget.render()
             return
 
-            # --- MOVE SELECTED ACTOR ---
+        # --- MOVE SELECTED ACTOR ---
         if getattr(self, "move_mode", False) and getattr(self, "selected", None) and self.left_down and not self._is_panning:
             pos = self._get_mouse_world()
             if not hasattr(self, "_last_pos") or self._last_pos is None:
@@ -3324,6 +3807,10 @@ class DigitizeManager:
         self.drawings.append(drawing_entry)
 
         print(f"✅ SmartLine finalized: {len(clean_points)} vertices")
+
+        # ✅ Hide completed smartline vertex markers after 3 seconds
+        self._schedule_hide_snap_marker(500)
+
         self.temp_points = []
         self._smartline_vertex_markers = []
         self._clear_temp_vertex_history()
@@ -3331,6 +3818,120 @@ class DigitizeManager:
             self.active_tool = None
         self.renderer.Modified()
         self.app.vtk_widget.render()
+
+
+    def _hide_snap_marker_now(self):
+        """Hide the green snap marker immediately."""
+        self._snap_hide_seq = getattr(self, "_snap_hide_seq", 0) + 1
+
+        marker = getattr(self, "_snap_marker", None)
+        if marker is not None:
+            try:
+                marker.SetVisibility(False)
+            except Exception:
+                pass
+
+
+    def _schedule_hide_snap_marker(self, delay_ms=500):
+        """Hide snap marker after delay, safely."""
+        marker = getattr(self, "_snap_marker", None)
+        if marker is None:
+            return
+
+        try:
+            from PySide6.QtCore import QTimer
+        except ImportError:
+            from PyQt5.QtCore import QTimer
+
+        self._snap_hide_seq = getattr(self, "_snap_hide_seq", 0) + 1
+        seq = self._snap_hide_seq
+
+        def _hide():
+            if seq != getattr(self, "_snap_hide_seq", 0):
+                return
+
+            marker = getattr(self, "_snap_marker", None)
+            if marker is not None:
+                try:
+                    marker.SetVisibility(False)
+                except Exception:
+                    pass
+
+            try:
+                self.app.vtk_widget.render()
+            except Exception:
+                pass
+
+        QTimer.singleShot(delay_ms, _hide)
+
+
+    def _hide_drawing_markers_now(self, drawing_entries=None):
+        """
+        Hide completed drawing markers:
+        - smartline/polyline vertex_markers
+        - line segment start_marker/end_marker
+        """
+        if drawing_entries is None:
+            drawing_entries = list(getattr(self, "drawings", []))
+
+        if isinstance(drawing_entries, dict):
+            drawing_entries = [drawing_entries]
+
+        any_hidden = False
+
+        for d in drawing_entries:
+            if not isinstance(d, dict):
+                continue
+
+            # smartline / polyline markers
+            for marker in d.get("vertex_markers", []) or []:
+                try:
+                    if marker and marker.GetVisibility():
+                        marker.SetVisibility(False)
+                        any_hidden = True
+                except Exception:
+                    pass
+
+            # line segment endpoint markers
+            for key in ("start_marker", "end_marker"):
+                marker = d.get(key)
+                if marker is not None:
+                    try:
+                        if marker.GetVisibility():
+                            marker.SetVisibility(False)
+                            any_hidden = True
+                    except Exception:
+                        pass
+
+        if any_hidden:
+            try:
+                self.app.vtk_widget.render()
+            except Exception:
+                pass
+
+
+    def _schedule_vertex_marker_hide(self, drawing_entries, delay_ms=500):
+        """
+        Hide completed drawing vertex/end markers after delay.
+        This handles:
+        - smartline/polyline: vertex_markers
+        - line: start_marker/end_marker
+        Also hides snap marker after same delay.
+        """
+        try:
+            from PySide6.QtCore import QTimer
+        except ImportError:
+            from PyQt5.QtCore import QTimer
+
+        def _hide_markers():
+            self._hide_drawing_markers_now(drawing_entries)
+            self._hide_snap_marker_now()
+            try:
+                self.app.vtk_widget.render()
+            except Exception:
+                pass
+
+        QTimer.singleShot(delay_ms, _hide_markers)
             
         
     def _finalize_line(self):
@@ -3355,6 +3956,8 @@ class DigitizeManager:
 
         arrow_enabled = getattr(self, 'line_arrow_mode', False)
 
+        created_line_entries = []
+
         for i in range(len(all_points) - 1):
             p1, p2 = all_points[i], all_points[i + 1]
             coords = [p1, p2]
@@ -3368,7 +3971,7 @@ class DigitizeManager:
             start_marker = self._line_vertex_markers[i] if i < len(self._line_vertex_markers) else None
             end_marker = self._line_vertex_markers[i + 1] if (i + 1) < len(self._line_vertex_markers) else None
 
-            self.drawings.append({
+            drawing_entry = {
                 "type": "line_segment",
                 "coords": coords,
                 "actor": actor,
@@ -3379,7 +3982,13 @@ class DigitizeManager:
                 "original_color": ln_color,
                 "original_width": ln_width,
                 "original_style": ln_lstyle,
-            })
+            }
+
+            self.drawings.append(drawing_entry)
+            created_line_entries.append(drawing_entry)
+
+        # ✅ Hide line endpoint markers after 3 seconds
+        self._schedule_vertex_marker_hide(created_line_entries, 500)
 
         # REPLACE WITH:
         self._line_vertex_markers = []
@@ -3392,6 +4001,9 @@ class DigitizeManager:
 
 
     def _cancel_smart_line(self):
+        # ✅ Hide snap marker immediately on cancel/deactivate
+        self._hide_snap_marker_now()
+
         # ✅ FIX: All preview actors are now 2D
         self._remove_preview_actor_2d('_preview_line_actor')
         self._remove_preview_actor_2d('_continuous_line_actor')
@@ -3456,6 +4068,10 @@ class DigitizeManager:
             "original_style": pl_lstyle,
         }
         self.drawings.append(drawing_entry)
+
+        # ✅ Hide polyline vertex markers after 3 seconds
+        self._schedule_hide_snap_marker(500)
+
         self._polyline_vertex_markers = []
         self._clear_temp_vertex_history()
         self.renderer.Modified()
@@ -3686,6 +4302,11 @@ class DigitizeManager:
 
         self._clear_live_preview_actors()
         self._clear_suspended_preview_actor()
+
+        # ✅ Hide any remaining snap / vertex markers
+        self._hide_snap_marker_now()
+        self._hide_drawing_markers_now()
+
         self.temp_points = []
         self.left_down = False
         self.middle_down = False
@@ -4889,8 +5510,110 @@ class DigitizeManager:
             text_prop.SetFontFamily(vtk.VTK_ARIAL)
         print(f"🔧 Text font applied: {font_family} -> VTK Enum {text_prop.GetFontFamily()}")
 
+
+    def _cleanup_text_tool(self):
+        """
+        Fully reset all text tool state before switching to another tool.
+        Called at the TOP of set_tool() whenever active_tool == 'text'.
+        """
+        print("🧹 Cleaning up text tool state before switch")
+
+        # 1. Cancel any in-progress text placement
+        if getattr(self, '_placing_text', False):
+            try:
+                dlg = getattr(self, '_text_dialog', None)
+                if dlg is not None:
+                    try:
+                        dlg.reject()
+                    except Exception:
+                        pass
+                self._text_dialog = None
+            except Exception as e:
+                print(f"  ⚠️ Could not close text dialog: {e}")
+
+        # 2. Reset ALL text-specific state flags
+        self._placing_text = False
+        self._text_drag_start = None
+        self._text_placement_pos = None
+
+        # 3. Remove any lingering text preview / cursor actors
+        for attr in (
+            '_text_preview_actor',
+            '_text_cursor_actor',
+            '_text_placement_actor',
+            '_text_drag_actor',
+            '_text_anchor_marker',
+        ):
+            actor = getattr(self, attr, None)
+            if actor is not None:
+                try:
+                    self.overlay_renderer.RemoveActor(actor)
+                except Exception:
+                    pass
+                try:
+                    self.renderer.RemoveActor(actor)
+                except Exception:
+                    pass
+                try:
+                    self.renderer.RemoveActor2D(actor)
+                except Exception:
+                    pass
+                try:
+                    self.renderer.RemoveViewProp(actor)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+        # ============================================================
+        # ✅ FIX: Include ALL observers that _start_text_label() creates
+        # The original list was missing middle button observers!
+        # ============================================================
+        for attr in (
+            '_text_press_observer',           # ✅ left button press
+            '_text_move_observer',            # ✅ mouse move
+            '_text_release_observer',         # legacy (might not exist)
+            '_text_observer_id',              # legacy (might not exist)
+            '_text_click_observer',           # legacy (might not exist)
+            '_text_left_press_observer',      # legacy (might not exist)
+            '_text_middle_press_observer',    # ✅ FIX: was missing!
+            '_text_middle_release_observer',  # ✅ FIX: was missing!
+        ):
+            oid = getattr(self, attr, None)
+            if oid is not None:
+                try:
+                    self.interactor.RemoveObserver(oid)
+                    print(f"  ✅ Removed text observer: {attr}")
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+        # 5. Clear temp_points — text tool leaves ghost points
+        self.temp_points = []
+        self._clear_temp_vertex_history()
+
+        print("✅ Text tool cleanup complete")
+
     def _start_text_label(self):
         """Opens text input dialog, then enters placement mode with scalable text."""
+
+        # Remove any previous text-specific observers (prevent stacking)
+        for attr in (
+            '_text_press_observer',
+            '_text_move_observer',
+            '_text_release_observer',
+            '_text_click_observer',
+            '_text_left_press_observer',
+            '_text_middle_press_observer',
+            '_text_middle_release_observer',
+        ):
+            oid = getattr(self, attr, None)
+            if oid is not None:
+                try:
+                    self.interactor.RemoveObserver(oid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
         dialog = TextEditDialog(
             current_text="New Text",
             current_size=40,
@@ -4899,67 +5622,82 @@ class DigitizeManager:
             current_italic=False,
             current_color=(1, 0, 0)
         )
-        
+
         try:
             from PySide6.QtWidgets import QDialog
             result = dialog.exec()
         except ImportError:
             from PyQt5.QtWidgets import QDialog
             result = dialog.exec_()
-            
+
         if result == QDialog.Accepted:
             values = dialog.get_values()
-            
+
             if not values['text'].strip():
                 print("⚠️ Empty text - cancelled")
                 self.active_tool = None
                 return
-            
+
             self._pending_text_config = values
             self._placing_text = True
-            
+
             pos = self._get_mouse_world_no_snap()
-            
+
             # Create scalable preview actor
             self._temp_text_actor = self._make_scalable_text_actor(
                 text=values['text'],
                 position=pos,
-                color=(1, 1, 0),  # Yellow while placing
+                color=(1, 1, 0),
                 font_size=values['font_size'],
                 bold=values['bold'],
                 font_family=values['font_family'],
                 justify='center',
             )
-            
-            # ✅ FIX: vtkTextActor3D uses GetTextProperty(), not GetProperty()
             self._temp_text_actor.GetTextProperty().SetOpacity(0.6)
-            
             self._add_actor_to_overlay(self._temp_text_actor)
-            
             self._temp_text_color = values['color']
-            
-            # After removing observers and before adding text drag ones, re-add middle mouse at high priority:
-            self.interactor.RemoveObservers("MouseMoveEvent")
-            self.interactor.RemoveObservers("LeftButtonPressEvent")
-            self.interactor.RemoveObservers("MiddleButtonPressEvent")    # ADD
-            self.interactor.RemoveObservers("MiddleButtonReleaseEvent")  # ADD
-            self.interactor.AddObserver("MouseMoveEvent", self._on_text_drag, 2.0)
-            self.interactor.AddObserver("LeftButtonPressEvent", self._finalize_text_drag, 2.0)
-            self.interactor.AddObserver("MiddleButtonPressEvent", self._on_middle_press, 2.0)    # ADD
-            self.interactor.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release, 2.0) # ADD
 
-            
+            # ══════════════════════════════════════════════════════════════
+            # CRITICAL: Remove draw-tool observers by stored ID only.
+            # NEVER call RemoveObservers() globally — it destroys observers
+            # from other systems (grid labels etc.) that we cannot restore.
+            #
+            # We remove the current _draw_observer_ids (left press, mouse
+            # move, right press from set_tool) and replace them with
+            # text-specific ones.  Middle button observers are left
+            # completely untouched so pan always works.
+            # ══════════════════════════════════════════════════════════════
+            for oid in list(self._draw_observer_ids):
+                try:
+                    self.interactor.RemoveObserver(oid)
+                except Exception:
+                    pass
+            self._draw_observer_ids = []
+
+            # Text placement needs only these two:
+            self._text_move_observer = self.interactor.AddObserver(
+                "MouseMoveEvent", self._on_text_drag, 2.0
+            )
+            self._text_press_observer = self.interactor.AddObserver(
+                "LeftButtonPressEvent", self._finalize_text_drag, 2.0
+            )
+
+            # Keep right-press so user can cancel via right-click
+            oid = self.interactor.AddObserver(
+                "RightButtonPressEvent", self._on_right_press, 1.0
+            )
+            self._draw_observer_ids.append(oid)
+
             self.app.vtk_widget.render()
-            print(f"📝 Scalable text ready for placement: '{values['text']}' — click to place")
+            print(
+                f"📝 Scalable text ready for placement: "
+                f"'{values['text']}' — click to place"
+            )
         else:
             print("❌ Text tool cancelled")
             self.active_tool = None
             if hasattr(self.app, 'set_cross_cursor_active'):
                 self.app.set_cross_cursor_active(False, "draw")
-
-    # ============================================================
-    # COMPLETE _finalize_text_drag with proper existing text handling
-    # ============================================================
 
     def _finalize_text_drag(self, obj, evt):
         """Finalize scalable text position."""
@@ -4967,51 +5705,48 @@ class DigitizeManager:
             return
 
         self._save_state()
-        
+
         pos = self._get_mouse_world_no_snap()
         config = getattr(self, '_pending_text_config', {})
-        
+
         # Remove preview actor (only if creating new text)
-        if getattr(self, '_temp_text_actor', None) and not hasattr(self, "_dragging_text_drawing"):
+        if getattr(self, '_temp_text_actor', None) and \
+        not hasattr(self, "_dragging_text_drawing"):
             self._remove_actor_from_overlay(self._temp_text_actor)
             self._temp_text_actor = None
-        
+
         # Handle repositioning existing text
         if hasattr(self, "_dragging_text_drawing") and self._dragging_text_drawing:
             drawing = self._dragging_text_drawing
             actor = drawing['actor']
-            
-            # Update position
+
             actor.SetPosition(pos[0], pos[1], pos[2])
-            
-            # Restore original appearance
+
             text_prop = actor.GetTextProperty()
-            
             if 'original_text_color' in drawing:
                 text_prop.SetColor(*drawing['original_text_color'])
-            
             text_prop.SetOpacity(1.0)
-            
-            # Update drawing entry
+
             drawing['coords'] = [tuple(pos)]
             drawing['bounds'] = actor.GetBounds()
-            
-            print(f"✅ Text repositioned at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
-            
-            # Cleanup dragging state
+
+            print(f"✅ Text repositioned at "
+                f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
+
             self._placing_text = False
             self._dragging_text_drawing = None
             self._temp_text_actor = None
-            
+
         else:
-            # Creating new text - remove preview first
+            # Creating new text
             if getattr(self, '_temp_text_actor', None):
                 self._remove_actor_from_overlay(self._temp_text_actor)
                 self._temp_text_actor = None
-            
-            # Create new scalable text actor
-            final_color = getattr(self, "_temp_text_color", config.get('color', (0, 0, 1)))
-            
+
+            final_color = getattr(
+                self, "_temp_text_color", config.get('color', (0, 0, 1))
+            )
+
             text_actor = self._make_scalable_text_actor(
                 text=config.get('text', 'Text'),
                 position=pos,
@@ -5021,11 +5756,10 @@ class DigitizeManager:
                 font_family=config.get('font_family', 'Arial'),
                 justify='center',
             )
-            
+
             text_actor.GetTextProperty().SetOpacity(1.0)
-            
             self._add_actor_to_overlay(text_actor)
-            
+
             drawing_entry = {
                 "type": "text",
                 "coords": [tuple(pos)],
@@ -5040,35 +5774,80 @@ class DigitizeManager:
                 "scalable": True,
             }
             self.drawings.append(drawing_entry)
-            
-            print(f"✅ Scalable text placed at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
-        
-        # Cleanup all state
+
+            print(f"✅ Scalable text placed at "
+                f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
+
+        # ── Cleanup all state ──────────────────────────────────────────────
         self._placing_text = False
         self._pending_text_config = None
-        
+
         if hasattr(self, "_temp_text_color"):
             delattr(self, "_temp_text_color")
         if hasattr(self, "_dragging_text_drawing"):
             self._dragging_text_drawing = None
 
-        self.interactor.RemoveObservers("MouseMoveEvent")
-        self.interactor.RemoveObservers("LeftButtonPressEvent")
+        # ══════════════════════════════════════════════════════════════════
+        # CRITICAL FIX: Remove ONLY the text-specific observers by their
+        # stored IDs — never call RemoveObservers() globally.
+        # Global RemoveObservers() wipes ALL observers for that event type
+        # including ones installed by grid_label_manager and other systems,
+        # leaving the interactor in a broken state for subsequent tools.
+        # ══════════════════════════════════════════════════════════════════
+        for attr in ('_text_press_observer', '_text_move_observer'):
+            oid = getattr(self, attr, None)
+            if oid is not None:
+                try:
+                    self.interactor.RemoveObserver(oid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+        # ── Reinstall the standard draw observers cleanly ─────────────────
+        # Clear the ID list first so set_tool's cleanup loop has nothing
+        # stale to remove, then populate with fresh registrations.
+        self._draw_observer_ids = []
+
+        oid = self.interactor.AddObserver(
+            "LeftButtonPressEvent", self._on_left_press, 1.0
+        )
+        self._draw_observer_ids.append(oid)
+
+        oid = self.interactor.AddObserver(
+            "MouseMoveEvent", self._on_mouse_move, 1.0
+        )
+        self._draw_observer_ids.append(oid)
+
+        oid = self.interactor.AddObserver(
+            "LeftButtonReleaseEvent", self._on_left_release, 1.0
+        )
+        self._draw_observer_ids.append(oid)
+
+        oid = self.interactor.AddObserver(
+            "RightButtonPressEvent", self._on_right_press, 1.0
+        )
+        self._draw_observer_ids.append(oid)
+
+        # Middle button pan observers — remove old ones and re-register
+        # to guarantee exactly one copy is active.
         self.interactor.RemoveObservers("MiddleButtonPressEvent")
         self.interactor.RemoveObservers("MiddleButtonReleaseEvent")
-        self.interactor.AddObserver("LeftButtonPressEvent", self._on_left_press, 1.0)
-        self.interactor.AddObserver("MouseMoveEvent", self._on_mouse_move, 1.0)
-        self.interactor.AddObserver("MiddleButtonPressEvent", self._on_middle_press, 1.0)
-        self.interactor.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release, 1.0)
-                
-        # Clear tool state
-        self._clear_temp_vertex_history()
+        self.interactor.AddObserver(
+            "MiddleButtonPressEvent", self._on_middle_press, 1.0
+        )
+        self.interactor.AddObserver(
+            "MiddleButtonReleaseEvent", self._on_middle_release, 10.0
+        )
+
+        # ── Reset tool state ───────────────────────────────────────────────
+        self.temp_points = []
         self._clear_temp_vertex_history()
         self.active_tool = None
+
         if hasattr(self.app, 'set_cross_cursor_active'):
             self.app.set_cross_cursor_active(False, "draw")
-        self._restore_shared_interactor_observers()
 
+        self._restore_shared_interactor_observers()
         self._force_render()
 
     # ============================================================
@@ -5788,6 +6567,17 @@ class DigitizeManager:
         ESC behavior: Exit/deactivate current tool.
         Cancel ONLY in-progress preview. KEEP all already drawn lines.
         """
+        
+        # ============================================================
+        # ✅ FIX: Clean up text tool state when deactivating via ESC
+        # This must happen BEFORE tool checks below, while active_tool
+        # is still 'text', so _cleanup_text_tool() can find and remove
+        # all text-specific observers.
+        # ============================================================
+        if getattr(self, 'active_tool', None) == 'text':
+            self._cleanup_text_tool()
+        # ============================================================
+        
         tool = getattr(self, "active_tool", None)
         if not tool or tool == "none":
             return False
@@ -5833,6 +6623,8 @@ class DigitizeManager:
             self.temp_points = []
 
         elif tool == "text":
+            # ✅ Text cleanup already happened at top of method
+            # This block just handles visual restoration of dragged text
             dragging_text = getattr(self, "_dragging_text_drawing", None)
             if dragging_text and dragging_text.get("actor") is not None:
                 try:
@@ -5856,6 +6648,8 @@ class DigitizeManager:
             if hasattr(self, "_dragging_text_drawing"):
                 self._dragging_text_drawing = None
 
+            # Observer cleanup is now handled by _cleanup_text_tool() at top
+            # Just restore normal observers here
             self.interactor.RemoveObservers("MouseMoveEvent")
             self.interactor.RemoveObservers("LeftButtonPressEvent")
             self.interactor.RemoveObservers("LeftButtonReleaseEvent")
@@ -5890,6 +6684,10 @@ class DigitizeManager:
         self.active_tool = None
         if hasattr(self.app, 'set_cross_cursor_active'):
             self.app.set_cross_cursor_active(False, "draw")
+        # ✅ If user deactivates before 3-sec timer, hide markers immediately
+        self._hide_snap_marker_now()
+        self._hide_drawing_markers_now()
+
         self._restore_shared_interactor_observers()
         self.app.vtk_widget.render()
         print(f"✅ {tool} exited — tool deactivated (drawings kept)")

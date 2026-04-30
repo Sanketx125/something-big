@@ -1,3 +1,10 @@
+"""
+AI Inference Module - PRODUCTION VERSION
+Power line / pole detection is now optional via `enable_power_lines` flag.
+When disabled (default), the pipeline behaves exactly like the original
+5-class building/vegetation/ground classifier — preserving building accuracy.
+"""
+
 import numpy as np
 import torch
 import json
@@ -56,7 +63,7 @@ class InferenceConfig:
     CSF_ITERATIONS        = 500
 
     # ── HAG vegetation boundary defaults ──
-    LOWVEG_HAG_MIN        = 0.15   # below this → Ground (corrects LowVeg over-prediction)
+    LOWVEG_HAG_MIN        = 0.15
     LOWVEG_HAG_MAX        = 0.50
     MIDVEG_HAG_MAX        = 3.00
     HIGHVEG_HAG_MIN       = 3.00
@@ -83,7 +90,6 @@ class InferenceConfig:
 
     RANDOM_SEED           = 42
 
-    # GPU PCA safe limit — torch.cdist is O(N²), catastrophic above this
     GPU_PCA_MAX_VOXELS    = 30_000
 
 
@@ -218,7 +224,20 @@ class InferenceWorker(QThread):
     BUILDING = 4
 
     def __init__(self, data_dict, class_mapping, power_mapping,
-                 advanced_config=None):
+                 advanced_config=None, enable_power_lines=False):
+        """
+        Args:
+            data_dict           : App data dict with xyz, intensity, etc.
+            class_mapping       : Dict {0..4: output_code}
+            power_mapping       : Dict {5: wire_code, 6: pole_code}
+                                  Used ONLY when enable_power_lines=True.
+            advanced_config     : Optional override dict for tunable params.
+            enable_power_lines  : If False (default), the power-line / pole
+                                  post-pass is skipped entirely. Output will
+                                  contain only the 5 base classes — exactly
+                                  matching the original reliable pipeline.
+                                  Building accuracy is preserved.
+        """
         super().__init__()
 
         self._xyz = np.array(data_dict["xyz"], dtype=np.float64)
@@ -233,10 +252,11 @@ class InferenceWorker(QThread):
         if data_dict.get("number_of_returns") is not None:
             self._number_of_returns = np.array(data_dict["number_of_returns"], dtype=np.float32)
 
-        self._data_dict_ref    = data_dict
-        self.class_mapping     = dict(class_mapping)
-        self.power_mapping     = dict(power_mapping)
-        self._cancel_requested = threading.Event()
+        self._data_dict_ref     = data_dict
+        self.class_mapping      = dict(class_mapping)
+        self.power_mapping      = dict(power_mapping) if power_mapping else {}
+        self.enable_power_lines = bool(enable_power_lines)
+        self._cancel_requested  = threading.Event()
         self.model     = None
         self.ort_sess  = None
         self.device    = None
@@ -282,29 +302,38 @@ class InferenceWorker(QThread):
 
     def _log_active_config(self):
         print("\n  ── Active inference config ──")
+        print(f"  Power-line detection: {'ENABLED' if self.enable_power_lines else 'DISABLED (5-class mode)'}")
         print(f"  CSF: cloth_res={self._csf_cloth_resolution}  rigidness={self._csf_rigidness}"
               f"  threshold={self._csf_class_threshold}")
         print(f"  HAG veg: Ground<{self._lowveg_min}m  LowVeg:{self._lowveg_min}-{self._lowveg_max}m"
               f"  MidVeg:{self._lowveg_max}-{self._midveg_max}m  HighVeg>={self._highveg_min}m")
-        print(f"  Wire: HAG={self._wire_hag_min}-{self._wire_hag_max}m"
-              f"  chain_r={self._wire_chain_radius}m  density_max={self._wire_density_max}"
-              f"  min_seg={self._wire_min_segment_pts}pts  lin_min={self._wire_linearity_min}")
+        if self.enable_power_lines:
+            print(f"  Wire: HAG={self._wire_hag_min}-{self._wire_hag_max}m"
+                  f"  chain_r={self._wire_chain_radius}m  density_max={self._wire_density_max}"
+                  f"  min_seg={self._wire_min_segment_pts}pts  lin_min={self._wire_linearity_min}")
 
     def _build_mapping_array(self):
-        all_keys = list(self.class_mapping.keys()) + list(self.power_mapping.keys())
-        all_vals = list(self.class_mapping.values()) + list(self.power_mapping.values())
+        # Always include base 5 classes; include power codes only if we have them.
+        all_keys = list(self.class_mapping.keys())
+        all_vals = list(self.class_mapping.values())
+        if self.enable_power_lines and self.power_mapping:
+            all_keys += list(self.power_mapping.keys())
+            all_vals += list(self.power_mapping.values())
+
         for k in all_keys:
             if not isinstance(k, int) or k < 0:
                 raise ValueError(f"Mapping key must be non-negative int, got {k}")
         for v in all_vals:
             if not isinstance(v, int) or v < 0 or v > 255:
                 raise ValueError(f"Mapping value must be 0-255, got {v}")
+
         max_idx        = max(all_keys)
         self.map_array = np.zeros(max_idx + 1, dtype=np.uint8)
         for k, v in self.class_mapping.items():
             self.map_array[k] = v
-        for k, v in self.power_mapping.items():
-            self.map_array[k] = v
+        if self.enable_power_lines and self.power_mapping:
+            for k, v in self.power_mapping.items():
+                self.map_array[k] = v
         print(f"  Class mapping array: {self.map_array}")
 
     def cancel(self):
@@ -403,7 +432,7 @@ class InferenceWorker(QThread):
             self.model.load_state_dict(ckpt['model_state_dict'], strict=True)
             self.model.eval()
 
-        del ckpt  # Free weight-tensor duplicate from VRAM immediately.
+        del ckpt
 
         with open(stats_path) as f:
             stats = json.load(f)
@@ -467,10 +496,8 @@ class InferenceWorker(QThread):
 
         assert features.shape == (n_total, InferenceConfig.EXPECTED_NUM_FEATURES)
 
-        # Compact post-processing feature slice (saves RAM)
         post_features = features[:, _POST_COL_INDICES].copy()
 
-        # In-place standardize
         self._check_cancel()
         self.progress.emit(45, "Normalizing features...")
         features -= self.feat_mean
@@ -489,13 +516,14 @@ class InferenceWorker(QThread):
         total_votes[total_votes == 0] = 1
         confidence  = vote_counts.max(axis=1) / total_votes.squeeze()
 
-        # ── HAG correction pass (before standard post-processing) ──
+        # ── HAG correction pass ──
         self._check_cancel()
         self.progress.emit(86, "Applying HAG vegetation correction...")
         t0 = time.time()
         predictions, hag_fixes = self._hag_correction_pass(predictions, hag)
         print(f"    HAG correction: {hag_fixes:,} fixes ({time.time()-t0:.1f}s)")
 
+        # ── Standard post-processing (always runs) ──
         self._check_cancel()
         self.progress.emit(88, "Post-processing...")
         t0 = time.time()
@@ -507,15 +535,21 @@ class InferenceWorker(QThread):
         for k, v in fix_report.items():
             print(f"      {k}: {v:,}")
 
-        self._check_cancel()
-        self.progress.emit(92, "Detecting power lines and poles...")
-        t0 = time.time()
-        predictions, power_report = self._detect_power_lines(
-            xyz, predictions, hag, post_features
-        )
-        print(f"    Power lines: {time.time()-t0:.1f}s")
-        for k, v in power_report.items():
-            print(f"      {k}: {v:,}")
+        # ══════════════════════════════════════════════════════
+        # Power-line / pole post-pass — ONLY IF ENABLED
+        # ══════════════════════════════════════════════════════
+        if self.enable_power_lines:
+            self._check_cancel()
+            self.progress.emit(92, "Detecting power lines and poles...")
+            t0 = time.time()
+            predictions, power_report = self._detect_power_lines(
+                xyz, predictions, hag, post_features
+            )
+            print(f"    Power lines: {time.time()-t0:.1f}s")
+            for k, v in power_report.items():
+                print(f"      {k}: {v:,}")
+        else:
+            print(f"    Power-line detection SKIPPED (disabled by user)")
 
         self._check_cancel()
         self.progress.emit(97, "Applying class mapping...")
@@ -523,13 +557,15 @@ class InferenceWorker(QThread):
 
         names = {0:'Ground',1:'LowVeg',2:'MidVeg',3:'HighVeg',4:'Building',
                  5:'Wire',6:'Pole'}
+        max_idx = 7 if self.enable_power_lines else 5
         print(f"\n  Mapping applied:")
-        for model_idx in range(7):
+        for model_idx in range(max_idx):
             mask = predictions == model_idx
             n    = mask.sum()
             if n > 0:
+                code = self.map_array[model_idx] if model_idx < len(self.map_array) else '?'
                 print(f"    {names[model_idx]} (idx {model_idx}) "
-                      f"-> code {self.map_array[model_idx]}: {n:,} pts")
+                      f"-> code {code}: {n:,} pts")
 
         self._data_dict_ref["classification"] = classified
 
@@ -546,10 +582,6 @@ class InferenceWorker(QThread):
     # ── HAG ───────────────────────────────────────────────────
 
     def _compute_hag_csf(self, xyz):
-        """
-        CSF ground extraction using per-project parameters from advanced_config.
-        cloth_resolution / rigidness / class_threshold are user-tunable.
-        """
         if not HAS_CSF:
             raise RuntimeError("CSF required.")
         csf = CSF.CSF()
@@ -586,26 +618,8 @@ class InferenceWorker(QThread):
     # ── HAG CORRECTION PASS ───────────────────────────────────
 
     def _hag_correction_pass(self, predictions, hag):
-        """
-        After model voting, apply HAG-based corrections for clear boundary
-        violations. Only corrects confident mistakes — conservative by design.
-
-        Corrections applied:
-          1. Any veg class (LowVeg/MidVeg/HighVeg) with HAG < lowveg_min
-             → forced to Ground.
-             Addresses: Ground misclassified as LowVeg (most common error).
-
-          2. Ground class with HAG > lowveg_max (significantly above surface)
-             that is NOT near a building → corrected to LowVeg.
-             Conservative: only applied when HAG is clearly non-ground
-             and no building neighbour context.
-
-        Buildings, Wire, Pole are never touched by this pass.
-        """
         fixes = 0
-        n     = len(predictions)
 
-        # ── Correction 1: Veg below minimum ground threshold → Ground ──
         veg_mask = np.isin(predictions, [self.LOWVEG, self.MIDVEG, self.HIGHVEG])
         below_ground = veg_mask & (hag < self._lowveg_min)
         n1 = int(below_ground.sum())
@@ -614,15 +628,11 @@ class InferenceWorker(QThread):
             fixes += n1
             print(f"      HAG corr-1 (veg→ground, HAG<{self._lowveg_min:.2f}m): {n1:,}")
 
-        # ── Correction 2: Ground above lowveg_max → LowVeg ──
-        # Only apply if HAG is clearly above threshold and point is not
-        # immediately surrounded by buildings (avoid clipping roof points)
         ground_mask   = predictions == self.GROUND
         above_lowveg  = ground_mask & (hag > self._lowveg_max)
         n_candidates  = int(above_lowveg.sum())
 
         if n_candidates > 0:
-            # Build quick building proximity check using 2D KD-tree
             building_mask = predictions == self.BUILDING
             n_corrected   = 0
             cand_idx      = np.where(above_lowveg)[0]
@@ -632,7 +642,6 @@ class InferenceWorker(QThread):
                 dists, _  = tree_bldg.query(
                     self._xyz[cand_idx][:, :2], k=1, workers=-1
                 )
-                # Only correct if clearly away from buildings (>= 3m)
                 safe_to_correct = dists >= 3.0
                 to_fix = cand_idx[safe_to_correct]
             else:
@@ -833,7 +842,6 @@ class InferenceWorker(QThread):
         x_min, y_min = xyz[:,0].min(), xyz[:,1].min()
         x_max, y_max = xyz[:,0].max(), xyz[:,1].max()
 
-        # Pre-sort by x for O(log N) tile lookups instead of O(N) masks
         x_order  = np.argsort(xyz[:, 0])
         x_sorted = xyz[x_order, 0]
 
@@ -845,7 +853,6 @@ class InferenceWorker(QThread):
                 tile_specs.append((xs, ys)); ys += stride
             xs += stride
 
-        # Pre-compute tile members: binary search on x, then filter y
         tile_members = []
         for tx, ty in tile_specs:
             lo = np.searchsorted(x_sorted, tx, side='left')
@@ -855,7 +862,7 @@ class InferenceWorker(QThread):
             cands  = x_order[lo:hi]
             y_vals = xyz[cands, 1]
             t_idx  = cands[(y_vals >= ty) & (y_vals < ty + tile_size)]
-            t_idx.sort()  # match np.where order for RNG reproducibility
+            t_idx.sort()
             tile_members.append(t_idx if len(t_idx) >= 100 else None)
 
         n_active = sum(1 for m in tile_members if m is not None)
@@ -1002,7 +1009,6 @@ class InferenceWorker(QThread):
         all_ground_xyz = xyz[ground_mask]
         if len(all_ground_xyz) == 0: return predictions, 0
 
-        # First pass: filter by building ratio (variable-length neighbors)
         ratio_pass = []
         for i, neighbors in enumerate(neighbor_lists):
             if len(neighbors) >= 5:
@@ -1013,14 +1019,12 @@ class InferenceWorker(QThread):
 
         pass_candidates = candidates[np.array(ratio_pass)]
 
-        # Batch ground elevation query (replaces per-point KDTree calls)
         tree_ground_2d = cKDTree(all_ground_xyz[:, :2])
         d_g, i_g = tree_ground_2d.query(
             xyz[pass_candidates, :2], k=10, workers=-1
         )
         del tree_ground_2d
 
-        # Vectorized elevation check
         near_mask    = d_g < 20.0
         ground_z     = all_ground_xyz[i_g, 2]
         ground_z_m   = np.where(near_mask, ground_z, np.nan)
@@ -1090,7 +1094,6 @@ class InferenceWorker(QThread):
                 if len(nbrs) < 5: isolated.append(pi)
                 elif (predictions[nbrs] == self.BUILDING).sum() / len(nbrs) < 0.15:
                     isolated.append(pi)
-            # Batch KDTree query for all isolated points at once
             if isolated:
                 isolated_arr = np.array(isolated)
                 _, nn_batch  = tree_all.query(xyz[isolated_arr], k=20, workers=-1)
@@ -1106,7 +1109,6 @@ class InferenceWorker(QThread):
             np.isin(predictions, [self.MIDVEG, self.HIGHVEG, self.BUILDING])
         )[0]
         if 0 < len(lc) < 500_000:
-            # Batch KDTree query for all low-confidence points at once
             _, nn_batch = tree_all.query(xyz[lc], k=15, workers=-1)
             nn_conf = confidence[nn_batch[:, 1:]]
             nn_pred = predictions[nn_batch[:, 1:]]
@@ -1118,17 +1120,12 @@ class InferenceWorker(QThread):
                 new = v[c.argmax()]
                 if new != predictions[lc[i]]:
                     predictions[lc[i]] = new; fixes += 1
-                del tree_all
+        del tree_all
         return predictions, fixes
 
-    # ── POWER LINE DETECTION ─────────────────────────────────
+    # ── POWER LINE DETECTION (only invoked when enable_power_lines=True) ──
 
     def _detect_power_lines(self, xyz, predictions, hag, post_features):
-        """
-        Wire and pole detection using per-project geometry params.
-        chain_radius / density_max / min_segment_pts / linearity_min
-        are all user-tunable via Advanced config.
-        """
         report = {
             'wire_candidates': 0, 'wires_final': 0,
             'pole_candidates': 0, 'poles_final': 0,
@@ -1136,7 +1133,6 @@ class InferenceWorker(QThread):
         cfg = InferenceConfig
         HAG_CONSISTENCY_MAX = 1.0
 
-        # ── Resolved per-project wire params ──
         wire_hag_min        = self._wire_hag_min
         wire_hag_max        = self._wire_hag_max
         wire_chain_radius   = self._wire_chain_radius
@@ -1149,7 +1145,7 @@ class InferenceWorker(QThread):
               f"chain_r={wire_chain_radius}m  density_max={wire_density_max}  "
               f"min_seg={wire_min_seg}  lin_min={wire_linearity_min}")
 
-        # STEP 1: WIRE DETECTION
+        # STEP 1: WIRE DETECTION (only from veg pool — NEVER touches buildings)
         veg_pool_mask = (
             ((predictions == self.MIDVEG) | (predictions == self.HIGHVEG)) &
             (hag >= wire_hag_min) &
@@ -1260,6 +1256,10 @@ class InferenceWorker(QThread):
             print(f"    Wire: no veg candidates in HAG {wire_hag_min}-{wire_hag_max}m — skipping")
 
         # STEP 2: POLE DETECTION
+        # NOTE: pool intentionally includes BUILDING — when this pass is
+        # enabled the user accepts that some building walls may be
+        # reclassified as poles. To preserve building accuracy, leave
+        # power-line detection DISABLED in the dialog.
         pole_pool_mask = (
             ((predictions == self.BUILDING) |
              (predictions == self.HIGHVEG)  |
