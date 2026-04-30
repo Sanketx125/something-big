@@ -403,6 +403,8 @@ class InferenceWorker(QThread):
             self.model.load_state_dict(ckpt['model_state_dict'], strict=True)
             self.model.eval()
 
+        del ckpt  # Free weight-tensor duplicate from VRAM immediately.
+
         with open(stats_path) as f:
             stats = json.load(f)
         self.feat_mean = np.array(stats['mean'], dtype=np.float32)
@@ -574,6 +576,7 @@ class InferenceWorker(QThread):
         tree        = cKDTree(ground_pts[:, :2])
         k           = min(5, len(ground_pts))
         dists, idxs = tree.query(xyz[:, :2], k=k, workers=-1)
+        del tree
         if k == 1:
             dists = dists.reshape(-1, 1); idxs = idxs.reshape(-1, 1)
         w  = 1.0 / (dists + 1e-6); w /= w.sum(axis=1, keepdims=True)
@@ -911,6 +914,7 @@ class InferenceWorker(QThread):
             print(f"    {n_no_votes:,} without votes — NN fill")
             tree    = cKDTree(xyz[has_votes])
             _, nn_i = tree.query(xyz[~has_votes], k=1)
+            del tree
             predictions[~has_votes] = predictions[has_votes][nn_i]
 
         return predictions, vote_counts
@@ -928,6 +932,7 @@ class InferenceWorker(QThread):
             }
             logits_np = self.ort_sess.run(None, ort_inputs)[0]
             preds     = logits_np.argmax(axis=-1)
+            del ort_inputs, logits_np
             return [preds[i] for i in range(B)]
 
         c_t = torch.from_numpy(coords_batch).float().to(self.device)
@@ -939,6 +944,7 @@ class InferenceWorker(QThread):
             else:
                 logits = self.model(c_t, f_t)
         preds = logits.argmax(dim=-1).cpu().numpy()
+        del c_t, f_t, logits
         return [preds[i] for i in range(B)]
 
     # ── POST-PROCESSING ───────────────────────────────────────
@@ -986,6 +992,7 @@ class InferenceWorker(QThread):
         dists, _       = tree_bldg_2d.query(
             xyz[ground_indices][:, :2], k=1, workers=-1
         )
+        del tree_bldg_2d
         candidates = ground_indices[dists < 3.0]
         if len(candidates) == 0: return predictions, 0
         tree_all       = cKDTree(xyz)
@@ -1011,6 +1018,7 @@ class InferenceWorker(QThread):
         d_g, i_g = tree_ground_2d.query(
             xyz[pass_candidates, :2], k=10, workers=-1
         )
+        del tree_ground_2d
 
         # Vectorized elevation check
         near_mask    = d_g < 20.0
@@ -1051,6 +1059,7 @@ class InferenceWorker(QThread):
                 (hag[rem] < building_hag[nn_r] + 1.0)
             )
             predictions[rem[buf]] = self.BUILDING; fixes += buf.sum()
+        del tree_bldg_2d
         return predictions, fixes
 
     def _fix_salt_pepper(self, xyz, predictions, confidence):
@@ -1060,6 +1069,7 @@ class InferenceWorker(QThread):
             nb_idx = np.where(~b_mask)[0]
             tree_b = cKDTree(xyz[b_mask])
             d, _   = tree_b.query(xyz[nb_idx], k=1, workers=-1)
+            del tree_b
             cand   = nb_idx[d < 2.0]
             if len(cand) > 0:
                 nls = tree_all.query_ball_point(xyz[cand], r=1.5, workers=-1)
@@ -1108,6 +1118,7 @@ class InferenceWorker(QThread):
                 new = v[c.argmax()]
                 if new != predictions[lc[i]]:
                     predictions[lc[i]] = new; fixes += 1
+                del tree_all
         return predictions, fixes
 
     # ── POWER LINE DETECTION ─────────────────────────────────
@@ -1168,6 +1179,7 @@ class InferenceWorker(QThread):
                         workers=-1, return_length=True
                     )
                 ) - 1
+                del tree_cand
                 sparse_idx = geom_idx[raw_counts <= wire_density_max]
                 print(f"    Wire after density filter: {len(sparse_idx):,}")
 
@@ -1179,6 +1191,7 @@ class InferenceWorker(QThread):
                             workers=-1, return_length=True
                         )
                     ) - 1
+                    del tree_sparse
                     chain_pass_idx = sparse_idx[chain_counts >= cfg.WIRE_CHAIN_MIN]
                     print(f"    Wire after chain filter: {len(chain_pass_idx):,}")
 
@@ -1188,6 +1201,7 @@ class InferenceWorker(QThread):
                         _, nn_idx  = tree_chain.query(
                             xyz[chain_pass_idx], k=k_hag, workers=-1
                         )
+                        del tree_chain
                         chain_hag = hag[chain_pass_idx]
                         nb_hag    = chain_hag[nn_idx]
                         hag_ok    = (
@@ -1203,6 +1217,7 @@ class InferenceWorker(QThread):
                             seg_pairs = seg_tree.query_pairs(
                                 r=wire_chain_radius, output_type='ndarray'
                             )
+                            del seg_tree
                             n_ch = len(hag_consistent_idx)
                             if len(seg_pairs) > 0:
                                 row  = np.concatenate(
@@ -1288,7 +1303,9 @@ class InferenceWorker(QThread):
 
         pole_xyz_2d = xyz[pole_cand_idx, :2]
         t0    = time.time()
-        pairs = cKDTree(pole_xyz_2d).query_pairs(r=3.0, output_type='ndarray')
+        _pole_tree = cKDTree(pole_xyz_2d)
+        pairs      = _pole_tree.query_pairs(r=3.0, output_type='ndarray')
+        del _pole_tree
         n_cand = len(pole_cand_idx)
         if len(pairs) > 0:
             row = np.concatenate([pairs[:,0], pairs[:,1]])

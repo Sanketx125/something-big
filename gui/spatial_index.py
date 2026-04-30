@@ -26,19 +26,34 @@ _INDEX_CACHE: dict = {
 def get_or_build_index(xyz: np.ndarray, method: str = "auto") -> "SpatialIndex":
     """
     Return the cached SpatialIndex for xyz, building it only when the array
-    identity changes (i.e. a new file was loaded).
+    identity or content fingerprint changes (i.e. a new file was loaded).
 
-    Safe to call from any thread context — building is GIL-held but all
-    downstream queries release the GIL inside scipy's C layer.
+    id(xyz) alone is unsafe: CPython reuses addresses after an array is freed,
+    causing false cache hits across file loads. A cheap 3-point content
+    fingerprint is added as a secondary guard.
     """
     arr_id = id(xyz)
-    if _INDEX_CACHE["index"] is not None and _INDEX_CACHE["point_id"] == arr_id:
-        return _INDEX_CACHE["index"]               # cache hit — O(1)
+    n      = len(xyz)
+
+    def _fp(a):
+        if n == 0:
+            return (0.0, 0.0, 0.0)
+        mid = n // 2
+        return (float(a[0, 0]), float(a[mid, 0]), float(a[-1, 0]))
+
+    if (
+        _INDEX_CACHE["index"]    is not None
+        and _INDEX_CACHE["point_id"]  == arr_id
+        and _INDEX_CACHE["n_points"]  == n
+        and _INDEX_CACHE.get("fp")    == _fp(xyz)
+    ):
+        return _INDEX_CACHE["index"]
 
     idx = build_spatial_index_auto(xyz, method)
     _INDEX_CACHE["index"]    = idx
     _INDEX_CACHE["point_id"] = arr_id
-    _INDEX_CACHE["n_points"] = len(xyz)
+    _INDEX_CACHE["n_points"] = n
+    _INDEX_CACHE["fp"]       = _fp(xyz)
     return idx
 
 

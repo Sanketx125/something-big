@@ -649,6 +649,7 @@ class AIClassificationDialog(QDialog):
         except Exception:
             pass
         # ─────────────────────────────────────────────────────────────────────────
+        self._teardown_worker()
 
         try:
             summary = self._build_result_summary()
@@ -705,6 +706,7 @@ class AIClassificationDialog(QDialog):
         self.status_label.setText("Classification failed")
         self.cancel_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
+        self._teardown_worker()
         QMessageBox.critical(self, "AI Classification Failed",
             f"Error:\n\n{error_msg}")
 
@@ -719,16 +721,32 @@ class AIClassificationDialog(QDialog):
             self.status_label.setText("Classification cancelled")
             self.close_btn.setEnabled(True)
 
+    def _teardown_worker(self):
+        if self.worker is None:
+            return
+        try:
+            self.worker.progress.disconnect()
+            self.worker.finished.disconnect()
+            self.worker.error.disconnect()
+        except RuntimeError:
+            pass
+        self.worker.deleteLater()
+        self.worker = None
+
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
             reply = QMessageBox.question(self, "In Progress",
                 "Classification is still running. Cancel and close?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.Yes:
-                self.worker.cancel(); self.worker.wait(5000); event.accept()
+                self.worker.cancel()
+                self.worker.wait(5000)
+                self._teardown_worker()
+                event.accept()
             else:
                 event.ignore()
         else:
+            self._teardown_worker()
             event.accept()
 
 
