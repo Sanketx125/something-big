@@ -676,7 +676,7 @@ def _queue_incremental_patch(app, sci):
         except Exception:
             pass
         _rebuild_timer = None
-        
+
     def do_patch():
         global _rebuild_timer
         _rebuild_timer = None
@@ -1890,15 +1890,14 @@ def refresh_shaded_after_undo_fast(app, changed_mask=None):
         return True
     
     # Single-class optimized path
-    if len(pbv) > 0 and len(pbh) > 0:
-        # Both add and remove - use optimized rebuild
+    # CRITICAL: _rebuild_single_class is a RECOLOR-ONLY function — it never
+    # removes faces from cache.faces. When undo puts points back into a
+    # non-shaded class (pbh > 0), we MUST use _rebuild_single_class_for_undo
+    # which surgically removes the phantom faces before recoloring.
+    # Using _rebuild_single_class here is the root cause of the "undo paints
+    # undone geometry in wrong class colors" bug shown in the screenshots.
+    if len(pbv) > 0 or len(pbh) > 0:
         _rebuild_single_class_for_undo(app, sci, changed_mask)
-        return True
-    if len(pbv) > 0:
-        _rebuild_single_class_for_undo(app, sci, changed_mask)
-        return True
-    if len(pbh) > 0:
-        _rebuild_single_class(app, sci)
         return True
     return True
 
@@ -1963,8 +1962,14 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
 
     ci = np.flatnonzero(changed_mask)
     rgi = ci[cls[ci] == sci]
-    if len(rgi) == 0: return
-
+    if len(rgi) == 0:
+        # No points of the shaded class in the changed region after undo.
+        # This means all changed points left the class → we must still prune
+        # their faces. Fall back to a full single-class rebuild which re-reads
+        # cache.faces and removes any face whose vertices are no longer class sci.
+        _do_full_rebuild(app, sci)
+        return
+        
     # ✅ FIX: Use cache values first for shading parameters
     az_ = cache.last_azimuth if cache.last_azimuth >= 0 else getattr(app, 'last_shade_azimuth', 45.)
     an_ = cache.last_angle if cache.last_angle >= 0 else getattr(app, 'last_shade_angle', 45.)
